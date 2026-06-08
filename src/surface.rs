@@ -240,12 +240,15 @@ pub enum MeshValidationIssue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeMask {
-    selected: Vec<bool>,
-}
+pub struct NodeMask(BitMask);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FaceMask {
+pub struct FaceMask(BitMask);
+
+/// Shared bit-set backing both [`NodeMask`] and [`FaceMask`]. Indices are
+/// `usize`; the wrappers convert their public index types to and from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BitMask {
     selected: Vec<bool>,
 }
 
@@ -283,7 +286,7 @@ pub enum SmoothingWeights {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceTransform {
-    pub matrix: [[f32; 4]; 4],
+    mat: Mat4,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -575,7 +578,7 @@ impl SurfaceMesh {
             })
             .collect();
 
-        Ok(FaceMask { selected })
+        Ok(FaceMask(BitMask { selected }))
     }
 
     pub fn patch_from_node_mask(
@@ -1153,75 +1156,60 @@ impl MeshValidationReport {
     }
 }
 
-impl NodeMask {
-    pub fn empty(node_count: usize) -> Self {
+impl BitMask {
+    fn filled(len: usize, value: bool) -> Self {
         Self {
-            selected: vec![false; node_count],
+            selected: vec![value; len],
         }
     }
 
-    pub fn all(node_count: usize) -> Self {
-        Self {
-            selected: vec![true; node_count],
-        }
-    }
-
-    pub fn from_nodes(node_count: usize, nodes: impl IntoIterator<Item = u32>) -> Result<Self> {
-        let mut mask = Self::empty(node_count);
-        for node in nodes {
+    fn from_indices(
+        len: usize,
+        indices: impl IntoIterator<Item = usize>,
+        what: &str,
+    ) -> Result<Self> {
+        let mut mask = Self::filled(len, false);
+        for index in indices {
             ensure!(
-                (node as usize) < node_count,
-                "node mask references node {} outside node count {}",
-                node,
-                node_count
+                index < len,
+                "{what} mask references {what} {} outside {what} count {}",
+                index,
+                len
             );
-            mask.selected[node as usize] = true;
+            mask.selected[index] = true;
         }
         Ok(mask)
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.selected.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         !self.selected.iter().any(|selected| *selected)
     }
 
-    pub fn contains(&self, node: u32) -> bool {
-        self.selected.get(node as usize).copied().unwrap_or(false)
+    fn contains(&self, index: usize) -> bool {
+        self.selected.get(index).copied().unwrap_or(false)
     }
 
-    pub fn nodes(&self) -> Vec<u32> {
+    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
         self.selected
             .iter()
             .enumerate()
-            .filter_map(|(node, selected)| selected.then_some(node as u32))
-            .collect()
+            .filter_map(|(index, selected)| selected.then_some(index))
     }
 
-    pub fn union(&self, other: &Self) -> Result<Self> {
-        self.combine(other, |left, right| left || right)
-    }
-
-    pub fn intersection(&self, other: &Self) -> Result<Self> {
-        self.combine(other, |left, right| left && right)
-    }
-
-    pub fn difference(&self, other: &Self) -> Result<Self> {
-        self.combine(other, |left, right| left && !right)
-    }
-
-    pub fn invert(&self) -> Self {
+    fn invert(&self) -> Self {
         Self {
             selected: self.selected.iter().map(|selected| !selected).collect(),
         }
     }
 
-    fn combine(&self, other: &Self, f: impl Fn(bool, bool) -> bool) -> Result<Self> {
+    fn combine(&self, other: &Self, what: &str, f: impl Fn(bool, bool) -> bool) -> Result<Self> {
         ensure!(
             self.len() == other.len(),
-            "node masks have different lengths: {} and {}",
+            "{what} masks have different lengths: {} and {}",
             self.len(),
             other.len()
         );
@@ -1235,135 +1223,156 @@ impl NodeMask {
                 .map(|(left, right)| f(left, right))
                 .collect(),
         })
+    }
+}
+
+impl NodeMask {
+    pub fn empty(node_count: usize) -> Self {
+        Self(BitMask::filled(node_count, false))
+    }
+
+    pub fn all(node_count: usize) -> Self {
+        Self(BitMask::filled(node_count, true))
+    }
+
+    pub fn from_nodes(node_count: usize, nodes: impl IntoIterator<Item = u32>) -> Result<Self> {
+        Ok(Self(BitMask::from_indices(
+            node_count,
+            nodes.into_iter().map(|node| node as usize),
+            "node",
+        )?))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains(&self, node: u32) -> bool {
+        self.0.contains(node as usize)
+    }
+
+    pub fn nodes(&self) -> Vec<u32> {
+        self.0.indices().map(|node| node as u32).collect()
+    }
+
+    pub fn union(&self, other: &Self) -> Result<Self> {
+        Ok(Self(self.0.combine(&other.0, "node", |l, r| l || r)?))
+    }
+
+    pub fn intersection(&self, other: &Self) -> Result<Self> {
+        Ok(Self(self.0.combine(&other.0, "node", |l, r| l && r)?))
+    }
+
+    pub fn difference(&self, other: &Self) -> Result<Self> {
+        Ok(Self(self.0.combine(&other.0, "node", |l, r| l && !r)?))
+    }
+
+    pub fn invert(&self) -> Self {
+        Self(self.0.invert())
     }
 }
 
 impl FaceMask {
     pub fn empty(face_count: usize) -> Self {
-        Self {
-            selected: vec![false; face_count],
-        }
+        Self(BitMask::filled(face_count, false))
     }
 
     pub fn all(face_count: usize) -> Self {
-        Self {
-            selected: vec![true; face_count],
-        }
+        Self(BitMask::filled(face_count, true))
     }
 
     pub fn from_faces(face_count: usize, faces: impl IntoIterator<Item = usize>) -> Result<Self> {
-        let mut mask = Self::empty(face_count);
-        for face in faces {
-            ensure!(
-                face < face_count,
-                "face mask references face {} outside face count {}",
-                face,
-                face_count
-            );
-            mask.selected[face] = true;
-        }
-        Ok(mask)
+        Ok(Self(BitMask::from_indices(face_count, faces, "face")?))
     }
 
     pub fn len(&self) -> usize {
-        self.selected.len()
+        self.0.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        !self.selected.iter().any(|selected| *selected)
+        self.0.is_empty()
     }
 
     pub fn contains(&self, face: usize) -> bool {
-        self.selected.get(face).copied().unwrap_or(false)
+        self.0.contains(face)
     }
 
     pub fn faces(&self) -> Vec<usize> {
-        self.selected
-            .iter()
-            .enumerate()
-            .filter_map(|(face, selected)| selected.then_some(face))
-            .collect()
+        self.0.indices().collect()
     }
 
     pub fn union(&self, other: &Self) -> Result<Self> {
-        self.combine(other, |left, right| left || right)
+        Ok(Self(self.0.combine(&other.0, "face", |l, r| l || r)?))
     }
 
     pub fn intersection(&self, other: &Self) -> Result<Self> {
-        self.combine(other, |left, right| left && right)
+        Ok(Self(self.0.combine(&other.0, "face", |l, r| l && r)?))
     }
 
     pub fn difference(&self, other: &Self) -> Result<Self> {
-        self.combine(other, |left, right| left && !right)
+        Ok(Self(self.0.combine(&other.0, "face", |l, r| l && !r)?))
     }
 
     pub fn invert(&self) -> Self {
-        Self {
-            selected: self.selected.iter().map(|selected| !selected).collect(),
-        }
-    }
-
-    fn combine(&self, other: &Self, f: impl Fn(bool, bool) -> bool) -> Result<Self> {
-        ensure!(
-            self.len() == other.len(),
-            "face masks have different lengths: {} and {}",
-            self.len(),
-            other.len()
-        );
-
-        Ok(Self {
-            selected: self
-                .selected
-                .iter()
-                .copied()
-                .zip(other.selected.iter().copied())
-                .map(|(left, right)| f(left, right))
-                .collect(),
-        })
+        Self(self.0.invert())
     }
 }
 
 impl SurfaceTransform {
     pub fn identity() -> Self {
-        Self::from_mat4(Mat4::IDENTITY)
+        Self {
+            mat: Mat4::IDENTITY,
+        }
     }
 
     pub fn from_matrix(matrix: [[f32; 4]; 4]) -> Self {
-        Self { matrix }
+        Self {
+            mat: Mat4::from_cols_array_2d(&matrix),
+        }
+    }
+
+    pub fn to_matrix(self) -> [[f32; 4]; 4] {
+        self.mat.to_cols_array_2d()
     }
 
     pub fn translation(offset: [f32; 3]) -> Self {
-        Self::from_mat4(Mat4::from_translation(Vec3::from_array(offset)))
+        Self {
+            mat: Mat4::from_translation(Vec3::from_array(offset)),
+        }
     }
 
     pub fn scale(scale: [f32; 3]) -> Self {
-        Self::from_mat4(Mat4::from_scale(Vec3::from_array(scale)))
+        Self {
+            mat: Mat4::from_scale(Vec3::from_array(scale)),
+        }
     }
 
     pub fn then(self, next: Self) -> Self {
-        Self::from_mat4(next.to_mat4() * self.to_mat4())
+        Self {
+            mat: next.mat * self.mat,
+        }
+    }
+
+    pub fn inverse(self) -> Self {
+        Self {
+            mat: self.mat.inverse(),
+        }
     }
 
     pub fn transform_point(self, point: [f32; 3]) -> [f32; 3] {
-        self.to_mat4()
+        self.mat
             .transform_point3(Vec3::from_array(point))
             .to_array()
     }
 
     pub fn transform_vector(self, vector: [f32; 3]) -> [f32; 3] {
-        self.to_mat4()
+        self.mat
             .transform_vector3(Vec3::from_array(vector))
             .to_array()
-    }
-
-    fn from_mat4(matrix: Mat4) -> Self {
-        Self {
-            matrix: matrix.to_cols_array_2d(),
-        }
-    }
-
-    fn to_mat4(self) -> Mat4 {
-        Mat4::from_cols_array_2d(&self.matrix)
     }
 }
 
@@ -1373,7 +1382,7 @@ impl VolumeSpace {
             dimensions.iter().all(|dimension| *dimension > 0),
             "volume dimensions must all be positive"
         );
-        let world_to_voxel = SurfaceTransform::from_mat4(voxel_to_world.to_mat4().inverse());
+        let world_to_voxel = voxel_to_world.inverse();
 
         Ok(Self {
             dimensions,

@@ -6,27 +6,31 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
-use glam::{Mat3, Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::surface::{NormalDirection, OverlayDataset, SurfaceMesh, ValueRange};
+use camera::{Camera, CameraMode, PresetOrientation};
+use gpu::{
+    DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
+};
 use mesh::PreparedSurface;
+use pick::pick_surface;
 
+mod camera;
+mod gpu;
 mod mesh;
+mod pick;
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
 const VERTEX_STRIDE: wgpu::BufferAddress = 40;
 const MODE_LABEL_DURATION: Duration = Duration::from_secs(2);
-const CAMERA_FOV_Y_RADIANS: f32 = std::f32::consts::FRAC_PI_4;
-const PICK_EPSILON: f32 = 1.0e-6;
 const CONTROL_CONTENT_WIDTH_POINTS: f32 = 380.0;
 const CONTROL_MIN_INNER_WIDTH: u32 = 420;
 const CONTROL_MIN_INNER_HEIGHT: u32 = 420;
@@ -806,7 +810,7 @@ impl ViewerState {
                     }
 
                     ui.separator();
-                    ui.label(format!("Camera: {}", self.camera.mode.label()));
+                    ui.label(format!("Camera: {}", self.camera.mode().label()));
                     ui.horizontal(|ui| {
                         if ui.button("Reset").clicked() {
                             actions.push(UiAction::ResetCamera);
@@ -1329,433 +1333,11 @@ impl BackgroundMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CameraMode {
-    Orbit,
-    Turntable,
-}
-
-impl CameraMode {
-    fn label(self) -> &'static str {
-        match self {
-            CameraMode::Orbit => "orbit",
-            CameraMode::Turntable => "turntable",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PresetOrientation {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-struct Camera {
-    mode: CameraMode,
-    orientation: Quat,
-    yaw: f32,
-    pitch: f32,
-    distance: f32,
-    rotating: bool,
-    last_cursor: Option<(f64, f64)>,
-}
-
-impl Default for Camera {
-    fn default() -> Self {
-        let mut camera = Self {
-            mode: CameraMode::Orbit,
-            orientation: Quat::IDENTITY,
-            yaw: 0.0,
-            pitch: 0.25,
-            distance: 3.0,
-            rotating: false,
-            last_cursor: None,
-        };
-        camera.sync_orientation_from_angles();
-        camera
-    }
-}
-
-impl Camera {
-    fn pointer_input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.rotating = *state == ElementState::Pressed;
-                if !self.rotating {
-                    self.last_cursor = None;
-                }
-                true
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if self.rotating {
-                    if let Some((last_x, last_y)) = self.last_cursor {
-                        let dx = position.x - last_x;
-                        let dy = position.y - last_y;
-                        self.drag(dx as f32, dy as f32);
-                    }
-                    self.last_cursor = Some((position.x, position.y));
-                    return true;
-                }
-
-                false
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(position) => position.y as f32 / 120.0,
-                };
-                self.distance = (self.distance * 0.9_f32.powf(scroll)).clamp(0.75, 25.0);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn toggle_mode(&mut self) -> CameraMode {
-        self.mode = match self.mode {
-            CameraMode::Orbit => {
-                self.sync_angles_from_orientation();
-                CameraMode::Turntable
-            }
-            CameraMode::Turntable => {
-                self.sync_orientation_from_angles();
-                CameraMode::Orbit
-            }
-        };
-        self.mode
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn set_preset(&mut self, preset: PresetOrientation) {
-        match preset {
-            PresetOrientation::Left => self.set_view_direction(Vec3::NEG_X, Vec3::Z),
-            PresetOrientation::Right => self.set_view_direction(Vec3::X, Vec3::Z),
-            PresetOrientation::Top => self.set_view_direction(Vec3::Z, Vec3::Y),
-            PresetOrientation::Bottom => self.set_view_direction(Vec3::NEG_Z, Vec3::Y),
-        }
-    }
-
-    fn drag(&mut self, dx: f32, dy: f32) {
-        let sensitivity = 0.01;
-
-        match self.mode {
-            CameraMode::Orbit => {
-                let yaw = Quat::from_axis_angle(Vec3::Z, -dx * sensitivity);
-                let right = self.orientation * Vec3::X;
-                let pitch = Quat::from_axis_angle(right.normalize(), -dy * sensitivity);
-                self.orientation = (yaw * pitch * self.orientation).normalize();
-                self.sync_angles_from_orientation();
-            }
-            CameraMode::Turntable => {
-                self.yaw -= dx * sensitivity;
-                self.pitch = (self.pitch - dy * sensitivity).clamp(-1.45, 1.45);
-                self.sync_orientation_from_angles();
-            }
-        }
-    }
-
-    fn uniform_bytes(&self, aspect: f32) -> Vec<u8> {
-        let view_projection = self.view_projection(aspect);
-        let model = Mat4::IDENTITY;
-        let light_direction = Vec3::new(0.35, 0.8, 0.45).normalize();
-        let surface_color = [0.76, 0.78, 0.74, 1.0];
-        let floats = [
-            view_projection.to_cols_array().as_slice(),
-            model.to_cols_array().as_slice(),
-            &[light_direction.x, light_direction.y, light_direction.z, 0.0],
-            &surface_color,
-        ]
-        .concat();
-
-        f32_bytes(&floats)
-    }
-
-    fn view_projection(&self, aspect: f32) -> Mat4 {
-        let (eye_direction, up) = self.view_axes();
-        let eye = eye_direction * self.distance;
-        let view = Mat4::look_at_rh(eye, Vec3::ZERO, up);
-        let projection = Mat4::perspective_rh(CAMERA_FOV_Y_RADIANS, aspect.max(0.01), 0.01, 100.0);
-
-        projection * view
-    }
-
-    fn view_axes(&self) -> (Vec3, Vec3) {
-        match self.mode {
-            CameraMode::Orbit => (self.orientation * Vec3::Z, self.orientation * Vec3::Y),
-            CameraMode::Turntable => {
-                let eye_direction = self.eye_direction_from_angles();
-                let up = stable_up_for_direction(eye_direction);
-                (eye_direction, up)
-            }
-        }
-    }
-
-    fn eye_direction_from_angles(&self) -> Vec3 {
-        let pitch_cos = self.pitch.cos();
-        Vec3::new(
-            self.yaw.sin() * pitch_cos,
-            self.yaw.cos() * pitch_cos,
-            self.pitch.sin(),
-        )
-        .normalize()
-    }
-
-    fn sync_orientation_from_angles(&mut self) {
-        let eye_direction = self.eye_direction_from_angles();
-        self.orientation = orientation_for(eye_direction, stable_up_for_direction(eye_direction));
-    }
-
-    fn sync_angles_from_orientation(&mut self) {
-        let eye_direction = (self.orientation * Vec3::Z).normalize();
-        self.pitch = eye_direction.z.asin().clamp(-1.45, 1.45);
-        self.yaw = eye_direction.x.atan2(eye_direction.y);
-    }
-
-    fn set_view_direction(&mut self, eye_direction: Vec3, up: Vec3) {
-        self.orientation = orientation_for(eye_direction, up);
-        self.sync_angles_from_orientation();
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PickRay {
-    origin: Vec3,
-    direction: Vec3,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct RayTriangleHit {
-    distance: f32,
-}
-
-fn pick_surface(
-    mesh: &SurfaceMesh,
-    overlay: Option<&OverlayDataset>,
-    camera: &Camera,
-    view_size: PhysicalSize<u32>,
-    cursor: (f64, f64),
-) -> Option<SurfacePick> {
-    let ray = screen_ray_for_camera(camera, view_size, cursor)?;
-    let center = Vec3::from_array(mesh.bounds.center);
-    let scale = if mesh.bounds.radius > f32::EPSILON {
-        1.0 / mesh.bounds.radius
-    } else {
-        1.0
-    };
-    let mut best_pick = None;
-    let mut best_distance = f32::INFINITY;
-
-    for (face_index, triangle) in mesh.triangles.iter().copied().enumerate() {
-        let Some(positions) = normalized_triangle_positions(mesh, triangle, center, scale) else {
-            continue;
-        };
-        let Some(hit) = ray_triangle_intersection(
-            ray.origin,
-            ray.direction,
-            positions[0],
-            positions[1],
-            positions[2],
-        ) else {
-            continue;
-        };
-
-        if hit.distance < best_distance {
-            let hit_position = ray.origin + ray.direction * hit.distance;
-            let node_index = closest_triangle_node(triangle, positions, hit_position);
-            let overlay_value = overlay
-                .and_then(|overlay| overlay.values.get(node_index as usize))
-                .copied();
-
-            best_distance = hit.distance;
-            best_pick = Some(SurfacePick {
-                node_index,
-                face_index,
-                overlay_value,
-            });
-        }
-    }
-
-    best_pick
-}
-
-fn screen_ray_for_camera(
-    camera: &Camera,
-    view_size: PhysicalSize<u32>,
-    cursor: (f64, f64),
-) -> Option<PickRay> {
-    if view_size.width == 0 || view_size.height == 0 {
-        return None;
-    }
-
-    let cursor_x = cursor.0 as f32;
-    let cursor_y = cursor.1 as f32;
-    if !cursor_x.is_finite() || !cursor_y.is_finite() {
-        return None;
-    }
-
-    let width = view_size.width as f32;
-    let height = view_size.height as f32;
-    let ndc_x = (cursor_x / width) * 2.0 - 1.0;
-    let ndc_y = 1.0 - (cursor_y / height) * 2.0;
-    let aspect = (width / height).max(0.01);
-    let (eye_direction, up) = camera.view_axes();
-    let eye_direction = eye_direction.normalize();
-    let up = up.normalize();
-    let right = up.cross(eye_direction).normalize();
-    let forward = -eye_direction;
-    let tan_half_fov = (CAMERA_FOV_Y_RADIANS * 0.5).tan();
-    let direction =
-        (forward + right * ndc_x * aspect * tan_half_fov + up * ndc_y * tan_half_fov).normalize();
-
-    Some(PickRay {
-        origin: eye_direction * camera.distance,
-        direction,
-    })
-}
-
-fn normalized_triangle_positions(
-    mesh: &SurfaceMesh,
-    triangle: [u32; 3],
-    center: Vec3,
-    scale: f32,
-) -> Option<[Vec3; 3]> {
-    Some([
-        normalized_vertex_position(mesh, triangle[0], center, scale)?,
-        normalized_vertex_position(mesh, triangle[1], center, scale)?,
-        normalized_vertex_position(mesh, triangle[2], center, scale)?,
-    ])
-}
-
-fn normalized_vertex_position(
-    mesh: &SurfaceMesh,
-    node_index: u32,
-    center: Vec3,
-    scale: f32,
-) -> Option<Vec3> {
-    mesh.vertices
-        .get(node_index as usize)
-        .map(|position| (Vec3::from_array(*position) - center) * scale)
-}
-
-fn ray_triangle_intersection(
-    origin: Vec3,
-    direction: Vec3,
-    a: Vec3,
-    b: Vec3,
-    c: Vec3,
-) -> Option<RayTriangleHit> {
-    let edge_ab = b - a;
-    let edge_ac = c - a;
-    let p = direction.cross(edge_ac);
-    let determinant = edge_ab.dot(p);
-
-    if determinant.abs() <= PICK_EPSILON {
-        return None;
-    }
-
-    let inverse_determinant = 1.0 / determinant;
-    let origin_to_a = origin - a;
-    let u = origin_to_a.dot(p) * inverse_determinant;
-    if !(0.0..=1.0).contains(&u) {
-        return None;
-    }
-
-    let q = origin_to_a.cross(edge_ab);
-    let v = direction.dot(q) * inverse_determinant;
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-
-    let distance = edge_ac.dot(q) * inverse_determinant;
-    (distance > PICK_EPSILON).then_some(RayTriangleHit { distance })
-}
-
-fn closest_triangle_node(triangle: [u32; 3], positions: [Vec3; 3], point: Vec3) -> u32 {
-    let mut closest_node = triangle[0];
-    let mut closest_distance = positions[0].distance_squared(point);
-
-    for (node_index, position) in triangle.into_iter().zip(positions).skip(1) {
-        let distance = position.distance_squared(point);
-        if distance < closest_distance {
-            closest_node = node_index;
-            closest_distance = distance;
-        }
-    }
-
-    closest_node
-}
-
 fn window_title(surface_path: Option<&PathBuf>) -> String {
     surface_path.map_or_else(
         || "sumaru".to_string(),
         |path| format!("sumaru - {}", path.display()),
     )
-}
-
-fn choose_surface_format(
-    view_caps: &wgpu::SurfaceCapabilities,
-    control_caps: &wgpu::SurfaceCapabilities,
-) -> wgpu::TextureFormat {
-    preferred_surface_formats()
-        .into_iter()
-        .find(|format| view_caps.formats.contains(format) && control_caps.formats.contains(format))
-        .or_else(|| {
-            view_caps
-                .formats
-                .iter()
-                .copied()
-                .find(|format| control_caps.formats.contains(format))
-        })
-        .unwrap_or(view_caps.formats[0])
-}
-
-fn preferred_surface_formats() -> [wgpu::TextureFormat; 4] {
-    [
-        wgpu::TextureFormat::Bgra8Unorm,
-        wgpu::TextureFormat::Rgba8Unorm,
-        wgpu::TextureFormat::Bgra8UnormSrgb,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-    ]
-}
-
-fn choose_present_mode(
-    view_caps: &wgpu::SurfaceCapabilities,
-    control_caps: &wgpu::SurfaceCapabilities,
-) -> wgpu::PresentMode {
-    [wgpu::PresentMode::Fifo]
-        .into_iter()
-        .find(|mode| {
-            view_caps.present_modes.contains(mode) && control_caps.present_modes.contains(mode)
-        })
-        .or_else(|| {
-            view_caps
-                .present_modes
-                .iter()
-                .copied()
-                .find(|mode| control_caps.present_modes.contains(mode))
-        })
-        .unwrap_or(view_caps.present_modes[0])
-}
-
-fn choose_alpha_mode(
-    view_caps: &wgpu::SurfaceCapabilities,
-    control_caps: &wgpu::SurfaceCapabilities,
-) -> wgpu::CompositeAlphaMode {
-    view_caps
-        .alpha_modes
-        .iter()
-        .copied()
-        .find(|mode| control_caps.alpha_modes.contains(mode))
-        .unwrap_or(view_caps.alpha_modes[0])
 }
 
 fn pick_surface_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
@@ -1834,85 +1416,9 @@ fn size_is_close(current: PhysicalSize<u32>, desired: PhysicalSize<u32>) -> bool
         && current.height.abs_diff(desired.height) <= CONTROL_RESIZE_THRESHOLD
 }
 
-fn orientation_for(eye_direction: Vec3, up_hint: Vec3) -> Quat {
-    let eye_direction = eye_direction.normalize();
-    let mut right = up_hint.cross(eye_direction);
-
-    if right.length_squared() <= f32::EPSILON {
-        right = Vec3::X;
-    }
-
-    let right = right.normalize();
-    let up = eye_direction.cross(right).normalize();
-
-    Quat::from_mat3(&Mat3::from_cols(right, up, eye_direction)).normalize()
-}
-
-fn stable_up_for_direction(eye_direction: Vec3) -> Vec3 {
-    if eye_direction.normalize().dot(Vec3::Z).abs() > 0.95 {
-        Vec3::Y
-    } else {
-        Vec3::Z
-    }
-}
-
-struct DepthBuffer {
-    _texture: wgpu::Texture,
-    view: wgpu::TextureView,
-}
-
-impl DepthBuffer {
-    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        Self {
-            _texture: texture,
-            view,
-        }
-    }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
-
-    for value in values {
-        bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-
-    bytes
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        BackgroundMode, Camera, CameraMode, PresetOrientation, closest_triangle_node,
-        overlay_toggle_label, pick_surface, ray_triangle_intersection, screen_ray_for_camera,
-    };
-    use crate::surface::{OverlayDataset, SurfaceMesh, ValueRange};
-    use glam::Vec3;
-    use winit::dpi::PhysicalSize;
-
-    #[test]
-    fn camera_mode_toggles_between_orbit_and_turntable() {
-        let mut camera = Camera::default();
-
-        assert_eq!(camera.toggle_mode(), CameraMode::Turntable);
-        assert_eq!(camera.toggle_mode(), CameraMode::Orbit);
-    }
+    use super::{BackgroundMode, overlay_toggle_label};
 
     #[test]
     fn background_toggles_between_black_and_white() {
@@ -1941,87 +1447,5 @@ mod tests {
             winit::dpi::PhysicalSize::new(420, 700),
             winit::dpi::PhysicalSize::new(460, 700)
         ));
-    }
-
-    #[test]
-    fn option_up_preset_points_camera_from_top() {
-        let mut camera = Camera::default();
-
-        camera.set_preset(PresetOrientation::Top);
-        let (eye_direction, _) = camera.view_axes();
-
-        assert!(eye_direction.z > 0.99);
-    }
-
-    #[test]
-    fn center_screen_ray_points_toward_camera_target() {
-        let camera = Camera::default();
-        let (eye_direction, _) = camera.view_axes();
-
-        let ray =
-            screen_ray_for_camera(&camera, PhysicalSize::new(100, 100), (50.0, 50.0)).unwrap();
-
-        assert_vec3_close(ray.origin, eye_direction * camera.distance);
-        assert!(ray.direction.dot(-eye_direction) > 0.999);
-    }
-
-    #[test]
-    fn ray_triangle_intersection_hits_triangle() {
-        let hit = ray_triangle_intersection(
-            Vec3::new(0.25, 0.25, 1.0),
-            Vec3::NEG_Z,
-            Vec3::ZERO,
-            Vec3::X,
-            Vec3::Y,
-        )
-        .unwrap();
-
-        assert!((hit.distance - 1.0).abs() < 0.0001);
-    }
-
-    #[test]
-    fn closest_triangle_node_uses_hit_position() {
-        let triangle = [10, 11, 12];
-        let positions = [Vec3::ZERO, Vec3::X, Vec3::Y];
-
-        assert_eq!(
-            closest_triangle_node(triangle, positions, Vec3::new(0.1, 0.8, 0.0)),
-            12
-        );
-    }
-
-    #[test]
-    fn surface_pick_reports_node_triangle_and_overlay_value() {
-        let mesh = SurfaceMesh::new(
-            vec![[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
-            vec![[0, 1, 2]],
-        )
-        .unwrap();
-        let overlay = OverlayDataset {
-            values: vec![10.0, 20.0, 30.0],
-            range: ValueRange {
-                min: 10.0,
-                max: 30.0,
-            },
-        };
-        let mut camera = Camera::default();
-        camera.set_preset(PresetOrientation::Top);
-
-        let pick = pick_surface(
-            &mesh,
-            Some(&overlay),
-            &camera,
-            PhysicalSize::new(100, 100),
-            (50.0, 50.0),
-        )
-        .unwrap();
-
-        assert_eq!(pick.node_index, 2);
-        assert_eq!(pick.face_index, 0);
-        assert_eq!(pick.overlay_value, Some(30.0));
-    }
-
-    fn assert_vec3_close(actual: Vec3, expected: Vec3) {
-        assert!((actual - expected).length() < 0.0001);
     }
 }
