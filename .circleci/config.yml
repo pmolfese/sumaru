@@ -1,0 +1,87 @@
+version: 2.1
+
+# Build and test sumaru on Linux and macOS. Both jobs mirror the local Cargo
+# aliases from .cargo/config.toml:
+#   fmt-all   = fmt --all
+#   check-all = check --all-targets --all-features
+#   test-all  = test --all-targets --all-features
+#
+# `cargo test` (and therefore `test-all`) auto-discovers and runs every test in
+# the crate: inline `#[cfg(test)]` unit tests, integration tests under tests/,
+# and doc tests. Note that `--all-targets` is the one exception that skips doc
+# tests; the crate currently has none, so test-all still covers everything.
+
+jobs:
+  test-linux:
+    docker:
+      - image: rust:latest
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install system libraries for winit/wgpu
+          command: |
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              cmake pkg-config \
+              libx11-dev libxkbcommon-dev libwayland-dev \
+              libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run:
+          name: Toolchain versions
+          command: |
+            rustup component add rustfmt
+            rustc --version && cargo --version
+      - restore_cache:
+          keys:
+            - cargo-linux-v1-{{ checksum "Cargo.lock" }}
+            - cargo-linux-v1-
+      - run:
+          name: Format check
+          command: cargo fmt-all -- --check
+      - run:
+          name: Build and test
+          command: cargo test-all
+      - save_cache:
+          key: cargo-linux-v1-{{ checksum "Cargo.lock" }}
+          paths:
+            - /usr/local/cargo/registry
+            - target
+
+  test-macos:
+    # Apple silicon (arm64).
+    macos:
+      # Pick a value from CircleCI's supported Xcode images; bump as needed.
+      xcode: "16.2.0"
+    resource_class: macos.m1.medium.gen1
+    steps:
+      - checkout
+      - run:
+          name: Install Rust
+          command: |
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --component rustfmt
+            echo 'source "$HOME/.cargo/env"' >> "$BASH_ENV"
+      - run:
+          name: Toolchain versions
+          command: rustc --version && cargo --version
+      - restore_cache:
+          keys:
+            - cargo-macos-v1-{{ checksum "Cargo.lock" }}
+            - cargo-macos-v1-
+      - run:
+          name: Format check
+          command: cargo fmt-all -- --check
+      - run:
+          name: Build and test
+          command: cargo test-all
+      - save_cache:
+          key: cargo-macos-v1-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - target
+
+workflows:
+  build-and-test:
+    jobs:
+      - test-linux
+      - test-macos

@@ -9,10 +9,61 @@ Build a Rust-native surface/volume model first, then hang CLIs and viewers from
 that model. Avoid copying AFNI's implementation; use public file formats,
 behavioral tests, and user-visible compatibility as the guide.
 
+Once the model is rich enough to support a real task, prefer building the
+thinnest end-to-end slice that is actually usable (load → view → adjust →
+export), dogfood it, and let real use pull depth into the model — rather than
+pre-building model depth on spec. The "Daily Driver" phase below exists for
+exactly this: it pulls a small set of items forward out of later phases so the
+tool becomes usable day-to-day before those phases are finished in order.
+
 AFNI/SUMA reference points for the early model work include
 `SUMA_define.h` (`SUMA_SurfaceObject`, `SUMA_OVERLAYS`, `SUMA_VOLPAR`, ROI
 records), `suma_datasets.h`, `surface_domain.h`, `SUMA_GeomComp.h`, and
 `SUMA_Color.h`.
+
+## Phase: Daily Driver (current focus)
+
+The near-term goal: make `sumaru` usable for the two most common day-to-day
+SUMA tasks — viewing statistical overlays and drawing/editing ROIs — on real
+AFNI data (`.niml.dset`, `.spec`). Items here are pulled forward from Phases 3,
+4, and 5; the canonical descriptions still live in those phases. Much of this is
+wiring already-built model code (the `Overlay`/`ColorMap` model, the `Roi`
+model, and the Phase 2 path/fill/geodesic geometry) into the viewer, not new
+foundation.
+
+Deliberately *not* in scope yet: a standalone controller/command-routing layer
+(wire controls directly to viewer state for now and extract a controller only
+once scripts or AFNI become a second consumer), atlas/label coloring, live AFNI
+interop, and volume rendering.
+
+### Tier 1 — Statistical overlay loop
+
+- [ ] Parse `.niml.dset` into the canonical `Dataset` (from Phase 3) so real
+  AFNI overlays load, not just GIFTI shape files.
+- [ ] Wire overlay display controls into the viewer using the existing
+  `color.rs`/`overlay.rs` model: selectable colormap, intensity range,
+  threshold mode/range, symmetric range, and opacity (from Phase 4).
+- [ ] Add screenshot export (from Phase 4) for figures and QA.
+
+### Tier 2 — ROI loop
+
+- [ ] Add persistent node/triangle selection highlighting and crosshair state
+  (from Phase 4) on top of the existing right-click pick.
+- [ ] Load and display `.niml.roi` regions (from Phases 3/5), including a
+  second color layer composited over the scalar overlay.
+- [ ] Drawing, editing, undo/redo, and `.niml.roi` save (from Phase 5),
+  exercising the Phase 2 node/edge/triangle paths, fill-to-mask, and geodesics.
+
+### Tier 3 — Sessions and anatomy
+
+- [ ] Parse `.spec` files and load multi-surface scenes with visibility toggles
+  and pial/inflated/sphere state switching (from Phases 3/5), including the
+  surface-volume parent needed to keep ROI node indexing honest.
+
+### Continuous (cheap insurance, do early)
+
+- [ ] Add CircleCI building and testing on macOS and Linux (a minimal version
+  of the Phase 8 CI item), since cross-platform support is a core goal.
 
 ## Phase 0: Bootstrap
 
@@ -139,6 +190,9 @@ records), `suma_datasets.h`, `surface_domain.h`, `SUMA_GeomComp.h`, and
 
 ## Phase 3: SUMA Compatibility Layer
 
+> Top priority (pulled into Daily Driver): `.niml.dset` → `Dataset`, `.spec`
+> parsing, and `.niml.roi` reading.
+
 - [ ] Inventory the SUMA file formats and workflows we want first: `.spec`,
   GIFTI surfaces, `.niml.dset`, `.niml.roi`, labels, overlays, and AFNI
   session coordination.
@@ -187,6 +241,10 @@ records), `suma_datasets.h`, `surface_domain.h`, `SUMA_GeomComp.h`, and
     of every file format.
 
 ## Phase 4: Rendering Prototype
+
+> Top priority (pulled into Daily Driver): overlay colormap/range/threshold/
+> symmetric-range/opacity controls, persistent selection + crosshair, and
+> screenshot export.
 
 - [x] Start with a desktop viewer using `winit` for windowing and `wgpu` for
   rendering.
@@ -272,6 +330,9 @@ records), `suma_datasets.h`, `surface_domain.h`, `SUMA_GeomComp.h`, and
     us confidence that the window still draws real content.
 
 ## Phase 5: Interactive SUMA Workflows
+
+> Top priority (pulled into Daily Driver): multi-surface scenes + state
+> switching, and ROI display/drawing/editing/undo/save.
 
 - [ ] Add multi-surface scenes: pial, smoothwm, inflated, sphere, and
   registered template surfaces.
