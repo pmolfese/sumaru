@@ -1,0 +1,24 @@
+[package]
+name = "sumaru"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A Rust rebuild of AFNI SUMA."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+egui = "0.34.3"
+egui-wgpu = "0.34.3"
+egui-winit = "0.34.3"
+gifti_rs = { package = "gifti-rs", git = "https://github.com/PennLINC/gifti-rs" }
+glam = "0.33"
+nifti = { version = "0.17.0", features = ["nalgebra_affine"] }
+pollster = "0.4"
+rfd = "0.15"
+wgpu = "29"
+winit = "0.30"
+
+[lints.rust]
+unsafe_code = "forbid"

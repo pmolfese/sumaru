@@ -1,0 +1,6 @@
+[alias]
+check-all = "check --all-targets --all-features"
+fmt-all = "fmt --all"
+inspect = "run -- inspect"
+surface = "run -- -i"
+test-all = "test --all-targets --all-features"
