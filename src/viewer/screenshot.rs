@@ -137,13 +137,158 @@ pub(super) fn stitch_horizontal(images: &[ScreenshotImage]) -> Result<Screenshot
     ScreenshotImage::new(width, height, rgba)
 }
 
+pub(super) fn stitch_horizontal_with_gap(
+    images: &[ScreenshotImage],
+    gap_width: u32,
+    background: [u8; 4],
+) -> Result<ScreenshotImage> {
+    let first = images
+        .first()
+        .ok_or_else(|| anyhow!("cannot stitch an empty screenshot montage"))?;
+    let image_width = images
+        .iter()
+        .try_fold(0_u32, |total, image| total.checked_add(image.width))
+        .ok_or_else(|| anyhow!("montage image width overflowed"))?;
+    let gap_total = gap_width
+        .checked_mul(images.len().saturating_sub(1) as u32)
+        .ok_or_else(|| anyhow!("montage gap width overflowed"))?;
+    let width = image_width
+        .checked_add(gap_total)
+        .ok_or_else(|| anyhow!("montage image width overflowed"))?;
+    let height = images
+        .iter()
+        .map(|image| image.height)
+        .max()
+        .unwrap_or(first.height);
+    let mut rgba = repeated_pixel_buffer(width, height, background);
+
+    let mut dst_x = 0_u32;
+    for image in images {
+        let dst_y = ((height - image.height) / 2) as usize;
+        for y in 0..image.height as usize {
+            let src_start = y * image.width as usize * 4;
+            let src_end = src_start + image.width as usize * 4;
+            let dst_start = ((dst_y + y) * width as usize + dst_x as usize) * 4;
+            rgba[dst_start..dst_start + image.width as usize * 4]
+                .copy_from_slice(&image.rgba[src_start..src_end]);
+        }
+        dst_x = dst_x
+            .checked_add(image.width)
+            .and_then(|x| x.checked_add(gap_width))
+            .ok_or_else(|| anyhow!("montage image width overflowed"))?;
+    }
+
+    ScreenshotImage::new(width, height, rgba)
+}
+
+pub(super) fn crop_to_content(
+    image: &ScreenshotImage,
+    background: [u8; 4],
+    tolerance: u8,
+    padding: u32,
+) -> Result<ScreenshotImage> {
+    let Some((mut min_x, mut min_y, mut max_x, mut max_y)) =
+        content_bounds(image, background, tolerance)
+    else {
+        return Ok(image.clone());
+    };
+
+    min_x = min_x.saturating_sub(padding);
+    min_y = min_y.saturating_sub(padding);
+    max_x = (max_x + padding).min(image.width - 1);
+    max_y = (max_y + padding).min(image.height - 1);
+
+    let width = max_x - min_x + 1;
+    let height = max_y - min_y + 1;
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in min_y..=max_y {
+        let start = ((y * image.width + min_x) * 4) as usize;
+        let end = start + width as usize * 4;
+        rgba.extend_from_slice(&image.rgba[start..end]);
+    }
+
+    ScreenshotImage::new(width, height, rgba)
+}
+
+pub(super) fn pad_image(
+    image: &ScreenshotImage,
+    horizontal_padding: u32,
+    vertical_padding: u32,
+    background: [u8; 4],
+) -> Result<ScreenshotImage> {
+    let width = image
+        .width
+        .checked_add(horizontal_padding.saturating_mul(2))
+        .ok_or_else(|| anyhow!("padded image width overflowed"))?;
+    let height = image
+        .height
+        .checked_add(vertical_padding.saturating_mul(2))
+        .ok_or_else(|| anyhow!("padded image height overflowed"))?;
+    let mut rgba = repeated_pixel_buffer(width, height, background);
+
+    for y in 0..image.height as usize {
+        let src_start = y * image.width as usize * 4;
+        let src_end = src_start + image.width as usize * 4;
+        let dst_start = (((y as u32 + vertical_padding) * width + horizontal_padding) * 4) as usize;
+        rgba[dst_start..dst_start + image.width as usize * 4]
+            .copy_from_slice(&image.rgba[src_start..src_end]);
+    }
+
+    ScreenshotImage::new(width, height, rgba)
+}
+
+fn content_bounds(
+    image: &ScreenshotImage,
+    background: [u8; 4],
+    tolerance: u8,
+) -> Option<(u32, u32, u32, u32)> {
+    let mut min_x = image.width;
+    let mut min_y = image.height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let index = ((y * image.width + x) * 4) as usize;
+            let pixel = &image.rgba[index..index + 4];
+            if pixel_differs_from_background(pixel, background, tolerance) {
+                found = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    found.then_some((min_x, min_y, max_x, max_y))
+}
+
+fn pixel_differs_from_background(pixel: &[u8], background: [u8; 4], tolerance: u8) -> bool {
+    pixel
+        .iter()
+        .zip(background)
+        .take(3)
+        .any(|(channel, background)| channel.abs_diff(background) > tolerance)
+}
+
+fn repeated_pixel_buffer(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for _ in 0..width as usize * height as usize {
+        rgba.extend_from_slice(&pixel);
+    }
+
+    rgba
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ScreenshotImage, append_png_extension, padded_bytes_per_row, stitch_horizontal,
-        texture_bytes_to_rgba,
+        ScreenshotImage, append_png_extension, crop_to_content, pad_image, padded_bytes_per_row,
+        stitch_horizontal, stitch_horizontal_with_gap, texture_bytes_to_rgba,
     };
 
     #[test]
@@ -188,5 +333,53 @@ mod tests {
         assert_eq!(montage.width, 2);
         assert_eq!(montage.height, 1);
         assert_eq!(montage.rgba, vec![255, 0, 0, 255, 0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn images_stitch_with_gap_and_vertical_centering() {
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let black = [0, 0, 0, 255];
+        let left = ScreenshotImage::new(1, 3, red.repeat(3)).unwrap();
+        let right = ScreenshotImage::new(1, 1, blue.to_vec()).unwrap();
+        let montage = stitch_horizontal_with_gap(&[left, right], 2, black).unwrap();
+
+        assert_eq!(montage.width, 4);
+        assert_eq!(montage.height, 3);
+        let middle_right_pixel = ((1 * montage.width + 3) * 4) as usize;
+        assert_eq!(
+            &montage.rgba[middle_right_pixel..middle_right_pixel + 4],
+            &blue
+        );
+        let top_right_pixel = 3 * 4;
+        assert_eq!(&montage.rgba[top_right_pixel..top_right_pixel + 4], &black);
+    }
+
+    #[test]
+    fn crop_to_content_removes_background_border() {
+        let black = [0, 0, 0, 255];
+        let white = [255, 255, 255, 255];
+        let mut rgba = black.repeat(9);
+        rgba[4 * 4..4 * 4 + 4].copy_from_slice(&white);
+        let image = ScreenshotImage::new(3, 3, rgba).unwrap();
+        let cropped = crop_to_content(&image, black, 2, 0).unwrap();
+
+        assert_eq!(cropped.width, 1);
+        assert_eq!(cropped.height, 1);
+        assert_eq!(cropped.rgba, white);
+    }
+
+    #[test]
+    fn pad_image_adds_background_border() {
+        let black = [0, 0, 0, 255];
+        let white = [255, 255, 255, 255];
+        let image = ScreenshotImage::new(1, 1, white.to_vec()).unwrap();
+        let padded = pad_image(&image, 2, 1, black).unwrap();
+
+        assert_eq!(padded.width, 5);
+        assert_eq!(padded.height, 3);
+        let center = ((1 * padded.width + 2) * 4) as usize;
+        assert_eq!(&padded.rgba[center..center + 4], &white);
+        assert_eq!(&padded.rgba[0..4], &black);
     }
 }

@@ -21,7 +21,7 @@ cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.gii.dset
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset --verbose
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
-cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --no-preload
+cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --preload
 cargo run -- inspect /path/to/file.nii.gz
 ```
 
@@ -53,9 +53,8 @@ threshold control can operate in p-value mode.
   volume. The controls window auto-fits to its current contents, capped by
   the monitor size.
 - Add `--verbose` to print viewer status messages to the terminal.
-- Spec scenes load the first display state immediately and preload the rest in
-  the background by default. Add `--no-preload` to load only surfaces as they
-  are displayed.
+- Spec scenes load only the active display state by default. Add `--preload`
+  to load the remaining spec surfaces in the background after launch.
 - Left-drag to orbit.
 - Right-click the surface to inspect the nearest node, triangle, and loaded
   overlay value.
@@ -70,9 +69,12 @@ threshold control can operate in p-value mode.
   persistently switch between the closed and acorn paired-hemisphere layouts.
   Hold Control and left-drag in the viewer to fine-tune the pair: left/right
   adjusts the open angle, and up/down adjusts the gap between hemispheres.
+- In a `both` spec scene, press `[` to show/hide the left hemisphere and `]` to
+  show/hide the right hemisphere.
 - Press `r` to save the current view as a PNG, or Shift-`R` to save a 1x4
-  left/right/top/bottom montage. The VIEW section also has `Save` and
-  `Montage` buttons.
+  montage. Single-surface scenes use left/right/top/bottom views; `both` spec
+  scenes use closed top, closed bottom, open medial-in, and open outer-out
+  views. The VIEW section also has `Save` and `Montage` buttons.
 - Press `F5` to switch the background between black and white.
 - Hold Option and press an arrow key for preset views:
   - Option-Left: left side view
@@ -109,7 +111,7 @@ See `docs/ROADMAP.md` for the staged build plan.
   launches the viewer with an initial surface or `.spec` scene, requires `-sv`
   surface-volume context for `.spec` launches, handles `--overlay`, passes
   through `--verbose` terminal logging, controls spec preloading with
-  `--no-preload`, and runs the `inspect` subcommand.
+  `--preload`, and runs the `inspect` subcommand.
 - `src/color.rs` contains shared RGBA, continuous color-map, and label-table
   models for scalar maps and integer label datasets, including GIFTI and
   FreeSurfer import helpers.

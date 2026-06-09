@@ -69,15 +69,71 @@ interop, and volume rendering.
   - [x] Load `both` specs as paired left/right surfaces rendered together.
   - [x] Add closed/acorn paired-hemisphere view presets and Control-drag
     controls for opening angle and hemisphere gap.
-  - [x] Load the first spec state immediately and preload remaining spec
-    surfaces in the background, with `--no-preload` for strict on-demand
-    loading.
-  - [ ] Update screenshot montage behavior for paired-hemisphere scenes.
+  - [x] Load the first spec state immediately and use strict on-demand loading
+    by default, with `--preload` for background loading of remaining spec
+    surfaces.
+  - [x] Update screenshot montage behavior for paired-hemisphere scenes.
 
 ### Continuous (cheap insurance, do early)
 
 - [ ] Add CircleCI building and testing on macOS and Linux (a minimal version
   of the Phase 8 CI item), since cross-platform support is a core goal.
+
+## Phase: Performance (viewer interaction)
+
+Keeping overlay thresholding and surface/hemisphere toggling responsive on large
+standard-mesh, both-hemisphere scenes. Guiding principle: **build durable data
+once, then express interaction as cheap state on top** (recolor, transforms,
+flags, draw-call selection, GPU uniforms) instead of rebuilding the canonical
+model or re-uploading large per-vertex data on every change.
+
+Always **measure before optimizing** — time the recolor, upload, and rebuild
+paths on a real ~275k-vertex scene to confirm where the cost is before moving to
+the next rung.
+
+### Recolor path hygiene (done)
+
+- [x] Cache geometry-derived scene stats (`winding_report`/`total_area`) per
+  surface id so a recolor no longer recomputes whole-mesh topology; only the
+  cheap overlay range is refreshed.
+- [x] Compute the overlay color cache exactly once per appearance change
+  (`Overlay::without_color_cache` + a single `rebuild_color_cache`) instead of
+  building it once with default settings and again with the real settings.
+
+### Thresholding — Level 2: separate color buffer
+
+- [ ] Split the interleaved vertex buffer into a position+normal buffer
+  (uploaded once) and a separate color buffer. A threshold/colormap change then
+  re-uploads only ~4·N color bytes and never touches geometry. Split
+  `upload_surface_buffers` into a geometry upload (on mesh/visibility change)
+  and a color upload (on recolor). Still does an O(n) CPU recolor per change,
+  but ~10× less upload; often enough on its own.
+
+### Thresholding — Level 3: GPU/shader colormapping
+
+- [ ] Upload the raw per-vertex scalar columns (intensity, threshold, optional
+  brightness) once; put threshold/range/opacity/colormap-id in a small uniform;
+  colormap in the shader against a 1-D LUT texture. A threshold change becomes a
+  tiny uniform write — no CPU recolor, no per-vertex upload — so slider dragging
+  is immediate even on large meshes. Naturally supports SUMA's independent
+  intensity/threshold sub-bricks. Costs: porting threshold semantics (symmetric
+  range, abs, hide-failed vs dim, p-value→stat, NaN) to WGSL, adding pixel/render
+  tests since that logic leaves unit-testable Rust, and a node→vertex expansion
+  for sparse overlays. The Level 2 multi-buffer/bind-group plumbing carries into
+  this.
+
+### Toggling and hemisphere layout — durable mesh residency
+
+- [ ] Keep the durable `SurfaceMesh` immutable after load; never rebuild it for a
+  view change. Express the `both`-hemisphere open-angle/gap layout as per-
+  hemisphere transforms (model matrices) rather than baking transformed vertex
+  positions into a rebuilt merged mesh, and make picking layout-aware (transform
+  the pick ray) so layout changes never rebuild the durable mesh. Currently the
+  open-angle drag is debounced (render-only per frame, durable rebuild once on
+  release for picking correctness); this removes that release-time rebuild too.
+- [ ] Keep each surface's geometry resident on the GPU and toggle visibility via
+  draw-call selection instead of rebuilding/re-uploading filtered geometry, so
+  hemisphere and state switches are a draw-list change rather than an upload.
 
 ## Phase 0: Bootstrap
 

@@ -89,6 +89,22 @@ impl Overlay {
     pub fn from_dataset(
         dataset: &Dataset,
         domain: &SurfaceDomain,
+        columns: OverlayColumns,
+    ) -> Result<Self> {
+        let mut overlay = Self::without_color_cache(dataset, domain, columns)?;
+        overlay.rebuild_color_cache(dataset, domain)?;
+
+        Ok(overlay)
+    }
+
+    /// Builds the overlay with default display settings but an empty color
+    /// cache, leaving `rebuild_color_cache` to the caller. Use this when you
+    /// will immediately apply display settings (colormap, range, threshold,
+    /// opacity) so the cache is only computed once rather than once here with
+    /// defaults and again after the settings are applied.
+    pub fn without_color_cache(
+        dataset: &Dataset,
+        domain: &SurfaceDomain,
         mut columns: OverlayColumns,
     ) -> Result<Self> {
         ensure!(
@@ -97,7 +113,7 @@ impl Overlay {
         );
         columns.attach_labels(dataset);
 
-        let mut overlay = Self {
+        Ok(Self {
             dataset_id: dataset.parent_ids.source_dataset_id.clone(),
             domain_id: dataset.domain_id.clone(),
             columns,
@@ -111,10 +127,7 @@ impl Overlay {
             plane_order: 0,
             layer_role: OverlayLayerRole::Foreground,
             color_cache: PerNodeColorCache::transparent(domain.node_count),
-        };
-        overlay.rebuild_color_cache(dataset, domain)?;
-
-        Ok(overlay)
+        })
     }
 
     pub fn rebuild_color_cache(&mut self, dataset: &Dataset, domain: &SurfaceDomain) -> Result<()> {

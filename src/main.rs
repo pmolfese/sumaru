@@ -29,8 +29,12 @@ struct Cli {
     #[arg(long = "verbose")]
     verbose: bool,
 
-    /// Only load spec surfaces when they are displayed.
-    #[arg(long = "no-preload")]
+    /// Preload spec surfaces in the background after the first display state.
+    #[arg(long = "preload")]
+    preload: bool,
+
+    /// Deprecated: on-demand spec loading is now the default.
+    #[arg(long = "no-preload", hide = true, conflicts_with = "preload")]
     no_preload: bool,
 
     #[command(subcommand)]
@@ -49,7 +53,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse_from(normalized_afni_style_args());
     let verbose = cli.verbose;
-    let no_preload = cli.no_preload;
+    let preload = cli.preload && !cli.no_preload;
 
     match (
         cli.surface,
@@ -66,7 +70,7 @@ fn main() -> Result<()> {
                 surface_volume_path: surface_volume,
                 overlay_path: overlay,
                 verbose,
-                no_preload,
+                preload,
             })?;
         }
         (None, None, None, None, Some(Commands::Inspect { path })) => {
@@ -119,7 +123,8 @@ fn normalized_afni_style_args() -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_viewer_launch;
+    use super::{Cli, validate_viewer_launch};
+    use clap::Parser;
     use std::path::PathBuf;
 
     fn path(value: &str) -> Option<PathBuf> {
@@ -164,5 +169,38 @@ mod tests {
             validate_viewer_launch(&path("surface.gii"), &path("surface.spec"), &None, &None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn spec_preload_is_opt_in() {
+        let cli = Cli::parse_from(["sumaru", "--spec", "scene.spec", "--sv", "SurfVol.nii"]);
+        assert!(!cli.preload);
+        assert!(!cli.no_preload);
+
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--spec",
+            "scene.spec",
+            "--sv",
+            "SurfVol.nii",
+            "--preload",
+        ]);
+        assert!(cli.preload);
+        assert!(!cli.no_preload);
+    }
+
+    #[test]
+    fn deprecated_no_preload_flag_is_a_compatible_no_op() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--spec",
+            "scene.spec",
+            "--sv",
+            "SurfVol.nii",
+            "--no-preload",
+        ]);
+
+        assert!(!cli.preload);
+        assert!(cli.no_preload);
     }
 }
