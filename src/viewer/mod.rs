@@ -1,34 +1,48 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
+use glam::{Quat, Vec3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset};
+use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
 use crate::io::{read_gifti_dataset, read_niml_dataset};
+use crate::overlay::{
+    ColumnSelection, MaskMode, Overlay, OverlayColumns, OverlayRange, RangeSelection, Threshold,
+};
+use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, read_spec};
 use crate::stats::AfniStatSpec;
-use crate::surface::{NormalDirection, OverlayDataset, SurfaceMesh, ValueRange};
+use crate::surface::{
+    AnatomicalCorrectness, NormalDirection, OverlayDataset, SurfaceDomain, SurfaceId, SurfaceMesh,
+    SurfaceSide, ValueRange,
+};
 use camera::{Camera, CameraMode, PresetOrientation};
 use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
 };
-use mesh::{OverlayAppearance, OverlayColorMap, PreparedSurface, sample_colormap};
+use mesh::{
+    OverlayAppearance, OverlayColorMap, PreparedGeometry, PreparedSurface, sample_colormap,
+};
 use pick::pick_surface;
+use screenshot::ScreenshotImage;
 
 mod camera;
 mod gpu;
 mod mesh;
 mod pick;
+mod screenshot;
 
 const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
@@ -49,6 +63,11 @@ const DEFAULT_OVERLAY_RANGE: ValueRange = ValueRange {
     min: -1.0,
     max: 1.0,
 };
+const PAIR_OPEN_DEGREES_PER_PIXEL: f32 = 0.18;
+const PAIR_MAX_OPEN_DEGREES: f32 = 85.0;
+const PAIR_ACORN_EXTRA_GAP: f32 = 50.0;
+const PAIR_MIN_CLEARANCE_FRACTION: f32 = 0.02;
+const PAIR_MAX_DRAG_GAP_FACTOR: f32 = 1.5;
 const BLACK_BACKGROUND: wgpu::Color = wgpu::Color {
     r: 0.0,
     g: 0.0,
@@ -62,13 +81,24 @@ const WHITE_BACKGROUND: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-pub fn run(surface_path: Option<PathBuf>, overlay_path: Option<PathBuf>) -> Result<()> {
-    let event_loop = EventLoop::new()?;
+#[derive(Debug, Default)]
+pub struct LaunchOptions {
+    pub surface_path: Option<PathBuf>,
+    pub spec_path: Option<PathBuf>,
+    pub surface_volume_path: Option<PathBuf>,
+    pub overlay_path: Option<PathBuf>,
+    pub verbose: bool,
+    pub no_preload: bool,
+}
+
+pub fn run(options: LaunchOptions) -> Result<()> {
+    let event_loop = EventLoop::<ViewerEvent>::with_user_event().build()?;
     // Render on demand rather than spinning at max FPS: the loop sleeps until an
     // input event, a requested redraw, or a scheduled animation deadline.
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = ViewerApp::new(surface_path, overlay_path);
+    let event_proxy = event_loop.create_proxy();
+    let mut app = ViewerApp::new(options, event_proxy);
     event_loop.run_app(&mut app)?;
 
     if let Some(error) = app.setup_error {
@@ -80,16 +110,26 @@ pub fn run(surface_path: Option<PathBuf>, overlay_path: Option<PathBuf>) -> Resu
 
 struct ViewerApp {
     initial_surface_path: Option<PathBuf>,
+    initial_spec_path: Option<PathBuf>,
+    initial_surface_volume_path: Option<PathBuf>,
     initial_overlay_path: Option<PathBuf>,
+    verbose: bool,
+    no_preload: bool,
+    event_proxy: EventLoopProxy<ViewerEvent>,
     state: Option<ViewerState>,
     setup_error: Option<anyhow::Error>,
 }
 
 impl ViewerApp {
-    fn new(initial_surface_path: Option<PathBuf>, initial_overlay_path: Option<PathBuf>) -> Self {
+    fn new(options: LaunchOptions, event_proxy: EventLoopProxy<ViewerEvent>) -> Self {
         Self {
-            initial_surface_path,
-            initial_overlay_path,
+            initial_surface_path: options.surface_path,
+            initial_spec_path: options.spec_path,
+            initial_surface_volume_path: options.surface_volume_path,
+            initial_overlay_path: options.overlay_path,
+            verbose: options.verbose,
+            no_preload: options.no_preload,
+            event_proxy,
             state: None,
             setup_error: None,
         }
@@ -117,14 +157,19 @@ impl ViewerApp {
             view_window,
             control_window,
             self.initial_surface_path.take(),
+            self.initial_spec_path.take(),
+            self.initial_surface_volume_path.take(),
             self.initial_overlay_path.take(),
+            self.verbose,
+            !self.no_preload,
+            self.event_proxy.clone(),
         ))?);
 
         Ok(())
     }
 }
 
-impl ApplicationHandler for ViewerApp {
+impl ApplicationHandler<ViewerEvent> for ViewerApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() || self.setup_error.is_some() {
             return;
@@ -217,6 +262,21 @@ impl ApplicationHandler for ViewerApp {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ViewerEvent) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+
+        match event {
+            ViewerEvent::SpecPreloadReady => {
+                if state.drain_preload_results() {
+                    state.control_window().request_redraw();
+                    state.view_window().request_redraw();
+                }
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_ref() else {
             return;
@@ -270,7 +330,11 @@ struct ViewerState {
     uniform_bind_group: wgpu::BindGroup,
     depth_buffer: DepthBuffer,
     mesh: Option<SurfaceMesh>,
-    overlay: Option<OverlayDataset>,
+    prepared_geometry_cache: Option<PreparedGeometryCache>,
+    surface_scene: Option<SurfaceScene>,
+    scene_generation: u64,
+    overlay: Option<Overlay>,
+    overlay_values: Option<OverlayDataset>,
     overlay_dataset: Option<Dataset>,
     overlay_columns: OverlayColumnSelections,
     overlay_visible: bool,
@@ -278,13 +342,23 @@ struct ViewerState {
     overlay_symmetric_range: bool,
     surface_path: Option<PathBuf>,
     overlay_path: Option<PathBuf>,
-    surface_path_input: String,
-    overlay_path_input: String,
+    overlay_display_name: Option<String>,
+    surface_volume_path: Option<PathBuf>,
+    hemisphere_layout: HemisphereLayout,
+    hemisphere_open_angle_degrees: f32,
+    hemisphere_separation_distance: f32,
     scene_stats: Option<SceneStats>,
     surface_pick: Option<SurfacePick>,
-    status: StatusMessage,
+    verbose: bool,
+    preload_enabled: bool,
+    preload_sender: Sender<PreloadResult>,
+    preload_receiver: Receiver<PreloadResult>,
+    event_proxy: EventLoopProxy<ViewerEvent>,
     camera: Camera,
     view_cursor_position: Option<(f64, f64)>,
+    pair_dragging: bool,
+    pair_drag_last_cursor: Option<(f64, f64)>,
+    pair_drag_changed: bool,
     background: BackgroundMode,
     modifiers: ModifiersState,
     mode_label: Option<ModeLabel>,
@@ -300,7 +374,12 @@ impl ViewerState {
         view_window: Arc<Window>,
         control_window: Arc<Window>,
         initial_surface_path: Option<PathBuf>,
+        initial_spec_path: Option<PathBuf>,
+        initial_surface_volume_path: Option<PathBuf>,
         initial_overlay_path: Option<PathBuf>,
+        verbose: bool,
+        preload_enabled: bool,
+        event_proxy: EventLoopProxy<ViewerEvent>,
     ) -> Result<Self> {
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
@@ -441,6 +520,9 @@ impl ViewerState {
         );
         egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
         let egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
+        let initial_surface_volume_path =
+            initial_surface_volume_path.map(canonical_or_original_path);
+        let (preload_sender, preload_receiver) = mpsc::channel();
 
         let mut state = Self {
             view_window,
@@ -464,7 +546,11 @@ impl ViewerState {
             uniform_bind_group,
             depth_buffer,
             mesh: None,
+            prepared_geometry_cache: None,
+            surface_scene: None,
+            scene_generation: 0,
             overlay: None,
+            overlay_values: None,
             overlay_dataset: None,
             overlay_columns: OverlayColumnSelections::default(),
             overlay_visible: true,
@@ -472,17 +558,23 @@ impl ViewerState {
             overlay_symmetric_range: true,
             surface_path: None,
             overlay_path: None,
-            surface_path_input: initial_surface_path
-                .as_ref()
-                .map_or_else(String::new, |path| path.display().to_string()),
-            overlay_path_input: initial_overlay_path
-                .as_ref()
-                .map_or_else(String::new, |path| path.display().to_string()),
+            overlay_display_name: None,
+            surface_volume_path: initial_surface_volume_path.clone(),
+            hemisphere_layout: HemisphereLayout::Closed,
+            hemisphere_open_angle_degrees: 0.0,
+            hemisphere_separation_distance: 0.0,
             scene_stats: None,
             surface_pick: None,
-            status: StatusMessage::info("Ready. Paste a GIFTI surface path and load it."),
+            verbose,
+            preload_enabled,
+            preload_sender,
+            preload_receiver,
+            event_proxy,
             camera,
             view_cursor_position: None,
+            pair_dragging: false,
+            pair_drag_last_cursor: None,
+            pair_drag_changed: false,
             background: BackgroundMode::Black,
             modifiers: ModifiersState::empty(),
             mode_label: None,
@@ -495,11 +587,14 @@ impl ViewerState {
 
         if let Some(path) = initial_surface_path {
             state.load_surface_path(path)?;
+        } else if let Some(path) = initial_spec_path {
+            state.load_spec_path(path, initial_surface_volume_path)?;
         }
         if let Some(path) = initial_overlay_path {
             state.load_overlay_path(path)?;
         }
         state.arm_startup_redraw_guard();
+        state.log_status("Viewer initialized.");
 
         Ok(state)
     }
@@ -563,11 +658,40 @@ impl ViewerState {
         match event {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
+                if !self.modifiers.control_key() && self.pair_dragging {
+                    self.finish_pair_drag();
+                }
                 false
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.view_cursor_position = Some((position.x, position.y));
+                let cursor = (position.x, position.y);
+                self.view_cursor_position = Some(cursor);
+                if self.pair_dragging {
+                    self.update_pair_drag(cursor);
+                    return true;
+                }
+
                 self.camera.pointer_input(event)
+            }
+            WindowEvent::MouseInput { state, button, .. }
+                if self.pair_dragging
+                    && matches!(*button, MouseButton::Left | MouseButton::Right) =>
+            {
+                if *state == ElementState::Released {
+                    self.finish_pair_drag();
+                }
+                true
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } if self.modifiers.control_key()
+                && self.has_both_scene()
+                && matches!(*button, MouseButton::Left | MouseButton::Right) =>
+            {
+                self.begin_pair_drag();
+                true
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -594,10 +718,36 @@ impl ViewerState {
                         self.background.toggle();
                         true
                     }
+                    PhysicalKey::Code(KeyCode::KeyR) if self.modifiers.shift_key() => {
+                        if let Err(error) = self.save_preset_montage_screenshot() {
+                            self.set_error(error);
+                        }
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::KeyR) => {
+                        if let Err(error) = self.save_current_view_screenshot() {
+                            self.set_error(error);
+                        }
+                        true
+                    }
                     PhysicalKey::Code(KeyCode::KeyO) => {
                         self.toggle_overlay_visibility();
                         true
                     }
+                    PhysicalKey::Code(KeyCode::Period) => match self.cycle_scene_surface(1) {
+                        Ok(changed) => changed,
+                        Err(error) => {
+                            self.set_error(error);
+                            true
+                        }
+                    },
+                    PhysicalKey::Code(KeyCode::Comma) => match self.cycle_scene_surface(-1) {
+                        Ok(changed) => changed,
+                        Err(error) => {
+                            self.set_error(error);
+                            true
+                        }
+                    },
                     PhysicalKey::Code(KeyCode::ArrowLeft) if self.modifiers.alt_key() => {
                         self.camera.set_preset(PresetOrientation::Left);
                         true
@@ -657,45 +807,198 @@ impl ViewerState {
                 label: Some("surface render encoder"),
             });
 
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("surface render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.background.color()),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_buffer.view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            if let Some(buffers) = &self.surface_buffers {
-                render_pass.set_pipeline(&self.render_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(buffers.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..buffers.index_count, 0, 0..1);
-            }
-        }
+        self.encode_surface_render_pass(&mut encoder, &view, &self.depth_buffer.view);
 
         self.queue.submit([encoder.finish()]);
         output.present();
 
         RenderStatus::Rendered
+    }
+
+    fn encode_surface_render_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+    ) {
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("surface render pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.background.color()),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
+
+        if let Some(buffers) = &self.surface_buffers {
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(buffers.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..buffers.index_count, 0, 0..1);
+        }
+    }
+
+    fn save_current_view_screenshot(&mut self) -> Result<()> {
+        if self.surface_buffers.is_none() {
+            self.log_status("Load a surface before saving a screenshot.");
+            return Ok(());
+        }
+
+        let Some(path) = save_screenshot_file(
+            "Save current view",
+            &timestamped_png_name("sumaru_view"),
+            self.surface_path.as_ref(),
+        ) else {
+            self.log_status("Screenshot save cancelled.");
+            return Ok(());
+        };
+
+        let camera = self.camera.clone();
+        let image = self.capture_surface_view(&camera)?;
+        screenshot::save_png(&path, &image)?;
+        self.log_status(format!("Saved screenshot {}.", path.display()));
+
+        Ok(())
+    }
+
+    fn save_preset_montage_screenshot(&mut self) -> Result<()> {
+        if self.surface_buffers.is_none() {
+            self.log_status("Load a surface before saving a montage.");
+            return Ok(());
+        }
+
+        let Some(path) = save_screenshot_file(
+            "Save left/right/top/bottom montage",
+            &timestamped_png_name("sumaru_montage"),
+            self.surface_path.as_ref(),
+        ) else {
+            self.log_status("Montage save cancelled.");
+            return Ok(());
+        };
+
+        let result = (|| {
+            let presets = [
+                PresetOrientation::Left,
+                PresetOrientation::Right,
+                PresetOrientation::Top,
+                PresetOrientation::Bottom,
+            ];
+            let mut images = Vec::with_capacity(presets.len());
+            for preset in presets {
+                let mut camera = self.camera.clone();
+                camera.set_preset(preset);
+                images.push(self.capture_surface_view(&camera)?);
+            }
+
+            screenshot::stitch_horizontal(&images)
+        })();
+        self.update();
+
+        let montage = result?;
+        screenshot::save_png(&path, &montage)?;
+        self.log_status(format!("Saved montage {}.", path.display()));
+
+        Ok(())
+    }
+
+    fn capture_surface_view(&mut self, camera: &Camera) -> Result<ScreenshotImage> {
+        let width = self.view_config.width.max(1);
+        let height = self.view_config.height.max(1);
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let screenshot_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screenshot texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.view_config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let screenshot_view =
+            screenshot_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_buffer = DepthBuffer::new(&self.device, width, height);
+        let padded_bytes_per_row = screenshot::padded_bytes_per_row(width);
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screenshot readback buffer"),
+            size: u64::from(padded_bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let aspect = width as f32 / height as f32;
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, &camera.uniform_bytes(aspect));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("screenshot render encoder"),
+            });
+        self.encode_surface_render_pass(&mut encoder, &screenshot_view, &depth_buffer.view);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &screenshot_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            extent,
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let buffer_slice = readback_buffer.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("failed to wait for screenshot readback")?;
+        receiver
+            .recv()
+            .context("screenshot readback callback did not run")?
+            .context("failed to map screenshot readback buffer")?;
+
+        let mapped = buffer_slice.get_mapped_range();
+        let rgba = screenshot::texture_bytes_to_rgba(
+            &mapped,
+            width,
+            height,
+            padded_bytes_per_row,
+            self.view_config.format,
+        )?;
+        drop(mapped);
+        readback_buffer.unmap();
+
+        ScreenshotImage::new(width, height, rgba)
     }
 
     fn render_control(&mut self) -> RenderStatus {
@@ -742,6 +1045,7 @@ impl ViewerState {
         self.apply_ui_actions(ui_actions);
         if actions_present {
             self.view_window.request_redraw();
+            self.control_window.request_redraw();
         }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
@@ -861,7 +1165,6 @@ impl ViewerState {
                     self.draw_view_section(ui, &mut actions);
                     self.draw_scene_section(ui);
                     self.draw_pick_section(ui);
-                    self.draw_status_section(ui);
                 });
             desired_control_size_points = egui::vec2(
                 scroll_output
@@ -904,71 +1207,82 @@ impl ViewerState {
 
     fn draw_surface_dataset_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
         controller_section(ui, "SURFACE / DATASET", |ui| {
-            egui::Grid::new("surface_dataset_grid")
-                .num_columns(2)
-                .spacing([8.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Surface");
-                    ui.horizontal(|ui| {
-                        let response = ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.surface_path_input)
-                                    .desired_width(270.0)
-                                    .hint_text("surface.gii"),
-                            )
-                            .on_hover_text("Press Return to load pasted path");
-                        if response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                            && let Some(path) = trimmed_path(&self.surface_path_input)
-                        {
-                            actions.push(UiAction::LoadSurface(path));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Open:");
+                if ui
+                    .button("Surf")
+                    .on_hover_text("Open GIFTI surface")
+                    .clicked()
+                {
+                    actions.push(UiAction::PickSurface);
+                }
+                if ui
+                    .add_enabled(self.mesh.is_some(), egui::Button::new("Olay"))
+                    .on_hover_text("Open overlay dataset")
+                    .clicked()
+                {
+                    actions.push(UiAction::PickOverlay);
+                }
+                if ui.button("Spec").on_hover_text("Open SUMA spec").clicked() {
+                    actions.push(UiAction::PickSpec);
+                }
+                if ui
+                    .button("SV")
+                    .on_hover_text("Open surface volume")
+                    .clicked()
+                {
+                    actions.push(UiAction::PickSurfaceVolume);
+                }
+            });
+
+            if let Some(scene) = self.surface_scene.as_ref() {
+                ui.add_space(8.0);
+                egui::Grid::new("spec_scene_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 5.0])
+                    .show(ui, |ui| {
+                        stat_row(ui, "Spec", file_display(Some(&scene.spec_path)));
+                        stat_row(
+                            ui,
+                            "SurfVol",
+                            file_display(scene.surface_volume_path.as_ref()),
+                        );
+                        stat_row(
+                            ui,
+                            "Hemi",
+                            format!(
+                                "{}{}",
+                                spec_hemisphere_label(scene.hemisphere),
+                                scene
+                                    .group
+                                    .as_ref()
+                                    .map_or_else(String::new, |group| format!(" / {group}"))
+                            ),
+                        );
+                        let active = scene.active_index + 1;
+                        let total = scene.surfaces.len();
+                        let surface = &scene.surfaces[scene.active_index];
+                        stat_row(
+                            ui,
+                            "Active",
+                            format!(
+                                "{active}/{total} {}{}",
+                                surface.name,
+                                surface
+                                    .state
+                                    .as_ref()
+                                    .map_or_else(String::new, |state| format!(" ({state})"))
+                            ),
+                        );
+                        stat_row(ui, "Overlay", self.overlay_display_text());
+                        if scene.skipped_surfaces > 0 {
+                            stat_row(ui, "Skipped files", scene.skipped_surfaces.to_string());
                         }
-                        if ui.button("...").on_hover_text("Browse surface").clicked() {
-                            actions.push(UiAction::PickSurface);
+                        if scene.skipped_states > 0 {
+                            stat_row(ui, "Skipped states", scene.skipped_states.to_string());
                         }
                     });
-                    ui.end_row();
-
-                    ui.label("Overlay");
-                    ui.horizontal(|ui| {
-                        let response = ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.overlay_path_input)
-                                    .desired_width(270.0)
-                                    .hint_text("overlay.gii"),
-                            )
-                            .on_hover_text("Press Return to load pasted path");
-                        let can_load_overlay =
-                            self.mesh.is_some() && trimmed_path(&self.overlay_path_input).is_some();
-                        if response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                            && can_load_overlay
-                            && let Some(path) = trimmed_path(&self.overlay_path_input)
-                        {
-                            actions.push(UiAction::LoadOverlay(path));
-                        }
-                        if ui
-                            .add_enabled(self.mesh.is_some(), egui::Button::new("..."))
-                            .on_hover_text("Browse overlay")
-                            .clicked()
-                        {
-                            actions.push(UiAction::PickOverlay);
-                        }
-                    });
-                    ui.end_row();
-                });
-
-            ui.add_space(4.0);
-            object_line(
-                ui,
-                "Surface object",
-                file_display(self.surface_path.as_ref()),
-            );
-            object_line(
-                ui,
-                "Dataset object",
-                file_display(self.overlay_path.as_ref()),
-            );
+            }
         });
     }
 
@@ -976,7 +1290,7 @@ impl ViewerState {
         let overlay_loaded = self.overlay.is_some();
         let overlay_row_count = self.overlay_dataset.as_ref().map_or_else(
             || {
-                self.overlay
+                self.overlay_values
                     .as_ref()
                     .map_or(0, |overlay| overlay.values.len())
             },
@@ -1029,7 +1343,7 @@ impl ViewerState {
                         .num_columns(2)
                         .spacing([10.0, 5.0])
                         .show(ui, |ui| {
-                            stat_row(ui, "Dset", file_display(self.overlay_path.as_ref()));
+                            stat_row(ui, "Dset", self.overlay_display_text());
                             stat_row(ui, "Rows", overlay_row_count.to_string());
                             if column_options.is_empty() {
                                 stat_row(ui, "I", "scalar column 0");
@@ -1192,7 +1506,7 @@ impl ViewerState {
                 min: range.min as f32,
                 max: range.max as f32,
             })
-            .or_else(|| self.overlay.as_ref().map(|overlay| overlay.range))
+            .or_else(|| self.overlay_values.as_ref().map(|overlay| overlay.range))
             .unwrap_or(DEFAULT_OVERLAY_RANGE)
     }
 
@@ -1215,6 +1529,20 @@ impl ViewerState {
                 if ui.button(self.background.next_label()).clicked() {
                     actions.push(UiAction::ToggleBackground);
                 }
+                if ui
+                    .button("Save")
+                    .on_hover_text("Save current view")
+                    .clicked()
+                {
+                    actions.push(UiAction::SaveScreenshot);
+                }
+                if ui
+                    .button("Montage")
+                    .on_hover_text("Save left/right/top/bottom montage")
+                    .clicked()
+                {
+                    actions.push(UiAction::SaveMontage);
+                }
             });
 
             ui.add_space(6.0);
@@ -1230,6 +1558,29 @@ impl ViewerState {
                 }
                 if ui.button("Bottom").clicked() {
                     actions.push(UiAction::Preset(PresetOrientation::Bottom));
+                }
+                let can_layout_hemispheres = self.has_both_scene();
+                if ui
+                    .add_enabled(
+                        can_layout_hemispheres,
+                        egui::Button::new("Close")
+                            .selected(self.hemisphere_layout == HemisphereLayout::Closed),
+                    )
+                    .on_hover_text("Reset paired hemispheres to their closed alignment")
+                    .clicked()
+                {
+                    actions.push(UiAction::HemisphereLayout(HemisphereLayout::Closed));
+                }
+                if ui
+                    .add_enabled(
+                        can_layout_hemispheres,
+                        egui::Button::new("Open")
+                            .selected(self.hemisphere_layout == HemisphereLayout::Open),
+                    )
+                    .on_hover_text("Open paired hemispheres into the acorn view")
+                    .clicked()
+                {
+                    actions.push(UiAction::HemisphereLayout(HemisphereLayout::Open));
                 }
             });
         });
@@ -1280,17 +1631,6 @@ impl ViewerState {
             } else {
                 ui.label(egui::RichText::new("No pick").color(muted_color()));
             }
-        });
-    }
-
-    fn draw_status_section(&self, ui: &mut egui::Ui) {
-        controller_section(ui, "STATUS", |ui| {
-            let color = if self.status.is_error {
-                egui::Color32::from_rgb(255, 126, 104)
-            } else {
-                egui::Color32::from_rgb(215, 224, 232)
-            };
-            ui.add(egui::Label::new(egui::RichText::new(&self.status.text).color(color)).wrap());
         });
     }
 
@@ -1381,11 +1721,6 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::LoadSurface(path) => {
-                    if let Err(error) = self.load_surface_path(path) {
-                        self.set_error(error);
-                    }
-                }
                 UiAction::PickOverlay => {
                     if let Some(path) =
                         pick_overlay_file(self.overlay_path.as_ref().or(self.surface_path.as_ref()))
@@ -1395,9 +1730,32 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::LoadOverlay(path) => {
-                    if let Err(error) = self.load_overlay_path(path) {
-                        self.set_error(error);
+                UiAction::PickSpec => {
+                    let current_path = self
+                        .surface_scene
+                        .as_ref()
+                        .map(|scene| &scene.spec_path)
+                        .or(self.surface_path.as_ref());
+                    if let Some(path) = pick_spec_file(current_path) {
+                        if let Err(error) = self.load_spec_path(path, None) {
+                            self.set_error(error);
+                        }
+                    }
+                }
+                UiAction::PickSurfaceVolume => {
+                    let current_path = self
+                        .surface_volume_path
+                        .as_ref()
+                        .or_else(|| {
+                            self.surface_scene
+                                .as_ref()
+                                .and_then(|scene| scene.surface_volume_path.as_ref())
+                        })
+                        .or(self.surface_path.as_ref());
+                    if let Some(path) = pick_surface_volume_file(current_path) {
+                        if let Err(error) = self.set_surface_volume_path(path) {
+                            self.set_error(error);
+                        }
                     }
                 }
                 UiAction::RefreshOverlayColumns => {
@@ -1406,8 +1764,8 @@ impl ViewerState {
                     }
                 }
                 UiAction::RefreshOverlayAppearance => {
-                    if self.overlay.is_some() {
-                        self.upload_surface_buffers();
+                    if let Err(error) = self.refresh_overlay_appearance() {
+                        self.set_error(error);
                     }
                 }
                 UiAction::ResetCamera => self.camera.reset(),
@@ -1417,36 +1775,557 @@ impl ViewerState {
                 }
                 UiAction::ToggleBackground => self.background.toggle(),
                 UiAction::Preset(preset) => self.camera.set_preset(preset),
+                UiAction::HemisphereLayout(layout) => {
+                    if let Err(error) = self.set_hemisphere_layout(layout) {
+                        self.set_error(error);
+                    }
+                }
+                UiAction::SaveScreenshot => {
+                    if let Err(error) = self.save_current_view_screenshot() {
+                        self.set_error(error);
+                    }
+                }
+                UiAction::SaveMontage => {
+                    if let Err(error) = self.save_preset_montage_screenshot() {
+                        self.set_error(error);
+                    }
+                }
             }
         }
     }
 
     fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
-        let mesh = SurfaceMesh::from_gifti_path(&path)
+        let mut mesh = SurfaceMesh::from_gifti_path(&path)
             .with_context(|| format!("failed to load surface {}", path.display()))?;
+        apply_surface_volume_parent(&mut mesh, self.surface_volume_path.as_ref());
         let node_count = mesh.vertices.len();
         let face_count = mesh.triangles.len();
 
-        self.mesh = Some(mesh);
+        self.set_active_mesh(mesh, None);
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+        self.surface_scene = None;
         self.surface_path = Some(path.clone());
-        self.surface_path_input = path.display().to_string();
         self.overlay = None;
+        self.overlay_values = None;
         self.overlay_dataset = None;
         self.overlay_columns = OverlayColumnSelections::default();
         self.overlay_visible = true;
         self.overlay_appearance = OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE);
         self.overlay_symmetric_range = true;
         self.overlay_path = None;
-        self.overlay_path_input.clear();
+        self.overlay_display_name = None;
         self.surface_pick = None;
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.camera.reset();
         self.view_window
             .set_title(&window_title(self.surface_path.as_ref()));
-        self.status = StatusMessage::info(format!(
+        self.log_status(format!(
             "Loaded surface with {node_count} nodes and {face_count} triangles."
         ));
+
+        Ok(())
+    }
+
+    fn load_spec_path(
+        &mut self,
+        spec_path: PathBuf,
+        surface_volume_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let spec = read_spec(&spec_path)
+            .with_context(|| format!("failed to read SUMA spec {}", spec_path.display()))?;
+        let surface_volume_path = surface_volume_path
+            .or_else(|| self.surface_volume_path.clone())
+            .map(canonical_or_original_path);
+        let surface_volume_path =
+            surface_volume_path.context("loading a SUMA spec requires -sv/--sv")?;
+        let mut components = Vec::new();
+        let mut skipped_surfaces = 0;
+
+        for surface in &spec.surfaces {
+            if !surface.path.exists() {
+                skipped_surfaces += 1;
+                self.log_status(format!(
+                    "Skipping missing spec surface {}.",
+                    surface.path.display()
+                ));
+                continue;
+            }
+
+            components.push(SceneSurfaceComponent {
+                name: surface.name.clone(),
+                state: surface.state.clone(),
+                path: surface.path.clone(),
+                side: surface.side.clone(),
+                spec_surface: surface.clone(),
+                mesh: None,
+            });
+        }
+
+        let (surfaces, skipped_states, messages) =
+            scene_surfaces_from_components(&spec, components);
+        for message in messages {
+            self.log_status(message);
+        }
+
+        ensure!(
+            !surfaces.is_empty(),
+            "SUMA spec {} did not contain any loadable GIFTI surfaces",
+            spec.path.display()
+        );
+
+        let loaded_count = surfaces.len();
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+        let generation = self.scene_generation;
+        let loaded_label = if spec.hemisphere == SpecHemisphere::Both {
+            "paired states"
+        } else {
+            "surfaces"
+        };
+        self.surface_volume_path = Some(surface_volume_path.clone());
+        self.surface_scene = Some(SurfaceScene {
+            spec: spec.clone(),
+            spec_path: spec.path.clone(),
+            surface_volume_path: Some(surface_volume_path.clone()),
+            group: spec.group.clone(),
+            hemisphere: spec.hemisphere,
+            surfaces,
+            active_index: 0,
+            skipped_surfaces,
+            skipped_states,
+        });
+        self.overlay = None;
+        self.overlay_values = None;
+        self.overlay_dataset = None;
+        self.overlay_columns = OverlayColumnSelections::default();
+        self.overlay_visible = true;
+        self.overlay_appearance = OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE);
+        self.overlay_symmetric_range = true;
+        self.overlay_path = None;
+        self.overlay_display_name = None;
+        self.surface_pick = None;
+        self.ensure_scene_surface_loaded(0)?;
+        self.activate_scene_surface(0)?;
+        self.start_scene_preload(generation);
+        self.camera.reset();
+        self.log_status(format!(
+            "Loaded {loaded_count} {loaded_label} from spec {} (skipped {skipped_surfaces} files, {skipped_states} states).",
+            spec.path.display()
+        ));
+
+        Ok(())
+    }
+
+    fn set_surface_volume_path(&mut self, path: PathBuf) -> Result<()> {
+        let path = canonical_or_original_path(path);
+        self.surface_volume_path = Some(path.clone());
+
+        if let Some(scene) = self.surface_scene.as_mut() {
+            scene.surface_volume_path = Some(path.clone());
+            for surface in &mut scene.surfaces {
+                surface.display_cache = None;
+                for component in &mut surface.components {
+                    if let Some(mesh) = component.mesh.as_mut() {
+                        apply_surface_volume_parent(mesh, Some(&path));
+                    }
+                }
+            }
+        }
+
+        if let Some(mesh) = self.mesh.as_mut() {
+            apply_surface_volume_parent(mesh, Some(&path));
+        }
+
+        self.log_status(format!("Surface volume set to {}.", path.display()));
+
+        Ok(())
+    }
+
+    fn ensure_scene_surface_loaded(&mut self, index: usize) -> Result<()> {
+        let (spec, surface_volume_path, tasks) = {
+            let scene = self
+                .surface_scene
+                .as_ref()
+                .context("no SUMA spec scene is loaded")?;
+            ensure!(
+                index < scene.surfaces.len(),
+                "surface index {index} is outside loaded scene"
+            );
+            let tasks = scene.surfaces[index]
+                .components
+                .iter()
+                .enumerate()
+                .filter(|(_, component)| component.mesh.is_none())
+                .map(|(component_index, component)| {
+                    (component_index, component.spec_surface.clone())
+                })
+                .collect::<Vec<_>>();
+
+            (scene.spec.clone(), scene.surface_volume_path.clone(), tasks)
+        };
+
+        for (component_index, surface) in tasks {
+            let mesh = load_spec_component_mesh(&spec, &surface, surface_volume_path.as_ref())?;
+            if let Some(scene) = self.surface_scene.as_mut()
+                && let Some(component) = scene
+                    .surfaces
+                    .get_mut(index)
+                    .and_then(|surface| surface.components.get_mut(component_index))
+                && component.mesh.is_none()
+            {
+                component.mesh = Some(mesh);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn start_scene_preload(&self, generation: u64) {
+        if !self.preload_enabled {
+            self.log_status("Spec preloading disabled.");
+            return;
+        }
+
+        let Some(scene) = self.surface_scene.as_ref() else {
+            return;
+        };
+        let mut tasks = Vec::new();
+        for (surface_index, surface) in scene.surfaces.iter().enumerate() {
+            for (component_index, component) in surface.components.iter().enumerate() {
+                if component.mesh.is_none() {
+                    tasks.push(PreloadTask {
+                        generation,
+                        surface_index,
+                        component_index,
+                        spec: scene.spec.clone(),
+                        surface: component.spec_surface.clone(),
+                        surface_volume_path: scene.surface_volume_path.clone(),
+                    });
+                }
+            }
+        }
+
+        if tasks.is_empty() {
+            return;
+        }
+
+        self.log_status(format!(
+            "Preloading {} spec surface components in the background.",
+            tasks.len()
+        ));
+        let sender = self.preload_sender.clone();
+        let event_proxy = self.event_proxy.clone();
+        thread::spawn(move || {
+            for task in tasks {
+                let result = load_spec_component_mesh(
+                    &task.spec,
+                    &task.surface,
+                    task.surface_volume_path.as_ref(),
+                )
+                .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(PreloadResult {
+                    generation: task.generation,
+                    surface_index: task.surface_index,
+                    component_index: task.component_index,
+                    path: task.surface.path.clone(),
+                    result,
+                });
+                let _ = event_proxy.send_event(ViewerEvent::SpecPreloadReady);
+            }
+        });
+    }
+
+    fn drain_preload_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.preload_receiver.try_recv() {
+            changed |= self.apply_preload_result(result);
+        }
+
+        changed
+    }
+
+    fn apply_preload_result(&mut self, result: PreloadResult) -> bool {
+        if result.generation != self.scene_generation {
+            return false;
+        }
+
+        match result.result {
+            Ok(mesh) => {
+                let layout = self.hemisphere_layout_state();
+                let mut warmed_cache = false;
+                let mut cache_error = None;
+                {
+                    let Some(scene) = self.surface_scene.as_mut() else {
+                        return false;
+                    };
+                    let Some(surface) = scene.surfaces.get_mut(result.surface_index) else {
+                        return false;
+                    };
+                    let Some(component) = surface.components.get_mut(result.component_index) else {
+                        return false;
+                    };
+                    if component.mesh.is_some() {
+                        return false;
+                    }
+                    component.mesh = Some(mesh);
+                    if surface
+                        .components
+                        .iter()
+                        .all(|component| component.mesh.is_some())
+                    {
+                        match surface.warm_display_cache(layout) {
+                            Ok(warmed) => warmed_cache = warmed,
+                            Err(error) => cache_error = Some(format!("{error:#}")),
+                        }
+                    }
+                }
+                if let Some(error) = cache_error {
+                    self.log_status(format!(
+                        "Preloaded {}, but failed to warm display cache: {error}.",
+                        result.path.display()
+                    ));
+                    return true;
+                }
+                if warmed_cache {
+                    self.log_status(format!("Preloaded and cached {}.", result.path.display()));
+                } else {
+                    self.log_status(format!("Preloaded {}.", result.path.display()));
+                }
+                true
+            }
+            Err(error) => {
+                self.log_status(format!(
+                    "Failed to preload {}: {error}",
+                    result.path.display()
+                ));
+                false
+            }
+        }
+    }
+
+    fn activate_scene_surface(&mut self, index: usize) -> Result<()> {
+        self.ensure_scene_surface_loaded(index)?;
+        let layout = self.hemisphere_layout_state();
+        let (surface_count, name, state, path, snapshot) = {
+            let Some(scene) = self.surface_scene.as_mut() else {
+                bail!("no SUMA spec scene is loaded");
+            };
+            ensure!(
+                index < scene.surfaces.len(),
+                "surface index {index} is outside loaded scene"
+            );
+
+            scene.active_index = index;
+            let surface = &mut scene.surfaces[index];
+            let name = surface.name.clone();
+            let state = surface.state.clone();
+            let path = surface.path.clone();
+            let snapshot = surface.display_mesh(layout)?;
+            (scene.surfaces.len(), name, state, path, snapshot)
+        };
+
+        self.set_active_mesh(snapshot.mesh, snapshot.prepared_geometry);
+        self.surface_path = Some(path.clone());
+        self.surface_pick = None;
+        if self.overlay_dataset.is_some() {
+            self.refresh_overlay_columns()?;
+        } else {
+            self.upload_surface_buffers();
+            self.update_scene_stats();
+        }
+        self.view_window
+            .set_title(&window_title(self.surface_path.as_ref()));
+        self.log_status(format!(
+            "Active surface {}/{}: {}{}.",
+            index + 1,
+            surface_count,
+            name,
+            state
+                .as_ref()
+                .map_or_else(String::new, |state| format!(" ({state})"))
+        ));
+
+        Ok(())
+    }
+
+    fn cycle_scene_surface(&mut self, step: isize) -> Result<bool> {
+        let Some(scene) = self.surface_scene.as_ref() else {
+            self.log_status("No SUMA spec scene is loaded.");
+            return Ok(false);
+        };
+        let len = scene.surfaces.len();
+        if len <= 1 {
+            self.log_status("The loaded SUMA spec has only one loadable surface.");
+            return Ok(false);
+        }
+
+        let active = scene.active_index as isize;
+        let len = len as isize;
+        let next = (active + step).rem_euclid(len) as usize;
+        self.activate_scene_surface(next)?;
+
+        Ok(true)
+    }
+
+    fn set_active_mesh(
+        &mut self,
+        mesh: SurfaceMesh,
+        prepared_geometry: Option<Arc<PreparedGeometry>>,
+    ) {
+        self.prepared_geometry_cache = prepared_geometry.map(|geometry| PreparedGeometryCache {
+            surface_id: mesh.metadata.id.clone(),
+            vertex_count: mesh.vertices.len(),
+            face_count: mesh.triangles.len(),
+            geometry,
+        });
+        self.mesh = Some(mesh);
+    }
+
+    fn has_both_scene(&self) -> bool {
+        self.surface_scene
+            .as_ref()
+            .is_some_and(|scene| scene.hemisphere == SpecHemisphere::Both)
+    }
+
+    fn active_paired_components(&self) -> Option<(&SceneSurfaceComponent, &SceneSurfaceComponent)> {
+        let scene = self.surface_scene.as_ref()?;
+        if scene.hemisphere != SpecHemisphere::Both {
+            return None;
+        }
+        let surface = scene.surfaces.get(scene.active_index)?;
+        let left = surface
+            .components
+            .iter()
+            .find(|component| component.side == SurfaceSide::Left)?;
+        let right = surface
+            .components
+            .iter()
+            .find(|component| component.side == SurfaceSide::Right)?;
+
+        Some((left, right))
+    }
+
+    fn active_pair_reference_width(&self) -> Option<f32> {
+        let (left, right) = self.active_paired_components()?;
+        Some(pair_reference_width(
+            left.mesh.as_ref()?,
+            right.mesh.as_ref()?,
+        ))
+    }
+
+    fn hemisphere_layout_state(&self) -> HemisphereLayoutState {
+        HemisphereLayoutState {
+            open_angle_degrees: self.hemisphere_open_angle_degrees,
+            separation_distance: self.hemisphere_separation_distance,
+        }
+    }
+
+    fn begin_pair_drag(&mut self) {
+        self.pair_dragging = true;
+        self.pair_drag_last_cursor = self.view_cursor_position;
+        self.pair_drag_changed = false;
+    }
+
+    fn update_pair_drag(&mut self, cursor: (f64, f64)) {
+        if let Some((last_x, last_y)) = self.pair_drag_last_cursor {
+            let dx = (cursor.0 - last_x) as f32;
+            let dy = (cursor.1 - last_y) as f32;
+            if let Err(error) = self.adjust_pair_transform(dx, dy) {
+                self.set_error(error);
+            }
+        }
+        self.pair_drag_last_cursor = Some(cursor);
+    }
+
+    fn finish_pair_drag(&mut self) {
+        self.pair_dragging = false;
+        self.pair_drag_last_cursor = None;
+        if self.pair_drag_changed {
+            self.log_status(format!(
+                "Hemisphere layout: open {:.1} deg, gap {:.1}.",
+                self.hemisphere_open_angle_degrees, self.hemisphere_separation_distance
+            ));
+        }
+        self.pair_drag_changed = false;
+    }
+
+    fn adjust_pair_transform(&mut self, dx: f32, dy: f32) -> Result<()> {
+        let Some(pair_width) = self.active_pair_reference_width() else {
+            return Ok(());
+        };
+        let vertical_scale = (pair_width / 700.0).max(0.05);
+        self.hemisphere_open_angle_degrees = (self.hemisphere_open_angle_degrees
+            + dx * PAIR_OPEN_DEGREES_PER_PIXEL)
+            .clamp(0.0, PAIR_MAX_OPEN_DEGREES);
+        self.hemisphere_separation_distance = (self.hemisphere_separation_distance
+            + -dy * vertical_scale)
+            .clamp(0.0, pair_width * PAIR_MAX_DRAG_GAP_FACTOR);
+        self.hemisphere_layout = if self.hemisphere_open_angle_degrees <= f32::EPSILON
+            && self.hemisphere_separation_distance <= f32::EPSILON
+        {
+            HemisphereLayout::Closed
+        } else {
+            HemisphereLayout::Open
+        };
+        self.pair_drag_changed = true;
+        self.rebuild_active_scene_surface_mesh()
+    }
+
+    fn overlay_display_text(&self) -> String {
+        self.overlay_display_name
+            .clone()
+            .or_else(|| self.overlay_path.as_deref().map(file_name_display))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn set_hemisphere_layout(&mut self, layout: HemisphereLayout) -> Result<()> {
+        let target = match layout {
+            HemisphereLayout::Closed => HemisphereLayoutState::closed(),
+            HemisphereLayout::Open => HemisphereLayoutState::acorn(),
+        };
+        if self.hemisphere_layout == layout && self.hemisphere_layout_state() == target {
+            return Ok(());
+        }
+
+        self.hemisphere_layout = layout;
+        self.hemisphere_open_angle_degrees = target.open_angle_degrees;
+        self.hemisphere_separation_distance = target.separation_distance;
+        if let Some(scene) = self.surface_scene.as_ref()
+            && scene.hemisphere == SpecHemisphere::Both
+        {
+            self.rebuild_active_scene_surface_mesh()?;
+        }
+        self.log_status(format!("Hemisphere layout: {}.", layout.label()));
+
+        Ok(())
+    }
+
+    fn rebuild_active_scene_surface_mesh(&mut self) -> Result<()> {
+        let Some(index) = self.surface_scene.as_ref().map(|scene| scene.active_index) else {
+            return Ok(());
+        };
+        self.ensure_scene_surface_loaded(index)?;
+        let layout = self.hemisphere_layout_state();
+        let (path, snapshot) = {
+            let scene = self
+                .surface_scene
+                .as_mut()
+                .context("no SUMA spec scene is loaded")?;
+            let surface = scene
+                .surfaces
+                .get_mut(index)
+                .context("active surface index is outside loaded scene")?;
+            (surface.path.clone(), surface.display_mesh(layout)?)
+        };
+
+        self.set_active_mesh(snapshot.mesh, snapshot.prepared_geometry);
+        self.surface_path = Some(path);
+        self.surface_pick = None;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.view_window
+            .set_title(&window_title(self.surface_path.as_ref()));
 
         Ok(())
     }
@@ -1456,32 +2335,85 @@ impl ViewerState {
             .mesh
             .as_ref()
             .context("load a surface before loading an overlay")?;
-        let loaded_overlay = load_overlay_from_path(&path, mesh)
+        let loaded_selection = self
+            .load_overlay_selection(&path, mesh)
             .with_context(|| format!("failed to load overlay {}", path.display()))?;
-        let overlay = loaded_overlay.overlay;
-        let range = overlay.range;
+        let loaded_overlay = loaded_selection.overlay;
+        let column_summary =
+            overlay_column_summary(&loaded_overlay.dataset, loaded_overlay.columns);
+        let overlay_values = loaded_overlay.overlay_values;
+        let range = overlay_values.range;
 
-        self.overlay = Some(overlay);
-        self.overlay_dataset = loaded_overlay.dataset;
+        self.overlay = None;
+        self.overlay_values = Some(overlay_values);
+        self.overlay_dataset = Some(loaded_overlay.dataset);
         self.overlay_columns = loaded_overlay.columns;
         self.overlay_visible = true;
         self.overlay_appearance = OverlayAppearance::from_range(range);
         self.overlay_symmetric_range = range.min < 0.0 && range.max > 0.0;
         self.overlay_path = Some(path.clone());
-        self.overlay_path_input = path.display().to_string();
+        self.overlay_display_name = Some(loaded_selection.display_name);
+        self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
-        self.status = StatusMessage::info(format!(
-            "Loaded overlay range {:.4} to {:.4}.{}",
-            range.min,
-            range.max,
-            loaded_overlay
-                .column_summary
-                .map_or_else(String::new, |summary| format!(" {summary}"))
+        self.log_status(format!(
+            "Loaded overlay range {:.4} to {:.4}. {column_summary}",
+            range.min, range.max
         ));
 
         Ok(())
+    }
+
+    fn load_overlay_selection(
+        &self,
+        path: &Path,
+        mesh: &SurfaceMesh,
+    ) -> Result<LoadedOverlaySelection> {
+        if let Some((left, right)) = self.active_paired_components()
+            && let Some(paths) = paired_overlay_paths(path)
+        {
+            let left_mesh = left
+                .mesh
+                .as_ref()
+                .context("left hemisphere surface is still loading")?;
+            let right_mesh = right
+                .mesh
+                .as_ref()
+                .context("right hemisphere surface is still loading")?;
+            ensure!(
+                paths.left_path.exists(),
+                "left hemisphere overlay {} does not exist",
+                paths.left_path.display()
+            );
+            ensure!(
+                paths.right_path.exists(),
+                "right hemisphere overlay {} does not exist",
+                paths.right_path.display()
+            );
+
+            let left_dataset = load_dataset_from_path(&paths.left_path, left_mesh)
+                .with_context(|| format!("failed to load {}", paths.left_path.display()))?;
+            let right_dataset = load_dataset_from_path(&paths.right_path, right_mesh)
+                .with_context(|| format!("failed to load {}", paths.right_path.display()))?;
+            let dataset = paired_overlay_dataset(
+                left_dataset,
+                right_dataset,
+                &mesh.domain,
+                left_mesh.vertices.len() as u32,
+            )?;
+            let overlay = loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "paired NIML")?;
+
+            return Ok(LoadedOverlaySelection {
+                overlay,
+                display_name: paths.display_name,
+            });
+        }
+
+        Ok(LoadedOverlaySelection {
+            overlay: load_overlay_from_path(path, mesh)?,
+            display_name: file_name_display(path),
+        })
     }
 
     fn refresh_overlay_columns(&mut self) -> Result<()> {
@@ -1489,81 +2421,122 @@ impl ViewerState {
             .overlay_dataset
             .as_ref()
             .context("no canonical overlay dataset is loaded")?;
-        let node_count = self
+        let domain = &self
             .mesh
             .as_ref()
-            .map(|mesh| mesh.vertices.len())
-            .context("load a surface before selecting overlay columns")?;
-        let overlay =
-            overlay_dataset_from_canonical_dataset(dataset, node_count, self.overlay_columns)?;
+            .context("load a surface before selecting overlay columns")?
+            .domain;
+        let overlay = overlay_dataset_from_canonical_dataset(
+            dataset,
+            domain.node_count,
+            self.overlay_columns,
+        )?;
         let range = overlay.range;
-        let status = format!(
-            "Overlay columns: I {}, T {}, B {}.",
-            column_selection_label(dataset, Some(self.overlay_columns.intensity)),
-            column_selection_label(dataset, self.overlay_columns.threshold),
-            column_selection_label(dataset, self.overlay_columns.brightness)
-        );
-
-        self.overlay = Some(overlay);
+        let column_summary = overlay_column_summary(dataset, self.overlay_columns);
+        self.overlay_values = Some(overlay);
         self.overlay_appearance.range = if self.overlay_symmetric_range {
             symmetric_value_range(range)
         } else {
             range
         };
         self.sanitize_overlay_appearance();
+        self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
-        self.status = StatusMessage::info(status);
+        self.log_status(format!("Overlay columns: {column_summary}"));
+
+        Ok(())
+    }
+
+    fn refresh_overlay_appearance(&mut self) -> Result<()> {
+        if self.overlay_dataset.is_none() {
+            return Ok(());
+        }
+
+        self.sanitize_overlay_appearance();
+        self.rebuild_overlay_model()?;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+
+        Ok(())
+    }
+
+    fn rebuild_overlay_model(&mut self) -> Result<()> {
+        let dataset = self
+            .overlay_dataset
+            .as_ref()
+            .context("no canonical overlay dataset is loaded")?;
+        let domain = &self
+            .mesh
+            .as_ref()
+            .context("load a surface before rebuilding overlay colors")?
+            .domain;
+        let columns = canonical_overlay_columns(
+            self.overlay_columns,
+            self.overlay_appearance.threshold.enabled,
+        );
+        let (threshold, mask_mode) = threshold_and_mask_from_appearance(self.overlay_appearance);
+        let mut overlay = Overlay::from_dataset(dataset, domain, columns)?
+            .with_colormap(self.overlay_appearance.colormap.to_color_map())
+            .with_intensity_range(RangeSelection::Manual(overlay_range_from_value_range(
+                self.overlay_appearance.range,
+            )))
+            .with_symmetric_range(self.overlay_symmetric_range)
+            .with_threshold(threshold, mask_mode)
+            .with_opacity(self.overlay_appearance.opacity);
+
+        overlay.rebuild_color_cache(dataset, domain)?;
+        self.overlay = Some(overlay);
 
         Ok(())
     }
 
     fn toggle_overlay_visibility(&mut self) {
         if self.overlay.is_none() {
-            self.status = StatusMessage::info("No overlay is loaded.");
+            self.log_status("No overlay is loaded.");
             return;
         }
 
         self.overlay_visible = !self.overlay_visible;
         self.upload_surface_buffers();
         self.update_scene_stats();
-        self.status = StatusMessage::info(if self.overlay_visible {
+        self.log_status(if self.overlay_visible {
             "Overlay visible."
         } else {
             "Overlay hidden."
         });
     }
 
-    fn visible_overlay(&self) -> Option<&OverlayDataset> {
+    fn visible_overlay(&self) -> Option<&Overlay> {
         self.overlay.as_ref().filter(|_| self.overlay_visible)
     }
 
     fn inspect_surface_at_cursor(&mut self) {
         let Some(cursor) = self.view_cursor_position else {
-            self.status =
-                StatusMessage::info("Move the cursor over the surface before inspecting.");
+            self.log_status("Move the cursor over the surface before inspecting.");
             return;
         };
         let Some(mesh) = self.mesh.as_ref() else {
-            self.status = StatusMessage::info("Load a surface before inspecting nodes.");
+            self.log_status("Load a surface before inspecting nodes.");
             return;
         };
 
         match pick_surface(
             mesh,
-            self.overlay.as_ref(),
+            self.overlay_values.as_ref(),
             &self.camera,
             self.view_size,
             cursor,
         ) {
             Some(pick) => {
-                self.status = StatusMessage::info(pick.status_text());
+                self.log_status(pick.status_text());
                 self.surface_pick = Some(pick);
             }
             None => {
                 self.surface_pick = None;
-                self.status = StatusMessage::info("No surface under the cursor.");
+                self.log_status("No surface under the cursor.");
             }
         }
     }
@@ -1571,7 +2544,7 @@ impl ViewerState {
     fn refresh_pick_overlay_value(&mut self) {
         if let Some(pick) = &mut self.surface_pick {
             pick.overlay_value = self
-                .overlay
+                .overlay_values
                 .as_ref()
                 .and_then(|overlay| overlay.values.get(pick.node_index as usize))
                 .copied();
@@ -1581,12 +2554,34 @@ impl ViewerState {
     fn upload_surface_buffers(&mut self) {
         let Some(mesh) = self.mesh.as_ref() else {
             self.surface_buffers = None;
+            self.prepared_geometry_cache = None;
             return;
         };
 
-        let overlay = self.visible_overlay();
-        let overlay_appearance = overlay.map(|_| self.overlay_appearance);
-        let prepared_surface = PreparedSurface::from_surface(mesh, overlay, overlay_appearance);
+        if !self
+            .prepared_geometry_cache
+            .as_ref()
+            .is_some_and(|cache| cache.matches(mesh))
+        {
+            self.prepared_geometry_cache = Some(PreparedGeometryCache {
+                surface_id: mesh.metadata.id.clone(),
+                vertex_count: mesh.vertices.len(),
+                face_count: mesh.triangles.len(),
+                geometry: Arc::new(PreparedGeometry::from_surface(mesh)),
+            });
+        }
+
+        let geometry = self
+            .prepared_geometry_cache
+            .as_ref()
+            .expect("prepared geometry cache is populated above")
+            .geometry
+            .clone();
+        let prepared_surface = PreparedSurface::from_geometry(
+            &geometry,
+            self.visible_overlay(),
+            self.overlay_appearance.dim,
+        );
         let vertex_bytes = prepared_surface.vertex_bytes();
         let index_bytes = prepared_surface.index_bytes();
         let vertex_buffer = self
@@ -1615,7 +2610,7 @@ impl ViewerState {
         self.scene_stats = self
             .mesh
             .as_ref()
-            .map(|mesh| SceneStats::from_scene(mesh, self.overlay.as_ref()));
+            .map(|mesh| SceneStats::from_scene(mesh, self.overlay_values.as_ref()));
     }
 
     fn show_mode_label(&mut self, mode: CameraMode) {
@@ -1639,7 +2634,13 @@ impl ViewerState {
     }
 
     fn set_error(&mut self, error: anyhow::Error) {
-        self.status = StatusMessage::error(format!("{error:#}"));
+        eprintln!("sumaru error: {error:#}");
+    }
+
+    fn log_status(&self, message: impl AsRef<str>) {
+        if self.verbose {
+            eprintln!("sumaru: {}", message.as_ref());
+        }
     }
 }
 
@@ -1649,12 +2650,404 @@ struct SurfaceBuffers {
     index_count: u32,
 }
 
+struct PreparedGeometryCache {
+    surface_id: SurfaceId,
+    vertex_count: usize,
+    face_count: usize,
+    geometry: Arc<PreparedGeometry>,
+}
+
+impl PreparedGeometryCache {
+    fn matches(&self, mesh: &SurfaceMesh) -> bool {
+        self.surface_id == mesh.metadata.id
+            && self.vertex_count == mesh.vertices.len()
+            && self.face_count == mesh.triangles.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SurfaceScene {
+    spec: SpecFile,
+    spec_path: PathBuf,
+    surface_volume_path: Option<PathBuf>,
+    group: Option<String>,
+    hemisphere: SpecHemisphere,
+    surfaces: Vec<SceneSurface>,
+    active_index: usize,
+    skipped_surfaces: usize,
+    skipped_states: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SceneSurface {
+    name: String,
+    state: Option<String>,
+    path: PathBuf,
+    components: Vec<SceneSurfaceComponent>,
+    display_cache: Option<DisplayMeshCache>,
+}
+
+#[derive(Debug, Clone)]
+struct DisplayMeshCache {
+    layout: HemisphereLayoutState,
+    mesh: SurfaceMesh,
+    prepared_geometry: Arc<PreparedGeometry>,
+}
+
+struct DisplayMeshSnapshot {
+    mesh: SurfaceMesh,
+    prepared_geometry: Option<Arc<PreparedGeometry>>,
+}
+
+#[derive(Debug, Clone)]
+struct SceneSurfaceComponent {
+    name: String,
+    state: Option<String>,
+    path: PathBuf,
+    side: SurfaceSide,
+    spec_surface: SpecSurface,
+    mesh: Option<SurfaceMesh>,
+}
+
+impl SceneSurface {
+    fn single(component: SceneSurfaceComponent) -> Self {
+        Self {
+            name: component.name.clone(),
+            state: component.state.clone(),
+            path: component.path.clone(),
+            components: vec![component],
+            display_cache: None,
+        }
+    }
+
+    fn paired(
+        state: String,
+        spec_path: PathBuf,
+        left: SceneSurfaceComponent,
+        right: SceneSurfaceComponent,
+    ) -> Self {
+        Self {
+            name: state.clone(),
+            state: Some(state),
+            path: spec_path,
+            components: vec![left, right],
+            display_cache: None,
+        }
+    }
+
+    fn display_mesh(&mut self, layout: HemisphereLayoutState) -> Result<DisplayMeshSnapshot> {
+        ensure!(
+            !self.components.is_empty(),
+            "scene surface {} has no components",
+            self.name
+        );
+        if self.components.len() == 1 {
+            if let Some(cache) = self.display_cache.as_ref() {
+                return Ok(DisplayMeshSnapshot {
+                    mesh: cache.mesh.clone(),
+                    prepared_geometry: Some(cache.prepared_geometry.clone()),
+                });
+            }
+            let mesh = self.components[0]
+                .mesh
+                .clone()
+                .with_context(|| format!("surface {} is still loading", self.name))?;
+            let prepared_geometry = Arc::new(PreparedGeometry::from_surface(&mesh));
+            self.display_cache = Some(DisplayMeshCache {
+                layout,
+                mesh: mesh.clone(),
+                prepared_geometry: prepared_geometry.clone(),
+            });
+            return Ok(DisplayMeshSnapshot {
+                mesh,
+                prepared_geometry: Some(prepared_geometry),
+            });
+        }
+
+        if let Some(cache) = self.display_cache.as_ref()
+            && cache.layout == layout
+        {
+            return Ok(DisplayMeshSnapshot {
+                mesh: cache.mesh.clone(),
+                prepared_geometry: Some(cache.prepared_geometry.clone()),
+            });
+        }
+
+        let mut mesh = composite_component_mesh(&self.components, layout)?;
+        mesh.metadata.label = Some(self.name.clone());
+        mesh.metadata.source_file = Some(self.path.clone());
+        mesh.metadata.side = SurfaceSide::Both;
+        mesh.metadata.state_name = self.state.clone();
+        if let Some(first) = self.components.first() {
+            let first_mesh = first
+                .mesh
+                .as_ref()
+                .with_context(|| format!("surface component {} is still loading", first.name))?;
+            mesh.metadata.group_label = first_mesh.metadata.group_label.clone();
+            mesh.metadata.subject_label = first_mesh.metadata.subject_label.clone();
+            mesh.metadata.surface_kind = first_mesh.metadata.surface_kind.clone();
+            mesh.metadata.lineage.parent_volume_id =
+                first_mesh.metadata.lineage.parent_volume_id.clone();
+        }
+
+        let prepared_geometry = Arc::new(PreparedGeometry::from_surface(&mesh));
+        self.display_cache = Some(DisplayMeshCache {
+            layout,
+            mesh: mesh.clone(),
+            prepared_geometry: prepared_geometry.clone(),
+        });
+
+        Ok(DisplayMeshSnapshot {
+            mesh,
+            prepared_geometry: Some(prepared_geometry),
+        })
+    }
+
+    fn warm_display_cache(&mut self, layout: HemisphereLayoutState) -> Result<bool> {
+        if self
+            .display_cache
+            .as_ref()
+            .is_some_and(|cache| self.components.len() == 1 || cache.layout == layout)
+        {
+            return Ok(false);
+        }
+
+        self.display_mesh(layout)?;
+        Ok(true)
+    }
+}
+
+#[derive(Default)]
+struct StatePair {
+    left: Option<SceneSurfaceComponent>,
+    right: Option<SceneSurfaceComponent>,
+}
+
+fn scene_surfaces_from_components(
+    spec: &SpecFile,
+    components: Vec<SceneSurfaceComponent>,
+) -> (Vec<SceneSurface>, usize, Vec<String>) {
+    if spec.hemisphere != SpecHemisphere::Both {
+        return (
+            components.into_iter().map(SceneSurface::single).collect(),
+            0,
+            Vec::new(),
+        );
+    }
+
+    paired_scene_surfaces(spec, components)
+}
+
+fn paired_scene_surfaces(
+    spec: &SpecFile,
+    components: Vec<SceneSurfaceComponent>,
+) -> (Vec<SceneSurface>, usize, Vec<String>) {
+    let mut by_state = BTreeMap::<String, StatePair>::new();
+    let mut skipped_states = 0;
+    let mut messages = Vec::new();
+
+    for component in components {
+        let Some(state) = component.state.clone() else {
+            skipped_states += 1;
+            messages.push(format!(
+                "Skipping both-spec surface {} because it has no SurfaceState.",
+                component.path.display()
+            ));
+            continue;
+        };
+
+        let side = component.side.clone();
+        let component_name = component.name.clone();
+        let pair = by_state.entry(state.clone()).or_default();
+        let slot = match side {
+            SurfaceSide::Left => &mut pair.left,
+            SurfaceSide::Right => &mut pair.right,
+            _ => {
+                skipped_states += 1;
+                messages.push(format!(
+                    "Skipping both-spec surface {} for state {state}: side is not left or right.",
+                    component.path.display()
+                ));
+                continue;
+            }
+        };
+
+        if slot.is_some() {
+            skipped_states += 1;
+            messages.push(format!(
+                "Skipping duplicate both-spec surface {component_name} for state {state}."
+            ));
+            continue;
+        }
+
+        *slot = Some(component);
+    }
+
+    let mut ordered_states = Vec::new();
+    let mut seen = HashSet::new();
+    for state in &spec.states {
+        if by_state.contains_key(state) && seen.insert(state.clone()) {
+            ordered_states.push(state.clone());
+        }
+    }
+    for state in by_state.keys() {
+        if seen.insert(state.clone()) {
+            ordered_states.push(state.clone());
+        }
+    }
+
+    let mut surfaces = Vec::new();
+    for state in ordered_states {
+        let Some(pair) = by_state.remove(&state) else {
+            continue;
+        };
+        match (pair.left, pair.right) {
+            (Some(left), Some(right)) => {
+                surfaces.push(SceneSurface::paired(state, spec.path.clone(), left, right));
+            }
+            (left, right) => {
+                skipped_states += 1;
+                let missing = match (left.is_some(), right.is_some()) {
+                    (true, false) => "right",
+                    (false, true) => "left",
+                    _ => "left and right",
+                };
+                messages.push(format!(
+                    "Skipping both-spec state {state}: missing {missing} hemisphere surface."
+                ));
+            }
+        }
+    }
+
+    (surfaces, skipped_states, messages)
+}
+
+fn composite_component_mesh(
+    components: &[SceneSurfaceComponent],
+    layout: HemisphereLayoutState,
+) -> Result<SurfaceMesh> {
+    let transforms = component_transforms(components, layout);
+    let vertex_count: usize = components
+        .iter()
+        .filter_map(|component| component.mesh.as_ref())
+        .map(|mesh| mesh.vertices.len())
+        .sum();
+    let face_count: usize = components
+        .iter()
+        .filter_map(|component| component.mesh.as_ref())
+        .map(|mesh| mesh.triangles.len())
+        .sum();
+    let mut vertices = Vec::with_capacity(vertex_count);
+    let mut triangles = Vec::with_capacity(face_count);
+    let mut node_offset = 0u32;
+
+    for (component, transform) in components.iter().zip(transforms) {
+        let mesh = component
+            .mesh
+            .as_ref()
+            .with_context(|| format!("surface component {} is still loading", component.name))?;
+        let center = Vec3::from_array(mesh.bounds.center);
+        let rotation = Quat::from_rotation_z(transform.rotation_z_degrees.to_radians());
+        vertices.extend(mesh.vertices.iter().map(|position| {
+            let point = Vec3::from_array(*position);
+            let rotated = center + rotation * (point - center);
+            (rotated + transform.offset).to_array()
+        }));
+        triangles.extend(mesh.triangles.iter().map(|triangle| {
+            [
+                triangle[0] + node_offset,
+                triangle[1] + node_offset,
+                triangle[2] + node_offset,
+            ]
+        }));
+        node_offset += u32::try_from(mesh.vertices.len())
+            .context("paired surface has too many vertices for u32 indices")?;
+    }
+
+    SurfaceMesh::new(vertices, triangles)
+}
+
+fn component_transforms(
+    components: &[SceneSurfaceComponent],
+    layout: HemisphereLayoutState,
+) -> Vec<ComponentTransform> {
+    let mut transforms = vec![ComponentTransform::default(); components.len()];
+    if components.len() != 2 {
+        return transforms;
+    }
+
+    let Some(left_index) = components
+        .iter()
+        .position(|component| component.side == SurfaceSide::Left)
+    else {
+        return transforms;
+    };
+    let Some(right_index) = components
+        .iter()
+        .position(|component| component.side == SurfaceSide::Right)
+    else {
+        return transforms;
+    };
+
+    let Some(left_mesh) = components[left_index].mesh.as_ref() else {
+        return transforms;
+    };
+    let Some(right_mesh) = components[right_index].mesh.as_ref() else {
+        return transforms;
+    };
+
+    let clearance = pair_default_clearance(left_mesh, right_mesh);
+    let auto_spread = pair_auto_spread_distance(left_mesh, right_mesh, layout.open_angle_degrees);
+    let half_shift = ((clearance + layout.separation_distance) * 0.5) + auto_spread;
+
+    transforms[left_index].offset.x -= half_shift;
+    transforms[left_index].rotation_z_degrees = layout.open_angle_degrees;
+    transforms[right_index].offset.x += half_shift;
+    transforms[right_index].rotation_z_degrees = -layout.open_angle_degrees;
+    transforms
+}
+
+fn pair_reference_width(left_mesh: &SurfaceMesh, right_mesh: &SurfaceMesh) -> f32 {
+    let min_x = left_mesh.bounds.min[0].min(right_mesh.bounds.min[0]);
+    let max_x = left_mesh.bounds.max[0].max(right_mesh.bounds.max[0]);
+    (max_x - min_x).abs().max(1.0)
+}
+
+fn pair_default_clearance(left_mesh: &SurfaceMesh, right_mesh: &SurfaceMesh) -> f32 {
+    let desired_gap = pair_reference_width(left_mesh, right_mesh) * PAIR_MIN_CLEARANCE_FRACTION;
+    let current_gap = right_mesh.bounds.min[0] - left_mesh.bounds.max[0];
+    (desired_gap - current_gap).max(0.0)
+}
+
+fn pair_auto_spread_distance(
+    left_mesh: &SurfaceMesh,
+    right_mesh: &SurfaceMesh,
+    open_angle_degrees: f32,
+) -> f32 {
+    let left_half_width = ((left_mesh.bounds.max[0] - left_mesh.bounds.min[0]) * 0.5).max(0.0);
+    let right_half_width = ((right_mesh.bounds.max[0] - right_mesh.bounds.min[0]) * 0.5).max(0.0);
+    let mean_half_width = (left_half_width + right_half_width) * 0.5;
+    mean_half_width * open_angle_degrees.to_radians().sin() * 0.9
+}
+
 #[derive(Debug, Clone)]
 struct LoadedOverlay {
-    overlay: OverlayDataset,
-    dataset: Option<Dataset>,
+    overlay_values: OverlayDataset,
+    dataset: Dataset,
     columns: OverlayColumnSelections,
-    column_summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedOverlaySelection {
+    overlay: LoadedOverlay,
+    display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairedOverlayPaths {
+    left_path: PathBuf,
+    right_path: PathBuf,
+    display_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1720,28 +3113,6 @@ impl SceneStats {
     }
 }
 
-#[derive(Debug, Clone)]
-struct StatusMessage {
-    text: String,
-    is_error: bool,
-}
-
-impl StatusMessage {
-    fn info(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            is_error: false,
-        }
-    }
-
-    fn error(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            is_error: true,
-        }
-    }
-}
-
 struct InputResponse {
     consumed: bool,
     repaint: bool,
@@ -1752,17 +3123,42 @@ struct ControlUiOutput {
     desired_control_size_points: egui::Vec2,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ViewerEvent {
+    SpecPreloadReady,
+}
+
+struct PreloadTask {
+    generation: u64,
+    surface_index: usize,
+    component_index: usize,
+    spec: SpecFile,
+    surface: SpecSurface,
+    surface_volume_path: Option<PathBuf>,
+}
+
+struct PreloadResult {
+    generation: u64,
+    surface_index: usize,
+    component_index: usize,
+    path: PathBuf,
+    result: std::result::Result<SurfaceMesh, String>,
+}
+
 enum UiAction {
     PickSurface,
-    LoadSurface(PathBuf),
     PickOverlay,
-    LoadOverlay(PathBuf),
+    PickSpec,
+    PickSurfaceVolume,
     RefreshOverlayColumns,
     RefreshOverlayAppearance,
     ResetCamera,
     ToggleCameraMode,
     ToggleBackground,
     Preset(PresetOrientation),
+    HemisphereLayout(HemisphereLayout),
+    SaveScreenshot,
+    SaveMontage,
 }
 
 enum RenderStatus {
@@ -1770,6 +3166,58 @@ enum RenderStatus {
     Skipped,
     Reconfigure,
     ValidationError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HemisphereLayout {
+    Closed,
+    Open,
+}
+
+impl HemisphereLayout {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HemisphereLayoutState {
+    open_angle_degrees: f32,
+    separation_distance: f32,
+}
+
+impl HemisphereLayoutState {
+    fn closed() -> Self {
+        Self {
+            open_angle_degrees: 0.0,
+            separation_distance: 0.0,
+        }
+    }
+
+    fn acorn() -> Self {
+        Self {
+            open_angle_degrees: PAIR_MAX_OPEN_DEGREES,
+            separation_distance: PAIR_ACORN_EXTRA_GAP,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComponentTransform {
+    offset: Vec3,
+    rotation_z_degrees: f32,
+}
+
+impl Default for ComponentTransform {
+    fn default() -> Self {
+        Self {
+            offset: Vec3::ZERO,
+            rotation_z_degrees: 0.0,
+        }
+    }
 }
 
 struct ModeLabel {
@@ -1813,6 +3261,92 @@ fn window_title(surface_path: Option<&PathBuf>) -> String {
     )
 }
 
+fn apply_spec_surface_metadata(
+    mesh: &mut SurfaceMesh,
+    spec: &SpecFile,
+    surface: &SpecSurface,
+    surface_volume_path: Option<&PathBuf>,
+) {
+    mesh.metadata.label = Some(surface.name.clone());
+    mesh.metadata.group_label = spec.group.clone();
+    if mesh.metadata.subject_label.is_none() {
+        mesh.metadata.subject_label = spec.group.clone();
+    }
+    if let Some(state) = &surface.state {
+        mesh.metadata.state_name = Some(state.clone());
+    }
+    if surface.side != SurfaceSide::Unknown {
+        mesh.metadata.side = surface.side.clone();
+    }
+    if let Some(anatomical) = surface.anatomical {
+        mesh.metadata.anatomically_correct = if anatomical {
+            AnatomicalCorrectness::Correct
+        } else {
+            AnatomicalCorrectness::Incorrect
+        };
+    }
+    if let Some(embed_dimension) = surface.embed_dimension {
+        mesh.metadata.embedding_dimension = embed_dimension;
+    }
+    mesh.metadata.lineage.local_domain_parent = surface.local_domain_parent.clone();
+    mesh.metadata.lineage.local_curvature_parent = surface.local_curvature_parent.clone();
+    apply_surface_volume_parent(mesh, surface_volume_path);
+}
+
+fn load_spec_component_mesh(
+    spec: &SpecFile,
+    surface: &SpecSurface,
+    surface_volume_path: Option<&PathBuf>,
+) -> Result<SurfaceMesh> {
+    let mut mesh = SurfaceMesh::from_gifti_path(&surface.path)
+        .with_context(|| format!("failed to load spec surface {}", surface.path.display()))?;
+    apply_spec_surface_metadata(&mut mesh, spec, surface, surface_volume_path);
+
+    Ok(mesh)
+}
+
+fn apply_surface_volume_parent(mesh: &mut SurfaceMesh, surface_volume_path: Option<&PathBuf>) {
+    mesh.metadata.lineage.parent_volume_id =
+        surface_volume_path.map(|path| path.display().to_string());
+}
+
+fn canonical_or_original_path(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
+}
+
+fn spec_hemisphere_label(hemisphere: SpecHemisphere) -> &'static str {
+    match hemisphere {
+        SpecHemisphere::Left => "lh",
+        SpecHemisphere::Right => "rh",
+        SpecHemisphere::Both => "both",
+        SpecHemisphere::Unknown => "unknown",
+    }
+}
+
+fn save_screenshot_file(
+    title: &str,
+    default_name: &str,
+    current_path: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    let dialog = dialog_with_start_directory(
+        rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter("PNG image", &["png"])
+            .set_file_name(default_name),
+        current_path,
+    );
+
+    dialog.save_file().map(screenshot::append_png_extension)
+}
+
+fn timestamped_png_name(prefix: &str) -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+
+    format!("{prefix}_{seconds}.png")
+}
+
 fn pick_surface_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     let dialog = dialog_with_start_directory(
         rfd::FileDialog::new()
@@ -1835,33 +3369,250 @@ fn pick_overlay_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
-fn load_overlay_from_path(path: &Path, mesh: &SurfaceMesh) -> Result<LoadedOverlay> {
-    if is_niml_dset_path(path) {
-        let dataset = read_niml_dataset(path, &mesh.domain)?;
-        loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "NIML")
-    } else if is_gifti_path(path) {
-        match read_gifti_dataset(path, &mesh.domain) {
-            Ok(dataset) => loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "GIFTI"),
-            Err(dataset_error) => Ok(LoadedOverlay {
-                overlay: OverlayDataset::from_gifti_path(path, mesh.vertices.len())
-                    .with_context(|| {
-                        format!(
-                            "failed to load GIFTI as canonical dataset ({dataset_error:#}) or simple overlay"
-                        )
-                    })?,
-                dataset: None,
-                columns: OverlayColumnSelections::default(),
-                column_summary: None,
-            }),
+fn pick_spec_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
+    let dialog = dialog_with_start_directory(
+        rfd::FileDialog::new()
+            .set_title("Open SUMA spec")
+            .add_filter("SUMA spec", &["spec"]),
+        current_path,
+    );
+
+    dialog.pick_file()
+}
+
+fn pick_surface_volume_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
+    let dialog = dialog_with_start_directory(
+        rfd::FileDialog::new()
+            .set_title("Open surface volume")
+            .add_filter(
+                "Surface volume",
+                &["nii", "gz", "HEAD", "BRIK", "head", "brik"],
+            ),
+        current_path,
+    );
+
+    dialog.pick_file()
+}
+
+fn paired_overlay_paths(path: &Path) -> Option<PairedOverlayPaths> {
+    let file_name = path.file_name()?.to_str()?;
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    for &pattern in HEMISPHERE_FILE_PATTERNS {
+        if let Some(paths) = paired_overlay_paths_for_pattern(&parent, file_name, pattern) {
+            return Some(paths);
         }
-    } else {
-        Ok(LoadedOverlay {
-            overlay: OverlayDataset::from_gifti_path(path, mesh.vertices.len())?,
-            dataset: None,
-            columns: OverlayColumnSelections::default(),
-            column_summary: None,
-        })
     }
+
+    None
+}
+
+fn paired_overlay_paths_for_pattern(
+    parent: &Path,
+    file_name: &str,
+    pattern: HemisphereFilePattern,
+) -> Option<PairedOverlayPaths> {
+    if file_name.contains(pattern.left) {
+        let right_name = file_name.replacen(pattern.left, pattern.right, 1);
+        let display_name = file_name.replacen(pattern.left, pattern.wildcard, 1);
+        return Some(PairedOverlayPaths {
+            left_path: parent.join(file_name),
+            right_path: parent.join(right_name),
+            display_name,
+        });
+    }
+    if file_name.contains(pattern.right) {
+        let left_name = file_name.replacen(pattern.right, pattern.left, 1);
+        let display_name = file_name.replacen(pattern.right, pattern.wildcard, 1);
+        return Some(PairedOverlayPaths {
+            left_path: parent.join(left_name),
+            right_path: parent.join(file_name),
+            display_name,
+        });
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HemisphereFilePattern {
+    left: &'static str,
+    right: &'static str,
+    wildcard: &'static str,
+}
+
+const HEMISPHERE_FILE_PATTERNS: &[HemisphereFilePattern] = &[
+    HemisphereFilePattern {
+        left: "_lh_",
+        right: "_rh_",
+        wildcard: "_?h_",
+    },
+    HemisphereFilePattern {
+        left: "_lh.",
+        right: "_rh.",
+        wildcard: "_?h.",
+    },
+    HemisphereFilePattern {
+        left: ".lh.",
+        right: ".rh.",
+        wildcard: ".?h.",
+    },
+    HemisphereFilePattern {
+        left: "-lh-",
+        right: "-rh-",
+        wildcard: "-?h-",
+    },
+    HemisphereFilePattern {
+        left: "_lh-",
+        right: "_rh-",
+        wildcard: "_?h-",
+    },
+    HemisphereFilePattern {
+        left: "-lh_",
+        right: "-rh_",
+        wildcard: "-?h_",
+    },
+];
+
+fn paired_overlay_dataset(
+    left: Dataset,
+    right: Dataset,
+    domain: &SurfaceDomain,
+    right_node_offset: u32,
+) -> Result<Dataset> {
+    ensure!(
+        left.columns.len() == right.columns.len(),
+        "paired overlays have different column counts: {} vs {}",
+        left.columns.len(),
+        right.columns.len()
+    );
+    let left_is_dense = !left.is_sparse();
+    let right_is_dense = !right.is_sparse();
+    let left_row_count = left.row_count;
+    let right_row_count = right.row_count;
+    let left_node_indices = left.node_indices.clone();
+    let right_node_indices = right.node_indices.clone();
+    let kind = if left.kind == right.kind {
+        left.kind.clone()
+    } else {
+        DatasetKind::Unknown
+    };
+
+    let columns = left
+        .columns
+        .into_iter()
+        .zip(right.columns)
+        .map(|(left, right)| paired_data_column(left, right))
+        .collect::<Result<Vec<_>>>()?;
+
+    if left_is_dense
+        && right_is_dense
+        && left_row_count as u32 == right_node_offset
+        && left_row_count + right_row_count == domain.node_count
+    {
+        return Dataset::dense(kind, domain, columns)
+            .context("failed to build paired dense overlay dataset");
+    }
+
+    let mut node_indices = Vec::with_capacity(left_row_count + right_row_count);
+    if let Some(indices) = left_node_indices {
+        node_indices.extend(indices);
+    } else {
+        node_indices.extend(0..left_row_count as u32);
+    }
+    if let Some(indices) = right_node_indices {
+        node_indices.extend(indices.into_iter().map(|node| node + right_node_offset));
+    } else {
+        node_indices.extend((0..right_row_count as u32).map(|node| node + right_node_offset));
+    }
+
+    Dataset::sparse(kind, domain, node_indices, columns)
+        .context("failed to build paired overlay dataset")
+}
+
+fn paired_data_column(left: DataColumn, right: DataColumn) -> Result<DataColumn> {
+    let right_label = right.label;
+    let right_role = right.role;
+    let right_units = right.units;
+    let right_stat = right.stat;
+    ensure!(
+        std::mem::discriminant(&left.values) == std::mem::discriminant(&right.values),
+        "paired overlay column {} and {} have different data types",
+        left.label,
+        right_label
+    );
+    let stat = if left.stat == right_stat {
+        left.stat.clone()
+    } else {
+        None
+    };
+    let units = if left.units == right_units {
+        left.units.clone()
+    } else {
+        None
+    };
+    let role = if left.role == right_role {
+        left.role.clone()
+    } else {
+        ColumnRole::Unknown
+    };
+
+    Ok(DataColumn::new(
+        left.label,
+        role,
+        units,
+        paired_column_data(left.values, right.values)?,
+    )?
+    .with_stat(stat))
+}
+
+fn paired_column_data(left: ColumnData, right: ColumnData) -> Result<ColumnData> {
+    match (left, right) {
+        (ColumnData::UInt32(mut left), ColumnData::UInt32(right)) => {
+            left.extend(right);
+            Ok(ColumnData::UInt32(left))
+        }
+        (ColumnData::Int32(mut left), ColumnData::Int32(right)) => {
+            left.extend(right);
+            Ok(ColumnData::Int32(left))
+        }
+        (ColumnData::Float32(mut left), ColumnData::Float32(right)) => {
+            left.extend(right);
+            Ok(ColumnData::Float32(left))
+        }
+        (ColumnData::Float64(mut left), ColumnData::Float64(right)) => {
+            left.extend(right);
+            Ok(ColumnData::Float64(left))
+        }
+        (ColumnData::Text(mut left), ColumnData::Text(right)) => {
+            left.extend(right);
+            Ok(ColumnData::Text(left))
+        }
+        _ => bail!("paired overlay columns have different data types"),
+    }
+}
+
+fn load_dataset_from_path(path: &Path, mesh: &SurfaceMesh) -> Result<Dataset> {
+    if is_niml_dset_path(path) {
+        read_niml_dataset(path, &mesh.domain)
+    } else if is_gifti_path(path) {
+        read_gifti_dataset(path, &mesh.domain).or_else(|dataset_error| {
+            let overlay_values =
+                OverlayDataset::from_gifti_path(path, mesh.vertices.len()).with_context(|| {
+                    format!(
+                        "failed to load GIFTI as canonical dataset ({dataset_error:#}) or simple overlay"
+                    )
+                })?;
+            dataset_from_simple_overlay(&mesh.domain, overlay_values.values)
+        })
+    } else {
+        let overlay_values = OverlayDataset::from_gifti_path(path, mesh.vertices.len())?;
+        dataset_from_simple_overlay(&mesh.domain, overlay_values.values)
+    }
+}
+
+fn load_overlay_from_path(path: &Path, mesh: &SurfaceMesh) -> Result<LoadedOverlay> {
+    let dataset = load_dataset_from_path(path, mesh)?;
+    loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "overlay")
 }
 
 fn loaded_overlay_from_dataset(
@@ -1873,19 +3624,75 @@ fn loaded_overlay_from_dataset(
         format!("{source_label} dataset has no numeric column that can be displayed as an overlay")
     })?;
     let overlay = overlay_dataset_from_canonical_dataset(&dataset, node_count, columns)?;
-    let column_summary = Some(format!(
-        "I {}, T {}, B {}.",
-        column_selection_label(&dataset, Some(columns.intensity)),
-        column_selection_label(&dataset, columns.threshold),
-        column_selection_label(&dataset, columns.brightness)
-    ));
 
     Ok(LoadedOverlay {
-        overlay,
-        dataset: Some(dataset),
+        overlay_values: overlay,
+        dataset,
         columns,
-        column_summary,
     })
+}
+
+fn dataset_from_simple_overlay(domain: &SurfaceDomain, values: Vec<f32>) -> Result<Dataset> {
+    Dataset::dense(
+        DatasetKind::SurfaceScalar,
+        domain,
+        vec![
+            DataColumn::new(
+                "scalar",
+                ColumnRole::Intensity,
+                None,
+                ColumnData::Float32(values),
+            )
+            .context("failed to build scalar overlay column")?,
+        ],
+    )
+    .context("failed to wrap scalar overlay as canonical dataset")
+}
+
+fn canonical_overlay_columns(
+    selections: OverlayColumnSelections,
+    threshold_enabled: bool,
+) -> OverlayColumns {
+    let threshold = selections
+        .threshold
+        .or_else(|| threshold_enabled.then_some(selections.intensity));
+    let mut columns = OverlayColumns::new(selections.intensity);
+    if let Some(index) = threshold {
+        columns.threshold = Some(ColumnSelection::new(index));
+    }
+    if let Some(index) = selections.brightness {
+        columns.brightness = Some(ColumnSelection::new(index));
+    }
+
+    columns
+}
+
+fn threshold_and_mask_from_appearance(appearance: OverlayAppearance) -> (Threshold, MaskMode) {
+    if !appearance.threshold.enabled {
+        return (Threshold::off(), MaskMode::None);
+    }
+
+    let value = appearance.threshold.value as f64;
+    let threshold = if appearance.threshold.absolute {
+        let extent = value.abs();
+        Threshold::outside(-extent, extent)
+    } else {
+        Threshold::above(value)
+    };
+    let mask_mode = if appearance.threshold.hide_failed {
+        MaskMode::HideFailedThreshold
+    } else {
+        MaskMode::DimFailedThreshold(0.25)
+    };
+
+    (threshold, mask_mode)
+}
+
+fn overlay_range_from_value_range(range: ValueRange) -> OverlayRange {
+    OverlayRange {
+        min: range.min as f64,
+        max: range.max as f64,
+    }
 }
 
 fn overlay_dataset_from_canonical_dataset(
@@ -2035,6 +3842,15 @@ fn numeric_column_value_as_f32(column: &DataColumn, row: usize) -> Option<f32> {
     value.is_finite().then_some(value)
 }
 
+fn overlay_column_summary(dataset: &Dataset, columns: OverlayColumnSelections) -> String {
+    format!(
+        "I {}, T {}, B {}.",
+        column_selection_label(dataset, Some(columns.intensity)),
+        column_selection_label(dataset, columns.threshold),
+        column_selection_label(dataset, columns.brightness)
+    )
+}
+
 fn column_selection_label(dataset: &Dataset, selection: Option<usize>) -> String {
     selection
         .and_then(|index| dataset.columns.get(index).map(|column| (index, column)))
@@ -2084,11 +3900,6 @@ fn dialog_start_directory(current_path: Option<&PathBuf>) -> Option<PathBuf> {
         .or_else(|| std::env::current_dir().ok())
 }
 
-fn trimmed_path(value: &str) -> Option<PathBuf> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
-}
-
 fn controller_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(8.0);
     ui.label(
@@ -2103,13 +3914,6 @@ fn controller_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, add_contents);
-}
-
-fn object_line(ui: &mut egui::Ui, label: &str, value: String) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(muted_color()));
-        ui.monospace(value);
-    });
 }
 
 fn draw_intensity_column_selector(
@@ -2279,7 +4083,11 @@ fn vertical_threshold_bar(
 }
 
 fn file_display(path: Option<&PathBuf>) -> String {
-    path.and_then(|path| path.file_name())
+    path.map_or_else(|| "none".to_string(), |path| file_name_display(path))
+}
+
+fn file_name_display(path: &Path) -> String {
+    path.file_name()
         .and_then(|name| name.to_str())
         .map_or_else(|| "none".to_string(), ToString::to_string)
 }
@@ -2383,7 +4191,17 @@ fn size_is_close(current: PhysicalSize<u32>, desired: PhysicalSize<u32>) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::BackgroundMode;
+    use super::{
+        BackgroundMode, HemisphereLayoutState, OverlayAppearance, OverlayColumnSelections,
+        PAIR_MAX_DRAG_GAP_FACTOR, PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, SceneSurface,
+        SceneSurfaceComponent, canonical_overlay_columns, paired_overlay_dataset,
+        paired_overlay_paths, scene_surfaces_from_components, threshold_and_mask_from_appearance,
+    };
+    use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
+    use crate::overlay::{MaskMode, Threshold};
+    use crate::spec::{SpecFile, SpecHemisphere, SpecSurface};
+    use crate::surface::{SurfaceDomain, SurfaceMesh, SurfaceSide, ValueRange};
+    use std::path::PathBuf;
 
     #[test]
     fn background_toggles_between_black_and_white() {
@@ -2406,5 +4224,244 @@ mod tests {
             winit::dpi::PhysicalSize::new(420, 700),
             winit::dpi::PhysicalSize::new(460, 700)
         ));
+    }
+
+    #[test]
+    fn canonical_overlay_columns_use_intensity_as_threshold_fallback() {
+        let selections = OverlayColumnSelections {
+            intensity: 2,
+            threshold: None,
+            brightness: Some(4),
+        };
+
+        let columns = canonical_overlay_columns(selections, true);
+        assert_eq!(columns.intensity.index, 2);
+        assert_eq!(columns.threshold.unwrap().index, 2);
+        assert_eq!(columns.brightness.unwrap().index, 4);
+
+        let columns = canonical_overlay_columns(selections, false);
+        assert!(columns.threshold.is_none());
+    }
+
+    #[test]
+    fn viewer_threshold_slider_maps_to_canonical_threshold() {
+        let mut appearance = OverlayAppearance::from_range(ValueRange {
+            min: -5.0,
+            max: 5.0,
+        });
+        appearance.threshold.enabled = true;
+        appearance.threshold.absolute = true;
+        appearance.threshold.value = 2.0;
+
+        let (threshold, mask_mode) = threshold_and_mask_from_appearance(appearance);
+        assert_eq!(threshold, Threshold::outside(-2.0, 2.0));
+        assert_eq!(mask_mode, MaskMode::HideFailedThreshold);
+
+        appearance.threshold.absolute = false;
+        let (threshold, _) = threshold_and_mask_from_appearance(appearance);
+        assert_eq!(threshold, Threshold::above(2.0));
+    }
+
+    #[test]
+    fn both_spec_components_are_paired_by_normalized_state() {
+        let spec = both_spec(["std.smoothwm", "std.pial"]);
+        let (surfaces, skipped_states, messages) = scene_surfaces_from_components(
+            &spec,
+            vec![
+                component("std.smoothwm", SurfaceSide::Left, 0.0),
+                component("std.smoothwm", SurfaceSide::Right, 0.0),
+                component("std.pial", SurfaceSide::Left, 0.0),
+            ],
+        );
+
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].state.as_deref(), Some("std.smoothwm"));
+        assert_eq!(surfaces[0].components.len(), 2);
+        assert_eq!(skipped_states, 1);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("missing right hemisphere"))
+        );
+    }
+
+    #[test]
+    fn single_hemi_spec_components_remain_independent_surfaces() {
+        let spec = SpecFile {
+            path: PathBuf::from("lh.spec"),
+            group: None,
+            states: vec!["smoothwm".to_string()],
+            hemisphere: SpecHemisphere::Left,
+            surfaces: Vec::new(),
+        };
+        let (surfaces, skipped_states, messages) = scene_surfaces_from_components(
+            &spec,
+            vec![
+                component("smoothwm", SurfaceSide::Left, 0.0),
+                component("pial", SurfaceSide::Left, 2.0),
+            ],
+        );
+
+        assert_eq!(surfaces.len(), 2);
+        assert_eq!(skipped_states, 0);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn open_layout_spreads_and_rotates_paired_hemispheres() {
+        let mut surface = SceneSurface::paired(
+            "smoothwm".to_string(),
+            PathBuf::from("both.spec"),
+            component("smoothwm", SurfaceSide::Left, 0.0),
+            component("smoothwm", SurfaceSide::Right, 0.0),
+        );
+
+        let closed = surface
+            .display_mesh(HemisphereLayoutState::closed())
+            .unwrap()
+            .mesh;
+        let open = surface
+            .display_mesh(HemisphereLayoutState::acorn())
+            .unwrap()
+            .mesh;
+
+        assert_eq!(closed.metadata.side, SurfaceSide::Both);
+        assert_eq!(closed.vertices.len(), 6);
+        assert!(component_x_gap(&closed) > 0.0);
+        assert!(component_x_gap(&open) > component_x_gap(&closed));
+        assert_ne!(open.vertices[1][1], closed.vertices[1][1]);
+    }
+
+    #[test]
+    fn pair_transform_drag_math_matches_pysuma_direction() {
+        let mut open_angle = 0.0_f32;
+        let mut separation = 0.0_f32;
+        let pair_width = 140.0_f32;
+
+        open_angle =
+            (open_angle + 100.0 * PAIR_OPEN_DEGREES_PER_PIXEL).clamp(0.0, PAIR_MAX_OPEN_DEGREES);
+        separation = (separation + -(-50.0) * (pair_width / 700.0).max(0.05))
+            .clamp(0.0, pair_width * PAIR_MAX_DRAG_GAP_FACTOR);
+
+        assert_eq!(open_angle, 18.0);
+        assert_eq!(separation, 10.0);
+    }
+
+    #[test]
+    fn paired_overlay_paths_find_opposite_hemisphere_and_wildcard_label() {
+        let paths =
+            paired_overlay_paths(&PathBuf::from("std.141.ISC_lh_alpha_neg.niml.dset")).unwrap();
+
+        assert_eq!(
+            paths.left_path,
+            PathBuf::from("std.141.ISC_lh_alpha_neg.niml.dset")
+        );
+        assert_eq!(
+            paths.right_path,
+            PathBuf::from("std.141.ISC_rh_alpha_neg.niml.dset")
+        );
+        assert_eq!(paths.display_name, "std.141.ISC_?h_alpha_neg.niml.dset");
+
+        let paths = paired_overlay_paths(&PathBuf::from("std.141.rh.curv.gii.dset")).unwrap();
+        assert_eq!(paths.left_path, PathBuf::from("std.141.lh.curv.gii.dset"));
+        assert_eq!(paths.right_path, PathBuf::from("std.141.rh.curv.gii.dset"));
+        assert_eq!(paths.display_name, "std.141.?h.curv.gii.dset");
+    }
+
+    #[test]
+    fn paired_overlay_dataset_offsets_right_hemisphere_nodes() {
+        let left_domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let right_domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let composite_domain =
+            SurfaceDomain::from_triangles(6, vec![[0, 1, 2], [3, 4, 5]]).unwrap();
+        let left = scalar_dataset(&left_domain, vec![1.0, 2.0, 3.0]);
+        let right = scalar_dataset(&right_domain, vec![4.0, 5.0, 6.0]);
+
+        let paired = paired_overlay_dataset(left, right, &composite_domain, 3).unwrap();
+
+        assert_eq!(paired.row_count, 6);
+        assert_eq!(paired.node_indices.as_deref(), None);
+        let ColumnData::Float32(values) = &paired.columns[0].values else {
+            panic!("expected float values");
+        };
+        assert_eq!(values, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    fn both_spec<const N: usize>(states: [&str; N]) -> SpecFile {
+        SpecFile {
+            path: PathBuf::from("both.spec"),
+            group: None,
+            states: states.into_iter().map(str::to_string).collect(),
+            hemisphere: SpecHemisphere::Both,
+            surfaces: Vec::new(),
+        }
+    }
+
+    fn component(state: &str, side: SurfaceSide, x_offset: f32) -> SceneSurfaceComponent {
+        let mut mesh = SurfaceMesh::new(
+            vec![
+                [x_offset, 0.0, 0.0],
+                [x_offset + 1.0, 0.0, 0.0],
+                [x_offset, 1.0, 0.0],
+            ],
+            vec![[0, 1, 2]],
+        )
+        .unwrap();
+        mesh.metadata.side = side.clone();
+        mesh.metadata.state_name = Some(state.to_string());
+        let path = PathBuf::from(format!("{side:?}.{state}.gii"));
+
+        SceneSurfaceComponent {
+            name: format!("{side:?}.{state}"),
+            state: Some(state.to_string()),
+            path: path.clone(),
+            side,
+            spec_surface: SpecSurface {
+                name: state.to_string(),
+                path,
+                surface_name: format!("{state}.gii"),
+                surface_format: None,
+                surface_type: None,
+                state: Some(state.to_string()),
+                raw_state: Some(state.to_string()),
+                anatomical: None,
+                side: mesh.metadata.side.clone(),
+                local_domain_parent: None,
+                local_curvature_parent: None,
+                label_dataset: None,
+                embed_dimension: None,
+            },
+            mesh: Some(mesh),
+        }
+    }
+
+    fn component_x_gap(mesh: &SurfaceMesh) -> f32 {
+        let left_max = mesh.vertices[0..3]
+            .iter()
+            .map(|vertex| vertex[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let right_min = mesh.vertices[3..6]
+            .iter()
+            .map(|vertex| vertex[0])
+            .fold(f32::INFINITY, f32::min);
+
+        right_min - left_max
+    }
+
+    fn scalar_dataset(domain: &SurfaceDomain, values: Vec<f32>) -> Dataset {
+        Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            domain,
+            vec![
+                DataColumn::new(
+                    "scalar",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(values),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
     }
 }

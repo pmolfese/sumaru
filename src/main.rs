@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
@@ -12,9 +13,25 @@ struct Cli {
     #[arg(short = 'i', long = "surface", value_name = "PATH")]
     surface: Option<PathBuf>,
 
+    /// Launch the viewer from this SUMA spec file.
+    #[arg(long = "spec", value_name = "PATH")]
+    spec: Option<PathBuf>,
+
+    /// Surface-volume context for AFNI/NIML communication.
+    #[arg(long = "sv", value_name = "PATH")]
+    surface_volume: Option<PathBuf>,
+
     /// Load this GIFTI data array as a per-vertex surface overlay.
     #[arg(long = "overlay", value_name = "PATH")]
     overlay: Option<PathBuf>,
+
+    /// Print viewer status messages to the terminal.
+    #[arg(long = "verbose")]
+    verbose: bool,
+
+    /// Only load spec surfaces when they are displayed.
+    #[arg(long = "no-preload")]
+    no_preload: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -30,22 +47,122 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalized_afni_style_args());
+    let verbose = cli.verbose;
+    let no_preload = cli.no_preload;
 
-    match (cli.surface, cli.overlay, cli.command) {
-        (Some(path), overlay, None) => viewer::run(Some(path), overlay)?,
-        (None, None, Some(Commands::Inspect { path })) => {
+    match (
+        cli.surface,
+        cli.spec,
+        cli.surface_volume,
+        cli.overlay,
+        cli.command,
+    ) {
+        (surface, spec, surface_volume, overlay, None) => {
+            validate_viewer_launch(&surface, &spec, &surface_volume, &overlay)?;
+            viewer::run(viewer::LaunchOptions {
+                surface_path: surface,
+                spec_path: spec,
+                surface_volume_path: surface_volume,
+                overlay_path: overlay,
+                verbose,
+                no_preload,
+            })?;
+        }
+        (None, None, None, None, Some(Commands::Inspect { path })) => {
             let report = inspect_path(path)?;
             println!("{report}");
         }
-        (None, None, None) => viewer::run(None, None)?,
-        (None, Some(_), _) => {
-            bail!("--overlay requires -i/--surface");
-        }
-        (Some(_), _, Some(_)) => {
-            bail!("use -i/--surface with optional --overlay, or use a subcommand, not both");
+        _ => {
+            bail!("viewer launch options and subcommands cannot be mixed");
         }
     }
 
     Ok(())
+}
+
+fn validate_viewer_launch(
+    surface: &Option<PathBuf>,
+    spec: &Option<PathBuf>,
+    surface_volume: &Option<PathBuf>,
+    overlay: &Option<PathBuf>,
+) -> Result<()> {
+    if surface.is_some() && spec.is_some() {
+        bail!("use either -i/--surface or -spec/--spec, not both");
+    }
+    if spec.is_some() && surface_volume.is_none() {
+        bail!("-spec/--spec requires -sv/--sv");
+    }
+    if surface.is_none() && spec.is_none() && overlay.is_some() {
+        bail!("--overlay requires -i/--surface or -spec/--spec");
+    }
+    if surface.is_none() && spec.is_none() && surface_volume.is_some() {
+        bail!("-sv/--sv requires -i/--surface or -spec/--spec");
+    }
+
+    Ok(())
+}
+
+fn normalized_afni_style_args() -> Vec<OsString> {
+    std::env::args_os()
+        .map(|arg| {
+            if arg == "-spec" {
+                OsString::from("--spec")
+            } else if arg == "-sv" {
+                OsString::from("--sv")
+            } else {
+                arg
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_viewer_launch;
+    use std::path::PathBuf;
+
+    fn path(value: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(value))
+    }
+
+    #[test]
+    fn regular_surface_launch_does_not_require_spec_or_surface_volume() {
+        assert!(validate_viewer_launch(&path("surface.gii"), &None, &None, &None).is_ok());
+    }
+
+    #[test]
+    fn spec_launch_requires_surface_volume_context() {
+        assert!(validate_viewer_launch(&None, &path("surface.spec"), &None, &None).is_err());
+        assert!(
+            validate_viewer_launch(&None, &path("surface.spec"), &path("SurfVol.nii"), &None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn surface_volume_can_attach_to_direct_surface_launch() {
+        assert!(
+            validate_viewer_launch(&path("surface.gii"), &None, &path("SurfVol.nii"), &None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn surface_volume_without_surface_context_is_rejected() {
+        assert!(validate_viewer_launch(&None, &None, &path("SurfVol.nii"), &None).is_err());
+    }
+
+    #[test]
+    fn overlay_still_requires_a_surface_context() {
+        assert!(validate_viewer_launch(&None, &None, &None, &path("stats.niml.dset")).is_err());
+    }
+
+    #[test]
+    fn surface_and_spec_remain_mutually_exclusive() {
+        assert!(
+            validate_viewer_launch(&path("surface.gii"), &path("surface.spec"), &None, &None)
+                .is_err()
+        );
+    }
 }

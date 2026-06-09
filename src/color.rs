@@ -58,8 +58,16 @@ pub struct FreeSurferLabelEntry {
 }
 
 impl ColorMap {
+    pub fn afni_p2_spanned() -> Self {
+        Self::Continuous(ContinuousColorMap::afni_p2_spanned())
+    }
+
     pub fn blue_white_red() -> Self {
         Self::Continuous(ContinuousColorMap::blue_white_red())
+    }
+
+    pub fn fire() -> Self {
+        Self::Continuous(ContinuousColorMap::fire())
     }
 
     pub fn grayscale() -> Self {
@@ -128,6 +136,70 @@ impl ContinuousColorMap {
                 ColorStop {
                     position: 1.0,
                     color: Rgba::new_unchecked(0.86, 0.08, 0.08, 1.0),
+                },
+            ],
+        }
+    }
+
+    pub fn afni_p2_spanned() -> Self {
+        Self {
+            name: "afni_p2spanned".to_string(),
+            stops: vec![
+                ColorStop {
+                    position: 0.0,
+                    color: Rgba::new_unchecked(0.02, 0.12, 0.32, 1.0),
+                },
+                ColorStop {
+                    position: 0.22,
+                    color: Rgba::new_unchecked(0.08, 0.38, 0.68, 1.0),
+                },
+                ColorStop {
+                    position: 0.42,
+                    color: Rgba::new_unchecked(0.52, 0.74, 0.92, 1.0),
+                },
+                ColorStop {
+                    position: 0.5,
+                    color: Rgba::new_unchecked(0.98, 0.96, 0.86, 1.0),
+                },
+                ColorStop {
+                    position: 0.66,
+                    color: Rgba::new_unchecked(0.96, 0.68, 0.28, 1.0),
+                },
+                ColorStop {
+                    position: 0.82,
+                    color: Rgba::new_unchecked(0.80, 0.24, 0.16, 1.0),
+                },
+                ColorStop {
+                    position: 1.0,
+                    color: Rgba::new_unchecked(0.45, 0.09, 0.07, 1.0),
+                },
+            ],
+        }
+    }
+
+    pub fn fire() -> Self {
+        Self {
+            name: "nih_fire".to_string(),
+            stops: vec![
+                ColorStop {
+                    position: 0.0,
+                    color: Rgba::new_unchecked(0.02, 0.0, 0.0, 1.0),
+                },
+                ColorStop {
+                    position: 0.28,
+                    color: Rgba::new_unchecked(0.42, 0.02, 0.02, 1.0),
+                },
+                ColorStop {
+                    position: 0.58,
+                    color: Rgba::new_unchecked(0.90, 0.24, 0.02, 1.0),
+                },
+                ColorStop {
+                    position: 0.82,
+                    color: Rgba::new_unchecked(1.0, 0.74, 0.12, 1.0),
+                },
+                ColorStop {
+                    position: 1.0,
+                    color: Rgba::new_unchecked(1.0, 1.0, 0.88, 1.0),
                 },
             ],
         }
@@ -401,11 +473,22 @@ mod tests {
 
         assert_eq!(continuous.sample(0.0), Rgba::OPAQUE_BLACK);
         assert_eq!(
+            ColorMap::afni_p2_spanned()
+                .as_continuous()
+                .unwrap()
+                .sample(0.5),
+            Rgba::new(0.98, 0.96, 0.86, 1.0).unwrap()
+        );
+        assert_eq!(
             ColorMap::blue_white_red()
                 .as_continuous()
                 .unwrap()
                 .sample(0.5),
             Rgba::new(1.0, 1.0, 1.0, 1.0).unwrap()
+        );
+        assert_eq!(
+            ColorMap::fire().as_continuous().unwrap().sample(1.0),
+            Rgba::new(1.0, 1.0, 0.88, 1.0).unwrap()
         );
     }
 

@@ -377,7 +377,7 @@ impl Threshold {
             ThresholdMode::Above => value >= range.min,
             ThresholdMode::Below => value <= range.max,
             ThresholdMode::Between => range.contains(value),
-            ThresholdMode::Outside => !range.contains(value),
+            ThresholdMode::Outside => value <= range.min || value >= range.max,
         }
     }
 }
@@ -571,6 +571,42 @@ mod tests {
 
         assert_eq!(overlay.color_cache.colors[0][3], 0.0);
         assert_eq!(overlay.color_cache.colors[1][3], 1.0);
+        assert_eq!(overlay.color_cache.colors[2][3], 1.0);
+    }
+
+    #[test]
+    fn outside_threshold_includes_boundary_values() {
+        let domain = triangle_domain();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "effect",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![-1.0, 0.0, 1.0]),
+                )
+                .unwrap(),
+                DataColumn::new(
+                    "stat",
+                    ColumnRole::Threshold,
+                    None,
+                    ColumnData::Float32(vec![-2.0, 0.0, 2.0]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut overlay =
+            Overlay::from_dataset(&dataset, &domain, OverlayColumns::new(0).with_threshold(1))
+                .unwrap()
+                .with_threshold(Threshold::outside(-2.0, 2.0), MaskMode::HideFailedThreshold);
+
+        overlay.rebuild_color_cache(&dataset, &domain).unwrap();
+
+        assert_eq!(overlay.color_cache.colors[0][3], 1.0);
+        assert_eq!(overlay.color_cache.colors[1][3], 0.0);
         assert_eq!(overlay.color_cache.colors[2][3], 1.0);
     }
 

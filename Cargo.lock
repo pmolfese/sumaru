@@ -3006,6 +3006,7 @@ dependencies = [
  "egui-winit",
  "gifti-rs",
  "glam",
+ "image",
  "nifti",
  "pollster",
  "rfd",

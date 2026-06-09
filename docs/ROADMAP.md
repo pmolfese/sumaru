@@ -41,10 +41,10 @@ interop, and volume rendering.
 - [x] Parse `.niml.dset` and AFNI-converted `.gii.dset` into the canonical
   `Dataset` (from Phase 3) so real AFNI overlays load, not just one-column
   GIFTI shape files.
-- [ ] Wire overlay display controls into the viewer using the existing
+- [x] Wire overlay display controls into the viewer using the existing
   `color.rs`/`overlay.rs` model: selectable colormap, intensity range,
   threshold mode/range, symmetric range, and opacity (from Phase 4).
-- [ ] Add screenshot export (from Phase 4) for figures and QA.
+- [x] Add screenshot export (from Phase 4) for figures and QA.
 
 ### Tier 2 — ROI loop
 
@@ -58,8 +58,21 @@ interop, and volume rendering.
 ### Tier 3 — Sessions and anatomy
 
 - [ ] Parse `.spec` files and load multi-surface scenes with visibility toggles
-  and pial/inflated/sphere state switching (from Phases 3/5), including the
-  surface-volume parent needed to keep ROI node indexing honest.
+  and pial/inflated/sphere state switching (from Phases 3/5), with required
+  surface-volume parent context for spec launches.
+  - [x] Parse single- and both-hemisphere `.spec` files into surface entries,
+    states, groups, hemisphere labels, and SUMA parent fields.
+  - [x] Add `-spec/--spec` plus required `-sv/--sv` launch arguments and store
+    the surface-volume parent on loaded spec surfaces.
+  - [x] Load single-hemisphere spec scenes and switch the active surface with
+    `.` and `,`.
+  - [x] Load `both` specs as paired left/right surfaces rendered together.
+  - [x] Add closed/acorn paired-hemisphere view presets and Control-drag
+    controls for opening angle and hemisphere gap.
+  - [x] Load the first spec state immediately and preload remaining spec
+    surfaces in the background, with `--no-preload` for strict on-demand
+    loading.
+  - [ ] Update screenshot montage behavior for paired-hemisphere scenes.
 
 ### Continuous (cheap insurance, do early)
 
@@ -210,7 +223,7 @@ interop, and volume rendering.
 - [x] Extend NIML I/O with fixed-width binary numeric payloads,
   mixed numeric/string row tables, and conversion from `.niml.dset` payloads
   into canonical `Dataset` values.
-- [ ] Parse `.spec` files into surface groups, states, hemispheres, labels,
+- [x] Parse `.spec` files into surface groups, states, hemispheres, labels,
   topology/coordinate file pairs, local domain parents, curvature parents, and
   surface-volume parent references.
   - Why: `.spec` files describe how a SUMA scene fits together, so they are the
@@ -296,16 +309,16 @@ interop, and volume rendering.
     calling viewer methods directly.
   - Reference: `docs/EGUI_CONTROLLER_REFERENCE.md` preserves the first surface
     controller mockup and implementation notes.
-- [x] Add native file picker support for loading surfaces and overlays from the
-  first viewer workbench.
-  - Why: File dialogs make visual testing faster while the path boxes remain
-    useful for exact fixture paths and scripted workflows.
+- [x] Add native file picker support for loading surfaces, overlays, specs, and
+  surface volumes from the first viewer workbench.
+  - Why: File dialogs make visual testing faster while exact fixture paths and
+    scripted workflows remain command-line workflows.
 - [ ] Add recent-file support if repeated manual loading becomes annoying.
-  - Why: Path boxes are simple and reliable for testing, but repeated manual
-    loading will eventually want a friendlier file workflow.
+  - Why: File dialogs are simple and reliable for testing, but repeated manual
+    loading will eventually want remembered recent files and working folders.
 - [ ] Add label-table-aware coloring.
   - Why: Label datasets should display named regions with their intended colors.
-- [ ] Add selectable color maps.
+- [x] Add selectable color maps.
   - Why: Different scalar data needs different visual encodings, and users need
     control over that choice.
 - [ ] Add threshold, clipping, opacity, and symmetric-range controls.
@@ -324,7 +337,7 @@ interop, and volume rendering.
 - [ ] Add crosshair state and display.
   - Why: Crosshairs link the viewer to coordinates, selections, and later AFNI
     or volume views.
-- [ ] Add screenshot export.
+- [x] Add screenshot export.
   - Why: Users need a direct way to save figures for notes, QA, and papers.
 - [ ] Add viewer tests or screenshot/pixel checks for nonblank rendering once
   automated graphics verification is practical.
@@ -336,14 +349,14 @@ interop, and volume rendering.
 > Top priority (pulled into Daily Driver): multi-surface scenes + state
 > switching, and ROI display/drawing/editing/undo/save.
 
-- [ ] Add multi-surface scenes: pial, smoothwm, inflated, sphere, and
+- [x] Add multi-surface scenes: pial, smoothwm, inflated, sphere, and
   registered template surfaces.
   - Why: SUMA's power comes from switching among related surfaces in one scene,
     not opening one mesh at a time.
 - [ ] Add surface visibility toggles and current-surface focus.
   - Why: Multi-surface scenes need simple controls for hiding, showing, and
     choosing the active surface.
-- [ ] Add state switching across related surfaces, such as anatomical,
+- [x] Add state switching across related surfaces, such as anatomical,
   inflated, spherical, and template states.
   - Why: State switching lets users inspect the same data on surfaces that make
     different anatomical features easier to see.

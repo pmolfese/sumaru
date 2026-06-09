@@ -1668,10 +1668,10 @@ fn parse_attrs(header: &str) -> Result<BTreeMap<String, String>> {
         while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
             pos += 1;
         }
-        ensure!(
-            bytes.get(pos) == Some(&b'='),
-            "NIML attribute {key} is missing '='"
-        );
+        if bytes.get(pos) != Some(&b'=') {
+            attrs.insert(key.to_string(), String::new());
+            continue;
+        }
         pos += 1;
         while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
             pos += 1;
@@ -2209,6 +2209,31 @@ mod tests {
         );
         assert_eq!(matrix.get(0, 0), Some(1.5));
         assert_eq!(matrix.get(1, 1), Some(12.0));
+    }
+
+    #[test]
+    fn bare_niml_attributes_are_preserved_as_empty_values() {
+        let text = r#"<AFNI_dataset
+            dset_type="Node_Bucket"
+            domain_parent_idcode
+            geometry_parent_idcode
+            ni_form="ni_group">
+            </AFNI_dataset>"#;
+
+        let elements = parse_niml_str(text).unwrap();
+
+        assert_eq!(
+            elements[0].attrs.get("domain_parent_idcode"),
+            Some(&String::new())
+        );
+        assert_eq!(
+            elements[0].attrs.get("geometry_parent_idcode"),
+            Some(&String::new())
+        );
+        assert_eq!(
+            elements[0].attrs.get("dset_type").map(String::as_str),
+            Some("Node_Bucket")
+        );
     }
 
     #[test]

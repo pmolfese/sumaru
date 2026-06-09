@@ -18,7 +18,7 @@ impl CameraMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PresetOrientation {
     Left,
     Right,
@@ -26,6 +26,7 @@ pub(super) enum PresetOrientation {
     Bottom,
 }
 
+#[derive(Clone)]
 pub(super) struct Camera {
     mode: CameraMode,
     orientation: Quat,
@@ -198,7 +199,7 @@ impl Camera {
         self.yaw = eye_direction.x.atan2(eye_direction.y);
     }
 
-    fn set_view_direction(&mut self, eye_direction: Vec3, up: Vec3) {
+    pub(super) fn set_view_direction(&mut self, eye_direction: Vec3, up: Vec3) {
         self.orientation = orientation_for(eye_direction, up);
         self.sync_angles_from_orientation();
     }

@@ -8,6 +8,7 @@ neuroimaging file types SUMA workflows depend on.
 
 - GIFTI surface/shape/dataset I/O through `gifti-rs` from `PennLINC/gifti-rs`
 - NIFTI volume I/O through `nifti` from `Enet4/nifti-rs`
+- SUMA `.spec` parsing for single-hemisphere multi-surface scenes
 - A first surface viewer through `winit`, `wgpu`, and `egui`
 - Headless file inspection:
 
@@ -18,6 +19,9 @@ cargo run -- --surface /path/to/surface.gii
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/overlay.shape.gii
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.gii.dset
+cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset --verbose
+cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
+cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --no-preload
 cargo run -- inspect /path/to/file.nii.gz
 ```
 
@@ -45,9 +49,13 @@ threshold control can operate in p-value mode.
 ## Viewer Controls
 
 - Launch with `cargo run` to open an empty viewer and a separate controls
-  window, then browse for a surface and optional overlay or load them by
-  pasted path. The controls window auto-fits to its current contents, capped by
+  window, then use the `Open:` buttons for a surface, overlay, spec, or surface
+  volume. The controls window auto-fits to its current contents, capped by
   the monitor size.
+- Add `--verbose` to print viewer status messages to the terminal.
+- Spec scenes load the first display state immediately and preload the rest in
+  the background by default. Add `--no-preload` to load only surfaces as they
+  are displayed.
 - Left-drag to orbit.
 - Right-click the surface to inspect the nearest node, triangle, and loaded
   overlay value.
@@ -55,6 +63,16 @@ threshold control can operate in p-value mode.
 - Press Space to reset the camera.
 - Press `C` to switch camera mode between `orbit` and `turntable`.
 - Press `O` to toggle a loaded overlay on or off.
+- Press `.` to advance to the next surface in a loaded single-hemisphere
+  `.spec` scene, or the next matched left/right state pair in a `both` scene.
+  Press `,` to move backward.
+- In a `both` spec scene, use `Open` and `Close` in the VIEW section to
+  persistently switch between the closed and acorn paired-hemisphere layouts.
+  Hold Control and left-drag in the viewer to fine-tune the pair: left/right
+  adjusts the open angle, and up/down adjusts the gap between hemispheres.
+- Press `r` to save the current view as a PNG, or Shift-`R` to save a 1x4
+  left/right/top/bottom montage. The VIEW section also has `Save` and
+  `Montage` buttons.
 - Press `F5` to switch the background between black and white.
 - Hold Option and press an arrow key for preset views:
   - Option-Left: left side view
@@ -88,8 +106,10 @@ See `docs/ROADMAP.md` for the staged build plan.
 - `src/lib.rs` is the library crate entry point. It exposes the reusable modules
   so the binary, tests, and future tools can share the same implementation.
 - `src/main.rs` is the command-line entry point. It parses `sumaru` arguments,
-  launches the viewer with or without an initial surface, handles `--overlay`,
-  and runs the `inspect` subcommand.
+  launches the viewer with an initial surface or `.spec` scene, requires `-sv`
+  surface-volume context for `.spec` launches, handles `--overlay`, passes
+  through `--verbose` terminal logging, controls spec preloading with
+  `--no-preload`, and runs the `inspect` subcommand.
 - `src/color.rs` contains shared RGBA, continuous color-map, and label-table
   models for scalar maps and integer label datasets, including GIFTI and
   FreeSurfer import helpers.
@@ -112,6 +132,9 @@ See `docs/ROADMAP.md` for the staged build plan.
   and threshold-derived surface regions. It stores labels, styling,
   parent-surface/domain links, source/provenance, path history, domain
   validation, and conversion into sparse ROI datasets.
+- `src/spec.rs` parses SUMA `.spec` files into surface groups, states,
+  hemisphere labels, resolved surface paths, local domain/curvature parents,
+  anatomical flags, and label-dataset references.
 - `src/surface.rs` contains the current surface data model and GIFTI surface
   adapter. It loads vertices/triangles, validates indices, computes bounds and
   normals, records SUMA-inspired domain/metadata/lineage, and stores scalar
@@ -132,6 +155,9 @@ See `docs/ROADMAP.md` for the staged build plan.
 - `src/viewer/pick.rs` contains right-click surface inspection. It builds a
   camera ray from the cursor, intersects it with normalized triangles, and
   reports the hit triangle, nearest node, and overlay value.
+- `src/viewer/screenshot.rs` contains screenshot image helpers. It converts
+  `wgpu` readback bytes into RGBA pixels, writes PNG files, and stitches the
+  preset-view montage.
 - `src/viewer/shader.wgsl` contains the GPU shader code used by `wgpu`,
   primarily the lit surface rendering path.
 - `target/` is generated by Cargo when you build or run the project. It is not
