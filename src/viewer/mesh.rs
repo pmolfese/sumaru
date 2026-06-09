@@ -194,7 +194,7 @@ impl OverlayColorMap {
     }
 }
 
-fn compose_overlay_color(color: [f32; 4], dim: f32) -> [f32; 4] {
+pub(super) fn compose_overlay_color(color: [f32; 4], dim: f32) -> [f32; 4] {
     let alpha = finite_or(color[3], 0.0).clamp(0.0, 1.0);
     let dim = dim.clamp(0.0, 1.5);
     [

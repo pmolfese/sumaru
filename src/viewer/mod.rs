@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -338,6 +338,11 @@ struct ViewerState {
     surface_buffers: Option<SurfaceBuffers>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    uniform_bind_group_layout: wgpu::BindGroupLayout,
+    /// Active only while Control-dragging an acorn pair: per-hemisphere resident
+    /// buffers drawn with per-hemisphere model matrices, so the drag updates
+    /// small uniforms instead of re-transforming and re-uploading geometry.
+    pair_drag_render: Option<PairDragRender>,
     depth_buffer: DepthBuffer,
     mesh: Option<SurfaceMesh>,
     prepared_geometry_cache: Option<PreparedGeometryCache>,
@@ -558,6 +563,8 @@ impl ViewerState {
             surface_buffers: None,
             uniform_buffer,
             uniform_bind_group,
+            uniform_bind_group_layout,
+            pair_drag_render: None,
             depth_buffer,
             mesh: None,
             prepared_geometry_cache: None,
@@ -877,7 +884,21 @@ impl ViewerState {
             multiview_mask: None,
         });
 
-        if let Some(buffers) = &self.surface_buffers {
+        if let Some(drag) = &self.pair_drag_render {
+            // Drag mode: one draw per hemisphere, each with its own model matrix
+            // bind group, over geometry uploaded once at drag start.
+            render_pass.set_pipeline(&self.render_pipeline);
+            for hemisphere in &drag.hemispheres {
+                if !self.pair_visibility.is_visible(&hemisphere.side) {
+                    continue;
+                }
+                render_pass.set_bind_group(0, &hemisphere.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, hemisphere.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(hemisphere.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..hemisphere.index_count, 0, 0..1);
+            }
+        } else if let Some(buffers) = &self.surface_buffers {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
@@ -2405,6 +2426,13 @@ impl ViewerState {
         self.pair_dragging = true;
         self.pair_drag_last_cursor = self.view_cursor_position;
         self.pair_drag_changed = false;
+        // Upload each hemisphere's geometry once; the drag then only updates
+        // model matrices. If this can't be set up, refresh falls back to the
+        // old per-frame geometry rebuild.
+        self.pair_drag_render = self.build_pair_drag_render();
+        if let Err(error) = self.refresh_pair_drag_uniforms() {
+            self.set_error(error);
+        }
     }
 
     fn update_pair_drag(&mut self, cursor: (f64, f64)) {
@@ -2432,6 +2460,9 @@ impl ViewerState {
             ));
         }
         self.pair_drag_changed = false;
+        // Drop the drag-only resident buffers and resume the baked path, which
+        // keeps picking and the static display correct.
+        self.pair_drag_render = None;
         if let Err(error) = self.rebuild_active_scene_surface_mesh() {
             self.set_error(error);
         }
@@ -2460,7 +2491,139 @@ impl ViewerState {
     }
 
     fn preview_active_pair_transform(&mut self) -> Result<()> {
-        self.refresh_active_pair_render_geometry()
+        self.refresh_pair_drag_uniforms()
+    }
+
+    fn build_pair_drag_render(&mut self) -> Option<PairDragRender> {
+        struct RawComponent {
+            side: SurfaceSide,
+            positions: Vec<[f32; 3]>,
+            normals: Vec<[f32; 3]>,
+            triangles: Vec<[u32; 3]>,
+            vertex_count: usize,
+        }
+
+        let raw: Vec<RawComponent> = {
+            let scene = self.surface_scene.as_mut()?;
+            if scene.hemisphere != SpecHemisphere::Both {
+                return None;
+            }
+            let index = scene.active_index;
+            let surface = scene.surfaces.get_mut(index)?;
+            let mut raw = Vec::with_capacity(surface.components.len());
+            for component in &mut surface.components {
+                let normals = ensure_component_normals(component).ok()?;
+                let mesh = component.mesh.as_ref()?;
+                raw.push(RawComponent {
+                    side: component.side.clone(),
+                    positions: mesh.vertices.clone(),
+                    normals: (*normals).clone(),
+                    triangles: mesh.triangles.clone(),
+                    vertex_count: mesh.vertices.len(),
+                });
+            }
+            raw
+        };
+        if raw.len() != 2 {
+            return None;
+        }
+
+        // Slice the overlay color cache by cumulative node offset, matching the
+        // merged-domain ordering the baked path uses.
+        let overlay_colors = self
+            .overlay
+            .as_ref()
+            .filter(|_| self.overlay_visible)
+            .map(|overlay| overlay.color_cache.colors.as_slice());
+        let dim = self.overlay_appearance.dim;
+        let aspect = self.view_config.width as f32 / self.view_config.height as f32;
+        let init_bytes = self.camera.uniform_bytes(aspect);
+
+        let mut hemispheres = Vec::with_capacity(raw.len());
+        let mut offset = 0usize;
+        for component in &raw {
+            let colors = overlay_colors.map(|colors| {
+                let start = offset.min(colors.len());
+                let end = (offset + component.vertex_count).min(colors.len());
+                &colors[start..end]
+            });
+            let vertex_bytes =
+                pair_drag_vertex_bytes(&component.positions, &component.normals, colors, dim);
+            let (index_bytes, index_count) = pair_drag_index_bytes(&component.triangles);
+            let vertex_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("pair drag vertex buffer"),
+                    contents: &vertex_bytes,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                });
+            let index_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("pair drag index buffer"),
+                    contents: &index_bytes,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                });
+            let uniform_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("pair drag uniform buffer"),
+                        contents: &init_bytes,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pair drag bind group"),
+                layout: &self.uniform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+            });
+            hemispheres.push(PairDragHemisphere {
+                side: component.side.clone(),
+                vertex_buffer,
+                index_buffer,
+                index_count,
+                uniform_buffer,
+                bind_group,
+            });
+            offset += component.vertex_count;
+        }
+
+        Some(PairDragRender { hemispheres })
+    }
+
+    fn refresh_pair_drag_uniforms(&mut self) -> Result<()> {
+        if self.pair_drag_render.is_none() {
+            // GPU drag path unavailable; fall back to rebuilding render geometry.
+            return self.refresh_active_pair_render_geometry();
+        }
+
+        let layout = self.hemisphere_layout_state();
+        let visibility = self.pair_visibility;
+        let aspect = self.view_config.width as f32 / self.view_config.height as f32;
+        let matrices = {
+            let Some(scene) = self.surface_scene.as_ref() else {
+                return Ok(());
+            };
+            let Some(surface) = scene.surfaces.get(scene.active_index) else {
+                return Ok(());
+            };
+            pair_hemisphere_matrices(&surface.components, layout, visibility)
+        };
+
+        let Some(drag) = self.pair_drag_render.as_ref() else {
+            return Ok(());
+        };
+        for hemisphere in &drag.hemispheres {
+            if let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == hemisphere.side) {
+                let bytes = self.camera.uniform_bytes_with_model(aspect, *matrix);
+                self.queue
+                    .write_buffer(&hemisphere.uniform_buffer, 0, &bytes);
+            }
+        }
+
+        Ok(())
     }
 
     fn refresh_active_pair_render_geometry(&mut self) -> Result<()> {
@@ -2983,6 +3146,22 @@ struct SurfaceBuffers {
     index_count: u32,
 }
 
+/// Per-hemisphere resident geometry used only while dragging an acorn pair.
+/// The geometry is uploaded once (raw, untransformed); the layout drag updates
+/// each hemisphere's `uniform_buffer` model matrix instead of the geometry.
+struct PairDragRender {
+    hemispheres: Vec<PairDragHemisphere>,
+}
+
+struct PairDragHemisphere {
+    side: SurfaceSide,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
 #[derive(Clone)]
 struct PreparedGeometryCache {
     surface_id: SurfaceId,
@@ -3378,6 +3557,119 @@ fn paired_preview_geometry(
     Ok(PreparedGeometry { vertices, indices })
 }
 
+/// O(1) framing (center + radius) for the acorn pair while dragging. It
+/// approximates the exact transformed bounds with per-hemisphere bounding
+/// spheres (transformed component center + the mesh's bounding-sphere radius),
+/// so no per-vertex work runs per frame. It slightly over-estimates the exact
+/// fit the baked release path computes, which can show as a small scale change
+/// when the drag ends.
+fn pair_framing(
+    components: &[SceneSurfaceComponent],
+    transforms: &[ComponentTransform],
+    visibility: PairVisibility,
+) -> Option<(Vec3, f32)> {
+    let mut bounds = TransformedBounds::empty();
+    let mut any_visible = false;
+    for (component, transform) in components.iter().zip(transforms) {
+        if !visibility.is_visible(&component.side) {
+            continue;
+        }
+        let Some(mesh) = component.mesh.as_ref() else {
+            continue;
+        };
+        let corner = transformed_corner_bounds(mesh, *transform);
+        bounds.include(corner.min);
+        bounds.include(corner.max);
+        any_visible = true;
+    }
+    if !any_visible {
+        return None;
+    }
+
+    let center = bounds.center();
+    let radius = components
+        .iter()
+        .zip(transforms)
+        .filter(|(component, _)| visibility.is_visible(&component.side))
+        .filter_map(|(component, transform)| component.mesh.as_ref().map(|mesh| (mesh, transform)))
+        .map(|(mesh, transform)| {
+            let transformed_center =
+                transform_point(mesh, *transform, Vec3::from_array(mesh.bounds.center));
+            transformed_center.distance(center) + mesh.bounds.radius
+        })
+        .fold(0.0_f32, f32::max)
+        .max(1.0);
+
+    Some((center, radius))
+}
+
+/// Per-hemisphere display model matrices for the current layout. Cheap (no
+/// per-vertex allocation, transform, or upload) so dragging only writes small
+/// uniforms.
+fn pair_hemisphere_matrices(
+    components: &[SceneSurfaceComponent],
+    layout: HemisphereLayoutState,
+    visibility: PairVisibility,
+) -> Vec<(SurfaceSide, Mat4)> {
+    let transforms = component_transforms(components, layout);
+    let Some((center, radius)) = pair_framing(components, &transforms, visibility) else {
+        return Vec::new();
+    };
+    components
+        .iter()
+        .zip(transforms)
+        .filter_map(|(component, transform)| {
+            let mesh = component.mesh.as_ref()?;
+            let component_center = Vec3::from_array(mesh.bounds.center);
+            Some((
+                component.side.clone(),
+                hemisphere_model_matrix(
+                    component_center,
+                    transform.rotation_z_degrees,
+                    transform.offset,
+                    center,
+                    radius,
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// Packs raw (untransformed) per-hemisphere vertices into the standard
+/// position+normal+color vertex layout. The model matrix applies the layout
+/// transform on the GPU, so positions and normals here stay in mesh space.
+fn pair_drag_vertex_bytes(
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    colors: Option<&[[f32; 4]]>,
+    dim: f32,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(positions.len() * 40);
+    for (index, (position, normal)) in positions.iter().zip(normals).enumerate() {
+        for value in position.iter().chain(normal.iter()) {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        let color = colors
+            .and_then(|colors| colors.get(index))
+            .map(|color| mesh::compose_overlay_color(*color, dim))
+            .unwrap_or(mesh::DEFAULT_SURFACE_COLOR);
+        for value in color {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    bytes
+}
+
+fn pair_drag_index_bytes(triangles: &[[u32; 3]]) -> (Vec<u8>, u32) {
+    let mut bytes = Vec::with_capacity(triangles.len() * 12);
+    for triangle in triangles {
+        for index in triangle {
+            bytes.extend_from_slice(&index.to_ne_bytes());
+        }
+    }
+    (bytes, (triangles.len() * 3) as u32)
+}
+
 fn ensure_component_normals(component: &mut SceneSurfaceComponent) -> Result<Arc<Vec<[f32; 3]>>> {
     if component.normal_cache.is_none() {
         let mesh = component
@@ -3470,6 +3762,89 @@ fn component_transforms(
     }
 
     transforms
+}
+
+/// Builds the affine model matrix that reproduces the per-hemisphere display
+/// transform `paired_preview_geometry` bakes into vertices, so the GPU can
+/// apply it through the shader's `model` uniform instead of the CPU
+/// re-transforming and re-uploading every vertex on each drag frame.
+///
+/// The baked transform is `p -> (c + R*(p - c) + offset - center) / radius`,
+/// where `c` is the component center, `R` the Z rotation, and `center`/`radius`
+/// the scene normalization. The uniform scale keeps normals correct under the
+/// same matrix (the shader renormalizes them).
+fn hemisphere_model_matrix(
+    component_center: Vec3,
+    rotation_z_degrees: f32,
+    offset: Vec3,
+    scene_center: Vec3,
+    radius: f32,
+) -> Mat4 {
+    let inv_radius = 1.0 / radius;
+    Mat4::from_scale(Vec3::splat(inv_radius))
+        * Mat4::from_translation(component_center + offset - scene_center)
+        * Mat4::from_rotation_z(rotation_z_degrees.to_radians())
+        * Mat4::from_translation(-component_center)
+}
+
+#[cfg(test)]
+mod acorn_matrix_tests {
+    use super::hemisphere_model_matrix;
+    use glam::{Quat, Vec3};
+
+    /// Mirrors the per-vertex transform baked by `paired_preview_geometry`.
+    fn baked_position(
+        p: Vec3,
+        component_center: Vec3,
+        rotation_z_degrees: f32,
+        offset: Vec3,
+        scene_center: Vec3,
+        radius: f32,
+    ) -> Vec3 {
+        let rotation = Quat::from_rotation_z(rotation_z_degrees.to_radians());
+        let rotated = component_center + rotation * (p - component_center);
+        (rotated + offset - scene_center) / radius
+    }
+
+    #[test]
+    fn model_matrix_matches_baked_vertex_transform() {
+        let component_center = Vec3::new(2.0, -3.0, 1.5);
+        let offset = Vec3::new(-12.0, 0.0, 0.0);
+        let scene_center = Vec3::new(0.5, 0.5, 0.0);
+        let radius = 47.0;
+        let angle = 18.0;
+        let matrix = hemisphere_model_matrix(component_center, angle, offset, scene_center, radius);
+
+        for p in [
+            Vec3::ZERO,
+            Vec3::new(10.0, -5.0, 3.0),
+            Vec3::new(-7.0, 8.0, -2.0),
+            component_center,
+        ] {
+            let expected = baked_position(p, component_center, angle, offset, scene_center, radius);
+            let actual = matrix.transform_point3(p);
+            assert!(
+                (actual - expected).length() < 1e-4,
+                "matrix {actual:?} != baked {expected:?} for {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_layout_is_plain_normalization() {
+        let scene_center = Vec3::new(1.0, 2.0, 3.0);
+        let radius = 10.0;
+        let matrix = hemisphere_model_matrix(
+            Vec3::new(4.0, 4.0, 4.0),
+            0.0,
+            Vec3::ZERO,
+            scene_center,
+            radius,
+        );
+        let p = Vec3::new(11.0, 12.0, 13.0);
+        let expected = (p - scene_center) / radius;
+        assert!((matrix.transform_point3(p) - expected).length() < 1e-4);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

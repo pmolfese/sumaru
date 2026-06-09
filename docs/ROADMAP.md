@@ -124,13 +124,34 @@ the next rung.
 
 ### Toggling and hemisphere layout — durable mesh residency
 
-- [ ] Keep the durable `SurfaceMesh` immutable after load; never rebuild it for a
-  view change. Express the `both`-hemisphere open-angle/gap layout as per-
-  hemisphere transforms (model matrices) rather than baking transformed vertex
-  positions into a rebuilt merged mesh, and make picking layout-aware (transform
-  the pick ray) so layout changes never rebuild the durable mesh. Currently the
-  open-angle drag is debounced (render-only per frame, durable rebuild once on
-  release for picking correctness); this removes that release-time rebuild too.
+- [x] Draw the `both`-hemisphere acorn pair with per-hemisphere model matrices
+  during the open-angle/gap drag: geometry is uploaded once per hemisphere at
+  drag start, and the drag only writes two small uniforms instead of
+  re-transforming and re-uploading ~275k vertices each frame.
+- [x] Compute the drag framing (center/radius) in O(1) from per-hemisphere
+  bounding spheres instead of two full-vertex transform passes per frame, so the
+  drag itself is smooth. Known artifact: the bounding-sphere radius uses
+  `mesh.bounds.radius` (the mesh's longest axis), which over-states the
+  outward extent that matters as the acorn opens, so the pair renders slightly
+  zoomed out during the drag and snaps back to the exact (tighter) framing on
+  release. Most visible on elongated meshes (brains). Removed by the
+  persistent-mode item below, which makes drag and resting framing identical.
+- [ ] Remove the post-drag pause (the "later milestone"). On release,
+  `finish_pair_drag` currently rebuilds the durable merged `SurfaceMesh`
+  (transform all vertices + normals + topology) and re-uploads ~11 MB
+  synchronously, purely so `self.mesh` matches the layout for picking. Fix by
+  making the per-hemisphere matrix rendering **persistent** for `both` scenes
+  (not torn down on release) and making **picking layout-aware** (transform the
+  pick ray by each hemisphere's inverse model matrix and test against that
+  hemisphere's raw mesh) so the durable mesh never needs rebuilding for a layout
+  change. This also removes the drag zoom/snap artifact, since rendering no
+  longer switches between the cheap drag framing and the exact baked framing —
+  both come from one consistent computation.
+  - Why deferred: it is a larger change touching the both-scene lifecycle
+    (load/switch/overlay/visibility all must keep the per-hemisphere buffers in
+    sync) and the picking path, and rendering/picking correctness can only be
+    confirmed by running the viewer. Worth doing deliberately with the pick-ray
+    transform unit-tested.
 - [ ] Keep each surface's geometry resident on the GPU and toggle visibility via
   draw-call selection instead of rebuilding/re-uploading filtered geometry, so
   hemisphere and state switches are a draw-list change rather than an upload.

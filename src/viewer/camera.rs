@@ -143,8 +143,13 @@ impl Camera {
     }
 
     pub(super) fn uniform_bytes(&self, aspect: f32) -> Vec<u8> {
+        self.uniform_bytes_with_model(aspect, Mat4::IDENTITY)
+    }
+
+    /// Same as [`Self::uniform_bytes`] but with an explicit model matrix, used
+    /// to draw each acorn hemisphere with its own transform while dragging.
+    pub(super) fn uniform_bytes_with_model(&self, aspect: f32, model: Mat4) -> Vec<u8> {
         let view_projection = self.view_projection(aspect);
-        let model = Mat4::IDENTITY;
         let light_direction = Vec3::new(0.35, 0.8, 0.45).normalize();
         let surface_color = [0.76, 0.78, 0.74, 1.0];
         let floats = [
