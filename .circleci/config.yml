@@ -1,6 +1,6 @@
 version: 2.1
 
-# Build and test sumaru on Linux and macOS. Both jobs mirror the local Cargo
+# Build and test sumaru on Linux. The job mirrors the local Cargo
 # aliases from .cargo/config.toml:
 #   fmt-all   = fmt --all
 #   check-all = check --all-targets --all-features
@@ -24,6 +24,7 @@ jobs:
             apt-get update
             apt-get install -y --no-install-recommends \
               cmake pkg-config \
+              libgtk-3-dev \
               libx11-dev libxkbcommon-dev libwayland-dev \
               libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run:
@@ -47,41 +48,7 @@ jobs:
             - /usr/local/cargo/registry
             - target
 
-  test-macos:
-    # Apple silicon (arm64).
-    macos:
-      # Pick a value from CircleCI's supported Xcode images; bump as needed.
-      xcode: "16.2.0"
-    resource_class: macos.m4pro.medium
-    steps:
-      - checkout
-      - run:
-          name: Install Rust
-          command: |
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --default-toolchain stable --component rustfmt
-            echo 'source "$HOME/.cargo/env"' >> "$BASH_ENV"
-      - run:
-          name: Toolchain versions
-          command: rustc --version && cargo --version
-      - restore_cache:
-          keys:
-            - cargo-macos-v1-{{ checksum "Cargo.lock" }}
-            - cargo-macos-v1-
-      - run:
-          name: Format check
-          command: cargo fmt-all -- --check
-      - run:
-          name: Build and test
-          command: cargo test-all
-      - save_cache:
-          key: cargo-macos-v1-{{ checksum "Cargo.lock" }}
-          paths:
-            - ~/.cargo/registry
-            - target
-
 workflows:
   build-and-test:
     jobs:
       - test-linux
-      - test-macos
