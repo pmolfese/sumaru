@@ -4,5 +4,6 @@ pub mod inspect;
 pub mod io;
 pub mod overlay;
 pub mod roi;
+pub mod stats;
 pub mod surface;
 pub mod viewer;

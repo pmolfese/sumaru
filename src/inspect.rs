@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use nifti::{NiftiObject, NiftiVolume, ReaderOptions};
 
+use crate::io::read_gifti_image;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Gifti,
@@ -72,7 +74,7 @@ pub fn detect_file_kind(path: &Path) -> Option<FileKind> {
 }
 
 fn inspect_gifti(path: &Path) -> Result<InspectReport> {
-    let image = gifti_rs::read(path)
+    let image = read_gifti_image(path)
         .with_context(|| format!("failed to read GIFTI file {}", path.display()))?;
 
     let pointsets = image

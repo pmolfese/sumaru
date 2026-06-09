@@ -38,8 +38,9 @@ interop, and volume rendering.
 
 ### Tier 1 — Statistical overlay loop
 
-- [ ] Parse `.niml.dset` into the canonical `Dataset` (from Phase 3) so real
-  AFNI overlays load, not just GIFTI shape files.
+- [x] Parse `.niml.dset` and AFNI-converted `.gii.dset` into the canonical
+  `Dataset` (from Phase 3) so real AFNI overlays load, not just one-column
+  GIFTI shape files.
 - [ ] Wire overlay display controls into the viewer using the existing
   `color.rs`/`overlay.rs` model: selectable colormap, intensity range,
   threshold mode/range, symmetric range, and opacity (from Phase 4).
@@ -214,10 +215,11 @@ interop, and volume rendering.
   surface-volume parent references.
   - Why: `.spec` files describe how a SUMA scene fits together, so they are the
     bridge from single-file loading to real sessions.
-- [ ] Parse `.niml.dset` into the canonical `Dataset` model with column labels,
-  column roles, typed values, node-index columns, ranges, and parent/domain ids.
-  - Why: NIML datasets carry the rich table structure that overlays,
-    thresholds, and statistics need.
+- [x] Parse `.niml.dset` and AFNI-converted `.gii.dset` into the canonical
+  `Dataset` model with column labels, column roles, typed values, node-index
+  columns, ranges, stat metadata, and parent/domain ids.
+  - Why: AFNI datasets can arrive as NIML or GIFTI, and both carry the rich
+    table structure that overlays, thresholds, and statistics need.
 - [ ] Parse `.niml.roi` into `Roi`/`RoiDatum` with stroke history, node
   paths, triangle paths, labels, colors, and parent-surface metadata.
   - Why: Reading ROI files lets users bring existing SUMA annotations into
@@ -372,6 +374,11 @@ interop, and volume rendering.
   crosshair updates, dataset loading, and controller state.
   - Why: A small documented protocol target is easier to implement and test
     than trying to mirror everything.
+- [ ] Add AFNI/SUMA-compatible `BBox` threshold A/B semantics for future
+  multi-threshold transparency and masking controls.
+  - Why: Threshold failures should eventually be controlled as overlay
+    transparency/masking state, not by unexpectedly changing the base surface
+    appearance.
 - [ ] If needed, implement a small protocol crate for AFNI/SUMA messaging
   rather than burying protocol details inside the viewer.
   - Why: Protocol code should be reusable by CLIs and tests, not locked inside

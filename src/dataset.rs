@@ -36,6 +36,7 @@ pub struct DataColumn {
     pub label: String,
     pub role: ColumnRole,
     pub units: Option<String>,
+    pub stat: Option<String>,
     pub values: ColumnData,
     pub range: Option<ColumnRange>,
 }
@@ -173,9 +174,19 @@ impl DataColumn {
             label,
             role,
             units,
+            stat: None,
             values,
             range,
         })
+    }
+
+    pub fn with_stat(mut self, stat: Option<String>) -> Self {
+        self.stat = stat.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none"))
+                .then(|| trimmed.to_string())
+        });
+        self
     }
 
     pub fn len(&self) -> usize {

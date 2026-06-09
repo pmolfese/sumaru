@@ -236,6 +236,10 @@ mod tests {
                 min: 10.0,
                 max: 30.0,
             },
+            threshold_values: None,
+            threshold_pvalues: None,
+            brightness_values: None,
+            brightness_range: None,
         };
         let mut camera = Camera::default();
         camera.set_preset(PresetOrientation::Top);

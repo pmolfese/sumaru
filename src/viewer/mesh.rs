@@ -17,8 +17,37 @@ pub(super) struct PreparedVertex {
     pub(super) color: [f32; 4],
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct OverlayAppearance {
+    pub(super) range: ValueRange,
+    pub(super) colormap: OverlayColorMap,
+    pub(super) threshold: OverlayThreshold,
+    pub(super) opacity: f32,
+    pub(super) dim: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OverlayColorMap {
+    AfniP2Spanned,
+    BlueWhiteRed,
+    Fire,
+    Grayscale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct OverlayThreshold {
+    pub(super) enabled: bool,
+    pub(super) absolute: bool,
+    pub(super) value: f32,
+    pub(super) hide_failed: bool,
+}
+
 impl PreparedSurface {
-    pub(super) fn from_surface(surface: &SurfaceMesh, overlay: Option<&OverlayDataset>) -> Self {
+    pub(super) fn from_surface(
+        surface: &SurfaceMesh,
+        overlay: Option<&OverlayDataset>,
+        overlay_appearance: Option<OverlayAppearance>,
+    ) -> Self {
         let normals = surface.vertex_normals();
         let center = Vec3::from_array(surface.bounds.center);
         let scale = if surface.bounds.radius > f32::EPSILON {
@@ -26,7 +55,9 @@ impl PreparedSurface {
         } else {
             1.0
         };
-        let colors = overlay.map(overlay_vertex_colors);
+        let colors = overlay
+            .zip(overlay_appearance)
+            .map(|(overlay, appearance)| overlay_vertex_colors(overlay, appearance));
 
         let vertices = surface
             .vertices
@@ -77,38 +108,214 @@ impl PreparedSurface {
     }
 }
 
-fn overlay_vertex_colors(overlay: &OverlayDataset) -> Vec<[f32; 4]> {
+impl OverlayAppearance {
+    pub(super) fn from_range(range: ValueRange) -> Self {
+        Self {
+            range: symmetric_range_if_signed(range),
+            colormap: OverlayColorMap::AfniP2Spanned,
+            threshold: OverlayThreshold {
+                enabled: false,
+                absolute: true,
+                value: 0.0,
+                hide_failed: true,
+            },
+            opacity: 1.0,
+            dim: 1.0,
+        }
+    }
+}
+
+impl OverlayColorMap {
+    pub(super) const ALL: [Self; 4] = [
+        Self::AfniP2Spanned,
+        Self::BlueWhiteRed,
+        Self::Fire,
+        Self::Grayscale,
+    ];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::AfniP2Spanned => "afni_p2spanned",
+            Self::BlueWhiteRed => "blue-white-red",
+            Self::Fire => "nih_fire",
+            Self::Grayscale => "grayscale",
+        }
+    }
+}
+
+fn overlay_vertex_colors(overlay: &OverlayDataset, appearance: OverlayAppearance) -> Vec<[f32; 4]> {
     overlay
         .values
         .iter()
-        .map(|value| color_for_value(overlay.range, *value))
+        .enumerate()
+        .map(|(index, value)| {
+            color_for_value(
+                appearance,
+                *value,
+                overlay
+                    .threshold_values
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .copied(),
+                overlay
+                    .brightness_values
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .copied(),
+                overlay.brightness_range,
+            )
+        })
         .collect()
 }
 
-fn color_for_value(range: ValueRange, value: f32) -> [f32; 4] {
+fn color_for_value(
+    appearance: OverlayAppearance,
+    value: f32,
+    threshold_value: Option<f32>,
+    brightness_value: Option<f32>,
+    brightness_range: Option<ValueRange>,
+) -> [f32; 4] {
     if !value.is_finite() {
-        return [0.35, 0.35, 0.35, 1.0];
+        return [0.35, 0.35, 0.35, appearance.opacity.clamp(0.0, 1.0)];
     }
 
-    let (min, max) = if range.min < 0.0 && range.max > 0.0 {
-        let extent = range.min.abs().max(range.max.abs());
-        (-extent, extent)
-    } else {
-        (range.min, range.max)
-    };
+    let min = appearance.range.min;
+    let max = appearance.range.max;
 
     if (max - min).abs() <= f32::EPSILON {
-        return [1.0, 1.0, 1.0, 1.0];
+        return [1.0, 1.0, 1.0, appearance.opacity.clamp(0.0, 1.0)];
     }
 
     let normalized = ((value - min) / (max - min)).clamp(0.0, 1.0);
-    if normalized < 0.5 {
-        let t = normalized * 2.0;
-        lerp_color([0.1, 0.22, 0.85, 1.0], [1.0, 1.0, 1.0, 1.0], t)
+    let mut color = sample_colormap(appearance.colormap, normalized);
+    apply_brightness(&mut color, brightness_value, brightness_range);
+    let passes_threshold = appearance
+        .threshold
+        .passes(threshold_value.unwrap_or(value));
+
+    if !passes_threshold && appearance.threshold.hide_failed {
+        color = DEFAULT_SURFACE_COLOR;
     } else {
-        let t = (normalized - 0.5) * 2.0;
-        lerp_color([1.0, 1.0, 1.0, 1.0], [0.86, 0.08, 0.08, 1.0], t)
+        let dim = appearance.dim.clamp(0.0, 1.5);
+        let opacity = appearance.opacity.clamp(0.0, 1.0);
+        let failed_factor = if passes_threshold { 1.0 } else { 0.25 };
+        color[0] *= dim * failed_factor;
+        color[1] *= dim * failed_factor;
+        color[2] *= dim * failed_factor;
+        color[0] = DEFAULT_SURFACE_COLOR[0] * (1.0 - opacity) + color[0] * opacity;
+        color[1] = DEFAULT_SURFACE_COLOR[1] * (1.0 - opacity) + color[1] * opacity;
+        color[2] = DEFAULT_SURFACE_COLOR[2] * (1.0 - opacity) + color[2] * opacity;
+        color[3] = 1.0;
     }
+
+    color
+}
+
+impl OverlayThreshold {
+    fn passes(self, value: f32) -> bool {
+        if !self.enabled {
+            return true;
+        }
+
+        if self.absolute {
+            value.abs() >= self.value.abs()
+        } else {
+            value >= self.value
+        }
+    }
+}
+
+fn apply_brightness(
+    color: &mut [f32; 4],
+    brightness_value: Option<f32>,
+    brightness_range: Option<ValueRange>,
+) {
+    let (Some(value), Some(range)) = (brightness_value, brightness_range) else {
+        return;
+    };
+    if !value.is_finite() || (range.max - range.min).abs() <= f32::EPSILON {
+        return;
+    }
+
+    let factor = ((value - range.min) / (range.max - range.min)).clamp(0.0, 1.0);
+    color[0] *= factor;
+    color[1] *= factor;
+    color[2] *= factor;
+}
+
+fn symmetric_range_if_signed(range: ValueRange) -> ValueRange {
+    if range.min < 0.0 && range.max > 0.0 {
+        let extent = range.min.abs().max(range.max.abs());
+        ValueRange {
+            min: -extent,
+            max: extent,
+        }
+    } else {
+        range
+    }
+}
+
+pub(super) fn sample_colormap(colormap: OverlayColorMap, t: f32) -> [f32; 4] {
+    match colormap {
+        OverlayColorMap::AfniP2Spanned => sample_stops(
+            t,
+            &[
+                (0.0, [0.02, 0.12, 0.32, 1.0]),
+                (0.22, [0.08, 0.38, 0.68, 1.0]),
+                (0.42, [0.52, 0.74, 0.92, 1.0]),
+                (0.5, [0.98, 0.96, 0.86, 1.0]),
+                (0.66, [0.96, 0.68, 0.28, 1.0]),
+                (0.82, [0.80, 0.24, 0.16, 1.0]),
+                (1.0, [0.45, 0.09, 0.07, 1.0]),
+            ],
+        ),
+        OverlayColorMap::BlueWhiteRed => sample_stops(
+            t,
+            &[
+                (0.0, [0.1, 0.22, 0.85, 1.0]),
+                (0.5, [1.0, 1.0, 1.0, 1.0]),
+                (1.0, [0.86, 0.08, 0.08, 1.0]),
+            ],
+        ),
+        OverlayColorMap::Fire => sample_stops(
+            t,
+            &[
+                (0.0, [0.02, 0.0, 0.0, 1.0]),
+                (0.28, [0.42, 0.02, 0.02, 1.0]),
+                (0.58, [0.90, 0.24, 0.02, 1.0]),
+                (0.82, [1.0, 0.74, 0.12, 1.0]),
+                (1.0, [1.0, 1.0, 0.88, 1.0]),
+            ],
+        ),
+        OverlayColorMap::Grayscale => sample_stops(
+            t,
+            &[(0.0, [0.0, 0.0, 0.0, 1.0]), (1.0, [1.0, 1.0, 1.0, 1.0])],
+        ),
+    }
+}
+
+fn sample_stops(t: f32, stops: &[(f32, [f32; 4])]) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    if t <= stops[0].0 {
+        return stops[0].1;
+    }
+
+    for window in stops.windows(2) {
+        let [(left_t, left_color), (right_t, right_color)] = window else {
+            continue;
+        };
+        if t <= *right_t {
+            let span = *right_t - *left_t;
+            let local_t = if span.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                (t - *left_t) / span
+            };
+            return lerp_color(*left_color, *right_color, local_t);
+        }
+    }
+
+    stops[stops.len() - 1].1
 }
 
 fn lerp_color(start: [f32; 4], end: [f32; 4], t: f32) -> [f32; 4] {
@@ -132,7 +339,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SURFACE_COLOR, PreparedSurface};
+    use super::{DEFAULT_SURFACE_COLOR, OverlayAppearance, PreparedSurface};
     use crate::surface::{OverlayDataset, SurfaceMesh, ValueRange};
     use glam::Vec3;
 
@@ -140,7 +347,7 @@ mod tests {
     fn prepared_surface_flattens_indices_and_computes_normals() {
         let mesh = triangle_mesh();
 
-        let prepared = PreparedSurface::from_surface(&mesh, None);
+        let prepared = PreparedSurface::from_surface(&mesh, None, None);
 
         assert_eq!(prepared.indices, vec![0, 1, 2]);
         assert_eq!(prepared.vertices.len(), 3);
@@ -154,7 +361,7 @@ mod tests {
     fn prepared_surface_normalizes_positions_for_viewing() {
         let mesh = triangle_mesh();
 
-        let prepared = PreparedSurface::from_surface(&mesh, None);
+        let prepared = PreparedSurface::from_surface(&mesh, None, None);
 
         for vertex in prepared.vertices {
             let length = Vec3::from_array(vertex.position).length();
@@ -168,19 +375,56 @@ mod tests {
         let overlay = OverlayDataset {
             values: vec![-1.0, 0.0, 1.0],
             range: ValueRange::from_values(&[-1.0, 0.0, 1.0]).unwrap(),
+            threshold_values: None,
+            threshold_pvalues: None,
+            brightness_values: None,
+            brightness_range: None,
         };
 
-        let prepared = PreparedSurface::from_surface(&mesh, Some(&overlay));
+        let prepared = PreparedSurface::from_surface(
+            &mesh,
+            Some(&overlay),
+            Some(OverlayAppearance::from_range(overlay.range)),
+        );
 
-        assert_color_close(prepared.vertices[0].color, [0.1, 0.22, 0.85, 1.0]);
-        assert_color_close(prepared.vertices[1].color, [1.0, 1.0, 1.0, 1.0]);
-        assert_color_close(prepared.vertices[2].color, [0.86, 0.08, 0.08, 1.0]);
+        assert_color_close(prepared.vertices[0].color, [0.02, 0.12, 0.32, 1.0]);
+        assert_color_close(prepared.vertices[1].color, [0.98, 0.96, 0.86, 1.0]);
+        assert_color_close(prepared.vertices[2].color, [0.45, 0.09, 0.07, 1.0]);
+    }
+
+    #[test]
+    fn prepared_surface_can_threshold_with_stat_values() {
+        let mesh = triangle_mesh();
+        let overlay = OverlayDataset {
+            values: vec![-1.0, 0.0, 1.0],
+            range: ValueRange::from_values(&[-1.0, 0.0, 1.0]).unwrap(),
+            threshold_values: Some(vec![4.0, 0.0, 4.0]),
+            threshold_pvalues: Some(vec![0.001, 1.0, 0.001]),
+            brightness_values: None,
+            brightness_range: None,
+        };
+        let mut appearance = OverlayAppearance::from_range(overlay.range);
+        appearance.threshold.enabled = true;
+        appearance.threshold.value = 2.0;
+
+        let prepared = PreparedSurface::from_surface(&mesh, Some(&overlay), Some(appearance));
+
+        assert_color_close(prepared.vertices[0].color, [0.02, 0.12, 0.32, 1.0]);
+        assert_eq!(prepared.vertices[1].color, DEFAULT_SURFACE_COLOR);
+        assert_color_close(prepared.vertices[2].color, [0.45, 0.09, 0.07, 1.0]);
+
+        let mut dimmed_appearance = appearance;
+        dimmed_appearance.threshold.hide_failed = false;
+        let dimmed_prepared =
+            PreparedSurface::from_surface(&mesh, Some(&overlay), Some(dimmed_appearance));
+
+        assert_color_close(dimmed_prepared.vertices[1].color, [0.245, 0.24, 0.215, 1.0]);
     }
 
     #[test]
     fn prepared_surface_packs_vertex_bytes() {
         let mesh = triangle_mesh();
-        let prepared = PreparedSurface::from_surface(&mesh, None);
+        let prepared = PreparedSurface::from_surface(&mesh, None, None);
 
         assert_eq!(
             prepared.vertex_bytes().len(),

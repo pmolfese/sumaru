@@ -14,12 +14,15 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset};
+use crate::io::{read_gifti_dataset, read_niml_dataset};
+use crate::stats::AfniStatSpec;
 use crate::surface::{NormalDirection, OverlayDataset, SurfaceMesh, ValueRange};
 use camera::{Camera, CameraMode, PresetOrientation};
 use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
 };
-use mesh::PreparedSurface;
+use mesh::{OverlayAppearance, OverlayColorMap, PreparedSurface, sample_colormap};
 use pick::pick_surface;
 
 mod camera;
@@ -31,11 +34,21 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
 const VERTEX_STRIDE: wgpu::BufferAddress = 40;
 const MODE_LABEL_DURATION: Duration = Duration::from_secs(2);
-const CONTROL_CONTENT_WIDTH_POINTS: f32 = 380.0;
-const CONTROL_MIN_INNER_WIDTH: u32 = 420;
+const STARTUP_REDRAW_TIMEOUT: Duration = Duration::from_secs(2);
+const STARTUP_REDRAW_RETRY_INTERVAL: Duration = Duration::from_millis(16);
+const CONTROL_CONTENT_WIDTH_POINTS: f32 = 560.0;
+const CONTROL_MIN_INNER_WIDTH: u32 = 620;
 const CONTROL_MIN_INNER_HEIGHT: u32 = 420;
-const CONTROL_MAX_INNER_WIDTH: u32 = 640;
+const CONTROL_MAX_INNER_WIDTH: u32 = 900;
 const CONTROL_RESIZE_THRESHOLD: u32 = 12;
+const OVERLAY_THRESHOLD_COLUMN_WIDTH_POINTS: f32 = 96.0;
+const OVERLAY_THRESHOLD_RAIL_HEIGHT_POINTS: f32 = 390.0;
+const OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS: f32 = 320.0;
+const OVERLAY_SELECTOR_WIDTH_POINTS: f32 = 250.0;
+const DEFAULT_OVERLAY_RANGE: ValueRange = ValueRange {
+    min: -1.0,
+    max: 1.0,
+};
 const BLACK_BACKGROUND: wgpu::Color = wgpu::Color {
     r: 0.0,
     g: 0.0,
@@ -51,7 +64,9 @@ const WHITE_BACKGROUND: wgpu::Color = wgpu::Color {
 
 pub fn run(surface_path: Option<PathBuf>, overlay_path: Option<PathBuf>) -> Result<()> {
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // Render on demand rather than spinning at max FPS: the loop sleeps until an
+    // input event, a requested redraw, or a scheduled animation deadline.
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = ViewerApp::new(surface_path, overlay_path);
     event_loop.run_app(&mut app)?;
@@ -92,7 +107,7 @@ impl ViewerApp {
             event_loop.create_window(
                 Window::default_attributes()
                     .with_title("sumaru controls")
-                    .with_inner_size(PhysicalSize::new(420, 720)),
+                    .with_inner_size(PhysicalSize::new(CONTROL_MIN_INNER_WIDTH, 720)),
             )?,
         );
         if let Ok(position) = view_window.outer_position() {
@@ -118,6 +133,13 @@ impl ApplicationHandler for ViewerApp {
         if let Err(error) = self.initialize(event_loop) {
             self.setup_error = Some(error);
             event_loop.exit();
+            return;
+        }
+
+        // Under ControlFlow::Wait we must ask for the first frame explicitly.
+        if let Some(state) = self.state.as_ref() {
+            state.view_window().request_redraw();
+            state.control_window().request_redraw();
         }
     }
 
@@ -133,19 +155,29 @@ impl ApplicationHandler for ViewerApp {
 
         if window_id == state.view_window().id() {
             if state.view_input(&event) {
+                // View-window input can change state the control panel shows
+                // (picks, camera mode label, overlay toggle), so refresh both.
                 state.view_window().request_redraw();
+                state.control_window().request_redraw();
                 return;
             }
 
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
-                WindowEvent::Resized(size) => state.resize_view(size),
+                WindowEvent::Resized(size) => {
+                    state.resize_view(size);
+                    state.view_window().request_redraw();
+                }
                 WindowEvent::RedrawRequested => {
                     state.update();
 
                     match state.render_view() {
-                        RenderStatus::Rendered | RenderStatus::Skipped => {}
-                        RenderStatus::Reconfigure => state.resize_view(state.view_size),
+                        RenderStatus::Rendered => state.view_frame_rendered = true,
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_view(state.view_size);
+                            state.view_window().request_redraw();
+                        }
                         RenderStatus::ValidationError => eprintln!("surface validation error"),
                     }
                 }
@@ -168,20 +200,48 @@ impl ApplicationHandler for ViewerApp {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize_control(size),
+            WindowEvent::Resized(size) => {
+                state.resize_control(size);
+                state.control_window().request_redraw();
+            }
             WindowEvent::RedrawRequested => match state.render_control() {
-                RenderStatus::Rendered | RenderStatus::Skipped => {}
-                RenderStatus::Reconfigure => state.resize_control(state.control_size),
+                RenderStatus::Rendered => state.control_frame_rendered = true,
+                RenderStatus::Skipped => {}
+                RenderStatus::Reconfigure => {
+                    state.resize_control(state.control_size);
+                    state.control_window().request_redraw();
+                }
                 RenderStatus::ValidationError => eprintln!("control validation error"),
             },
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = self.state.as_ref() {
-            state.view_window().request_redraw();
-            state.control_window().request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+
+        let now = Instant::now();
+        if state.needs_startup_redraw(now) {
+            state.request_missing_startup_redraws();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                now.checked_add(STARTUP_REDRAW_RETRY_INTERVAL)
+                    .unwrap_or(now),
+            ));
+            return;
+        }
+
+        // The only timed redraws come from egui (panel animations and the
+        // transient camera-mode label, which schedules its own repaint).
+        // Everything else is driven by input-triggered request_redraw calls.
+        match state.control_repaint_at {
+            Some(at) if at <= now => {
+                state.control_window().request_redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }
@@ -198,6 +258,12 @@ struct ViewerState {
     view_size: PhysicalSize<u32>,
     control_size: PhysicalSize<u32>,
     last_requested_control_size: Option<PhysicalSize<u32>>,
+    /// When the control window should next repaint for an egui animation, or
+    /// `None` if it is idle. Drives `ControlFlow::WaitUntil`.
+    control_repaint_at: Option<Instant>,
+    view_frame_rendered: bool,
+    control_frame_rendered: bool,
+    startup_redraw_until: Instant,
     render_pipeline: wgpu::RenderPipeline,
     surface_buffers: Option<SurfaceBuffers>,
     uniform_buffer: wgpu::Buffer,
@@ -205,7 +271,11 @@ struct ViewerState {
     depth_buffer: DepthBuffer,
     mesh: Option<SurfaceMesh>,
     overlay: Option<OverlayDataset>,
+    overlay_dataset: Option<Dataset>,
+    overlay_columns: OverlayColumnSelections,
     overlay_visible: bool,
+    overlay_appearance: OverlayAppearance,
+    overlay_symmetric_range: bool,
     surface_path: Option<PathBuf>,
     overlay_path: Option<PathBuf>,
     surface_path_input: String,
@@ -384,6 +454,10 @@ impl ViewerState {
             view_size,
             control_size,
             last_requested_control_size: None,
+            control_repaint_at: None,
+            view_frame_rendered: false,
+            control_frame_rendered: false,
+            startup_redraw_until: Instant::now(),
             render_pipeline,
             surface_buffers: None,
             uniform_buffer,
@@ -391,7 +465,11 @@ impl ViewerState {
             depth_buffer,
             mesh: None,
             overlay: None,
+            overlay_dataset: None,
+            overlay_columns: OverlayColumnSelections::default(),
             overlay_visible: true,
+            overlay_appearance: OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE),
+            overlay_symmetric_range: true,
             surface_path: None,
             overlay_path: None,
             surface_path_input: initial_surface_path
@@ -421,6 +499,7 @@ impl ViewerState {
         if let Some(path) = initial_overlay_path {
             state.load_overlay_path(path)?;
         }
+        state.arm_startup_redraw_guard();
 
         Ok(state)
     }
@@ -431,6 +510,28 @@ impl ViewerState {
 
     fn control_window(&self) -> &Window {
         &self.control_window
+    }
+
+    fn arm_startup_redraw_guard(&mut self) {
+        self.view_frame_rendered = false;
+        self.control_frame_rendered = false;
+        self.startup_redraw_until = Instant::now()
+            .checked_add(STARTUP_REDRAW_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+    }
+
+    fn needs_startup_redraw(&self, now: Instant) -> bool {
+        now <= self.startup_redraw_until
+            && (!self.view_frame_rendered || !self.control_frame_rendered)
+    }
+
+    fn request_missing_startup_redraws(&self) {
+        if !self.view_frame_rendered {
+            self.view_window.request_redraw();
+        }
+        if !self.control_frame_rendered {
+            self.control_window.request_redraw();
+        }
     }
 
     fn resize_view(&mut self, size: PhysicalSize<u32>) {
@@ -618,10 +719,30 @@ impl ViewerState {
             ui_actions = output.actions;
             desired_control_size_points = output.desired_control_size_points;
         });
+        // Schedule the next control-window repaint from egui's requested delay:
+        // ZERO means "again next frame" (an active animation), MAX means idle.
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        self.control_repaint_at = if repaint_delay == Duration::ZERO {
+            Some(Instant::now())
+        } else if repaint_delay == Duration::MAX {
+            None
+        } else {
+            Instant::now().checked_add(repaint_delay)
+        };
+        // A panel action (load, toggle, camera/background change) alters the
+        // 3D scene, so the view window needs to repaint too.
+        let actions_present = !ui_actions.is_empty();
         self.egui_state
             .handle_platform_output(&self.control_window, full_output.platform_output);
         self.fit_control_window(desired_control_size_points, full_output.pixels_per_point);
         self.apply_ui_actions(ui_actions);
+        if actions_present {
+            self.view_window.request_redraw();
+        }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels: [self.control_config.width, self.control_config.height],
@@ -708,7 +829,9 @@ impl ViewerState {
         }
         self.pending_egui_textures = retained_textures;
         if needs_texture_repaint {
-            self.egui_ctx.request_repaint();
+            // Deferred texture upload: repaint next frame to finish it. Under
+            // ControlFlow::Wait this scheduled wake is what actually drives it.
+            self.control_repaint_at = Some(Instant::now());
         }
 
         command_buffers.push(encoder.finish());
@@ -728,179 +851,31 @@ impl ViewerState {
 
         #[allow(deprecated)]
         egui::CentralPanel::default().show(ctx, |ui| {
-            let panel_top = ui.cursor().top();
-            ui.heading("sumaru");
-            ui.separator();
-            let content_top = ui.cursor().top();
             let scroll_output = egui::ScrollArea::vertical()
                 .max_height(panel_height)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.set_min_width(CONTROL_CONTENT_WIDTH_POINTS);
-                    ui.label("Surface");
-                    let surface_response = ui.text_edit_singleline(&mut self.surface_path_input);
-                    let surface_enter = surface_response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                    let surface_path = trimmed_path(&self.surface_path_input);
-                    ui.horizontal(|ui| {
-                        if ui.button("Browse...").clicked() {
-                            actions.push(UiAction::PickSurface);
-                        }
-                        if ui
-                            .add_enabled(surface_path.is_some(), egui::Button::new("Load surface"))
-                            .clicked()
-                            || surface_enter
-                        {
-                            if let Some(path) = surface_path.clone() {
-                                actions.push(UiAction::LoadSurface(path));
-                            }
-                        }
-                    });
-
-                    ui.add_space(8.0);
-                    ui.label("Overlay");
-                    let overlay_response = ui.text_edit_singleline(&mut self.overlay_path_input);
-                    let overlay_enter = overlay_response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                    let overlay_path = trimmed_path(&self.overlay_path_input);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(self.mesh.is_some(), egui::Button::new("Browse..."))
-                            .clicked()
-                        {
-                            actions.push(UiAction::PickOverlay);
-                        }
-                        if ui
-                            .add_enabled(
-                                self.mesh.is_some() && overlay_path.is_some(),
-                                egui::Button::new("Load overlay"),
-                            )
-                            .clicked()
-                            || overlay_enter
-                        {
-                            if let Some(path) = overlay_path.clone() {
-                                actions.push(UiAction::LoadOverlay(path));
-                            }
-                        }
-                        if ui
-                            .add_enabled(self.overlay.is_some(), egui::Button::new("Clear"))
-                            .clicked()
-                        {
-                            actions.push(UiAction::ClearOverlay);
-                        }
-                        if ui
-                            .add_enabled(
-                                self.overlay.is_some(),
-                                egui::Button::new(overlay_toggle_label(self.overlay_visible)),
-                            )
-                            .clicked()
-                        {
-                            actions.push(UiAction::ToggleOverlayVisibility);
-                        }
-                    });
-                    if self.overlay.is_some() {
-                        ui.label(format!(
-                            "Overlay: {}",
-                            if self.overlay_visible {
-                                "visible"
-                            } else {
-                                "hidden"
-                            }
-                        ));
-                    }
-
-                    ui.separator();
-                    ui.label(format!("Camera: {}", self.camera.mode().label()));
-                    ui.horizontal(|ui| {
-                        if ui.button("Reset").clicked() {
-                            actions.push(UiAction::ResetCamera);
-                        }
-                        if ui.button("Switch").clicked() {
-                            actions.push(UiAction::ToggleCameraMode);
-                        }
-                        if ui.button(self.background.next_label()).clicked() {
-                            actions.push(UiAction::ToggleBackground);
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Left").clicked() {
-                            actions.push(UiAction::Preset(PresetOrientation::Left));
-                        }
-                        if ui.button("Right").clicked() {
-                            actions.push(UiAction::Preset(PresetOrientation::Right));
-                        }
-                        if ui.button("Top").clicked() {
-                            actions.push(UiAction::Preset(PresetOrientation::Top));
-                        }
-                        if ui.button("Bottom").clicked() {
-                            actions.push(UiAction::Preset(PresetOrientation::Bottom));
-                        }
-                    });
-
-                    if let Some(stats) = &self.scene_stats {
-                        ui.separator();
-                        ui.label("Scene");
-                        egui::Grid::new("scene_stats")
-                            .num_columns(2)
-                            .spacing([12.0, 4.0])
-                            .show(ui, |ui| {
-                                stat_row(ui, "Nodes", stats.node_count.to_string());
-                                stat_row(ui, "Triangles", stats.face_count.to_string());
-                                stat_row(ui, "Area", format!("{:.3}", stats.total_area));
-                                stat_row(ui, "Boundary edges", stats.boundary_edges.to_string());
-                                stat_row(
-                                    ui,
-                                    "Non-manifold edges",
-                                    stats.non_manifold_edges.to_string(),
-                                );
-                                stat_row(
-                                    ui,
-                                    "Normals",
-                                    normal_direction_label(stats.normal_direction),
-                                );
-                                if let Some(range) = stats.overlay_range {
-                                    stat_row(
-                                        ui,
-                                        "Overlay range",
-                                        format!("{:.4} to {:.4}", range.min, range.max),
-                                    );
-                                }
-                            });
-                    }
-
-                    if let Some(pick) = &self.surface_pick {
-                        ui.separator();
-                        ui.label("Inspect");
-                        egui::Grid::new("surface_pick")
-                            .num_columns(2)
-                            .spacing([12.0, 4.0])
-                            .show(ui, |ui| {
-                                stat_row(ui, "Node", pick.node_index.to_string());
-                                stat_row(ui, "Triangle", pick.face_index.to_string());
-                                stat_row(ui, "Overlay", overlay_value_label(pick.overlay_value));
-                            });
-                    }
-
-                    ui.separator();
-                    let color = if self.status.is_error {
-                        egui::Color32::from_rgb(255, 120, 120)
-                    } else {
-                        egui::Color32::from_rgb(145, 220, 145)
-                    };
-                    ui.colored_label(color, &self.status.text);
+                    self.draw_surface_dataset_section(ui, &mut actions);
+                    self.draw_overlay_workbench(ui, &mut actions);
+                    self.draw_view_section(ui, &mut actions);
+                    self.draw_scene_section(ui);
+                    self.draw_pick_section(ui);
+                    self.draw_status_section(ui);
                 });
-            let header_height = content_top - panel_top;
             desired_control_size_points = egui::vec2(
                 scroll_output
                     .content_size
                     .x
                     .max(CONTROL_CONTENT_WIDTH_POINTS)
                     + 32.0,
-                header_height + scroll_output.content_size.y + 32.0,
+                scroll_output.content_size.y + 32.0,
             );
         });
 
-        if let Some(text) = self.active_mode_label_text() {
+        if let Some((text, remaining)) = self.active_mode_label() {
+            // Ensure the label is cleared on time even with no further input.
+            ctx.request_repaint_after(remaining);
             egui::Area::new(egui::Id::new("camera_mode_label"))
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 18.0])
                 .interactable(false)
@@ -927,6 +902,432 @@ impl ViewerState {
         }
     }
 
+    fn draw_surface_dataset_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        controller_section(ui, "SURFACE / DATASET", |ui| {
+            egui::Grid::new("surface_dataset_grid")
+                .num_columns(2)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Surface");
+                    ui.horizontal(|ui| {
+                        let response = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.surface_path_input)
+                                    .desired_width(270.0)
+                                    .hint_text("surface.gii"),
+                            )
+                            .on_hover_text("Press Return to load pasted path");
+                        if response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            && let Some(path) = trimmed_path(&self.surface_path_input)
+                        {
+                            actions.push(UiAction::LoadSurface(path));
+                        }
+                        if ui.button("...").on_hover_text("Browse surface").clicked() {
+                            actions.push(UiAction::PickSurface);
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Overlay");
+                    ui.horizontal(|ui| {
+                        let response = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.overlay_path_input)
+                                    .desired_width(270.0)
+                                    .hint_text("overlay.gii"),
+                            )
+                            .on_hover_text("Press Return to load pasted path");
+                        let can_load_overlay =
+                            self.mesh.is_some() && trimmed_path(&self.overlay_path_input).is_some();
+                        if response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            && can_load_overlay
+                            && let Some(path) = trimmed_path(&self.overlay_path_input)
+                        {
+                            actions.push(UiAction::LoadOverlay(path));
+                        }
+                        if ui
+                            .add_enabled(self.mesh.is_some(), egui::Button::new("..."))
+                            .on_hover_text("Browse overlay")
+                            .clicked()
+                        {
+                            actions.push(UiAction::PickOverlay);
+                        }
+                    });
+                    ui.end_row();
+                });
+
+            ui.add_space(4.0);
+            object_line(
+                ui,
+                "Surface object",
+                file_display(self.surface_path.as_ref()),
+            );
+            object_line(
+                ui,
+                "Dataset object",
+                file_display(self.overlay_path.as_ref()),
+            );
+        });
+    }
+
+    fn draw_overlay_workbench(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        let overlay_loaded = self.overlay.is_some();
+        let overlay_row_count = self.overlay_dataset.as_ref().map_or_else(
+            || {
+                self.overlay
+                    .as_ref()
+                    .map_or(0, |overlay| overlay.values.len())
+            },
+            |dataset| dataset.row_count,
+        );
+        let column_options = self
+            .overlay_dataset
+            .as_ref()
+            .map(overlay_column_options)
+            .unwrap_or_default();
+        let mut columns_changed = false;
+        let mut changed = false;
+
+        controller_section(ui, "OVERLAY WORKBENCH", |ui| {
+            if !overlay_loaded {
+                ui.label(egui::RichText::new("No overlay loaded").color(muted_color()));
+                return;
+            }
+
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(
+                        OVERLAY_THRESHOLD_COLUMN_WIDTH_POINTS,
+                        OVERLAY_THRESHOLD_RAIL_HEIGHT_POINTS,
+                    ),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.label("Thresh");
+                        let threshold_range = self.selected_threshold_range();
+                        changed |= vertical_threshold_bar(
+                            ui,
+                            &mut self.overlay_appearance,
+                            threshold_range,
+                        );
+                        ui.monospace(threshold_value_display(
+                            self.overlay_appearance.threshold.value,
+                        ));
+                        ui.label(
+                            egui::RichText::new(threshold_p_value_display(
+                                self.selected_threshold_p_value(),
+                            ))
+                            .color(muted_color()),
+                        );
+                    },
+                );
+
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    egui::Grid::new("overlay_mapping_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 5.0])
+                        .show(ui, |ui| {
+                            stat_row(ui, "Dset", file_display(self.overlay_path.as_ref()));
+                            stat_row(ui, "Rows", overlay_row_count.to_string());
+                            if column_options.is_empty() {
+                                stat_row(ui, "I", "scalar column 0");
+                                stat_row(ui, "T", "scalar column 0");
+                                stat_row(ui, "B", "none");
+                            } else {
+                                columns_changed |= draw_intensity_column_selector(
+                                    ui,
+                                    &column_options,
+                                    &mut self.overlay_columns.intensity,
+                                );
+                                columns_changed |= draw_threshold_column_selector(
+                                    ui,
+                                    &column_options,
+                                    &mut self.overlay_columns.threshold,
+                                    self.overlay_appearance.threshold.value,
+                                );
+                                columns_changed |= draw_optional_column_selector(
+                                    ui,
+                                    "B",
+                                    "brightness_column",
+                                    &column_options,
+                                    &mut self.overlay_columns.brightness,
+                                );
+                            }
+                        });
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Map");
+                        egui::ComboBox::from_id_salt("overlay_colormap")
+                            .selected_text(self.overlay_appearance.colormap.label())
+                            .width(170.0)
+                            .show_ui(ui, |ui| {
+                                for colormap in OverlayColorMap::ALL {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut self.overlay_appearance.colormap,
+                                            colormap,
+                                            colormap.label(),
+                                        )
+                                        .changed();
+                                }
+                            });
+                    });
+                    ui.add_space(8.0);
+                    changed |= self.draw_overlay_range_controls(ui);
+                    ui.add_space(6.0);
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.overlay_appearance.dim, 0.0..=1.5)
+                                .text("Dim"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.overlay_appearance.opacity, 0.0..=1.0)
+                                .text("Opacity"),
+                        )
+                        .changed();
+
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
+                        changed |= ui
+                            .checkbox(&mut self.overlay_appearance.threshold.absolute, "Abs")
+                            .changed();
+                    });
+                    if let Some(stat) = self.selected_threshold_stat_label() {
+                        ui.label(egui::RichText::new(format!("Stat: {stat}")).color(muted_color()));
+                    }
+                });
+            });
+        });
+
+        if columns_changed {
+            actions.push(UiAction::RefreshOverlayColumns);
+        }
+        if changed {
+            self.sanitize_overlay_appearance();
+            actions.push(UiAction::RefreshOverlayAppearance);
+        }
+    }
+
+    fn draw_overlay_range_controls(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut self.overlay_symmetric_range, "Symmetric")
+                .changed();
+
+            if self.overlay_symmetric_range {
+                let mut extent = self
+                    .overlay_appearance
+                    .range
+                    .min
+                    .abs()
+                    .max(self.overlay_appearance.range.max.abs())
+                    .max(0.0001);
+                let speed = (extent / 100.0).max(0.001);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut extent)
+                            .speed(speed)
+                            .prefix("+/- "),
+                    )
+                    .changed()
+                {
+                    let extent = extent.abs().max(0.0001);
+                    self.overlay_appearance.range = ValueRange {
+                        min: -extent,
+                        max: extent,
+                    };
+                    changed = true;
+                }
+            } else {
+                let speed = range_drag_speed(self.overlay_appearance.range);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.overlay_appearance.range.min)
+                            .speed(speed)
+                            .prefix("min "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.overlay_appearance.range.max)
+                            .speed(speed)
+                            .prefix("max "),
+                    )
+                    .changed();
+            }
+        });
+
+        changed
+    }
+
+    fn selected_threshold_stat_label(&self) -> Option<String> {
+        let dataset = self.overlay_dataset.as_ref()?;
+        let index = self.overlay_columns.threshold?;
+        dataset.columns.get(index)?.stat.clone()
+    }
+
+    fn selected_threshold_stat_spec(&self) -> Option<AfniStatSpec> {
+        self.selected_threshold_stat_label()
+            .as_deref()
+            .and_then(AfniStatSpec::parse)
+    }
+
+    fn selected_threshold_range(&self) -> ValueRange {
+        self.overlay_dataset
+            .as_ref()
+            .and_then(|dataset| {
+                self.overlay_columns
+                    .threshold
+                    .and_then(|index| dataset.columns.get(index))
+                    .and_then(|column| column.range)
+            })
+            .map(|range| ValueRange {
+                min: range.min as f32,
+                max: range.max as f32,
+            })
+            .or_else(|| self.overlay.as_ref().map(|overlay| overlay.range))
+            .unwrap_or(DEFAULT_OVERLAY_RANGE)
+    }
+
+    fn selected_threshold_p_value(&self) -> Option<f64> {
+        self.selected_threshold_stat_spec()
+            .and_then(|stat| stat.two_sided_p_value(self.overlay_appearance.threshold.value as f64))
+    }
+
+    fn draw_view_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        controller_section(ui, "VIEW", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Mode");
+                ui.monospace(self.camera.mode().label());
+                if ui.button("Cycle").clicked() {
+                    actions.push(UiAction::ToggleCameraMode);
+                }
+                if ui.button("Reset").clicked() {
+                    actions.push(UiAction::ResetCamera);
+                }
+                if ui.button(self.background.next_label()).clicked() {
+                    actions.push(UiAction::ToggleBackground);
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Left").clicked() {
+                    actions.push(UiAction::Preset(PresetOrientation::Left));
+                }
+                if ui.button("Right").clicked() {
+                    actions.push(UiAction::Preset(PresetOrientation::Right));
+                }
+                if ui.button("Top").clicked() {
+                    actions.push(UiAction::Preset(PresetOrientation::Top));
+                }
+                if ui.button("Bottom").clicked() {
+                    actions.push(UiAction::Preset(PresetOrientation::Bottom));
+                }
+            });
+        });
+    }
+
+    fn draw_scene_section(&self, ui: &mut egui::Ui) {
+        controller_section(ui, "SCENE", |ui| {
+            if let Some(stats) = self.scene_stats.as_ref() {
+                egui::Grid::new("scene_stats_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 5.0])
+                    .show(ui, |ui| {
+                        stat_row(ui, "Nodes", stats.node_count.to_string());
+                        stat_row(ui, "Triangles", stats.face_count.to_string());
+                        stat_row(ui, "Area", format!("{:.4}", stats.total_area));
+                        stat_row(
+                            ui,
+                            "Normals",
+                            normal_direction_label(stats.normal_direction),
+                        );
+                        stat_row(ui, "Boundary edges", stats.boundary_edges.to_string());
+                        stat_row(ui, "Non-manifold", stats.non_manifold_edges.to_string());
+                        if let Some(range) = stats.overlay_range {
+                            stat_row(
+                                ui,
+                                "Overlay range",
+                                format!("{:.4} to {:.4}", range.min, range.max),
+                            );
+                        }
+                    });
+            } else {
+                ui.label(egui::RichText::new("No surface loaded").color(muted_color()));
+            }
+        });
+    }
+
+    fn draw_pick_section(&self, ui: &mut egui::Ui) {
+        controller_section(ui, "PICK", |ui| {
+            if let Some(pick) = self.surface_pick {
+                egui::Grid::new("pick_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 5.0])
+                    .show(ui, |ui| {
+                        stat_row(ui, "Node", pick.node_index.to_string());
+                        stat_row(ui, "Triangle", pick.face_index.to_string());
+                        stat_row(ui, "Overlay", overlay_value_label(pick.overlay_value));
+                    });
+            } else {
+                ui.label(egui::RichText::new("No pick").color(muted_color()));
+            }
+        });
+    }
+
+    fn draw_status_section(&self, ui: &mut egui::Ui) {
+        controller_section(ui, "STATUS", |ui| {
+            let color = if self.status.is_error {
+                egui::Color32::from_rgb(255, 126, 104)
+            } else {
+                egui::Color32::from_rgb(215, 224, 232)
+            };
+            ui.add(egui::Label::new(egui::RichText::new(&self.status.text).color(color)).wrap());
+        });
+    }
+
+    fn sanitize_overlay_appearance(&mut self) {
+        let range = &mut self.overlay_appearance.range;
+        if !range.min.is_finite() || !range.max.is_finite() {
+            *range = DEFAULT_OVERLAY_RANGE;
+        }
+
+        if self.overlay_symmetric_range {
+            let extent = range.min.abs().max(range.max.abs()).max(0.0001);
+            *range = ValueRange {
+                min: -extent,
+                max: extent,
+            };
+        } else if range.max < range.min {
+            std::mem::swap(&mut range.min, &mut range.max);
+        }
+
+        if (range.max - range.min).abs() <= f32::EPSILON {
+            range.max = range.min + 1.0;
+        }
+
+        self.overlay_appearance.dim = self.overlay_appearance.dim.clamp(0.0, 1.5);
+        self.overlay_appearance.opacity = self.overlay_appearance.opacity.clamp(0.0, 1.0);
+
+        let (threshold_min, threshold_max) = threshold_bounds(
+            self.selected_threshold_range(),
+            self.overlay_appearance.threshold.absolute,
+        );
+        self.overlay_appearance.threshold.value = self
+            .overlay_appearance
+            .threshold
+            .value
+            .clamp(threshold_min, threshold_max);
+    }
+
     fn fit_control_window(
         &mut self,
         desired_control_size_points: egui::Vec2,
@@ -941,7 +1342,7 @@ impl ViewerState {
             .current_monitor()
             .map(|monitor| monitor.size());
         let max_width = monitor_size
-            .map(|size| ((size.width as f32 * 0.45) as u32).min(CONTROL_MAX_INNER_WIDTH))
+            .map(|size| ((size.width as f32 * 0.55) as u32).min(CONTROL_MAX_INNER_WIDTH))
             .unwrap_or(CONTROL_MAX_INNER_WIDTH)
             .max(CONTROL_MIN_INNER_WIDTH);
         let max_height = monitor_size
@@ -999,8 +1400,16 @@ impl ViewerState {
                         self.set_error(error);
                     }
                 }
-                UiAction::ToggleOverlayVisibility => self.toggle_overlay_visibility(),
-                UiAction::ClearOverlay => self.clear_overlay(),
+                UiAction::RefreshOverlayColumns => {
+                    if let Err(error) = self.refresh_overlay_columns() {
+                        self.set_error(error);
+                    }
+                }
+                UiAction::RefreshOverlayAppearance => {
+                    if self.overlay.is_some() {
+                        self.upload_surface_buffers();
+                    }
+                }
                 UiAction::ResetCamera => self.camera.reset(),
                 UiAction::ToggleCameraMode => {
                     let mode = self.camera.toggle_mode();
@@ -1022,7 +1431,11 @@ impl ViewerState {
         self.surface_path = Some(path.clone());
         self.surface_path_input = path.display().to_string();
         self.overlay = None;
+        self.overlay_dataset = None;
+        self.overlay_columns = OverlayColumnSelections::default();
         self.overlay_visible = true;
+        self.overlay_appearance = OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE);
+        self.overlay_symmetric_range = true;
         self.overlay_path = None;
         self.overlay_path_input.clear();
         self.surface_pick = None;
@@ -1043,34 +1456,67 @@ impl ViewerState {
             .mesh
             .as_ref()
             .context("load a surface before loading an overlay")?;
-        let overlay = OverlayDataset::from_gifti_path(&path, mesh.vertices.len())
+        let loaded_overlay = load_overlay_from_path(&path, mesh)
             .with_context(|| format!("failed to load overlay {}", path.display()))?;
+        let overlay = loaded_overlay.overlay;
         let range = overlay.range;
 
         self.overlay = Some(overlay);
+        self.overlay_dataset = loaded_overlay.dataset;
+        self.overlay_columns = loaded_overlay.columns;
         self.overlay_visible = true;
+        self.overlay_appearance = OverlayAppearance::from_range(range);
+        self.overlay_symmetric_range = range.min < 0.0 && range.max > 0.0;
         self.overlay_path = Some(path.clone());
         self.overlay_path_input = path.display().to_string();
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.status = StatusMessage::info(format!(
-            "Loaded overlay range {:.4} to {:.4}.",
-            range.min, range.max
+            "Loaded overlay range {:.4} to {:.4}.{}",
+            range.min,
+            range.max,
+            loaded_overlay
+                .column_summary
+                .map_or_else(String::new, |summary| format!(" {summary}"))
         ));
 
         Ok(())
     }
 
-    fn clear_overlay(&mut self) {
-        self.overlay = None;
-        self.overlay_visible = true;
-        self.overlay_path = None;
-        self.overlay_path_input.clear();
+    fn refresh_overlay_columns(&mut self) -> Result<()> {
+        let dataset = self
+            .overlay_dataset
+            .as_ref()
+            .context("no canonical overlay dataset is loaded")?;
+        let node_count = self
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.vertices.len())
+            .context("load a surface before selecting overlay columns")?;
+        let overlay =
+            overlay_dataset_from_canonical_dataset(dataset, node_count, self.overlay_columns)?;
+        let range = overlay.range;
+        let status = format!(
+            "Overlay columns: I {}, T {}, B {}.",
+            column_selection_label(dataset, Some(self.overlay_columns.intensity)),
+            column_selection_label(dataset, self.overlay_columns.threshold),
+            column_selection_label(dataset, self.overlay_columns.brightness)
+        );
+
+        self.overlay = Some(overlay);
+        self.overlay_appearance.range = if self.overlay_symmetric_range {
+            symmetric_value_range(range)
+        } else {
+            range
+        };
+        self.sanitize_overlay_appearance();
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
-        self.status = StatusMessage::info("Cleared overlay.");
+        self.status = StatusMessage::info(status);
+
+        Ok(())
     }
 
     fn toggle_overlay_visibility(&mut self) {
@@ -1138,7 +1584,9 @@ impl ViewerState {
             return;
         };
 
-        let prepared_surface = PreparedSurface::from_surface(mesh, self.visible_overlay());
+        let overlay = self.visible_overlay();
+        let overlay_appearance = overlay.map(|_| self.overlay_appearance);
+        let prepared_surface = PreparedSurface::from_surface(mesh, overlay, overlay_appearance);
         let vertex_bytes = prepared_surface.vertex_bytes();
         let index_bytes = prepared_surface.index_bytes();
         let vertex_buffer = self
@@ -1177,14 +1625,17 @@ impl ViewerState {
         });
     }
 
-    fn active_mode_label_text(&mut self) -> Option<&'static str> {
+    /// Returns the active mode-label text and the time remaining before it
+    /// expires, so the caller can schedule a repaint to clear it.
+    fn active_mode_label(&mut self) -> Option<(&'static str, Duration)> {
         let label = self.mode_label.as_ref()?;
-        if Instant::now() > label.until {
+        let now = Instant::now();
+        if now >= label.until {
             self.mode_label = None;
             return None;
         }
 
-        Some(label.text)
+        Some((label.text, label.until - now))
     }
 
     fn set_error(&mut self, error: anyhow::Error) {
@@ -1196,6 +1647,28 @@ struct SurfaceBuffers {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedOverlay {
+    overlay: OverlayDataset,
+    dataset: Option<Dataset>,
+    columns: OverlayColumnSelections,
+    column_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct OverlayColumnSelections {
+    intensity: usize,
+    threshold: Option<usize>,
+    brightness: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct OverlayColumnOption {
+    index: usize,
+    label: String,
+    is_numeric: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1284,8 +1757,8 @@ enum UiAction {
     LoadSurface(PathBuf),
     PickOverlay,
     LoadOverlay(PathBuf),
-    ToggleOverlayVisibility,
-    ClearOverlay,
+    RefreshOverlayColumns,
+    RefreshOverlayAppearance,
     ResetCamera,
     ToggleCameraMode,
     ToggleBackground,
@@ -1355,11 +1828,243 @@ fn pick_overlay_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     let dialog = dialog_with_start_directory(
         rfd::FileDialog::new()
             .set_title("Open overlay")
-            .add_filter("GIFTI or SUMA dataset", &["gii", "dset"]),
+            .add_filter("GIFTI or SUMA dataset", &["gii", "dset", "niml.dset"]),
         current_path,
     );
 
     dialog.pick_file()
+}
+
+fn load_overlay_from_path(path: &Path, mesh: &SurfaceMesh) -> Result<LoadedOverlay> {
+    if is_niml_dset_path(path) {
+        let dataset = read_niml_dataset(path, &mesh.domain)?;
+        loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "NIML")
+    } else if is_gifti_path(path) {
+        match read_gifti_dataset(path, &mesh.domain) {
+            Ok(dataset) => loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "GIFTI"),
+            Err(dataset_error) => Ok(LoadedOverlay {
+                overlay: OverlayDataset::from_gifti_path(path, mesh.vertices.len())
+                    .with_context(|| {
+                        format!(
+                            "failed to load GIFTI as canonical dataset ({dataset_error:#}) or simple overlay"
+                        )
+                    })?,
+                dataset: None,
+                columns: OverlayColumnSelections::default(),
+                column_summary: None,
+            }),
+        }
+    } else {
+        Ok(LoadedOverlay {
+            overlay: OverlayDataset::from_gifti_path(path, mesh.vertices.len())?,
+            dataset: None,
+            columns: OverlayColumnSelections::default(),
+            column_summary: None,
+        })
+    }
+}
+
+fn loaded_overlay_from_dataset(
+    dataset: Dataset,
+    node_count: usize,
+    source_label: &str,
+) -> Result<LoadedOverlay> {
+    let columns = default_overlay_columns(&dataset).with_context(|| {
+        format!("{source_label} dataset has no numeric column that can be displayed as an overlay")
+    })?;
+    let overlay = overlay_dataset_from_canonical_dataset(&dataset, node_count, columns)?;
+    let column_summary = Some(format!(
+        "I {}, T {}, B {}.",
+        column_selection_label(&dataset, Some(columns.intensity)),
+        column_selection_label(&dataset, columns.threshold),
+        column_selection_label(&dataset, columns.brightness)
+    ));
+
+    Ok(LoadedOverlay {
+        overlay,
+        dataset: Some(dataset),
+        columns,
+        column_summary,
+    })
+}
+
+fn overlay_dataset_from_canonical_dataset(
+    dataset: &Dataset,
+    node_count: usize,
+    columns: OverlayColumnSelections,
+) -> Result<OverlayDataset> {
+    let intensity_column = dataset
+        .columns
+        .get(columns.intensity)
+        .filter(|column| column_is_numeric(column))
+        .context("selected intensity column is not numeric")?;
+    let threshold_column = columns
+        .threshold
+        .and_then(|index| dataset.columns.get(index))
+        .filter(|column| column_is_numeric(column));
+    let brightness_column = columns
+        .brightness
+        .and_then(|index| dataset.columns.get(index))
+        .filter(|column| column_is_numeric(column));
+    let threshold_stat =
+        threshold_column.and_then(|column| column.stat.as_deref().and_then(AfniStatSpec::parse));
+    let mut values = vec![f32::NAN; node_count];
+    let mut threshold_values = threshold_column.map(|_| vec![f32::NAN; node_count]);
+    let mut threshold_pvalues = threshold_stat.as_ref().map(|_| vec![f32::NAN; node_count]);
+    let mut brightness_values = brightness_column.map(|_| vec![f32::NAN; node_count]);
+
+    for row in 0..dataset.row_count {
+        let Some(node) = dataset.node_for_row(row) else {
+            continue;
+        };
+        let node = node as usize;
+        if let (Some(value), Some(slot)) = (
+            numeric_column_value_as_f32(intensity_column, row),
+            values.get_mut(node),
+        ) {
+            *slot = value;
+        }
+        if let (Some(column), Some(slots)) = (threshold_column, threshold_values.as_mut()) {
+            if let (Some(value), Some(slot)) = (
+                numeric_column_value_as_f32(column, row),
+                slots.get_mut(node),
+            ) {
+                *slot = value;
+                if let (Some(stat), Some(pvalue_slots)) =
+                    (threshold_stat.as_ref(), threshold_pvalues.as_mut())
+                {
+                    if let (Some(pvalue), Some(pvalue_slot)) = (
+                        stat.two_sided_p_value(value as f64),
+                        pvalue_slots.get_mut(node),
+                    ) {
+                        *pvalue_slot = pvalue as f32;
+                    }
+                }
+            }
+        }
+        if let (Some(column), Some(slots)) = (brightness_column, brightness_values.as_mut()) {
+            if let (Some(value), Some(slot)) = (
+                numeric_column_value_as_f32(column, row),
+                slots.get_mut(node),
+            ) {
+                *slot = value;
+            }
+        }
+    }
+
+    let range = ValueRange::from_values(&values)?;
+    let brightness_range = brightness_values
+        .as_ref()
+        .map(|values| ValueRange::from_values(values))
+        .transpose()?;
+    Ok(OverlayDataset {
+        values,
+        range,
+        threshold_values,
+        threshold_pvalues,
+        brightness_values,
+        brightness_range,
+    })
+}
+
+fn default_overlay_columns(dataset: &Dataset) -> Option<OverlayColumnSelections> {
+    let intensity = preferred_overlay_column(dataset)?;
+    let threshold = preferred_threshold_column(dataset, intensity);
+    Some(OverlayColumnSelections {
+        intensity,
+        threshold,
+        brightness: None,
+    })
+}
+
+fn preferred_overlay_column(dataset: &Dataset) -> Option<usize> {
+    dataset
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column_is_numeric(column))
+        .min_by_key(|(_, column)| overlay_column_priority(&column.role))
+        .map(|(index, _)| index)
+}
+
+fn preferred_threshold_column(dataset: &Dataset, intensity: usize) -> Option<usize> {
+    let next = intensity + 1;
+    if dataset
+        .columns
+        .get(next)
+        .is_some_and(|column| column_is_numeric(column) && column.stat.is_some())
+    {
+        return Some(next);
+    }
+
+    dataset
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, column)| column_is_numeric(column) && column.stat.is_some())
+        .map(|(index, _)| index)
+}
+
+fn overlay_column_priority(role: &ColumnRole) -> u8 {
+    match role {
+        ColumnRole::Intensity => 0,
+        ColumnRole::Statistic => 1,
+        ColumnRole::TimePoint => 2,
+        ColumnRole::Brightness => 3,
+        ColumnRole::Label => 4,
+        ColumnRole::Threshold => 5,
+        ColumnRole::Mask => 6,
+        ColumnRole::NodeIndex => 7,
+        ColumnRole::Unknown | ColumnRole::Other(_) => 8,
+    }
+}
+
+fn column_is_numeric(column: &DataColumn) -> bool {
+    !matches!(column.values, ColumnData::Text(_))
+}
+
+fn numeric_column_value_as_f32(column: &DataColumn, row: usize) -> Option<f32> {
+    let value = match &column.values {
+        ColumnData::UInt32(values) => *values.get(row)? as f32,
+        ColumnData::Int32(values) => *values.get(row)? as f32,
+        ColumnData::Float32(values) => *values.get(row)?,
+        ColumnData::Float64(values) => *values.get(row)? as f32,
+        ColumnData::Text(_) => return None,
+    };
+
+    value.is_finite().then_some(value)
+}
+
+fn column_selection_label(dataset: &Dataset, selection: Option<usize>) -> String {
+    selection
+        .and_then(|index| dataset.columns.get(index).map(|column| (index, column)))
+        .map_or_else(
+            || "none".to_string(),
+            |(index, column)| {
+                column.stat.as_ref().map_or_else(
+                    || format!("#{index} {}", column.label),
+                    |stat| format!("#{index} {} [{stat}]", column.label),
+                )
+            },
+        )
+}
+
+fn is_niml_dset_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".niml.dset"))
+}
+
+fn is_gifti_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name.ends_with(".gii")
+                || name.ends_with(".gii.gz")
+                || name.ends_with(".gii.dset")
+                || name.ends_with(".gii.dset.gz")
+        })
 }
 
 fn dialog_with_start_directory(
@@ -1384,6 +2089,274 @@ fn trimmed_path(value: &str) -> Option<PathBuf> {
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
+fn controller_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(title)
+            .size(11.0)
+            .strong()
+            .color(egui::Color32::from_rgb(123, 184, 226)),
+    );
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(28, 32, 39))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 62, 74)))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, add_contents);
+}
+
+fn object_line(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(muted_color()));
+        ui.monospace(value);
+    });
+}
+
+fn draw_intensity_column_selector(
+    ui: &mut egui::Ui,
+    options: &[OverlayColumnOption],
+    selection: &mut usize,
+) -> bool {
+    ui.label("I");
+    let mut changed = false;
+    egui::ComboBox::from_id_salt("intensity_column")
+        .selected_text(column_option_label(options, Some(*selection)))
+        .width(OVERLAY_SELECTOR_WIDTH_POINTS)
+        .show_ui(ui, |ui| {
+            for option in options {
+                changed |= ui
+                    .selectable_value(selection, option.index, option.label.as_str())
+                    .changed();
+            }
+        });
+    ui.end_row();
+    changed
+}
+
+fn draw_optional_column_selector(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: &'static str,
+    options: &[OverlayColumnOption],
+    selection: &mut Option<usize>,
+) -> bool {
+    ui.label(label);
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(column_option_label(options, *selection))
+        .width(OVERLAY_SELECTOR_WIDTH_POINTS)
+        .show_ui(ui, |ui| {
+            changed |= ui.selectable_value(selection, None, "none").changed();
+            for option in options {
+                changed |= ui
+                    .selectable_value(selection, Some(option.index), option.label.as_str())
+                    .changed();
+            }
+        });
+    ui.end_row();
+    changed
+}
+
+fn draw_threshold_column_selector(
+    ui: &mut egui::Ui,
+    options: &[OverlayColumnOption],
+    selection: &mut Option<usize>,
+    threshold_value: f32,
+) -> bool {
+    ui.label("T");
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("threshold_column")
+            .selected_text(column_option_label(options, *selection))
+            .width(OVERLAY_SELECTOR_WIDTH_POINTS)
+            .show_ui(ui, |ui| {
+                changed |= ui.selectable_value(selection, None, "none").changed();
+                for option in options {
+                    changed |= ui
+                        .selectable_value(selection, Some(option.index), option.label.as_str())
+                        .changed();
+                }
+            });
+        ui.monospace(threshold_value_display(threshold_value));
+    });
+    ui.end_row();
+    changed
+}
+
+fn overlay_column_options(dataset: &Dataset) -> Vec<OverlayColumnOption> {
+    dataset
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column_is_numeric(column))
+        .map(|(index, column)| OverlayColumnOption {
+            index,
+            label: column.stat.as_ref().map_or_else(
+                || format!("#{index} {}", column.label),
+                |stat| format!("#{index} {} [{stat}]", column.label),
+            ),
+            is_numeric: true,
+        })
+        .collect()
+}
+
+fn column_option_label(options: &[OverlayColumnOption], selection: Option<usize>) -> String {
+    selection
+        .and_then(|index| {
+            options
+                .iter()
+                .find(|option| option.index == index && option.is_numeric)
+        })
+        .map_or_else(|| "none".to_string(), |option| option.label.clone())
+}
+
+fn vertical_threshold_bar(
+    ui: &mut egui::Ui,
+    appearance: &mut OverlayAppearance,
+    threshold_range: ValueRange,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(54.0, OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS),
+        egui::Sense::click_and_drag(),
+    );
+    let painter = ui.painter_at(rect);
+    let bar_rect = rect.shrink2(egui::vec2(12.0, 4.0));
+    let steps = 80;
+    let mut changed = false;
+
+    for step in 0..steps {
+        let t0 = step as f32 / steps as f32;
+        let t1 = (step + 1) as f32 / steps as f32;
+        let y0 = bar_rect.bottom() - bar_rect.height() * t0;
+        let y1 = bar_rect.bottom() - bar_rect.height() * t1;
+        let color = color32_from_rgba(sample_colormap(appearance.colormap, (t0 + t1) * 0.5));
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(bar_rect.left(), y1),
+                egui::pos2(bar_rect.right(), y0),
+            ),
+            0,
+            color,
+        );
+    }
+
+    painter.rect_stroke(
+        bar_rect,
+        egui::CornerRadius::same(4),
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(95, 104, 121)),
+        egui::StrokeKind::Outside,
+    );
+
+    if response.clicked() || response.dragged() {
+        if let Some(position) = response.interact_pointer_pos() {
+            let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
+            appearance.threshold.value = threshold_value_from_bar_y(bar_rect, min, max, position.y);
+            appearance.threshold.enabled = true;
+            changed = true;
+        }
+    }
+
+    let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
+    let value = appearance.threshold.value.clamp(min, max);
+    let y = threshold_bar_y_for_value(bar_rect, min, max, value);
+    let marker_color = if appearance.threshold.enabled {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_gray(145)
+    };
+    painter.line_segment(
+        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+        egui::Stroke::new(2.0, marker_color),
+    );
+    painter.circle_filled(egui::pos2(rect.center().x, y), 3.5, egui::Color32::BLACK);
+    painter.circle_stroke(
+        egui::pos2(rect.center().x, y),
+        3.5,
+        egui::Stroke::new(1.0, marker_color),
+    );
+
+    changed
+}
+
+fn file_display(path: Option<&PathBuf>) -> String {
+    path.and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .map_or_else(|| "none".to_string(), ToString::to_string)
+}
+
+fn muted_color() -> egui::Color32 {
+    egui::Color32::from_rgb(151, 160, 174)
+}
+
+fn color32_from_rgba(color: [f32; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        float_color_channel(color[0]),
+        float_color_channel(color[1]),
+        float_color_channel(color[2]),
+        float_color_channel(color[3]),
+    )
+}
+
+fn float_color_channel(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn range_drag_speed(range: ValueRange) -> f32 {
+    ((range.max - range.min).abs() / 200.0).max(0.001)
+}
+
+fn symmetric_value_range(range: ValueRange) -> ValueRange {
+    if range.min < 0.0 && range.max > 0.0 {
+        let extent = range.min.abs().max(range.max.abs());
+        ValueRange {
+            min: -extent,
+            max: extent,
+        }
+    } else {
+        range
+    }
+}
+
+fn threshold_bounds(range: ValueRange, absolute: bool) -> (f32, f32) {
+    if absolute {
+        let extent = range.min.abs().max(range.max.abs()).max(0.0001);
+        (0.0, extent)
+    } else {
+        ordered_range(range)
+    }
+}
+
+fn threshold_value_display(value: f32) -> String {
+    format!("{value:.4}")
+}
+
+fn threshold_p_value_display(pvalue: Option<f64>) -> String {
+    match pvalue {
+        Some(value) if value < 0.001 => format!("p <= {value:.2e}"),
+        Some(value) => format!("p <= {value:.4}"),
+        None => "p --".to_string(),
+    }
+}
+
+fn threshold_bar_y_for_value(rect: egui::Rect, min: f32, max: f32, value: f32) -> f32 {
+    let span = (max - min).abs().max(f32::EPSILON);
+    let t = ((value - min) / span).clamp(0.0, 1.0);
+    rect.bottom() - rect.height() * t
+}
+
+fn threshold_value_from_bar_y(rect: egui::Rect, min: f32, max: f32, y: f32) -> f32 {
+    let t = ((rect.bottom() - y) / rect.height().max(f32::EPSILON)).clamp(0.0, 1.0);
+    min + (max - min) * t
+}
+
+fn ordered_range(range: ValueRange) -> (f32, f32) {
+    if range.min <= range.max {
+        (range.min, range.max)
+    } else {
+        (range.max, range.min)
+    }
+}
+
 fn stat_row(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
     ui.label(label);
     ui.monospace(value.into());
@@ -1403,14 +2376,6 @@ fn overlay_value_label(value: Option<f32>) -> String {
     value.map_or_else(|| "not loaded".to_string(), |value| format!("{value:.4}"))
 }
 
-fn overlay_toggle_label(overlay_visible: bool) -> &'static str {
-    if overlay_visible {
-        "Hide overlay"
-    } else {
-        "Show overlay"
-    }
-}
-
 fn size_is_close(current: PhysicalSize<u32>, desired: PhysicalSize<u32>) -> bool {
     current.width.abs_diff(desired.width) <= CONTROL_RESIZE_THRESHOLD
         && current.height.abs_diff(desired.height) <= CONTROL_RESIZE_THRESHOLD
@@ -1418,7 +2383,7 @@ fn size_is_close(current: PhysicalSize<u32>, desired: PhysicalSize<u32>) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::{BackgroundMode, overlay_toggle_label};
+    use super::BackgroundMode;
 
     #[test]
     fn background_toggles_between_black_and_white() {
@@ -1429,12 +2394,6 @@ mod tests {
 
         background.toggle();
         assert_eq!(background, BackgroundMode::Black);
-    }
-
-    #[test]
-    fn overlay_toggle_label_describes_next_action() {
-        assert_eq!(overlay_toggle_label(true), "Hide overlay");
-        assert_eq!(overlay_toggle_label(false), "Show overlay");
     }
 
     #[test]
