@@ -1,4 +1,4 @@
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use winit::dpi::PhysicalSize;
 
 use crate::surface::{OverlayDataset, SurfaceMesh};
@@ -77,6 +77,71 @@ pub(super) fn pick_surface(
     best_pick
 }
 
+pub(super) fn pick_surface_with_model(
+    mesh: &SurfaceMesh,
+    overlay: Option<&OverlayDataset>,
+    camera: &Camera,
+    view_size: PhysicalSize<u32>,
+    cursor: (f64, f64),
+    model: Mat4,
+    node_offset: u32,
+    face_offset: usize,
+) -> Option<(SurfacePick, f32)> {
+    let ray = screen_ray_for_camera(camera, view_size, cursor)?;
+    let inverse_model = model.inverse();
+    let local_origin = inverse_model.transform_point3(ray.origin);
+    let local_direction = inverse_model
+        .transform_vector3(ray.direction)
+        .normalize_or_zero();
+    if local_direction.length_squared() <= f32::EPSILON {
+        return None;
+    }
+
+    let mut best_pick = None;
+    let mut best_distance = f32::INFINITY;
+    for (local_face_index, triangle) in mesh.triangles.iter().copied().enumerate() {
+        let Some(positions) = raw_triangle_positions(mesh, triangle) else {
+            continue;
+        };
+        let Some(hit) = ray_triangle_intersection(
+            local_origin,
+            local_direction,
+            positions[0],
+            positions[1],
+            positions[2],
+        ) else {
+            continue;
+        };
+        let local_hit = local_origin + local_direction * hit.distance;
+        let scene_hit = model.transform_point3(local_hit);
+        let scene_distance = scene_hit.distance(ray.origin);
+        if scene_distance >= best_distance {
+            continue;
+        }
+
+        let node_index = node_offset + closest_triangle_node(triangle, positions, local_hit);
+        let overlay_value = overlay
+            .and_then(|overlay| overlay.values.get(node_index as usize))
+            .copied();
+        let threshold_value = overlay
+            .and_then(|overlay| overlay.threshold_values.as_ref())
+            .and_then(|values| values.get(node_index as usize))
+            .copied();
+
+        best_distance = scene_distance;
+        best_pick = Some(SurfacePick {
+            node_index,
+            face_index: face_offset + local_face_index,
+            surface_position: local_hit.to_array(),
+            normalized_position: scene_hit.to_array(),
+            overlay_value,
+            threshold_value,
+        });
+    }
+
+    best_pick.map(|pick| (pick, best_distance))
+}
+
 fn screen_ray_for_camera(
     camera: &Camera,
     view_size: PhysicalSize<u32>,
@@ -122,6 +187,14 @@ fn normalized_triangle_positions(
         normalized_vertex_position(mesh, triangle[0], center, scale)?,
         normalized_vertex_position(mesh, triangle[1], center, scale)?,
         normalized_vertex_position(mesh, triangle[2], center, scale)?,
+    ])
+}
+
+fn raw_triangle_positions(mesh: &SurfaceMesh, triangle: [u32; 3]) -> Option<[Vec3; 3]> {
+    Some([
+        Vec3::from_array(*mesh.vertices.get(triangle[0] as usize)?),
+        Vec3::from_array(*mesh.vertices.get(triangle[1] as usize)?),
+        Vec3::from_array(*mesh.vertices.get(triangle[2] as usize)?),
     ])
 }
 

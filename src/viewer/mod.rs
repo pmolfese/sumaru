@@ -40,7 +40,7 @@ use mesh::{
     OverlayAppearance, OverlayColorMap, PreparedGeometry, PreparedGeometryVertex, PreparedSurface,
     RoiAppearance, SelectionHighlight, sample_colormap,
 };
-use pick::pick_surface;
+use pick::{pick_surface, pick_surface_with_model};
 use screenshot::ScreenshotImage;
 
 mod camera;
@@ -445,10 +445,10 @@ struct ViewerState {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     uniform_bind_group_layout: wgpu::BindGroupLayout,
-    /// Active only while Control-dragging an acorn pair: per-hemisphere resident
-    /// buffers drawn with per-hemisphere model matrices, so the drag updates
-    /// small uniforms instead of re-transforming and re-uploading geometry.
-    pair_drag_render: Option<PairDragRender>,
+    /// Per-hemisphere resident buffers for active both-spec scenes. The logical
+    /// combined mesh still backs overlays, ROI node offsets, and picking, while
+    /// drawing uses these instances with tiny model-matrix uniform updates.
+    surface_render_set: Option<SurfaceRenderSet>,
     depth_buffer: DepthBuffer,
     mesh: Option<SurfaceMesh>,
     prepared_geometry_cache: Option<PreparedGeometryCache>,
@@ -749,7 +749,7 @@ impl ViewerState {
             uniform_buffer,
             uniform_bind_group,
             uniform_bind_group_layout,
-            pair_drag_render: None,
+            surface_render_set: None,
             depth_buffer,
             mesh: None,
             prepared_geometry_cache: None,
@@ -1087,9 +1087,28 @@ impl ViewerState {
     }
 
     fn update(&mut self) {
+        let camera = self.camera.clone();
+        self.update_render_uniforms_for_camera(&camera);
+    }
+
+    fn has_renderable_surface(&self) -> bool {
+        self.surface_render_set.is_some() || self.surface_buffers.is_some()
+    }
+
+    fn update_render_uniforms_for_camera(&mut self, camera: &Camera) {
         let aspect = self.view_config.width as f32 / self.view_config.height as f32;
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, &self.camera.uniform_bytes(aspect));
+        if let Some(render_set) = self.surface_render_set.as_ref() {
+            for instance in &render_set.instances {
+                self.queue.write_buffer(
+                    &instance.uniform_buffer,
+                    0,
+                    &camera.uniform_bytes_with_model(aspect, instance.model_matrix),
+                );
+            }
+        } else {
+            self.queue
+                .write_buffer(&self.uniform_buffer, 0, &camera.uniform_bytes(aspect));
+        }
     }
 
     fn render_view(&mut self) -> RenderStatus {
@@ -1239,19 +1258,17 @@ impl ViewerState {
             multiview_mask: None,
         });
 
-        if let Some(drag) = &self.pair_drag_render {
-            // Drag mode: one draw per hemisphere, each with its own model matrix
-            // bind group, over geometry uploaded once at drag start.
+        if let Some(render_set) = &self.surface_render_set {
             render_pass.set_pipeline(&self.render_pipeline);
-            for hemisphere in &drag.hemispheres {
-                if !self.pair_visibility.is_visible(&hemisphere.side) {
+            for instance in &render_set.instances {
+                if !self.pair_visibility.is_visible(&instance.side) {
                     continue;
                 }
-                render_pass.set_bind_group(0, &hemisphere.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, hemisphere.vertex_buffer.slice(..));
+                render_pass.set_bind_group(0, &instance.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
                 render_pass
-                    .set_index_buffer(hemisphere.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..hemisphere.index_count, 0, 0..1);
+                    .set_index_buffer(instance.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..instance.index_count, 0, 0..1);
             }
         } else if let Some(buffers) = &self.surface_buffers {
             render_pass.set_pipeline(&self.render_pipeline);
@@ -1263,7 +1280,7 @@ impl ViewerState {
     }
 
     fn save_current_view_screenshot(&mut self) -> Result<()> {
-        if self.surface_buffers.is_none() {
+        if !self.has_renderable_surface() {
             self.log_status("Load a surface before saving a screenshot.");
             return Ok(());
         }
@@ -1286,7 +1303,7 @@ impl ViewerState {
     }
 
     fn save_preset_montage_screenshot(&mut self) -> Result<()> {
-        if self.surface_buffers.is_none() {
+        if !self.has_renderable_surface() {
             self.log_status("Load a surface before saving a montage.");
             return Ok(());
         }
@@ -1325,12 +1342,12 @@ impl ViewerState {
     }
 
     fn capture_paired_spec_montage(&mut self) -> Result<ScreenshotImage> {
-        let original_geometry_cache = self.prepared_geometry_cache.clone();
+        let original_layout = self.hemisphere_layout;
+        let original_state = self.hemisphere_layout_state();
         let shots = paired_spec_montage_shots();
         let result = self.capture_paired_montage_shots(&shots);
 
-        self.prepared_geometry_cache = original_geometry_cache;
-        self.upload_surface_buffers();
+        self.apply_hemisphere_layout_state(original_layout, original_state)?;
         result
     }
 
@@ -1339,7 +1356,7 @@ impl ViewerState {
         let background = self.background.rgba8();
         for shot in shots {
             if let Some(layout) = shot.layout {
-                self.prepare_paired_montage_render_geometry(layout.state)?;
+                self.apply_hemisphere_layout_state(layout.layout, layout.state)?;
             }
             let mut camera = self.camera.clone();
             match shot.camera {
@@ -1388,42 +1405,11 @@ impl ViewerState {
         screenshot::stitch_horizontal(&images)
     }
 
-    fn prepare_paired_montage_render_geometry(
-        &mut self,
-        layout: HemisphereLayoutState,
-    ) -> Result<()> {
-        let visibility = self.pair_visibility;
-        let indices = self
-            .prepared_geometry_cache
-            .as_ref()
-            .filter(|cache| cache.pair_visibility == visibility)
-            .map(|cache| cache.geometry.indices.clone());
-        let geometry = {
-            let scene = self
-                .surface_scene
-                .as_mut()
-                .context("no SUMA spec scene is loaded")?;
-            let surface = scene
-                .surfaces
-                .get_mut(scene.active_index)
-                .context("active surface index is outside loaded scene")?;
-            surface.preview_geometry(layout, visibility, indices)?
-        };
-        if let Some(mesh) = self.mesh.as_ref() {
-            self.prepared_geometry_cache = Some(PreparedGeometryCache {
-                surface_id: mesh.metadata.id.clone(),
-                vertex_count: mesh.vertices.len(),
-                face_count: mesh.triangles.len(),
-                pair_visibility: visibility,
-                geometry: Arc::new(geometry),
-            });
-            self.upload_surface_buffers();
+    fn fit_camera_to_current_geometry(&self, camera: &mut Camera, padding: f32) {
+        if self.has_both_scene() && self.fit_camera_to_active_pair(camera, padding) {
+            return;
         }
 
-        Ok(())
-    }
-
-    fn fit_camera_to_current_geometry(&self, camera: &mut Camera, padding: f32) {
         let Some(geometry) = self
             .prepared_geometry_cache
             .as_ref()
@@ -1455,6 +1441,59 @@ impl ViewerState {
         camera.distance = (required_distance * padding.max(1.0)).clamp(0.75, 25.0);
     }
 
+    fn fit_camera_to_active_pair(&self, camera: &mut Camera, padding: f32) -> bool {
+        let Some(scene) = self.surface_scene.as_ref() else {
+            return false;
+        };
+        let Some(surface) = scene.surfaces.get(scene.active_index) else {
+            return false;
+        };
+        let matrices = pair_hemisphere_matrices(
+            &surface.components,
+            self.hemisphere_layout_state(),
+            self.pair_visibility,
+        );
+        if matrices.is_empty() {
+            return false;
+        }
+
+        let aspect = self.view_config.width.max(1) as f32 / self.view_config.height.max(1) as f32;
+        let tan_y = (camera::CAMERA_FOV_Y_RADIANS * 0.5).tan();
+        let tan_x = tan_y * aspect.max(0.01);
+        let (eye_direction, up) = camera.view_axes();
+        let eye_direction = eye_direction.normalize();
+        let up = up.normalize();
+        let right = up.cross(eye_direction).normalize_or_zero();
+        let mut required_distance = 0.75_f32;
+        let mut any = false;
+
+        for component in &surface.components {
+            if !self.pair_visibility.is_visible(&component.side) {
+                continue;
+            }
+            let Some(mesh) = component.mesh.as_ref() else {
+                continue;
+            };
+            let Some((_, model)) = matrices.iter().find(|(side, _)| *side == component.side) else {
+                continue;
+            };
+            for vertex in &mesh.vertices {
+                let point = model.transform_point3(Vec3::from_array(*vertex));
+                let depth = point.dot(eye_direction);
+                let horizontal = point.dot(right).abs() / tan_x;
+                let vertical = point.dot(up).abs() / tan_y;
+                required_distance = required_distance.max(depth + horizontal.max(vertical));
+                any = true;
+            }
+        }
+
+        if any {
+            camera.distance = (required_distance * padding.max(1.0)).clamp(0.75, 25.0);
+        }
+
+        any
+    }
+
     fn capture_surface_view(&mut self, camera: &Camera) -> Result<ScreenshotImage> {
         let width = self.view_config.width.max(1);
         let height = self.view_config.height.max(1);
@@ -1484,9 +1523,7 @@ impl ViewerState {
             mapped_at_creation: false,
         });
 
-        let aspect = width as f32 / height as f32;
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, &camera.uniform_bytes(aspect));
+        self.update_render_uniforms_for_camera(camera);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1847,29 +1884,6 @@ impl ViewerState {
             );
         });
 
-        if let Some((text, remaining)) = self.active_mode_label() {
-            // Ensure the label is cleared on time even with no further input.
-            ctx.request_repaint_after(remaining);
-            egui::Area::new(egui::Id::new("camera_mode_label"))
-                .anchor(egui::Align2::CENTER_TOP, [0.0, 18.0])
-                .interactable(false)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_black_alpha(180))
-                        .corner_radius(egui::CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(text)
-                                    .size(18.0)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                        });
-                });
-            ctx.request_repaint_after(Duration::from_millis(50));
-        }
-
         ControlUiOutput {
             actions,
             desired_control_size_points,
@@ -2033,7 +2047,40 @@ impl ViewerState {
                 });
             });
 
+        self.draw_view_transient_label(ctx);
+
         actions
+    }
+
+    fn draw_view_transient_label(&mut self, ctx: &egui::Context) {
+        if let Some((text, remaining)) = self.active_mode_label() {
+            // Ensure the label is cleared on time even with no further input.
+            ctx.request_repaint_after(remaining);
+            egui::Area::new(egui::Id::new("view_transient_label"))
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(180))
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.set_min_width(128.0);
+                            ui.vertical_centered(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(text)
+                                            .size(18.0)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                            });
+                        });
+                });
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
     }
 
     fn draw_roi_control_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {
@@ -3036,6 +3083,7 @@ impl ViewerState {
         self.roi_visible = true;
         self.surface_pick = None;
         self.pair_visibility = PairVisibility::both();
+        self.surface_render_set = None;
     }
 
     fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
@@ -3404,11 +3452,12 @@ impl ViewerState {
         mesh: SurfaceMesh,
         prepared_geometry: Option<Arc<PreparedGeometry>>,
     ) {
+        self.surface_buffers = None;
+        self.surface_render_set = None;
         self.prepared_geometry_cache = prepared_geometry.map(|geometry| PreparedGeometryCache {
             surface_id: mesh.metadata.id.clone(),
             vertex_count: mesh.vertices.len(),
             face_count: mesh.triangles.len(),
-            pair_visibility: PairVisibility::both(),
             geometry,
         });
         self.mesh = Some(mesh);
@@ -3488,11 +3537,10 @@ impl ViewerState {
         self.pair_dragging = true;
         self.pair_drag_last_cursor = self.view_cursor_position;
         self.pair_drag_changed = false;
-        // Upload each hemisphere's geometry once; the drag then only updates
-        // model matrices. If this can't be set up, refresh falls back to the
-        // old per-frame geometry rebuild.
-        self.pair_drag_render = self.build_pair_drag_render();
-        if let Err(error) = self.refresh_pair_drag_uniforms() {
+        if self.surface_render_set.is_none() {
+            self.upload_surface_buffers();
+        }
+        if let Err(error) = self.refresh_active_pair_render_geometry() {
             self.set_error(error);
         }
     }
@@ -3517,15 +3565,14 @@ impl ViewerState {
         self.pair_drag_last_cursor = None;
         if self.pair_drag_changed {
             self.log_status(format!(
-                "Hemisphere layout: open {:.1} deg, gap {:.1}.",
-                self.hemisphere_open_angle_degrees, self.hemisphere_separation_distance
+                "Hemisphere layout: open {}, angle {:.1} deg, gap {:.1}.",
+                pair_open_percent_label(self.hemisphere_open_angle_degrees),
+                self.hemisphere_open_angle_degrees,
+                self.hemisphere_separation_distance
             ));
         }
         self.pair_drag_changed = false;
-        // Drop the drag-only resident buffers and resume the baked path, which
-        // keeps picking and the static display correct.
-        self.pair_drag_render = None;
-        if let Err(error) = self.rebuild_active_scene_surface_mesh() {
+        if let Err(error) = self.refresh_active_pair_render_geometry() {
             self.set_error(error);
         }
     }
@@ -3537,11 +3584,11 @@ impl ViewerState {
         let vertical_scale = (pair_width / 700.0).max(0.05);
         self.hemisphere_open_angle_degrees = (self.hemisphere_open_angle_degrees
             + dx * PAIR_OPEN_DEGREES_PER_PIXEL)
-            .clamp(0.0, PAIR_MAX_OPEN_DEGREES);
+            .clamp(-PAIR_MAX_OPEN_DEGREES, PAIR_MAX_OPEN_DEGREES);
         self.hemisphere_separation_distance = (self.hemisphere_separation_distance
             + -dy * vertical_scale)
             .clamp(0.0, pair_width * PAIR_MAX_DRAG_GAP_FACTOR);
-        self.hemisphere_layout = if self.hemisphere_open_angle_degrees <= f32::EPSILON
+        self.hemisphere_layout = if self.hemisphere_open_angle_degrees.abs() <= f32::EPSILON
             && self.hemisphere_separation_distance <= f32::EPSILON
         {
             HemisphereLayout::Closed
@@ -3549,194 +3596,55 @@ impl ViewerState {
             HemisphereLayout::Open
         };
         self.pair_drag_changed = true;
+        self.show_transient_label(format!(
+            "Open {}",
+            pair_open_percent_label(self.hemisphere_open_angle_degrees)
+        ));
         self.preview_active_pair_transform()
     }
 
     fn preview_active_pair_transform(&mut self) -> Result<()> {
-        self.refresh_pair_drag_uniforms()
-    }
-
-    fn build_pair_drag_render(&mut self) -> Option<PairDragRender> {
-        struct RawComponent {
-            side: SurfaceSide,
-            positions: Vec<[f32; 3]>,
-            normals: Vec<[f32; 3]>,
-            triangles: Vec<[u32; 3]>,
-            surface_colors: Option<Vec<[f32; 4]>>,
-            vertex_count: usize,
-        }
-
-        let anatomical_shading_visible = self.anatomical_shading_visible;
-        let raw: Vec<RawComponent> = {
-            let scene = self.surface_scene.as_mut()?;
-            if scene.hemisphere != SpecHemisphere::Both {
-                return None;
-            }
-            let index = scene.active_index;
-            let surface = scene.surfaces.get_mut(index)?;
-            let mut raw = Vec::with_capacity(surface.components.len());
-            for component in &mut surface.components {
-                let normals = ensure_component_normals(component).ok()?;
-                let mesh = component.mesh.as_ref()?;
-                raw.push(RawComponent {
-                    side: component.side.clone(),
-                    positions: mesh.vertices.clone(),
-                    normals: (*normals).clone(),
-                    triangles: mesh.triangles.clone(),
-                    surface_colors: anatomical_shading_visible
-                        .then(|| anatomical_shading_colors(mesh)),
-                    vertex_count: mesh.vertices.len(),
-                });
-            }
-            raw
-        };
-        if raw.len() != 2 {
-            return None;
-        }
-
-        // Slice the overlay color cache by cumulative node offset, matching the
-        // merged-domain ordering the baked path uses.
-        let overlay_colors = self
-            .overlay
-            .as_ref()
-            .filter(|_| self.overlay_visible)
-            .map(|overlay| overlay.color_cache.colors.as_slice());
-        let roi_colors = self
-            .visible_roi_layer()
-            .map(|layer| layer.appearance.node_colors.as_slice());
-        let dim = self.overlay_appearance.dim;
-        let aspect = self.view_config.width as f32 / self.view_config.height as f32;
-        let init_bytes = self.camera.uniform_bytes(aspect);
-
-        let mut hemispheres = Vec::with_capacity(raw.len());
-        let mut offset = 0usize;
-        for component in &raw {
-            let colors = overlay_colors.map(|colors| {
-                let start = offset.min(colors.len());
-                let end = (offset + component.vertex_count).min(colors.len());
-                &colors[start..end]
-            });
-            let roi_colors = roi_colors.map(|colors| {
-                let start = offset.min(colors.len());
-                let end = (offset + component.vertex_count).min(colors.len());
-                &colors[start..end]
-            });
-            let vertex_bytes = pair_drag_vertex_bytes(
-                &component.positions,
-                &component.normals,
-                component.surface_colors.as_deref(),
-                colors,
-                dim,
-                roi_colors,
-            );
-            let (index_bytes, index_count) = pair_drag_index_bytes(&component.triangles);
-            let vertex_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("pair drag vertex buffer"),
-                    contents: &vertex_bytes,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                });
-            let index_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("pair drag index buffer"),
-                    contents: &index_bytes,
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                });
-            let uniform_buffer =
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("pair drag uniform buffer"),
-                        contents: &init_bytes,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    });
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("pair drag bind group"),
-                layout: &self.uniform_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                }],
-            });
-            hemispheres.push(PairDragHemisphere {
-                side: component.side.clone(),
-                vertex_buffer,
-                index_buffer,
-                index_count,
-                uniform_buffer,
-                bind_group,
-            });
-            offset += component.vertex_count;
-        }
-
-        Some(PairDragRender { hemispheres })
-    }
-
-    fn refresh_pair_drag_uniforms(&mut self) -> Result<()> {
-        if self.pair_drag_render.is_none() {
-            // GPU drag path unavailable; fall back to rebuilding render geometry.
-            return self.refresh_active_pair_render_geometry();
-        }
-
-        let layout = self.hemisphere_layout_state();
-        let visibility = self.pair_visibility;
-        let aspect = self.view_config.width as f32 / self.view_config.height as f32;
-        let matrices = {
-            let Some(scene) = self.surface_scene.as_ref() else {
-                return Ok(());
-            };
-            let Some(surface) = scene.surfaces.get(scene.active_index) else {
-                return Ok(());
-            };
-            pair_hemisphere_matrices(&surface.components, layout, visibility)
-        };
-
-        let Some(drag) = self.pair_drag_render.as_ref() else {
-            return Ok(());
-        };
-        for hemisphere in &drag.hemispheres {
-            if let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == hemisphere.side) {
-                let bytes = self.camera.uniform_bytes_with_model(aspect, *matrix);
-                self.queue
-                    .write_buffer(&hemisphere.uniform_buffer, 0, &bytes);
-            }
-        }
-
-        Ok(())
+        self.refresh_active_pair_render_geometry()
     }
 
     fn refresh_active_pair_render_geometry(&mut self) -> Result<()> {
-        let layout = self.hemisphere_layout_state();
-        let visibility = self.pair_visibility;
-        let indices = self
-            .prepared_geometry_cache
-            .as_ref()
-            .filter(|cache| cache.pair_visibility == visibility)
-            .map(|cache| cache.geometry.indices.clone());
-        let geometry = {
-            let scene = self
-                .surface_scene
-                .as_mut()
-                .context("no SUMA spec scene is loaded")?;
-            let surface = scene
-                .surfaces
-                .get_mut(scene.active_index)
-                .context("active surface index is outside loaded scene")?;
-            surface.preview_geometry(layout, visibility, indices)?
-        };
-        if let Some(mesh) = self.mesh.as_ref() {
-            self.prepared_geometry_cache = Some(PreparedGeometryCache {
-                surface_id: mesh.metadata.id.clone(),
-                vertex_count: mesh.vertices.len(),
-                face_count: mesh.triangles.len(),
-                pair_visibility: visibility,
-                geometry: Arc::new(geometry),
-            });
+        if self.surface_render_set.is_none() {
             self.upload_surface_buffers();
         }
+        self.refresh_surface_render_set_matrices();
+        let camera = self.camera.clone();
+        self.update_render_uniforms_for_camera(&camera);
 
         Ok(())
+    }
+
+    fn refresh_surface_render_set_matrices(&mut self) {
+        let matrices = self
+            .active_pair_matrices_for_layout(self.hemisphere_layout_state(), self.pair_visibility);
+        let Some(render_set) = self.surface_render_set.as_mut() else {
+            return;
+        };
+
+        for instance in &mut render_set.instances {
+            if let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == instance.side) {
+                instance.model_matrix = *matrix;
+            }
+        }
+    }
+
+    fn active_pair_matrices_for_layout(
+        &self,
+        layout: HemisphereLayoutState,
+        visibility: PairVisibility,
+    ) -> Vec<(SurfaceSide, Mat4)> {
+        let Some(scene) = self.surface_scene.as_ref() else {
+            return Vec::new();
+        };
+        let Some(surface) = scene.surfaces.get(scene.active_index) else {
+            return Vec::new();
+        };
+
+        pair_hemisphere_matrices(&surface.components, layout, visibility)
     }
 
     fn toggle_pair_hemisphere_visibility(&mut self, side: SurfaceSide) -> Result<()> {
@@ -3867,44 +3775,8 @@ impl ViewerState {
         if let Some(scene) = self.surface_scene.as_ref()
             && scene.hemisphere == SpecHemisphere::Both
         {
-            self.rebuild_active_scene_surface_mesh()?;
-        }
-
-        Ok(())
-    }
-
-    fn rebuild_active_scene_surface_mesh(&mut self) -> Result<()> {
-        let Some(index) = self.surface_scene.as_ref().map(|scene| scene.active_index) else {
-            return Ok(());
-        };
-        self.ensure_scene_surface_loaded(index)?;
-        let layout = self.hemisphere_layout_state();
-        let (path, snapshot) = {
-            let scene = self
-                .surface_scene
-                .as_mut()
-                .context("no SUMA spec scene is loaded")?;
-            let surface = scene
-                .surfaces
-                .get_mut(index)
-                .context("active surface index is outside loaded scene")?;
-            (surface.path.clone(), surface.display_mesh(layout)?)
-        };
-
-        self.set_active_mesh(snapshot.mesh, snapshot.prepared_geometry);
-        self.surface_path = Some(path);
-        self.surface_pick = None;
-        if self.roi_layer.is_some() {
-            self.rebuild_roi_layer_from_state()?;
-        }
-        if self.has_both_scene() && self.pair_visibility != PairVisibility::both() {
             self.refresh_active_pair_render_geometry()?;
         }
-        self.refresh_pick_overlay_value();
-        self.upload_surface_buffers();
-        self.update_scene_stats();
-        self.view_window
-            .set_title(&window_title(self.surface_path.as_ref()));
 
         Ok(())
     }
@@ -4381,6 +4253,10 @@ impl ViewerState {
 
     fn pick_surface_at_cursor(&self) -> Option<SurfacePick> {
         let cursor = self.view_cursor_position?;
+        if let Some(pick) = self.pick_active_pair_surface_at_cursor(cursor) {
+            return Some(pick);
+        }
+
         let mesh = self.mesh.as_ref()?;
         pick_surface(
             mesh,
@@ -4389,6 +4265,48 @@ impl ViewerState {
             self.view_size,
             cursor,
         )
+    }
+
+    fn pick_active_pair_surface_at_cursor(&self, cursor: (f64, f64)) -> Option<SurfacePick> {
+        if !self.has_both_scene() {
+            return None;
+        }
+        let scene = self.surface_scene.as_ref()?;
+        let surface = scene.surfaces.get(scene.active_index)?;
+        let matrices = pair_hemisphere_matrices(
+            &surface.components,
+            self.hemisphere_layout_state(),
+            self.pair_visibility,
+        );
+        let mut best = None;
+        let mut best_distance = f32::INFINITY;
+        let mut node_offset = 0u32;
+        let mut face_offset = 0usize;
+
+        for component in &surface.components {
+            let mesh = component.mesh.as_ref()?;
+            if self.pair_visibility.is_visible(&component.side)
+                && let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == component.side)
+                && let Some((pick, distance)) = pick_surface_with_model(
+                    mesh,
+                    self.overlay_values.as_ref(),
+                    &self.camera,
+                    self.view_size,
+                    cursor,
+                    *matrix,
+                    node_offset,
+                    face_offset,
+                )
+                && distance < best_distance
+            {
+                best_distance = distance;
+                best = Some(pick);
+            }
+            node_offset = node_offset.saturating_add(mesh.vertices.len() as u32);
+            face_offset += mesh.triangles.len();
+        }
+
+        best
     }
 
     fn handle_roi_draw_click_at_cursor(&mut self) -> Result<()> {
@@ -4674,13 +4592,25 @@ impl ViewerState {
 
     fn upload_surface_buffers(&mut self) {
         let surface_colors = self.visible_anatomical_shading_colors();
-        let Some(mesh) = self.mesh.as_ref() else {
+        if self.mesh.is_none() {
             self.surface_buffers = None;
+            self.surface_render_set = None;
             self.prepared_geometry_cache = None;
             self.anatomical_shading_cache = None;
             return;
-        };
+        }
 
+        if self.has_both_scene()
+            && self.upload_paired_surface_render_set(surface_colors.as_deref().map(Vec::as_slice))
+        {
+            return;
+        }
+
+        self.surface_render_set = None;
+        let mesh = self
+            .mesh
+            .as_ref()
+            .expect("mesh existence was checked above");
         if !self
             .prepared_geometry_cache
             .as_ref()
@@ -4690,7 +4620,6 @@ impl ViewerState {
                 surface_id: mesh.metadata.id.clone(),
                 vertex_count: mesh.vertices.len(),
                 face_count: mesh.triangles.len(),
-                pair_visibility: PairVisibility::both(),
                 geometry: Arc::new(PreparedGeometry::from_surface(mesh)),
             });
         }
@@ -4771,6 +4700,154 @@ impl ViewerState {
             index_bytes_len: index_bytes.len(),
             index_count,
         });
+    }
+
+    fn upload_paired_surface_render_set(&mut self, surface_colors: Option<&[[f32; 4]]>) -> bool {
+        struct RawRenderComponent {
+            side: SurfaceSide,
+            node_offset: u32,
+            face_offset: usize,
+            positions: Vec<[f32; 3]>,
+            normals: Vec<[f32; 3]>,
+            triangles: Vec<[u32; 3]>,
+        }
+
+        let raw = {
+            let Some(scene) = self.surface_scene.as_mut() else {
+                return false;
+            };
+            if scene.hemisphere != SpecHemisphere::Both {
+                return false;
+            }
+            let Some(surface) = scene.surfaces.get_mut(scene.active_index) else {
+                return false;
+            };
+
+            let mut raw = Vec::with_capacity(surface.components.len());
+            let mut node_offset = 0u32;
+            let mut face_offset = 0usize;
+            for component in &mut surface.components {
+                let Ok(normals) = ensure_component_normals(component) else {
+                    return false;
+                };
+                let Some(mesh) = component.mesh.as_ref() else {
+                    return false;
+                };
+                raw.push(RawRenderComponent {
+                    side: component.side.clone(),
+                    node_offset,
+                    face_offset,
+                    positions: mesh.vertices.clone(),
+                    normals: (*normals).clone(),
+                    triangles: mesh.triangles.clone(),
+                });
+                let Ok(component_nodes) = u32::try_from(mesh.vertices.len()) else {
+                    return false;
+                };
+                node_offset = node_offset.saturating_add(component_nodes);
+                face_offset += mesh.triangles.len();
+            }
+            raw
+        };
+        if raw.len() != 2 {
+            return false;
+        }
+
+        let overlay_colors = self
+            .visible_overlay()
+            .map(|overlay| overlay.color_cache.colors.clone());
+        let roi_colors = self
+            .visible_roi_layer()
+            .map(|layer| layer.appearance.node_colors.clone());
+        let selection = self.surface_pick;
+        let dim = self.overlay_appearance.dim;
+        let layout = self.hemisphere_layout_state();
+        let visibility = self.pair_visibility;
+        let matrices = self.active_pair_matrices_for_layout(layout, visibility);
+        let aspect = self.view_config.width as f32 / self.view_config.height as f32;
+
+        let mut instances = Vec::with_capacity(raw.len());
+        for component in raw {
+            let node_start = component.node_offset as usize;
+            let node_end = node_start + component.positions.len();
+            let surface_color_slice =
+                surface_colors.and_then(|colors| colors.get(node_start..node_end));
+            let overlay_color_slice = overlay_colors
+                .as_ref()
+                .and_then(|colors| colors.get(node_start..node_end));
+            let roi_color_slice = roi_colors
+                .as_ref()
+                .and_then(|colors| colors.get(node_start..node_end));
+            let selection = selection_for_component(
+                selection,
+                component.node_offset,
+                component.face_offset,
+                &component.positions,
+            );
+            let geometry = prepared_geometry_from_raw_component(
+                &component.positions,
+                &component.normals,
+                &component.triangles,
+            );
+            let prepared_surface = PreparedSurface::from_geometry_color_slices(
+                &geometry,
+                surface_color_slice,
+                overlay_color_slice,
+                dim,
+                roi_color_slice,
+                selection,
+            );
+            let vertex_bytes = prepared_surface.vertex_bytes();
+            let index_bytes = prepared_surface.index_bytes();
+            let model_matrix = matrices
+                .iter()
+                .find(|(side, _)| *side == component.side)
+                .map(|(_, matrix)| *matrix)
+                .unwrap_or(Mat4::IDENTITY);
+            let uniform_bytes = self.camera.uniform_bytes_with_model(aspect, model_matrix);
+            let vertex_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("paired surface vertex buffer"),
+                    contents: &vertex_bytes,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                });
+            let index_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("paired surface index buffer"),
+                    contents: &index_bytes,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                });
+            let uniform_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("paired surface uniform buffer"),
+                        contents: &uniform_bytes,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("paired surface bind group"),
+                layout: &self.uniform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+            });
+            instances.push(SurfaceRenderInstance {
+                side: component.side,
+                vertex_buffer,
+                index_buffer,
+                index_count: prepared_surface.index_count(),
+                uniform_buffer,
+                bind_group,
+                model_matrix,
+            });
+        }
+
+        self.surface_buffers = None;
+        self.surface_render_set = Some(SurfaceRenderSet { instances });
+        true
     }
 
     fn visible_anatomical_shading_colors(&mut self) -> Option<Arc<Vec<[f32; 4]>>> {
@@ -4855,15 +4932,19 @@ impl ViewerState {
     }
 
     fn show_mode_label(&mut self, mode: CameraMode) {
+        self.show_transient_label(mode.label());
+    }
+
+    fn show_transient_label(&mut self, text: impl Into<String>) {
         self.mode_label = Some(ModeLabel {
-            text: mode.label(),
+            text: text.into(),
             until: Instant::now() + MODE_LABEL_DURATION,
         });
     }
 
     /// Returns the active mode-label text and the time remaining before it
     /// expires, so the caller can schedule a repaint to clear it.
-    fn active_mode_label(&mut self) -> Option<(&'static str, Duration)> {
+    fn active_mode_label(&mut self) -> Option<(String, Duration)> {
         let label = self.mode_label.as_ref()?;
         let now = Instant::now();
         if now >= label.until {
@@ -4871,7 +4952,7 @@ impl ViewerState {
             return None;
         }
 
-        Some((label.text, label.until - now))
+        Some((label.text.clone(), label.until - now))
     }
 
     fn set_error(&mut self, error: anyhow::Error) {
@@ -4894,20 +4975,21 @@ struct SurfaceBuffers {
     index_count: u32,
 }
 
-/// Per-hemisphere resident geometry used only while dragging an acorn pair.
-/// The geometry is uploaded once (raw, untransformed); the layout drag updates
-/// each hemisphere's `uniform_buffer` model matrix instead of the geometry.
-struct PairDragRender {
-    hemispheres: Vec<PairDragHemisphere>,
+/// Per-hemisphere resident geometry for both-spec scenes. Positions and normals
+/// remain in each source surface's mesh space; the model matrix moves them into
+/// the active paired layout.
+struct SurfaceRenderSet {
+    instances: Vec<SurfaceRenderInstance>,
 }
 
-struct PairDragHemisphere {
+struct SurfaceRenderInstance {
     side: SurfaceSide,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    model_matrix: Mat4,
 }
 
 #[derive(Clone)]
@@ -4915,7 +4997,6 @@ struct PreparedGeometryCache {
     surface_id: SurfaceId,
     vertex_count: usize,
     face_count: usize,
-    pair_visibility: PairVisibility,
     geometry: Arc<PreparedGeometry>,
 }
 
@@ -4968,7 +5049,7 @@ struct SceneSurface {
 struct DisplayMeshCache {
     layout: HemisphereLayoutState,
     mesh: SurfaceMesh,
-    prepared_geometry: Arc<PreparedGeometry>,
+    prepared_geometry: Option<Arc<PreparedGeometry>>,
 }
 
 struct DisplayMeshSnapshot {
@@ -5023,7 +5104,7 @@ impl SceneSurface {
             if let Some(cache) = self.display_cache.as_ref() {
                 return Ok(DisplayMeshSnapshot {
                     mesh: cache.mesh.clone(),
-                    prepared_geometry: Some(cache.prepared_geometry.clone()),
+                    prepared_geometry: cache.prepared_geometry.clone(),
                 });
             }
             let mesh = self.components[0]
@@ -5034,7 +5115,7 @@ impl SceneSurface {
             self.display_cache = Some(DisplayMeshCache {
                 layout,
                 mesh: mesh.clone(),
-                prepared_geometry: prepared_geometry.clone(),
+                prepared_geometry: Some(prepared_geometry.clone()),
             });
             return Ok(DisplayMeshSnapshot {
                 mesh,
@@ -5047,7 +5128,7 @@ impl SceneSurface {
         {
             return Ok(DisplayMeshSnapshot {
                 mesh: cache.mesh.clone(),
-                prepared_geometry: Some(cache.prepared_geometry.clone()),
+                prepared_geometry: cache.prepared_geometry.clone(),
             });
         }
 
@@ -5068,16 +5149,15 @@ impl SceneSurface {
                 first_mesh.metadata.lineage.parent_volume_id.clone();
         }
 
-        let prepared_geometry = Arc::new(PreparedGeometry::from_surface(&mesh));
         self.display_cache = Some(DisplayMeshCache {
             layout,
             mesh: mesh.clone(),
-            prepared_geometry: prepared_geometry.clone(),
+            prepared_geometry: None,
         });
 
         Ok(DisplayMeshSnapshot {
             mesh,
-            prepared_geometry: Some(prepared_geometry),
+            prepared_geometry: None,
         })
     }
 
@@ -5092,23 +5172,6 @@ impl SceneSurface {
 
         self.display_mesh(layout)?;
         Ok(true)
-    }
-
-    fn preview_geometry(
-        &mut self,
-        layout: HemisphereLayoutState,
-        visibility: PairVisibility,
-        reusable_indices: Option<Vec<u32>>,
-    ) -> Result<PreparedGeometry> {
-        if self.components.len() <= 1 {
-            let mesh = self.components[0]
-                .mesh
-                .as_ref()
-                .with_context(|| format!("surface {} is still loading", self.name))?;
-            return Ok(PreparedGeometry::from_surface(mesh));
-        }
-
-        paired_preview_geometry(&mut self.components, layout, visibility, reusable_indices)
     }
 }
 
@@ -5241,12 +5304,8 @@ fn composite_component_mesh(
             .mesh
             .as_ref()
             .with_context(|| format!("surface component {} is still loading", component.name))?;
-        let center = Vec3::from_array(mesh.bounds.center);
-        let rotation = Quat::from_rotation_z(transform.rotation_z_degrees.to_radians());
         vertices.extend(mesh.vertices.iter().map(|position| {
-            let point = Vec3::from_array(*position);
-            let rotated = center + rotation * (point - center);
-            (rotated + transform.offset).to_array()
+            transform_point(mesh, transform, Vec3::from_array(*position)).to_array()
         }));
         triangles.extend(mesh.triangles.iter().map(|triangle| {
             [
@@ -5260,64 +5319,6 @@ fn composite_component_mesh(
     }
 
     SurfaceMesh::new(vertices, triangles)
-}
-
-fn paired_preview_geometry(
-    components: &mut [SceneSurfaceComponent],
-    layout: HemisphereLayoutState,
-    visibility: PairVisibility,
-    reusable_indices: Option<Vec<u32>>,
-) -> Result<PreparedGeometry> {
-    let normals = components
-        .iter_mut()
-        .map(ensure_component_normals)
-        .collect::<Result<Vec<_>>>()?;
-    let transforms = component_transforms(components, layout);
-    let bounds = transformed_bounds(components, &transforms, visibility)?;
-    let center = bounds.center();
-    let radius = transformed_radius(components, &transforms, visibility, center).max(1.0);
-    let vertex_count = components
-        .iter()
-        .filter_map(|component| component.mesh.as_ref())
-        .map(|mesh| mesh.vertices.len())
-        .sum();
-    let face_count: usize = components
-        .iter()
-        .filter(|component| visibility.is_visible(&component.side))
-        .filter_map(|component| component.mesh.as_ref())
-        .map(|mesh| mesh.triangles.len())
-        .sum();
-    let mut vertices = Vec::with_capacity(vertex_count);
-
-    for ((component, transform), normals) in components.iter().zip(transforms).zip(normals) {
-        let mesh = component
-            .mesh
-            .as_ref()
-            .with_context(|| format!("surface component {} is still loading", component.name))?;
-        let component_center = Vec3::from_array(mesh.bounds.center);
-        let rotation = Quat::from_rotation_z(transform.rotation_z_degrees.to_radians());
-        vertices.extend(
-            mesh.vertices
-                .iter()
-                .zip(normals.iter())
-                .map(|(position, normal)| {
-                    let point = Vec3::from_array(*position);
-                    let rotated = component_center + rotation * (point - component_center);
-                    let normal = (rotation * Vec3::from_array(*normal)).normalize_or_zero();
-                    PreparedGeometryVertex {
-                        position: ((rotated + transform.offset - center) / radius).to_array(),
-                        normal: normal.to_array(),
-                    }
-                }),
-        );
-    }
-
-    let expected_index_len = face_count * 3;
-    let indices = reusable_indices
-        .filter(|indices| indices.len() == expected_index_len)
-        .unwrap_or_else(|| component_indices(components, visibility, expected_index_len));
-
-    Ok(PreparedGeometry { vertices, indices })
 }
 
 fn paired_component_for_node<'a>(
@@ -5436,11 +5437,12 @@ fn pair_hemisphere_matrices(
         .zip(transforms)
         .filter_map(|(component, transform)| {
             let mesh = component.mesh.as_ref()?;
-            let component_center = Vec3::from_array(mesh.bounds.center);
             Some((
                 component.side.clone(),
                 hemisphere_model_matrix(
-                    component_center,
+                    transform
+                        .rotation_pivot
+                        .unwrap_or_else(|| Vec3::from_array(mesh.bounds.center)),
                     transform.rotation_z_degrees,
                     transform.offset,
                     center,
@@ -5451,49 +5453,45 @@ fn pair_hemisphere_matrices(
         .collect()
 }
 
-/// Packs raw (untransformed) per-hemisphere vertices into the standard
-/// position+normal+color vertex layout. The model matrix applies the layout
-/// transform on the GPU, so positions and normals here stay in mesh space.
-fn pair_drag_vertex_bytes(
+fn prepared_geometry_from_raw_component(
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
-    surface_colors: Option<&[[f32; 4]]>,
-    overlay_colors: Option<&[[f32; 4]]>,
-    dim: f32,
-    roi_colors: Option<&[Option<[f32; 4]>]>,
-) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(positions.len() * 40);
-    for (index, (position, normal)) in positions.iter().zip(normals).enumerate() {
-        for value in position.iter().chain(normal.iter()) {
-            bytes.extend_from_slice(&value.to_ne_bytes());
-        }
-        let color = mesh::compose_vertex_color(
-            surface_colors
-                .and_then(|colors| colors.get(index))
-                .copied()
-                .unwrap_or(mesh::DEFAULT_SURFACE_COLOR),
-            overlay_colors.and_then(|colors| colors.get(index)).copied(),
-            dim,
-            roi_colors
-                .and_then(|colors| colors.get(index))
-                .copied()
-                .flatten(),
-        );
-        for value in color {
-            bytes.extend_from_slice(&value.to_ne_bytes());
-        }
-    }
-    bytes
+    triangles: &[[u32; 3]],
+) -> PreparedGeometry {
+    let vertices = positions
+        .iter()
+        .zip(normals)
+        .map(|(position, normal)| PreparedGeometryVertex {
+            position: *position,
+            normal: *normal,
+        })
+        .collect();
+    let indices = triangles
+        .iter()
+        .flat_map(|triangle| triangle.iter().copied())
+        .collect();
+
+    PreparedGeometry { vertices, indices }
 }
 
-fn pair_drag_index_bytes(triangles: &[[u32; 3]]) -> (Vec<u8>, u32) {
-    let mut bytes = Vec::with_capacity(triangles.len() * 12);
-    for triangle in triangles {
-        for index in triangle {
-            bytes.extend_from_slice(&index.to_ne_bytes());
-        }
+fn selection_for_component(
+    selection: Option<SurfacePick>,
+    node_offset: u32,
+    face_offset: usize,
+    positions: &[[f32; 3]],
+) -> Option<SelectionHighlight> {
+    let selection = selection?;
+    let local_node = selection.node_index.checked_sub(node_offset)?;
+    if local_node as usize >= positions.len() {
+        return None;
     }
-    (bytes, (triangles.len() * 3) as u32)
+    let local_face = selection.face_index.checked_sub(face_offset)?;
+
+    Some(SelectionHighlight {
+        node_index: local_node,
+        face_index: local_face,
+        crosshair_position: positions[local_node as usize],
+    })
 }
 
 fn ensure_component_normals(component: &mut SceneSurfaceComponent) -> Result<Arc<Vec<[f32; 3]>>> {
@@ -5510,31 +5508,6 @@ fn ensure_component_normals(component: &mut SceneSurfaceComponent) -> Result<Arc
         .as_ref()
         .expect("component normal cache is populated above")
         .clone())
-}
-
-fn component_indices(
-    components: &[SceneSurfaceComponent],
-    visibility: PairVisibility,
-    expected_len: usize,
-) -> Vec<u32> {
-    let mut indices = Vec::with_capacity(expected_len);
-    let mut node_offset = 0_u32;
-    for component in components {
-        if let Some(mesh) = component.mesh.as_ref() {
-            if visibility.is_visible(&component.side) {
-                indices.extend(mesh.triangles.iter().flat_map(|triangle| {
-                    [
-                        triangle[0] + node_offset,
-                        triangle[1] + node_offset,
-                        triangle[2] + node_offset,
-                    ]
-                }));
-            }
-            node_offset += mesh.vertices.len() as u32;
-        }
-    }
-
-    indices
 }
 
 fn component_transforms(
@@ -5571,8 +5544,12 @@ fn component_transforms(
     let mut half_shift = ((clearance + layout.separation_distance) * 0.5) + auto_spread;
 
     transforms[left_index].offset.x -= half_shift;
+    transforms[left_index].rotation_pivot =
+        Some(pair_medial_rotation_pivot(left_mesh, &SurfaceSide::Left));
     transforms[left_index].rotation_z_degrees = layout.open_angle_degrees;
     transforms[right_index].offset.x += half_shift;
+    transforms[right_index].rotation_pivot =
+        Some(pair_medial_rotation_pivot(right_mesh, &SurfaceSide::Right));
     transforms[right_index].rotation_z_degrees = -layout.open_angle_degrees;
 
     let extra_spacing = pair_bounds_overlap_extra_spacing(
@@ -5590,17 +5567,16 @@ fn component_transforms(
     transforms
 }
 
-/// Builds the affine model matrix that reproduces the per-hemisphere display
-/// transform `paired_preview_geometry` bakes into vertices, so the GPU can
-/// apply it through the shader's `model` uniform instead of the CPU
+/// Builds the affine model matrix that moves one raw hemisphere into the active
+/// paired layout, so the GPU can apply a small uniform update instead of the CPU
 /// re-transforming and re-uploading every vertex on each drag frame.
 ///
-/// The baked transform is `p -> (c + R*(p - c) + offset - center) / radius`,
-/// where `c` is the component center, `R` the Z rotation, and `center`/`radius`
-/// the scene normalization. The uniform scale keeps normals correct under the
-/// same matrix (the shader renormalizes them).
+/// The baked transform is `p -> (pivot + R*(p - pivot) + offset - center) /
+/// radius`, where `pivot` is the hemisphere hinge point, `R` the Z rotation,
+/// and `center`/`radius` the scene normalization. The uniform scale keeps
+/// normals correct under the same matrix (the shader renormalizes them).
 fn hemisphere_model_matrix(
-    component_center: Vec3,
+    rotation_pivot: Vec3,
     rotation_z_degrees: f32,
     offset: Vec3,
     scene_center: Vec3,
@@ -5608,9 +5584,9 @@ fn hemisphere_model_matrix(
 ) -> Mat4 {
     let inv_radius = 1.0 / radius;
     Mat4::from_scale(Vec3::splat(inv_radius))
-        * Mat4::from_translation(component_center + offset - scene_center)
+        * Mat4::from_translation(rotation_pivot + offset - scene_center)
         * Mat4::from_rotation_z(rotation_z_degrees.to_radians())
-        * Mat4::from_translation(-component_center)
+        * Mat4::from_translation(-rotation_pivot)
 }
 
 #[cfg(test)]
@@ -5618,7 +5594,7 @@ mod acorn_matrix_tests {
     use super::hemisphere_model_matrix;
     use glam::{Quat, Vec3};
 
-    /// Mirrors the per-vertex transform baked by `paired_preview_geometry`.
+    /// Mirrors the old CPU-side per-vertex transform.
     fn baked_position(
         p: Vec3,
         component_center: Vec3,
@@ -5697,56 +5673,23 @@ impl TransformedBounds {
     }
 }
 
-fn transformed_bounds(
-    components: &[SceneSurfaceComponent],
-    transforms: &[ComponentTransform],
-    visibility: PairVisibility,
-) -> Result<TransformedBounds> {
-    let mut bounds = TransformedBounds::empty();
-    for (component, transform) in components.iter().zip(transforms) {
-        if !visibility.is_visible(&component.side) {
-            continue;
-        }
-        let mesh = component
-            .mesh
-            .as_ref()
-            .with_context(|| format!("surface component {} is still loading", component.name))?;
-        for position in &mesh.vertices {
-            bounds.include(transform_point(
-                mesh,
-                *transform,
-                Vec3::from_array(*position),
-            ));
-        }
-    }
-
-    Ok(bounds)
-}
-
-fn transformed_radius(
-    components: &[SceneSurfaceComponent],
-    transforms: &[ComponentTransform],
-    visibility: PairVisibility,
-    center: Vec3,
-) -> f32 {
-    components
-        .iter()
-        .zip(transforms)
-        .filter(|(component, _)| visibility.is_visible(&component.side))
-        .filter_map(|(component, transform)| component.mesh.as_ref().map(|mesh| (mesh, transform)))
-        .flat_map(|(mesh, transform)| {
-            mesh.vertices
-                .iter()
-                .map(move |position| transform_point(mesh, *transform, Vec3::from_array(*position)))
-        })
-        .map(|point| (point - center).length())
-        .fold(0.0, f32::max)
-}
-
 fn transform_point(mesh: &SurfaceMesh, transform: ComponentTransform, point: Vec3) -> Vec3 {
-    let center = Vec3::from_array(mesh.bounds.center);
+    let pivot = transform
+        .rotation_pivot
+        .unwrap_or_else(|| Vec3::from_array(mesh.bounds.center));
     let rotation = Quat::from_rotation_z(transform.rotation_z_degrees.to_radians());
-    center + rotation * (point - center) + transform.offset
+    pivot + rotation * (point - pivot) + transform.offset
+}
+
+fn pair_medial_rotation_pivot(mesh: &SurfaceMesh, side: &SurfaceSide) -> Vec3 {
+    let center = Vec3::from_array(mesh.bounds.center);
+    let medial_x = match side {
+        SurfaceSide::Left => mesh.bounds.max[0],
+        SurfaceSide::Right => mesh.bounds.min[0],
+        _ => center.x,
+    };
+
+    Vec3::new(medial_x, center.y, center.z)
 }
 
 fn transformed_corner_bounds(
@@ -5805,7 +5748,20 @@ fn pair_auto_spread_distance(
     let left_half_width = ((left_mesh.bounds.max[0] - left_mesh.bounds.min[0]) * 0.5).max(0.0);
     let right_half_width = ((right_mesh.bounds.max[0] - right_mesh.bounds.min[0]) * 0.5).max(0.0);
     let mean_half_width = (left_half_width + right_half_width) * 0.5;
-    mean_half_width * open_angle_degrees.to_radians().sin() * 0.9
+    mean_half_width * open_angle_degrees.abs().to_radians().sin() * 0.9
+}
+
+fn pair_open_percent(open_angle_degrees: f32) -> f32 {
+    (open_angle_degrees / PAIR_MAX_OPEN_DEGREES) * 100.0
+}
+
+fn pair_open_percent_label(open_angle_degrees: f32) -> String {
+    let percent = pair_open_percent(open_angle_degrees);
+    if percent.abs() < 0.5 {
+        "0%".to_string()
+    } else {
+        format!("{percent:+.0}%")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6540,9 +6496,13 @@ fn paired_spec_montage_shots() -> [MontageShot; 4] {
         layout: HemisphereLayout::Closed,
         state: HemisphereLayoutState::closed(),
     });
-    let open = Some(MontageLayout {
+    let open_medial = Some(MontageLayout {
         layout: HemisphereLayout::Open,
-        state: HemisphereLayoutState::acorn(),
+        state: HemisphereLayoutState::acorn_signed(1.0),
+    });
+    let open_lateral = Some(MontageLayout {
+        layout: HemisphereLayout::Open,
+        state: HemisphereLayoutState::acorn_signed(-1.0),
     });
 
     [
@@ -6557,15 +6517,15 @@ fn paired_spec_montage_shots() -> [MontageShot; 4] {
             padding: MONTAGE_PAIRED_CLOSED_PADDING,
         },
         MontageShot {
-            layout: open,
+            layout: open_medial,
             camera: MontageCamera::Direction {
-                eye_direction: Vec3::Y,
+                eye_direction: Vec3::NEG_Y,
                 up: Vec3::Z,
             },
             padding: MONTAGE_OPEN_PADDING,
         },
         MontageShot {
-            layout: open,
+            layout: open_lateral,
             camera: MontageCamera::Direction {
                 eye_direction: Vec3::NEG_Y,
                 up: Vec3::Z,
@@ -6654,8 +6614,12 @@ impl HemisphereLayoutState {
     }
 
     fn acorn() -> Self {
+        Self::acorn_signed(1.0)
+    }
+
+    fn acorn_signed(sign: f32) -> Self {
         Self {
-            open_angle_degrees: PAIR_MAX_OPEN_DEGREES,
+            open_angle_degrees: PAIR_MAX_OPEN_DEGREES * sign.signum(),
             separation_distance: PAIR_ACORN_EXTRA_GAP,
         }
     }
@@ -6665,6 +6629,7 @@ impl HemisphereLayoutState {
 struct ComponentTransform {
     offset: Vec3,
     rotation_z_degrees: f32,
+    rotation_pivot: Option<Vec3>,
 }
 
 impl Default for ComponentTransform {
@@ -6672,12 +6637,13 @@ impl Default for ComponentTransform {
         Self {
             offset: Vec3::ZERO,
             rotation_z_degrees: 0.0,
+            rotation_pivot: None,
         }
     }
 }
 
 struct ModeLabel {
-    text: &'static str,
+    text: String,
     until: Instant,
 }
 
@@ -8540,12 +8506,12 @@ mod tests {
         OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR, PAIR_MAX_OPEN_DEGREES,
         PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation, RoiComponentRange,
         RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
-        canonical_overlay_columns, paired_component_for_node, paired_overlay_dataset,
-        paired_overlay_path_for_side, paired_overlay_paths, paired_preview_geometry,
-        paired_spec_montage_shots, resolve_overlay_subs, roi_appearance_for_mesh,
-        roi_fill_nodes_from_seed, scene_surface_display_label, scene_surfaces_from_components,
-        standard_montage_shots, surface_pick_for_mesh_node, threshold_and_mask_from_appearance,
-        timestamped_png_name_from_unix_seconds,
+        canonical_overlay_columns, component_transforms, pair_hemisphere_matrices,
+        paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
+        paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
+        roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
+        scene_surfaces_from_components, standard_montage_shots, surface_pick_for_mesh_node,
+        threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
     };
     use crate::color::Rgba;
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
@@ -8827,7 +8793,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_spec_montage_uses_closed_top_bottom_then_open_front_back() {
+    fn paired_spec_montage_uses_closed_top_bottom_then_signed_acorn_views() {
         let standard = standard_montage_shots();
         assert_eq!(
             standard.iter().map(|shot| shot.camera).collect::<Vec<_>>(),
@@ -8858,16 +8824,20 @@ mod tests {
         assert_eq!(paired[2].layout.unwrap().layout, HemisphereLayout::Open);
         assert_eq!(
             paired[2].layout.unwrap().state,
-            HemisphereLayoutState::acorn()
+            HemisphereLayoutState::acorn_signed(1.0)
         );
         assert_eq!(
             paired[2].camera,
             MontageCamera::Direction {
-                eye_direction: Vec3::Y,
+                eye_direction: Vec3::NEG_Y,
                 up: Vec3::Z,
             }
         );
         assert_eq!(paired[3].layout.unwrap().layout, HemisphereLayout::Open);
+        assert_eq!(
+            paired[3].layout.unwrap().state,
+            HemisphereLayoutState::acorn_signed(-1.0)
+        );
         assert_eq!(
             paired[3].camera,
             MontageCamera::Direction {
@@ -9180,6 +9150,35 @@ mod tests {
     }
 
     #[test]
+    fn acorn_opening_pivots_from_medial_edges() {
+        let components = vec![
+            component("smoothwm", SurfaceSide::Left, -3.0),
+            component("smoothwm", SurfaceSide::Right, 3.0),
+        ];
+
+        let transforms = component_transforms(&components, HemisphereLayoutState::acorn());
+        let left_mesh = components[0].mesh.as_ref().unwrap();
+        let right_mesh = components[1].mesh.as_ref().unwrap();
+
+        assert_eq!(
+            transforms[0].rotation_pivot.unwrap().x,
+            left_mesh.bounds.max[0]
+        );
+        assert_eq!(
+            transforms[1].rotation_pivot.unwrap().x,
+            right_mesh.bounds.min[0]
+        );
+        assert_ne!(
+            transforms[0].rotation_pivot.unwrap().x,
+            left_mesh.bounds.center[0]
+        );
+        assert_ne!(
+            transforms[1].rotation_pivot.unwrap().x,
+            right_mesh.bounds.center[0]
+        );
+    }
+
+    #[test]
     fn pair_visibility_keeps_at_least_one_hemisphere_visible() {
         let both = PairVisibility::both();
         assert_eq!(both.label(), "left+right");
@@ -9194,44 +9193,49 @@ mod tests {
     }
 
     #[test]
-    fn paired_preview_geometry_visibility_preserves_node_offsets() {
-        let mut components = vec![
+    fn pair_hemisphere_matrices_keep_resident_instances_when_visibility_changes() {
+        let components = vec![
             component("smoothwm", SurfaceSide::Left, 0.0),
             component("smoothwm", SurfaceSide::Right, 3.0),
         ];
 
-        let both = paired_preview_geometry(
-            &mut components,
+        let both = pair_hemisphere_matrices(
+            &components,
             HemisphereLayoutState::closed(),
             PairVisibility::both(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(both.indices, vec![0, 1, 2, 3, 4, 5]);
+        );
+        assert_eq!(
+            both.iter().map(|(side, _)| side).collect::<Vec<_>>(),
+            vec![&SurfaceSide::Left, &SurfaceSide::Right]
+        );
 
-        let left_only = paired_preview_geometry(
-            &mut components,
+        let left_only = pair_hemisphere_matrices(
+            &components,
             HemisphereLayoutState::closed(),
             PairVisibility {
                 left: true,
                 right: false,
             },
-            None,
-        )
-        .unwrap();
-        assert_eq!(left_only.indices, vec![0, 1, 2]);
+        );
+        assert_eq!(
+            left_only.iter().map(|(side, _)| side).collect::<Vec<_>>(),
+            vec![&SurfaceSide::Left, &SurfaceSide::Right]
+        );
 
-        let right_only = paired_preview_geometry(
-            &mut components,
+        let right_only = pair_hemisphere_matrices(
+            &components,
             HemisphereLayoutState::closed(),
             PairVisibility {
                 left: false,
                 right: true,
             },
-            None,
-        )
-        .unwrap();
-        assert_eq!(right_only.indices, vec![3, 4, 5]);
+        );
+        assert_eq!(
+            right_only.iter().map(|(side, _)| side).collect::<Vec<_>>(),
+            vec![&SurfaceSide::Left, &SurfaceSide::Right]
+        );
+        assert_ne!(both[0].1, left_only[0].1);
+        assert_ne!(both[1].1, right_only[1].1);
     }
 
     #[test]
@@ -9256,13 +9260,20 @@ mod tests {
         let mut separation = 0.0_f32;
         let pair_width = 140.0_f32;
 
-        open_angle =
-            (open_angle + 100.0 * PAIR_OPEN_DEGREES_PER_PIXEL).clamp(0.0, PAIR_MAX_OPEN_DEGREES);
+        open_angle = (open_angle + 100.0 * PAIR_OPEN_DEGREES_PER_PIXEL)
+            .clamp(-PAIR_MAX_OPEN_DEGREES, PAIR_MAX_OPEN_DEGREES);
         separation = (separation + -(-50.0) * (pair_width / 700.0).max(0.05))
             .clamp(0.0, pair_width * PAIR_MAX_DRAG_GAP_FACTOR);
 
         assert_eq!(open_angle, 18.0);
         assert_eq!(separation, 10.0);
+        assert_eq!(super::pair_open_percent_label(open_angle), "+21%");
+
+        open_angle = (open_angle + -200.0 * PAIR_OPEN_DEGREES_PER_PIXEL)
+            .clamp(-PAIR_MAX_OPEN_DEGREES, PAIR_MAX_OPEN_DEGREES);
+
+        assert_eq!(open_angle, -18.0);
+        assert_eq!(super::pair_open_percent_label(open_angle), "-21%");
     }
 
     #[test]

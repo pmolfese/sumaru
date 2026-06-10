@@ -40,7 +40,10 @@ jobs:
           name: Format check
           command: cargo fmt-all -- --check
       - run:
-          name: Build and test
+          name: Compile checks
+          command: cargo check-all
+      - run:
+          name: Run tests
           command: cargo test-all
       - save_cache:
           key: cargo-linux-v1-{{ checksum "Cargo.lock" }}

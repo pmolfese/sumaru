@@ -91,6 +91,24 @@ impl PreparedSurface {
         roi: Option<&RoiAppearance>,
         selection: Option<SelectionHighlight>,
     ) -> Self {
+        Self::from_geometry_color_slices(
+            geometry,
+            surface_colors,
+            overlay.map(|overlay| overlay.color_cache.colors.as_slice()),
+            overlay_dim,
+            roi.map(|roi| roi.node_colors.as_slice()),
+            selection,
+        )
+    }
+
+    pub(super) fn from_geometry_color_slices(
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        overlay_colors: Option<&[[f32; 4]]>,
+        overlay_dim: f32,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        selection: Option<SelectionHighlight>,
+    ) -> Self {
         let mut vertices = geometry
             .vertices
             .iter()
@@ -103,11 +121,10 @@ impl PreparedSurface {
                         .and_then(|colors| colors.get(index))
                         .copied()
                         .unwrap_or(DEFAULT_SURFACE_COLOR),
-                    overlay
-                        .and_then(|overlay| overlay.color_cache.colors.get(index))
-                        .copied(),
+                    overlay_colors.and_then(|colors| colors.get(index)).copied(),
                     overlay_dim,
-                    roi.and_then(|roi| roi.node_colors.get(index))
+                    roi_colors
+                        .and_then(|colors| colors.get(index))
                         .copied()
                         .flatten(),
                 ),

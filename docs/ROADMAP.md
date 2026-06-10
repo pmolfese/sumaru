@@ -52,7 +52,7 @@ interop, and volume rendering.
   (from Phase 4) on top of the existing right-click pick.
 - [x] Load and display `.niml.roi` regions (from Phases 3/5), including a
   second color layer composited over the scalar overlay.
-- [ ] Drawing, editing, undo/redo, and `.niml.roi` save (from Phase 5),
+- [x] Drawing, editing, undo/redo, and `.niml.roi` save (from Phase 5),
   exercising the Phase 2 node/edge/triangle paths, fill-to-mask, and geodesics.
 
 ### Tier 3 — Sessions and anatomy
@@ -78,8 +78,9 @@ interop, and volume rendering.
 
 ### Continuous (cheap insurance, do early)
 
-- [ ] Add CircleCI building and testing on macOS and Linux (a minimal version
-  of the Phase 8 CI item), since cross-platform support is a core goal.
+- [x] Add CircleCI building and testing on Linux as a minimal version of the
+  Phase 8 CI item. macOS CircleCI is deferred until hosted macOS resources are
+  available on the project plan.
 
 ## Phase: Performance (viewer interaction)
 
@@ -126,37 +127,31 @@ the next rung.
 
 ### Toggling and hemisphere layout — durable mesh residency
 
-- [x] Draw the `both`-hemisphere acorn pair with per-hemisphere model matrices
-  during the open-angle/gap drag: geometry is uploaded once per hemisphere at
-  drag start, and the drag only writes two small uniforms instead of
-  re-transforming and re-uploading ~275k vertices each frame.
-- [x] Compute the drag framing (center/radius) in O(1) from per-hemisphere
-  bounding spheres instead of two full-vertex transform passes per frame, so the
-  drag itself is smooth. Known artifact: the bounding-sphere radius uses
-  `mesh.bounds.radius` (the mesh's longest axis), which over-states the
-  outward extent that matters as the acorn opens, so the pair renders slightly
-  zoomed out during the drag and snaps back to the exact (tighter) framing on
-  release. Most visible on elongated meshes (brains). Removed by the
-  persistent-mode item below, which makes drag and resting framing identical.
-- [ ] Remove the post-drag pause (the "later milestone"). On release,
-  `finish_pair_drag` currently rebuilds the durable merged `SurfaceMesh`
-  (transform all vertices + normals + topology) and re-uploads ~11 MB
-  synchronously, purely so `self.mesh` matches the layout for picking. Fix by
-  making the per-hemisphere matrix rendering **persistent** for `both` scenes
-  (not torn down on release) and making **picking layout-aware** (transform the
-  pick ray by each hemisphere's inverse model matrix and test against that
-  hemisphere's raw mesh) so the durable mesh never needs rebuilding for a layout
-  change. This also removes the drag zoom/snap artifact, since rendering no
-  longer switches between the cheap drag framing and the exact baked framing —
-  both come from one consistent computation.
-  - Why deferred: it is a larger change touching the both-scene lifecycle
-    (load/switch/overlay/visibility all must keep the per-hemisphere buffers in
-    sync) and the picking path, and rendering/picking correctness can only be
-    confirmed by running the viewer. Worth doing deliberately with the pick-ray
-    transform unit-tested.
-- [ ] Keep each surface's geometry resident on the GPU and toggle visibility via
-  draw-call selection instead of rebuilding/re-uploading filtered geometry, so
-  hemisphere and state switches are a draw-list change rather than an upload.
+- [x] Draw `both`-hemisphere scenes as two resident per-hemisphere GPU mesh
+  instances instead of one rebuilt composite mesh. The logical combined
+  `SurfaceMesh` still backs overlays, ROI node offsets, and scene state, but
+  rendering keeps left and right geometry uploaded separately.
+- [x] Update acorn opening/closing with per-hemisphere model matrices. Opening
+  angle, signed acorn direction, gap, and left/right visibility now change by
+  writing small uniforms and changing the draw list, not by transforming and
+  re-uploading hundreds of thousands of vertices.
+- [x] Make picking layout-aware for resident hemispheres by transforming the
+  pick ray into each hemisphere's current model matrix and testing against that
+  hemisphere's raw mesh. The durable mesh no longer needs rebuilding just so
+  right-click picking can work after an acorn layout change.
+- [x] Add in-view acorn feedback for signed open percentage (`+/-100%`) while
+  Control-dragging, using the render-window overlay rather than the controller
+  window.
+- [ ] Keep all loaded spec states resident as reusable GPU geometry buffers so
+  pial/inflated/sphere switching becomes a draw-list/bind-group swap instead of
+  a surface upload. This should extend the same idea from resident hemispheres
+  to resident spec states.
+- [ ] Split ROI and selection highlighting out of baked vertex colors into
+  separate lightweight GPU layers or buffers, so editing/drawing ROIs does not
+  require rebuilding the full surface color stream.
+- [ ] Add a small viewer performance HUD or verbose timing hooks for mesh
+  upload, color upload, threshold rebuild, and frame time, so future GPU work is
+  guided by measured bottlenecks rather than feel alone.
 
 ## Phase 0: Bootstrap
 
@@ -388,9 +383,7 @@ the next rung.
 - [ ] Add node/triangle inspection panels backed by shared selection state.
   - Why: Clicking a node should reveal useful facts like coordinates, labels,
     overlay values, and topology.
-- [ ] Add ROI loading, display, creation, editing, undo/redo, and save/export.
-  - Why: ROIs are a core SUMA workflow, and users need to both view old ROIs
-    and create new ones safely.
+- [x] Add ROI loading, display, creation, editing, undo/redo, and save/export.
 - [ ] Add threshold controls and color-map management for loaded overlays.
   - Why: Real analysis maps need quick adjustment to reveal signal without
     reloading data.
