@@ -861,6 +861,34 @@ impl SurfaceMesh {
         self.shape_metrics_with_parent(None)
     }
 
+    pub fn suma_convexity(&self) -> Vec<f32> {
+        let topology = self.topology();
+        let normals = self.vertex_normals();
+        let mut convexity = Vec::with_capacity(self.vertices.len());
+
+        for (node, vertex) in self.vertices.iter().copied().enumerate() {
+            let position = Vec3::from_array(vertex);
+            let normal = Vec3::from_array(normals[node]);
+            let plane_offset = -normal.dot(position);
+            let mut node_convexity = 0.0;
+
+            for neighbor in &topology.node_neighbors[node] {
+                let neighbor_position = Vec3::from_array(self.vertices[*neighbor as usize]);
+                let edge_length = position.distance(neighbor_position);
+                if edge_length <= f32::EPSILON {
+                    continue;
+                }
+
+                let signed_distance = normal.dot(neighbor_position) + plane_offset;
+                node_convexity -= signed_distance / edge_length;
+            }
+
+            convexity.push(node_convexity);
+        }
+
+        convexity
+    }
+
     pub fn shape_metrics_with_parent(
         &self,
         parent_surface_id: Option<SurfaceId>,
@@ -3747,6 +3775,17 @@ mod tests {
             mesh.transformed_vertices(SurfaceTransform::translation([1.0, 0.0, 0.0]))[0],
             [1.0, 0.0, 0.0]
         );
+    }
+
+    #[test]
+    fn suma_convexity_is_zero_on_a_flat_surface() {
+        let mesh = SurfaceMesh::new(four_vertices(), vec![[0, 1, 2], [0, 2, 3]]).unwrap();
+        let convexity = mesh.suma_convexity();
+
+        assert_eq!(convexity.len(), 4);
+        for value in convexity {
+            assert_close(value, 0.0);
+        }
     }
 
     #[test]

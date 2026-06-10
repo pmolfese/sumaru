@@ -129,7 +129,8 @@ fn surface_from_block(
     let local_domain_parent =
         block_value(block, "LocalDomainParent").map(|parent| normalize_parent_name(parent, &name));
     let local_curvature_parent = block_value(block, "LocalCurvatureParent")
-        .map(|parent| normalize_parent_name(parent, &name));
+        .map(|parent| normalize_parent_name(parent, &name))
+        .or_else(|| local_domain_parent.clone());
     let label_dataset =
         block_value(block, "LabelDset").map(|path| resolve_spec_path(source_dir, path));
     let embed_dimension = block_value(block, "EmbedDimension")

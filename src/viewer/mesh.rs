@@ -80,11 +80,12 @@ impl PreparedSurface {
         overlay_dim: f32,
     ) -> Self {
         let geometry = PreparedGeometry::from_surface(surface);
-        Self::from_geometry_with_selection(&geometry, overlay, overlay_dim, None, None)
+        Self::from_geometry_with_selection(&geometry, None, overlay, overlay_dim, None, None)
     }
 
     pub(super) fn from_geometry_with_selection(
         geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
         overlay: Option<&Overlay>,
         overlay_dim: f32,
         roi: Option<&RoiAppearance>,
@@ -98,6 +99,10 @@ impl PreparedSurface {
                 position: vertex.position,
                 normal: vertex.normal,
                 color: compose_vertex_color(
+                    surface_colors
+                        .and_then(|colors| colors.get(index))
+                        .copied()
+                        .unwrap_or(DEFAULT_SURFACE_COLOR),
                     overlay
                         .and_then(|overlay| overlay.color_cache.colors.get(index))
                         .copied(),
@@ -339,26 +344,30 @@ impl OverlayColorMap {
     }
 }
 
-pub(super) fn compose_overlay_color(color: [f32; 4], dim: f32) -> [f32; 4] {
-    let alpha = finite_or(color[3], 0.0).clamp(0.0, 1.0);
-    let dim = dim.clamp(0.0, 1.5);
-    [
-        DEFAULT_SURFACE_COLOR[0] * (1.0 - alpha) + finite_or(color[0], 0.35) * dim * alpha,
-        DEFAULT_SURFACE_COLOR[1] * (1.0 - alpha) + finite_or(color[1], 0.35) * dim * alpha,
-        DEFAULT_SURFACE_COLOR[2] * (1.0 - alpha) + finite_or(color[2], 0.35) * dim * alpha,
-        1.0,
-    ]
-}
-
 pub(super) fn compose_vertex_color(
+    surface_color: [f32; 4],
     overlay_color: Option<[f32; 4]>,
     overlay_dim: f32,
     roi_color: Option<[f32; 4]>,
 ) -> [f32; 4] {
-    let base = overlay_color.map_or(DEFAULT_SURFACE_COLOR, |color| {
-        compose_overlay_color(color, overlay_dim)
+    let base = overlay_color.map_or(surface_color, |color| {
+        compose_overlay_color_over_base(surface_color, color, overlay_dim)
     });
     roi_color.map_or(base, |color| compose_annotation_color(base, color))
+}
+
+fn compose_overlay_color_over_base(base: [f32; 4], color: [f32; 4], dim: f32) -> [f32; 4] {
+    let alpha = finite_or(color[3], 0.0).clamp(0.0, 1.0);
+    let dim = dim.clamp(0.0, 1.5);
+    [
+        finite_or(base[0], DEFAULT_SURFACE_COLOR[0]) * (1.0 - alpha)
+            + finite_or(color[0], 0.35) * dim * alpha,
+        finite_or(base[1], DEFAULT_SURFACE_COLOR[1]) * (1.0 - alpha)
+            + finite_or(color[1], 0.35) * dim * alpha,
+        finite_or(base[2], DEFAULT_SURFACE_COLOR[2]) * (1.0 - alpha)
+            + finite_or(color[2], 0.35) * dim * alpha,
+        1.0,
+    ]
 }
 
 fn compose_annotation_color(base: [f32; 4], annotation: [f32; 4]) -> [f32; 4] {
@@ -433,6 +442,7 @@ mod tests {
 
         let prepared = PreparedSurface::from_geometry_with_selection(
             &geometry,
+            None,
             None,
             1.0,
             None,
@@ -524,6 +534,7 @@ mod tests {
 
         let prepared = PreparedSurface::from_geometry_with_selection(
             &geometry,
+            None,
             Some(&overlay),
             1.0,
             Some(&roi),
@@ -531,6 +542,32 @@ mod tests {
         );
 
         assert_color_close(prepared.vertices[1].color, [0.49, 0.98, 0.43, 1.0]);
+    }
+
+    #[test]
+    fn prepared_surface_uses_surface_colors_below_roi_colors() {
+        let mesh = triangle_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let surface_colors = vec![
+            [0.4, 0.4, 0.4, 1.0],
+            [0.6, 0.6, 0.6, 1.0],
+            [0.8, 0.8, 0.8, 1.0],
+        ];
+        let mut roi = RoiAppearance::empty(mesh.vertices.len());
+        assert!(roi.set_node_color(1, [1.0, 0.0, 0.0, 0.5]));
+
+        let prepared = PreparedSurface::from_geometry_with_selection(
+            &geometry,
+            Some(surface_colors.as_slice()),
+            None,
+            1.0,
+            Some(&roi),
+            None,
+        );
+
+        assert_color_close(prepared.vertices[0].color, [0.4, 0.4, 0.4, 1.0]);
+        assert_color_close(prepared.vertices[1].color, [0.8, 0.3, 0.3, 1.0]);
+        assert_color_close(prepared.vertices[2].color, [0.8, 0.8, 0.8, 1.0]);
     }
 
     #[test]
