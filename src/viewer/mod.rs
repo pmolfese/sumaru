@@ -58,6 +58,12 @@ const CONTROL_MIN_INNER_HEIGHT: u32 = 420;
 const CONTROL_INITIAL_INNER_HEIGHT: u32 = 720;
 const CONTROL_MAX_INNER_WIDTH: u32 = 900;
 const CONTROL_RESIZE_THRESHOLD: u32 = 12;
+const ROI_CONTROL_CONTENT_WIDTH_POINTS: f32 = 360.0;
+const ROI_CONTROL_MIN_INNER_WIDTH: u32 = 430;
+const ROI_CONTROL_INNER_WIDTH: u32 = 430;
+const ROI_CONTROL_INNER_HEIGHT: u32 = 260;
+const ROI_CONTROL_MAX_INNER_WIDTH: u32 = 1100;
+const ROI_CONTROL_MIN_INNER_HEIGHT: u32 = 260;
 const INITIAL_WINDOW_RAISE_PIXELS: i32 = 100;
 const OVERLAY_THRESHOLD_COLUMN_WIDTH_POINTS: f32 = 96.0;
 const OVERLAY_THRESHOLD_RAIL_HEIGHT_POINTS: f32 = 315.0;
@@ -175,14 +181,28 @@ impl ViewerApp {
                     )),
             )?,
         );
+        let roi_control_window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("sumaru ROI controls")
+                    .with_inner_size(PhysicalSize::new(
+                        ROI_CONTROL_INNER_WIDTH,
+                        ROI_CONTROL_INNER_HEIGHT,
+                    ))
+                    .with_visible(false),
+            )?,
+        );
         if let Ok(position) = view_window.outer_position() {
             let raised_y = position.y.saturating_sub(INITIAL_WINDOW_RAISE_PIXELS);
             view_window.set_outer_position(PhysicalPosition::new(position.x, raised_y));
             control_window.set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y));
+            roi_control_window
+                .set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y + 760));
         }
         self.state = Some(pollster::block_on(ViewerState::new(
             view_window,
             control_window,
+            roi_control_window,
             self.initial_surface_path.take(),
             self.initial_spec_path.take(),
             self.initial_surface_volume_path.take(),
@@ -261,34 +281,63 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             return;
         }
 
-        if window_id != state.control_window().id() {
+        if window_id == state.control_window().id() {
+            let input = state.control_input(&event);
+            if input.repaint {
+                state.control_window().request_redraw();
+            }
+            if input.consumed {
+                state.control_window().request_redraw();
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Resized(size) => {
+                    state.resize_control(size);
+                    state.control_window().request_redraw();
+                }
+                WindowEvent::RedrawRequested => match state.render_control() {
+                    RenderStatus::Rendered => state.control_frame_rendered = true,
+                    RenderStatus::Skipped => {}
+                    RenderStatus::Reconfigure => {
+                        state.resize_control(state.control_size);
+                        state.control_window().request_redraw();
+                    }
+                    RenderStatus::ValidationError => eprintln!("control validation error"),
+                },
+                _ => {}
+            }
             return;
         }
 
-        let input = state.control_input(&event);
-        if input.repaint {
-            state.control_window().request_redraw();
-        }
-        if input.consumed {
-            state.control_window().request_redraw();
-            return;
-        }
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
-                state.resize_control(size);
-                state.control_window().request_redraw();
+        if window_id == state.roi_control_window().id() {
+            let input = state.roi_control_input(&event);
+            if input.repaint {
+                state.roi_control_window().request_redraw();
             }
-            WindowEvent::RedrawRequested => match state.render_control() {
-                RenderStatus::Rendered => state.control_frame_rendered = true,
-                RenderStatus::Skipped => {}
-                RenderStatus::Reconfigure => {
-                    state.resize_control(state.control_size);
-                    state.control_window().request_redraw();
+            if input.consumed {
+                state.roi_control_window().request_redraw();
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested => {
+                    state.apply_ui_actions(vec![UiAction::SetRoiControllerOpen(false)]);
                 }
-                RenderStatus::ValidationError => eprintln!("control validation error"),
-            },
-            _ => {}
+                WindowEvent::Resized(size) => {
+                    state.resize_roi_control(size);
+                    state.roi_control_window().request_redraw();
+                }
+                WindowEvent::RedrawRequested => match state.render_roi_control() {
+                    RenderStatus::Rendered => {}
+                    RenderStatus::Skipped => {}
+                    RenderStatus::Reconfigure => {
+                        state.resize_roi_control(state.roi_control_size);
+                        state.roi_control_window().request_redraw();
+                    }
+                    RenderStatus::ValidationError => eprintln!("ROI control validation error"),
+                },
+                _ => {}
+            }
         }
     }
 
@@ -301,6 +350,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             ViewerEvent::SpecPreloadReady => {
                 if state.drain_preload_results() {
                     state.control_window().request_redraw();
+                    if state.roi_controller_open {
+                        state.roi_control_window().request_redraw();
+                    }
                     state.view_window().request_redraw();
                 }
             }
@@ -322,15 +374,35 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             return;
         }
 
-        // The only timed redraws come from egui (panel animations and the
-        // transient camera-mode label, which schedules its own repaint).
-        // Everything else is driven by input-triggered request_redraw calls.
-        match state.control_repaint_at {
-            Some(at) if at <= now => {
-                state.control_window().request_redraw();
-                event_loop.set_control_flow(ControlFlow::Wait);
-            }
+        let next_view = state.view_repaint_at;
+        let next_control = state.control_repaint_at;
+        let next_roi_control = state
+            .roi_controller_open
+            .then_some(state.roi_control_repaint_at)
+            .flatten();
+        let view_due = next_view.is_some_and(|at| at <= now);
+        let control_due = next_control.is_some_and(|at| at <= now);
+        let roi_control_due = next_roi_control.is_some_and(|at| at <= now);
+        if view_due {
+            state.view_window().request_redraw();
+        }
+        if control_due {
+            state.control_window().request_redraw();
+        }
+        if roi_control_due {
+            state.roi_control_window().request_redraw();
+        }
+
+        let next_wake = [next_view, next_control, next_roi_control]
+            .into_iter()
+            .flatten()
+            .filter(|at| *at > now)
+            .min();
+        match next_wake {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None if view_due || control_due || roi_control_due => {
+                event_loop.set_control_flow(ControlFlow::Wait)
+            }
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
@@ -339,18 +411,27 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
 struct ViewerState {
     view_window: Arc<Window>,
     control_window: Arc<Window>,
+    roi_control_window: Arc<Window>,
     view_surface: wgpu::Surface<'static>,
     control_surface: wgpu::Surface<'static>,
+    roi_control_surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     view_config: wgpu::SurfaceConfiguration,
     control_config: wgpu::SurfaceConfiguration,
+    roi_control_config: wgpu::SurfaceConfiguration,
     view_size: PhysicalSize<u32>,
     control_size: PhysicalSize<u32>,
+    roi_control_size: PhysicalSize<u32>,
     last_requested_control_size: Option<PhysicalSize<u32>>,
+    last_requested_roi_control_size: Option<PhysicalSize<u32>>,
+    /// When the view window should next repaint for menu animations, or `None`
+    /// if its egui overlay is idle.
+    view_repaint_at: Option<Instant>,
     /// When the control window should next repaint for an egui animation, or
     /// `None` if it is idle. Drives `ControlFlow::WaitUntil`.
     control_repaint_at: Option<Instant>,
+    roi_control_repaint_at: Option<Instant>,
     view_frame_rendered: bool,
     control_frame_rendered: bool,
     startup_redraw_until: Instant,
@@ -404,17 +485,30 @@ struct ViewerState {
     background: BackgroundMode,
     modifiers: ModifiersState,
     mode_label: Option<ModeLabel>,
+    surface_controller_visible: bool,
+    roi_controller_open: bool,
+    view_egui_ctx: egui::Context,
+    view_egui_state: egui_winit::State,
+    view_egui_renderer: Renderer,
+    view_pending_egui_textures: egui::TexturesDelta,
+    view_allocated_egui_textures: HashSet<egui::TextureId>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: Renderer,
     pending_egui_textures: egui::TexturesDelta,
     allocated_egui_textures: HashSet<egui::TextureId>,
+    roi_egui_ctx: egui::Context,
+    roi_egui_state: egui_winit::State,
+    roi_egui_renderer: Renderer,
+    roi_pending_egui_textures: egui::TexturesDelta,
+    roi_allocated_egui_textures: HashSet<egui::TextureId>,
 }
 
 impl ViewerState {
     async fn new(
         view_window: Arc<Window>,
         control_window: Arc<Window>,
+        roi_control_window: Arc<Window>,
         initial_surface_path: Option<PathBuf>,
         initial_spec_path: Option<PathBuf>,
         initial_surface_volume_path: Option<PathBuf>,
@@ -428,9 +522,11 @@ impl ViewerState {
     ) -> Result<Self> {
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
+        let roi_control_size = roi_control_window.inner_size();
         let instance = wgpu::Instance::default();
         let view_surface = instance.create_surface(view_window.clone())?;
         let control_surface = instance.create_surface(control_window.clone())?;
+        let roi_control_surface = instance.create_surface(roi_control_window.clone())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -449,9 +545,22 @@ impl ViewerState {
             .await?;
         let view_caps = view_surface.get_capabilities(&adapter);
         let control_caps = control_surface.get_capabilities(&adapter);
+        let roi_control_caps = roi_control_surface.get_capabilities(&adapter);
         let surface_format = choose_surface_format(&view_caps, &control_caps);
         let present_mode = choose_present_mode(&view_caps, &control_caps);
         let alpha_mode = choose_alpha_mode(&view_caps, &control_caps);
+        ensure!(
+            roi_control_caps.formats.contains(&surface_format),
+            "ROI controller surface does not support selected format {surface_format:?}"
+        );
+        ensure!(
+            roi_control_caps.present_modes.contains(&present_mode),
+            "ROI controller surface does not support selected present mode {present_mode:?}"
+        );
+        ensure!(
+            roi_control_caps.alpha_modes.contains(&alpha_mode),
+            "ROI controller surface does not support selected alpha mode {alpha_mode:?}"
+        );
         let view_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -472,8 +581,19 @@ impl ViewerState {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        let roi_control_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: roi_control_size.width.max(1),
+            height: roi_control_size.height.max(1),
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
         view_surface.configure(&device, &view_config);
         control_surface.configure(&device, &control_config);
+        roi_control_surface.configure(&device, &roi_control_config);
 
         let camera = Camera::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -553,6 +673,18 @@ impl ViewerState {
             cache: None,
         });
         let depth_buffer = DepthBuffer::new(&device, view_config.width, view_config.height);
+        let view_egui_ctx = egui::Context::default();
+        view_egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut view_egui_state = egui_winit::State::new(
+            view_egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            view_window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        view_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
+        let view_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(egui::Visuals::dark());
         let mut egui_state = egui_winit::State::new(
@@ -565,6 +697,18 @@ impl ViewerState {
         );
         egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
         let egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
+        let roi_egui_ctx = egui::Context::default();
+        roi_egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut roi_egui_state = egui_winit::State::new(
+            roi_egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            roi_control_window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        roi_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
+        let roi_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
         let initial_surface_volume_path =
             initial_surface_volume_path.map(canonical_or_original_path);
         let (preload_sender, preload_receiver) = mpsc::channel();
@@ -572,16 +716,23 @@ impl ViewerState {
         let mut state = Self {
             view_window,
             control_window,
+            roi_control_window,
             view_surface,
             control_surface,
+            roi_control_surface,
             device,
             queue,
             view_config,
             control_config,
+            roi_control_config,
             view_size,
             control_size,
+            roi_control_size,
             last_requested_control_size: None,
+            last_requested_roi_control_size: None,
+            view_repaint_at: None,
             control_repaint_at: None,
+            roi_control_repaint_at: None,
             view_frame_rendered: false,
             control_frame_rendered: false,
             startup_redraw_until: Instant::now(),
@@ -630,11 +781,23 @@ impl ViewerState {
             background: BackgroundMode::Black,
             modifiers: ModifiersState::empty(),
             mode_label: None,
+            surface_controller_visible: true,
+            roi_controller_open: false,
+            view_egui_ctx,
+            view_egui_state,
+            view_egui_renderer,
+            view_pending_egui_textures: egui::TexturesDelta::default(),
+            view_allocated_egui_textures: HashSet::new(),
             egui_ctx,
             egui_state,
             egui_renderer,
             pending_egui_textures: egui::TexturesDelta::default(),
             allocated_egui_textures: HashSet::new(),
+            roi_egui_ctx,
+            roi_egui_state,
+            roi_egui_renderer,
+            roi_pending_egui_textures: egui::TexturesDelta::default(),
+            roi_allocated_egui_textures: HashSet::new(),
         };
 
         if let Some(path) = initial_surface_path {
@@ -664,6 +827,10 @@ impl ViewerState {
 
     fn control_window(&self) -> &Window {
         &self.control_window
+    }
+
+    fn roi_control_window(&self) -> &Window {
+        &self.roi_control_window
     }
 
     fn arm_startup_redraw_guard(&mut self) {
@@ -713,15 +880,39 @@ impl ViewerState {
             .configure(&self.device, &self.control_config);
     }
 
+    fn resize_roi_control(&mut self, size: PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+
+        self.roi_control_size = size;
+        self.last_requested_roi_control_size = None;
+        self.roi_control_config.width = size.width;
+        self.roi_control_config.height = size.height;
+        self.roi_control_surface
+            .configure(&self.device, &self.roi_control_config);
+    }
+
     fn view_input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers.state();
-                if !self.modifiers.control_key() && self.pair_dragging {
-                    self.finish_pair_drag();
-                }
-                false
+        if let WindowEvent::ModifiersChanged(modifiers) = event {
+            self.modifiers = modifiers.state();
+            if !self.modifiers.control_key() && self.pair_dragging {
+                self.finish_pair_drag();
             }
+        }
+
+        let egui_response = self
+            .view_egui_state
+            .on_window_event(&self.view_window, event);
+        if egui_response.repaint {
+            self.view_window.request_redraw();
+        }
+        if egui_response.consumed {
+            return true;
+        }
+
+        match event {
+            WindowEvent::ModifiersChanged(_) => false,
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = (position.x, position.y);
                 self.view_cursor_position = Some(cursor);
@@ -855,6 +1046,17 @@ impl ViewerState {
         }
     }
 
+    fn roi_control_input(&mut self, event: &WindowEvent) -> InputResponse {
+        let egui_response = self
+            .roi_egui_state
+            .on_window_event(&self.roi_control_window, event);
+
+        InputResponse {
+            consumed: egui_response.consumed,
+            repaint: egui_response.repaint,
+        }
+    }
+
     fn update(&mut self) {
         let aspect = self.view_config.width as f32 / self.view_config.height as f32;
         self.queue
@@ -862,6 +1064,54 @@ impl ViewerState {
     }
 
     fn render_view(&mut self) -> RenderStatus {
+        egui_winit::update_viewport_info(
+            self.view_egui_state
+                .egui_input_mut()
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default(),
+            &self.view_egui_ctx,
+            &self.view_window,
+            false,
+        );
+        let raw_input = self.view_egui_state.take_egui_input(&self.view_window);
+        let egui_ctx = self.view_egui_ctx.clone();
+        let mut ui_actions = Vec::new();
+        #[allow(deprecated)]
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            ui_actions = self.draw_view_overlay_ui(ctx);
+        });
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        self.view_repaint_at = if repaint_delay == Duration::ZERO {
+            Some(Instant::now())
+        } else if repaint_delay == Duration::MAX {
+            None
+        } else {
+            Instant::now().checked_add(repaint_delay)
+        };
+        let actions_present = !ui_actions.is_empty();
+        self.view_egui_state
+            .handle_platform_output(&self.view_window, full_output.platform_output);
+        self.apply_ui_actions(ui_actions);
+        if actions_present {
+            self.view_window.request_redraw();
+            self.control_window.request_redraw();
+            if self.roi_controller_open {
+                self.roi_control_window.request_redraw();
+            }
+        }
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [self.view_config.width, self.view_config.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        self.view_pending_egui_textures
+            .append(full_output.textures_delta);
+
         let output = match self.view_surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
@@ -884,7 +1134,64 @@ impl ViewerState {
 
         self.encode_surface_render_pass(&mut encoder, &view, &self.depth_buffer.view);
 
-        self.queue.submit([encoder.finish()]);
+        let mut retained_textures = egui::TexturesDelta::default();
+        let mut needs_texture_repaint = false;
+        for (id, image_delta) in &self.view_pending_egui_textures.set {
+            if image_delta.pos.is_some() && !self.view_allocated_egui_textures.contains(id) {
+                retained_textures.set.push((*id, image_delta.clone()));
+                needs_texture_repaint = true;
+                continue;
+            }
+
+            self.view_egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+            self.view_allocated_egui_textures.insert(*id);
+        }
+        let mut command_buffers = self.view_egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        {
+            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("view egui render pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            self.view_egui_renderer.render(
+                &mut egui_pass.forget_lifetime(),
+                &paint_jobs,
+                &screen_descriptor,
+            );
+        }
+
+        for id in &self.view_pending_egui_textures.free {
+            if self.view_allocated_egui_textures.remove(id) {
+                self.view_egui_renderer.free_texture(id);
+            }
+        }
+        self.view_pending_egui_textures = retained_textures;
+        if needs_texture_repaint {
+            self.view_repaint_at = Some(Instant::now());
+        }
+
+        command_buffers.push(encoder.finish());
+        self.queue.submit(command_buffers);
         output.present();
 
         RenderStatus::Rendered
@@ -1267,6 +1574,9 @@ impl ViewerState {
         if actions_present {
             self.view_window.request_redraw();
             self.control_window.request_redraw();
+            if self.roi_controller_open {
+                self.roi_control_window.request_redraw();
+            }
         }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
@@ -1366,6 +1676,159 @@ impl ViewerState {
         RenderStatus::Rendered
     }
 
+    fn render_roi_control(&mut self) -> RenderStatus {
+        egui_winit::update_viewport_info(
+            self.roi_egui_state
+                .egui_input_mut()
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default(),
+            &self.roi_egui_ctx,
+            &self.roi_control_window,
+            false,
+        );
+        let raw_input = self
+            .roi_egui_state
+            .take_egui_input(&self.roi_control_window);
+        let egui_ctx = self.roi_egui_ctx.clone();
+        let mut ui_actions = Vec::new();
+        let mut desired_roi_control_size_points = egui::Vec2::ZERO;
+        #[allow(deprecated)]
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            let output = self.draw_roi_control_ui(ctx);
+            ui_actions = output.actions;
+            desired_roi_control_size_points = output.desired_control_size_points;
+        });
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        self.roi_control_repaint_at = if repaint_delay == Duration::ZERO {
+            Some(Instant::now())
+        } else if repaint_delay == Duration::MAX {
+            None
+        } else {
+            Instant::now().checked_add(repaint_delay)
+        };
+
+        let actions_present = !ui_actions.is_empty();
+        self.roi_egui_state
+            .handle_platform_output(&self.roi_control_window, full_output.platform_output);
+        if repaint_delay != Duration::ZERO {
+            self.fit_roi_control_window(
+                desired_roi_control_size_points,
+                full_output.pixels_per_point,
+            );
+        }
+        self.apply_ui_actions(ui_actions);
+        if actions_present {
+            self.view_window.request_redraw();
+            self.control_window.request_redraw();
+            if self.roi_controller_open {
+                self.roi_control_window.request_redraw();
+            }
+        }
+
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [
+                self.roi_control_config.width,
+                self.roi_control_config.height,
+            ],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        self.roi_pending_egui_textures
+            .append(full_output.textures_delta);
+
+        let output = match self.roi_control_surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(output)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return RenderStatus::Skipped;
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                return RenderStatus::Reconfigure;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => return RenderStatus::ValidationError,
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ROI control render encoder"),
+            });
+
+        let mut retained_textures = egui::TexturesDelta::default();
+        let mut needs_texture_repaint = false;
+        for (id, image_delta) in &self.roi_pending_egui_textures.set {
+            if image_delta.pos.is_some() && !self.roi_allocated_egui_textures.contains(id) {
+                retained_textures.set.push((*id, image_delta.clone()));
+                needs_texture_repaint = true;
+                continue;
+            }
+
+            self.roi_egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+            self.roi_allocated_egui_textures.insert(*id);
+        }
+        let mut command_buffers = self.roi_egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        {
+            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ROI control egui render pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.06,
+                            g: 0.07,
+                            b: 0.08,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            self.roi_egui_renderer.render(
+                &mut egui_pass.forget_lifetime(),
+                &paint_jobs,
+                &screen_descriptor,
+            );
+        }
+
+        for id in &self.roi_pending_egui_textures.free {
+            if self.roi_allocated_egui_textures.remove(id) {
+                self.roi_egui_renderer.free_texture(id);
+            }
+        }
+        self.roi_pending_egui_textures = retained_textures;
+        if needs_texture_repaint {
+            self.roi_control_repaint_at = Some(Instant::now());
+        }
+
+        command_buffers.push(encoder.finish());
+        self.queue.submit(command_buffers);
+        output.present();
+
+        RenderStatus::Rendered
+    }
+
     fn draw_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {
         let mut actions = Vec::new();
         let panel_height = (self.control_size.height as f32 - 24.0).max(240.0);
@@ -1383,7 +1846,6 @@ impl ViewerState {
                     ui.set_min_width(CONTROL_CONTENT_WIDTH_POINTS);
                     self.draw_surface_dataset_section(ui, &mut actions);
                     self.draw_overlay_workbench(ui, &mut actions);
-                    self.draw_view_section(ui, &mut actions);
                     self.draw_scene_section(ui);
                     self.draw_pick_section(ui);
                 });
@@ -1424,6 +1886,235 @@ impl ViewerState {
             actions,
             desired_control_size_points,
         }
+    }
+
+    fn draw_view_overlay_ui(&mut self, ctx: &egui::Context) -> Vec<UiAction> {
+        let mut actions = Vec::new();
+
+        #[allow(deprecated)]
+        egui::TopBottomPanel::top("main_menu_bar")
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Open Surface...").clicked() {
+                            actions.push(UiAction::PickSurface);
+                            ui.close();
+                        }
+                        if ui.button("Open Spec...").clicked() {
+                            actions.push(UiAction::PickSpec);
+                            ui.close();
+                        }
+                        if ui.button("Open Surface Volume...").clicked() {
+                            actions.push(UiAction::PickSurfaceVolume);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(self.mesh.is_some(), egui::Button::new("Open Overlay..."))
+                            .clicked()
+                        {
+                            actions.push(UiAction::PickOverlay);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(self.mesh.is_some(), egui::Button::new("Open ROI..."))
+                            .clicked()
+                        {
+                            actions.push(UiAction::PickRoi);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.surface_buffers.is_some(),
+                                egui::Button::new("Save View..."),
+                            )
+                            .clicked()
+                        {
+                            actions.push(UiAction::SaveScreenshot);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.surface_buffers.is_some(),
+                                egui::Button::new("Save Montage..."),
+                            )
+                            .clicked()
+                        {
+                            actions.push(UiAction::SaveMontage);
+                            ui.close();
+                        }
+                    });
+
+                    ui.menu_button("View", |ui| {
+                        ui.label(format!("Mode: {}", self.camera.mode().label()));
+                        ui.separator();
+                        if ui.button("Reset").clicked() {
+                            actions.push(UiAction::ResetCamera);
+                            ui.close();
+                        }
+                        if ui.button("Cycle Camera").clicked() {
+                            actions.push(UiAction::ToggleCameraMode);
+                            ui.close();
+                        }
+                        if ui.button(self.background.next_label()).clicked() {
+                            actions.push(UiAction::ToggleBackground);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Left").clicked() {
+                            actions.push(UiAction::Preset(PresetOrientation::Left));
+                            ui.close();
+                        }
+                        if ui.button("Right").clicked() {
+                            actions.push(UiAction::Preset(PresetOrientation::Right));
+                            ui.close();
+                        }
+                        if ui.button("Top").clicked() {
+                            actions.push(UiAction::Preset(PresetOrientation::Top));
+                            ui.close();
+                        }
+                        if ui.button("Bottom").clicked() {
+                            actions.push(UiAction::Preset(PresetOrientation::Bottom));
+                            ui.close();
+                        }
+                        ui.separator();
+                        let mut overlay_visible = self.overlay_visible;
+                        if ui
+                            .add_enabled_ui(self.overlay.is_some(), |ui| {
+                                ui.checkbox(&mut overlay_visible, "Overlay Visible")
+                            })
+                            .inner
+                            .changed()
+                        {
+                            actions.push(UiAction::SetOverlayVisible(overlay_visible));
+                            ui.close();
+                        }
+                        let can_layout_hemispheres = self.has_both_scene();
+                        if ui
+                            .add_enabled(can_layout_hemispheres, egui::Button::new("Close Pair"))
+                            .clicked()
+                        {
+                            actions.push(UiAction::HemisphereLayout(HemisphereLayout::Closed));
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(can_layout_hemispheres, egui::Button::new("Open Pair"))
+                            .clicked()
+                        {
+                            actions.push(UiAction::HemisphereLayout(HemisphereLayout::Open));
+                            ui.close();
+                        }
+                    });
+
+                    ui.menu_button("Controllers", |ui| {
+                        let mut surface_visible = self.surface_controller_visible;
+                        if ui
+                            .checkbox(&mut surface_visible, "Surface / Overlay Controller")
+                            .changed()
+                        {
+                            actions.push(UiAction::SetSurfaceControllerVisible(surface_visible));
+                            ui.close();
+                        }
+                        let mut roi_open = self.roi_controller_open;
+                        if ui
+                            .checkbox(&mut roi_open, "ROI Drawing Controller")
+                            .changed()
+                        {
+                            actions.push(UiAction::SetRoiControllerOpen(roi_open));
+                            ui.close();
+                        }
+                    });
+                });
+            });
+
+        actions
+    }
+
+    fn draw_roi_control_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {
+        let mut actions = Vec::new();
+        let panel_height = (self.roi_control_size.height as f32 - 24.0).max(160.0);
+        let mut desired_control_size_points = egui::vec2(
+            ROI_CONTROL_CONTENT_WIDTH_POINTS + 24.0,
+            ROI_CONTROL_MIN_INNER_HEIGHT as f32,
+        );
+
+        #[allow(deprecated)]
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let scroll_output = egui::ScrollArea::vertical()
+                .max_height(panel_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_min_width(ROI_CONTROL_CONTENT_WIDTH_POINTS);
+                    self.draw_roi_control_contents(ui, &mut actions);
+                });
+            desired_control_size_points = egui::vec2(
+                scroll_output
+                    .content_size
+                    .x
+                    .max(ROI_CONTROL_CONTENT_WIDTH_POINTS)
+                    + 32.0,
+                scroll_output.content_size.y + 32.0,
+            );
+        });
+
+        ControlUiOutput {
+            actions,
+            desired_control_size_points,
+        }
+    }
+
+    fn draw_roi_control_contents(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        controller_section(ui, "ROI", true, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.mesh.is_some(), egui::Button::new("Open ROI"))
+                    .clicked()
+                {
+                    actions.push(UiAction::PickRoi);
+                }
+                if ui
+                    .add_enabled(self.roi_layer.is_some(), egui::Button::new("Clear"))
+                    .clicked()
+                {
+                    actions.push(UiAction::ClearRoi);
+                }
+                let mut visible = self.roi_visible;
+                if ui
+                    .add_enabled_ui(self.roi_layer.is_some(), |ui| {
+                        ui.checkbox(&mut visible, "Visible")
+                    })
+                    .inner
+                    .changed()
+                {
+                    actions.push(UiAction::SetRoiVisible(visible));
+                }
+            });
+
+            ui.add_space(8.0);
+            egui::Grid::new("roi_controller_summary_grid")
+                .num_columns(2)
+                .spacing([10.0, 5.0])
+                .show(ui, |ui| {
+                    stat_row(ui, "ROI", self.roi_display_text());
+                    if let Some(layer) = self.roi_layer.as_ref() {
+                        stat_row(ui, "Objects", layer.rois.len().to_string());
+                        stat_row(ui, "Nodes", layer.mapped_nodes.to_string());
+                    }
+                });
+        });
+
+        ui.add_space(10.0);
+        controller_section(ui, "DRAWING", true, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_enabled(false, egui::Button::new("Draw"));
+                ui.add_enabled(false, egui::Button::new("Erase"));
+                ui.add_enabled(false, egui::Button::new("Fill"));
+                ui.add_enabled(false, egui::Button::new("Undo"));
+                ui.add_enabled(false, egui::Button::new("Save ROI"));
+            });
+        });
     }
 
     fn draw_surface_dataset_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
@@ -1742,81 +2433,6 @@ impl ViewerState {
             .and_then(|stat| stat.two_sided_p_value(self.overlay_appearance.threshold.value as f64))
     }
 
-    fn draw_view_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
-        controller_section(ui, "VIEW", false, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Mode");
-                ui.monospace(self.camera.mode().label());
-                if ui.button("Cycle").clicked() {
-                    actions.push(UiAction::ToggleCameraMode);
-                }
-                if ui.button("Reset").clicked() {
-                    actions.push(UiAction::ResetCamera);
-                }
-                if ui.button(self.background.next_label()).clicked() {
-                    actions.push(UiAction::ToggleBackground);
-                }
-                if ui
-                    .button("Save")
-                    .on_hover_text("Save current view")
-                    .clicked()
-                {
-                    actions.push(UiAction::SaveScreenshot);
-                }
-                if ui
-                    .button("Montage")
-                    .on_hover_text(if self.has_both_scene() {
-                        "Save closed top/bottom plus open paired-hemisphere views"
-                    } else {
-                        "Save left/right/top/bottom montage"
-                    })
-                    .clicked()
-                {
-                    actions.push(UiAction::SaveMontage);
-                }
-            });
-
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Left").clicked() {
-                    actions.push(UiAction::Preset(PresetOrientation::Left));
-                }
-                if ui.button("Right").clicked() {
-                    actions.push(UiAction::Preset(PresetOrientation::Right));
-                }
-                if ui.button("Top").clicked() {
-                    actions.push(UiAction::Preset(PresetOrientation::Top));
-                }
-                if ui.button("Bottom").clicked() {
-                    actions.push(UiAction::Preset(PresetOrientation::Bottom));
-                }
-                let can_layout_hemispheres = self.has_both_scene();
-                if ui
-                    .add_enabled(
-                        can_layout_hemispheres,
-                        egui::Button::new("Close")
-                            .selected(self.hemisphere_layout == HemisphereLayout::Closed),
-                    )
-                    .on_hover_text("Reset paired hemispheres to their closed alignment")
-                    .clicked()
-                {
-                    actions.push(UiAction::HemisphereLayout(HemisphereLayout::Closed));
-                }
-                if ui
-                    .add_enabled(
-                        can_layout_hemispheres,
-                        egui::Button::new("Open")
-                            .selected(self.hemisphere_layout == HemisphereLayout::Open),
-                    )
-                    .on_hover_text("Open paired hemispheres into the acorn view")
-                    .clicked()
-                {
-                    actions.push(UiAction::HemisphereLayout(HemisphereLayout::Open));
-                }
-            });
-        });
-    }
-
     fn draw_scene_section(&self, ui: &mut egui::Ui) {
         controller_section(ui, "SCENE", false, |ui| {
             if let Some(stats) = self.scene_stats.as_ref() {
@@ -1959,6 +2575,49 @@ impl ViewerState {
         self.control_window.request_redraw();
     }
 
+    fn fit_roi_control_window(
+        &mut self,
+        desired_control_size_points: egui::Vec2,
+        pixels_per_point: f32,
+    ) {
+        if desired_control_size_points.x <= 0.0 || desired_control_size_points.y <= 0.0 {
+            return;
+        }
+
+        let monitor_size = self
+            .roi_control_window
+            .current_monitor()
+            .map(|monitor| monitor.size());
+        let max_width = monitor_size
+            .map(|size| ((size.width as f32 * 0.65) as u32).min(ROI_CONTROL_MAX_INNER_WIDTH))
+            .unwrap_or(ROI_CONTROL_MAX_INNER_WIDTH)
+            .max(ROI_CONTROL_MIN_INNER_WIDTH);
+        let max_height = monitor_size
+            .map(|size| (size.height as f32 * 0.45) as u32)
+            .unwrap_or(520)
+            .max(ROI_CONTROL_MIN_INNER_HEIGHT);
+
+        let desired_size = PhysicalSize::new(
+            ((desired_control_size_points.x * pixels_per_point).ceil() as u32)
+                .clamp(ROI_CONTROL_MIN_INNER_WIDTH, max_width),
+            ((desired_control_size_points.y * pixels_per_point).ceil() as u32)
+                .clamp(ROI_CONTROL_MIN_INNER_HEIGHT, max_height),
+        );
+
+        if size_is_close(self.roi_control_size, desired_size) {
+            return;
+        }
+        if self.last_requested_roi_control_size == Some(desired_size) {
+            return;
+        }
+
+        self.last_requested_roi_control_size = Some(desired_size);
+        if let Some(actual_size) = self.roi_control_window.request_inner_size(desired_size) {
+            self.resize_roi_control(actual_size);
+        }
+        self.roi_control_window.request_redraw();
+    }
+
     fn apply_ui_actions(&mut self, actions: Vec<UiAction>) {
         for action in actions {
             match action {
@@ -2031,6 +2690,55 @@ impl ViewerState {
                     self.show_mode_label(mode);
                 }
                 UiAction::ToggleBackground => self.background.toggle(),
+                UiAction::SetOverlayVisible(visible) => {
+                    if self.overlay.is_some() {
+                        self.overlay_visible = visible;
+                        self.upload_surface_buffers();
+                        self.update_scene_stats();
+                        self.log_status(if visible {
+                            "Overlay visible."
+                        } else {
+                            "Overlay hidden."
+                        });
+                    }
+                }
+                UiAction::SetRoiVisible(visible) => {
+                    if self.roi_layer.is_some() {
+                        self.roi_visible = visible;
+                        self.upload_surface_buffers();
+                        self.update_scene_stats();
+                        self.log_status(if visible {
+                            "ROI visible."
+                        } else {
+                            "ROI hidden."
+                        });
+                    }
+                }
+                UiAction::ClearRoi => {
+                    if self.roi_layer.is_some() || self.roi_path.is_some() {
+                        self.roi_layer = None;
+                        self.roi_path = None;
+                        self.roi_visible = true;
+                        self.upload_surface_buffers();
+                        self.update_scene_stats();
+                        self.log_status("ROI cleared.");
+                    }
+                }
+                UiAction::SetSurfaceControllerVisible(visible) => {
+                    self.surface_controller_visible = visible;
+                    self.control_window.set_visible(visible);
+                    if visible {
+                        self.control_window.request_redraw();
+                    }
+                }
+                UiAction::SetRoiControllerOpen(open) => {
+                    self.roi_controller_open = open;
+                    self.roi_control_window.set_visible(open);
+                    if open {
+                        self.roi_control_window.request_redraw();
+                    }
+                    self.view_window.request_redraw();
+                }
                 UiAction::Preset(preset) => self.camera.set_preset(preset),
                 UiAction::HemisphereLayout(layout) => {
                     if let Err(error) = self.set_hemisphere_layout(layout) {
@@ -4528,6 +5236,11 @@ enum UiAction {
     ResetCamera,
     ToggleCameraMode,
     ToggleBackground,
+    SetOverlayVisible(bool),
+    SetRoiVisible(bool),
+    ClearRoi,
+    SetSurfaceControllerVisible(bool),
+    SetRoiControllerOpen(bool),
     Preset(PresetOrientation),
     HemisphereLayout(HemisphereLayout),
     SelectSceneSurface(usize),
