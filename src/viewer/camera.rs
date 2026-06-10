@@ -160,7 +160,7 @@ impl Camera {
         ]
         .concat();
 
-        f32_bytes(&floats)
+        super::f32_bytes(&floats)
     }
 
     fn view_projection(&self, aspect: f32) -> Mat4 {
@@ -230,16 +230,6 @@ pub(super) fn stable_up_for_direction(eye_direction: Vec3) -> Vec3 {
     } else {
         Vec3::Z
     }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
-
-    for value in values {
-        bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-
-    bytes
 }
 
 #[cfg(test)]

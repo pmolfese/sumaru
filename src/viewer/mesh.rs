@@ -129,7 +129,7 @@ impl PreparedSurface {
             floats.extend_from_slice(&vertex.color);
         }
 
-        f32_bytes(&floats)
+        super::f32_bytes(&floats)
     }
 
     pub(super) fn index_bytes(&self) -> Vec<u8> {
@@ -298,7 +298,7 @@ impl PreparedGeometry {
 impl OverlayAppearance {
     pub(super) fn from_range(range: ValueRange) -> Self {
         Self {
-            range: symmetric_range_if_signed(range),
+            range: super::symmetric_value_range(range),
             colormap: OverlayColorMap::AfniP2Spanned,
             threshold: OverlayThreshold {
                 enabled: false,
@@ -374,18 +374,6 @@ fn compose_annotation_color(base: [f32; 4], annotation: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-fn symmetric_range_if_signed(range: ValueRange) -> ValueRange {
-    if range.min < 0.0 && range.max > 0.0 {
-        let extent = range.min.abs().max(range.max.abs());
-        ValueRange {
-            min: -extent,
-            max: extent,
-        }
-    } else {
-        range
-    }
-}
-
 pub(super) fn sample_colormap(colormap: OverlayColorMap, t: f32) -> [f32; 4] {
     colormap
         .to_color_map()
@@ -397,16 +385,6 @@ pub(super) fn sample_colormap(colormap: OverlayColorMap, t: f32) -> [f32; 4] {
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
-
-    for value in values {
-        bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-
-    bytes
 }
 
 #[cfg(test)]

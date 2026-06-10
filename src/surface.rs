@@ -348,9 +348,6 @@ pub struct OverlayDataset {
     pub values: Vec<f32>,
     pub range: ValueRange,
     pub threshold_values: Option<Vec<f32>>,
-    pub threshold_pvalues: Option<Vec<f32>>,
-    pub brightness_values: Option<Vec<f32>>,
-    pub brightness_range: Option<ValueRange>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2439,9 +2436,6 @@ impl OverlayDataset {
             values,
             range,
             threshold_values: None,
-            threshold_pvalues: None,
-            brightness_values: None,
-            brightness_range: None,
         })
     }
 }

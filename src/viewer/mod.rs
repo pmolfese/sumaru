@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1094,18 +1094,7 @@ impl ViewerState {
         let full_output = egui_ctx.run(raw_input, |ctx| {
             ui_actions = self.draw_view_overlay_ui(ctx);
         });
-        let repaint_delay = full_output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|viewport| viewport.repaint_delay)
-            .unwrap_or(Duration::MAX);
-        self.view_repaint_at = if repaint_delay == Duration::ZERO {
-            Some(Instant::now())
-        } else if repaint_delay == Duration::MAX {
-            None
-        } else {
-            Instant::now().checked_add(repaint_delay)
-        };
+        self.view_repaint_at = repaint_delay_to_instant(&full_output);
         let actions_present = !ui_actions.is_empty();
         self.view_egui_state
             .handle_platform_output(&self.view_window, full_output.platform_output);
@@ -1147,19 +1136,13 @@ impl ViewerState {
 
         self.encode_surface_render_pass(&mut encoder, &view, &self.depth_buffer.view);
 
-        let mut retained_textures = egui::TexturesDelta::default();
-        let mut needs_texture_repaint = false;
-        for (id, image_delta) in &self.view_pending_egui_textures.set {
-            if image_delta.pos.is_some() && !self.view_allocated_egui_textures.contains(id) {
-                retained_textures.set.push((*id, image_delta.clone()));
-                needs_texture_repaint = true;
-                continue;
-            }
-
-            self.view_egui_renderer
-                .update_texture(&self.device, &self.queue, *id, image_delta);
-            self.view_allocated_egui_textures.insert(*id);
-        }
+        let (needs_texture_repaint, retained_textures) = upload_pending_egui_textures(
+            &self.device,
+            &self.queue,
+            &mut self.view_egui_renderer,
+            &self.view_pending_egui_textures,
+            &mut self.view_allocated_egui_textures,
+        );
         let mut command_buffers = self.view_egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -1193,11 +1176,11 @@ impl ViewerState {
             );
         }
 
-        for id in &self.view_pending_egui_textures.free {
-            if self.view_allocated_egui_textures.remove(id) {
-                self.view_egui_renderer.free_texture(id);
-            }
-        }
+        free_pending_egui_textures(
+            &mut self.view_egui_renderer,
+            &self.view_pending_egui_textures,
+            &mut self.view_allocated_egui_textures,
+        );
         self.view_pending_egui_textures = retained_textures;
         if needs_texture_repaint {
             self.view_repaint_at = Some(Instant::now());
@@ -1563,18 +1546,12 @@ impl ViewerState {
         });
         // Schedule the next control-window repaint from egui's requested delay:
         // ZERO means "again next frame" (an active animation), MAX means idle.
+        self.control_repaint_at = repaint_delay_to_instant(&full_output);
         let repaint_delay = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map(|viewport| viewport.repaint_delay)
             .unwrap_or(Duration::MAX);
-        self.control_repaint_at = if repaint_delay == Duration::ZERO {
-            Some(Instant::now())
-        } else if repaint_delay == Duration::MAX {
-            None
-        } else {
-            Instant::now().checked_add(repaint_delay)
-        };
         // A panel action (load, toggle, camera/background change) alters the
         // 3D scene, so the view window needs to repaint too.
         let actions_present = !ui_actions.is_empty();
@@ -1619,19 +1596,13 @@ impl ViewerState {
                 label: Some("control render encoder"),
             });
 
-        let mut retained_textures = egui::TexturesDelta::default();
-        let mut needs_texture_repaint = false;
-        for (id, image_delta) in &self.pending_egui_textures.set {
-            if image_delta.pos.is_some() && !self.allocated_egui_textures.contains(id) {
-                retained_textures.set.push((*id, image_delta.clone()));
-                needs_texture_repaint = true;
-                continue;
-            }
-
-            self.egui_renderer
-                .update_texture(&self.device, &self.queue, *id, image_delta);
-            self.allocated_egui_textures.insert(*id);
-        }
+        let (needs_texture_repaint, retained_textures) = upload_pending_egui_textures(
+            &self.device,
+            &self.queue,
+            &mut self.egui_renderer,
+            &self.pending_egui_textures,
+            &mut self.allocated_egui_textures,
+        );
         let mut command_buffers = self.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -1670,11 +1641,11 @@ impl ViewerState {
             );
         }
 
-        for id in &self.pending_egui_textures.free {
-            if self.allocated_egui_textures.remove(id) {
-                self.egui_renderer.free_texture(id);
-            }
-        }
+        free_pending_egui_textures(
+            &mut self.egui_renderer,
+            &self.pending_egui_textures,
+            &mut self.allocated_egui_textures,
+        );
         self.pending_egui_textures = retained_textures;
         if needs_texture_repaint {
             // Deferred texture upload: repaint next frame to finish it. Under
@@ -1712,18 +1683,12 @@ impl ViewerState {
             ui_actions = output.actions;
             desired_roi_control_size_points = output.desired_control_size_points;
         });
+        self.roi_control_repaint_at = repaint_delay_to_instant(&full_output);
         let repaint_delay = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map(|viewport| viewport.repaint_delay)
             .unwrap_or(Duration::MAX);
-        self.roi_control_repaint_at = if repaint_delay == Duration::ZERO {
-            Some(Instant::now())
-        } else if repaint_delay == Duration::MAX {
-            None
-        } else {
-            Instant::now().checked_add(repaint_delay)
-        };
 
         let actions_present = !ui_actions.is_empty();
         self.roi_egui_state
@@ -1774,19 +1739,13 @@ impl ViewerState {
                 label: Some("ROI control render encoder"),
             });
 
-        let mut retained_textures = egui::TexturesDelta::default();
-        let mut needs_texture_repaint = false;
-        for (id, image_delta) in &self.roi_pending_egui_textures.set {
-            if image_delta.pos.is_some() && !self.roi_allocated_egui_textures.contains(id) {
-                retained_textures.set.push((*id, image_delta.clone()));
-                needs_texture_repaint = true;
-                continue;
-            }
-
-            self.roi_egui_renderer
-                .update_texture(&self.device, &self.queue, *id, image_delta);
-            self.roi_allocated_egui_textures.insert(*id);
-        }
+        let (needs_texture_repaint, retained_textures) = upload_pending_egui_textures(
+            &self.device,
+            &self.queue,
+            &mut self.roi_egui_renderer,
+            &self.roi_pending_egui_textures,
+            &mut self.roi_allocated_egui_textures,
+        );
         let mut command_buffers = self.roi_egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -1825,11 +1784,11 @@ impl ViewerState {
             );
         }
 
-        for id in &self.roi_pending_egui_textures.free {
-            if self.roi_allocated_egui_textures.remove(id) {
-                self.roi_egui_renderer.free_texture(id);
-            }
-        }
+        free_pending_egui_textures(
+            &mut self.roi_egui_renderer,
+            &self.roi_pending_egui_textures,
+            &mut self.roi_allocated_egui_textures,
+        );
         self.roi_pending_egui_textures = retained_textures;
         if needs_texture_repaint {
             self.roi_control_repaint_at = Some(Instant::now());
@@ -2603,37 +2562,25 @@ impl ViewerState {
         desired_control_size_points: egui::Vec2,
         pixels_per_point: f32,
     ) {
-        if desired_control_size_points.x <= 0.0 || desired_control_size_points.y <= 0.0 {
+        let Some(desired_size) = desired_panel_size(
+            &self.control_window,
+            desired_control_size_points,
+            pixels_per_point,
+            CONTROL_MIN_INNER_WIDTH,
+            CONTROL_MIN_INNER_HEIGHT,
+            0.55,
+            CONTROL_MAX_INNER_WIDTH,
+            0.85,
+            960,
+        ) else {
             return;
-        }
-
-        let monitor_size = self
-            .control_window
-            .current_monitor()
-            .map(|monitor| monitor.size());
-        let max_width = monitor_size
-            .map(|size| ((size.width as f32 * 0.55) as u32).min(CONTROL_MAX_INNER_WIDTH))
-            .unwrap_or(CONTROL_MAX_INNER_WIDTH)
-            .max(CONTROL_MIN_INNER_WIDTH);
-        let max_height = monitor_size
-            .map(|size| (size.height as f32 * 0.85) as u32)
-            .unwrap_or(960)
-            .max(CONTROL_MIN_INNER_HEIGHT);
-
-        let desired_size = PhysicalSize::new(
-            ((desired_control_size_points.x * pixels_per_point).ceil() as u32)
-                .clamp(CONTROL_MIN_INNER_WIDTH, max_width),
-            ((desired_control_size_points.y * pixels_per_point).ceil() as u32)
-                .clamp(CONTROL_MIN_INNER_HEIGHT, max_height),
-        );
-
+        };
         if size_is_close(self.control_size, desired_size) {
             return;
         }
         if self.last_requested_control_size == Some(desired_size) {
             return;
         }
-
         self.last_requested_control_size = Some(desired_size);
         if let Some(actual_size) = self.control_window.request_inner_size(desired_size) {
             self.resize_control(actual_size);
@@ -2646,37 +2593,25 @@ impl ViewerState {
         desired_control_size_points: egui::Vec2,
         pixels_per_point: f32,
     ) {
-        if desired_control_size_points.x <= 0.0 || desired_control_size_points.y <= 0.0 {
+        let Some(desired_size) = desired_panel_size(
+            &self.roi_control_window,
+            desired_control_size_points,
+            pixels_per_point,
+            ROI_CONTROL_MIN_INNER_WIDTH,
+            ROI_CONTROL_MIN_INNER_HEIGHT,
+            0.65,
+            ROI_CONTROL_MAX_INNER_WIDTH,
+            0.45,
+            520,
+        ) else {
             return;
-        }
-
-        let monitor_size = self
-            .roi_control_window
-            .current_monitor()
-            .map(|monitor| monitor.size());
-        let max_width = monitor_size
-            .map(|size| ((size.width as f32 * 0.65) as u32).min(ROI_CONTROL_MAX_INNER_WIDTH))
-            .unwrap_or(ROI_CONTROL_MAX_INNER_WIDTH)
-            .max(ROI_CONTROL_MIN_INNER_WIDTH);
-        let max_height = monitor_size
-            .map(|size| (size.height as f32 * 0.45) as u32)
-            .unwrap_or(520)
-            .max(ROI_CONTROL_MIN_INNER_HEIGHT);
-
-        let desired_size = PhysicalSize::new(
-            ((desired_control_size_points.x * pixels_per_point).ceil() as u32)
-                .clamp(ROI_CONTROL_MIN_INNER_WIDTH, max_width),
-            ((desired_control_size_points.y * pixels_per_point).ceil() as u32)
-                .clamp(ROI_CONTROL_MIN_INNER_HEIGHT, max_height),
-        );
-
+        };
         if size_is_close(self.roi_control_size, desired_size) {
             return;
         }
         if self.last_requested_roi_control_size == Some(desired_size) {
             return;
         }
-
         self.last_requested_roi_control_size = Some(desired_size);
         if let Some(actual_size) = self.roi_control_window.request_inner_size(desired_size) {
             self.resize_roi_control(actual_size);
@@ -2888,17 +2823,7 @@ impl ViewerState {
         }
     }
 
-    fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
-        let mut mesh = SurfaceMesh::from_gifti_path(&path)
-            .with_context(|| format!("failed to load surface {}", path.display()))?;
-        apply_surface_volume_parent(&mut mesh, self.surface_volume_path.as_ref());
-        let node_count = mesh.vertices.len();
-        let face_count = mesh.triangles.len();
-
-        self.set_active_mesh(mesh, None);
-        self.scene_generation = self.scene_generation.wrapping_add(1);
-        self.surface_scene = None;
-        self.surface_path = Some(path.clone());
+    fn reset_scene_state(&mut self) {
         self.overlay = None;
         self.overlay_values = None;
         self.overlay_dataset = None;
@@ -2915,6 +2840,20 @@ impl ViewerState {
         self.roi_visible = true;
         self.surface_pick = None;
         self.pair_visibility = PairVisibility::both();
+    }
+
+    fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
+        let mut mesh = SurfaceMesh::from_gifti_path(&path)
+            .with_context(|| format!("failed to load surface {}", path.display()))?;
+        apply_surface_volume_parent(&mut mesh, self.surface_volume_path.as_ref());
+        let node_count = mesh.vertices.len();
+        let face_count = mesh.triangles.len();
+
+        self.set_active_mesh(mesh, None);
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+        self.surface_scene = None;
+        self.surface_path = Some(path.clone());
+        self.reset_scene_state();
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.camera.reset();
@@ -2994,22 +2933,7 @@ impl ViewerState {
             skipped_surfaces,
             skipped_states,
         });
-        self.overlay = None;
-        self.overlay_values = None;
-        self.overlay_dataset = None;
-        self.overlay_columns = OverlayColumnSelections::default();
-        self.overlay_visible = true;
-        self.overlay_appearance = OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE);
-        self.overlay_symmetric_range = true;
-        self.overlay_path = None;
-        self.overlay_display_name = None;
-        self.roi_path = None;
-        self.roi_layer = None;
-        self.roi_loaded_rois.clear();
-        self.roi_draft.clear();
-        self.roi_visible = true;
-        self.surface_pick = None;
-        self.pair_visibility = PairVisibility::both();
+        self.reset_scene_state();
         self.ensure_scene_surface_loaded(0)?;
         self.activate_scene_surface(0)?;
         self.start_scene_preload(generation);
@@ -3234,7 +3158,7 @@ impl ViewerState {
         self.surface_path = Some(path.clone());
         self.surface_pick = None;
         if self.roi_layer.is_some() {
-            self.refresh_roi_layer()?;
+            self.rebuild_roi_layer_from_state()?;
         }
         if self.has_both_scene() && self.pair_visibility != PairVisibility::both() {
             self.refresh_active_pair_render_geometry()?;
@@ -3794,7 +3718,7 @@ impl ViewerState {
         self.surface_path = Some(path);
         self.surface_pick = None;
         if self.roi_layer.is_some() {
-            self.refresh_roi_layer()?;
+            self.rebuild_roi_layer_from_state()?;
         }
         if self.has_both_scene() && self.pair_visibility != PairVisibility::both() {
             self.refresh_active_pair_render_geometry()?;
@@ -3936,10 +3860,6 @@ impl ViewerState {
             mapped_nodes: build.mapped_nodes,
             skipped_nodes: build.skipped_nodes,
         })
-    }
-
-    fn refresh_roi_layer(&mut self) -> Result<()> {
-        self.rebuild_roi_layer_from_state()
     }
 
     fn rebuild_roi_layer_from_state(&mut self) -> Result<()> {
@@ -5472,7 +5392,7 @@ struct RoiLayer {
     display_name: String,
     rois: Vec<Roi>,
     appearance: RoiAppearance,
-    node_labels: Vec<Vec<String>>,
+    node_labels: HashMap<u32, Vec<String>>,
     mapped_nodes: usize,
     skipped_nodes: usize,
 }
@@ -5520,7 +5440,7 @@ struct RoiPickTarget {
 impl RoiLayer {
     fn labels_for_node(&self, node: u32) -> &[String] {
         self.node_labels
-            .get(node as usize)
+            .get(&node)
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -5699,7 +5619,7 @@ impl RoiDraft {
 #[derive(Debug, Clone)]
 struct RoiAppearanceBuild {
     appearance: RoiAppearance,
-    node_labels: Vec<Vec<String>>,
+    node_labels: HashMap<u32, Vec<String>>,
     mapped_nodes: usize,
     skipped_nodes: usize,
 }
@@ -6594,7 +6514,7 @@ fn roi_appearance_for_mesh(
     ranges: &[RoiComponentRange],
 ) -> Result<RoiAppearanceBuild> {
     let mut appearance = RoiAppearance::empty(mesh.vertices.len());
-    let mut node_labels = vec![Vec::new(); mesh.vertices.len()];
+    let mut node_labels: HashMap<u32, Vec<String>> = HashMap::new();
     let mut mapped = BTreeSet::new();
     let mut skipped_nodes = 0usize;
 
@@ -6647,7 +6567,7 @@ fn paint_roi_datum(
     ranges: &[RoiComponentRange],
     color: [f32; 4],
     appearance: &mut RoiAppearance,
-    node_labels: &mut [Vec<String>],
+    node_labels: &mut HashMap<u32, Vec<String>>,
     mapped: &mut BTreeSet<u32>,
 ) -> usize {
     let mut skipped = 0usize;
@@ -6657,9 +6577,8 @@ fn paint_roi_datum(
         match node {
             Some(node) if appearance.set_node_color(node, color) => {
                 mapped.insert(node);
-                if let Some(labels) = node_labels.get_mut(node as usize)
-                    && !labels.contains(&label)
-                {
+                let labels = node_labels.entry(node).or_default();
+                if !labels.contains(&label) {
                     labels.push(label.clone());
                 }
             }
@@ -6890,16 +6809,8 @@ fn overlay_dataset_from_canonical_dataset(
         .threshold
         .and_then(|index| dataset.columns.get(index))
         .filter(|column| column_is_numeric(column));
-    let brightness_column = columns
-        .brightness
-        .and_then(|index| dataset.columns.get(index))
-        .filter(|column| column_is_numeric(column));
-    let threshold_stat =
-        threshold_column.and_then(|column| column.stat.as_deref().and_then(AfniStatSpec::parse));
     let mut values = vec![f32::NAN; node_count];
     let mut threshold_values = threshold_column.map(|_| vec![f32::NAN; node_count]);
-    let mut threshold_pvalues = threshold_stat.as_ref().map(|_| vec![f32::NAN; node_count]);
-    let mut brightness_values = brightness_column.map(|_| vec![f32::NAN; node_count]);
 
     for row in 0..dataset.row_count {
         let Some(node) = dataset.node_for_row(row) else {
@@ -6918,40 +6829,15 @@ fn overlay_dataset_from_canonical_dataset(
                 slots.get_mut(node),
             ) {
                 *slot = value;
-                if let (Some(stat), Some(pvalue_slots)) =
-                    (threshold_stat.as_ref(), threshold_pvalues.as_mut())
-                {
-                    if let (Some(pvalue), Some(pvalue_slot)) = (
-                        stat.two_sided_p_value(value as f64),
-                        pvalue_slots.get_mut(node),
-                    ) {
-                        *pvalue_slot = pvalue as f32;
-                    }
-                }
-            }
-        }
-        if let (Some(column), Some(slots)) = (brightness_column, brightness_values.as_mut()) {
-            if let (Some(value), Some(slot)) = (
-                numeric_column_value_as_f32(column, row),
-                slots.get_mut(node),
-            ) {
-                *slot = value;
             }
         }
     }
 
     let range = ValueRange::from_values(&values)?;
-    let brightness_range = brightness_values
-        .as_ref()
-        .map(|values| ValueRange::from_values(values))
-        .transpose()?;
     Ok(OverlayDataset {
         values,
         range,
         threshold_values,
-        threshold_pvalues,
-        brightness_values,
-        brightness_range,
     })
 }
 
@@ -7456,7 +7342,92 @@ fn range_drag_speed(range: ValueRange) -> f32 {
     ((range.max - range.min).abs() / 200.0).max(0.001)
 }
 
-fn symmetric_value_range(range: ValueRange) -> ValueRange {
+fn repaint_delay_to_instant(full_output: &egui::FullOutput) -> Option<Instant> {
+    let repaint_delay = full_output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map(|viewport| viewport.repaint_delay)
+        .unwrap_or(Duration::MAX);
+    if repaint_delay == Duration::ZERO {
+        Some(Instant::now())
+    } else if repaint_delay == Duration::MAX {
+        None
+    } else {
+        Instant::now().checked_add(repaint_delay)
+    }
+}
+
+fn upload_pending_egui_textures(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut Renderer,
+    pending: &egui::TexturesDelta,
+    allocated: &mut HashSet<egui::TextureId>,
+) -> (bool, egui::TexturesDelta) {
+    let mut retained = egui::TexturesDelta::default();
+    let mut needs_repaint = false;
+    for (id, image_delta) in &pending.set {
+        if image_delta.pos.is_some() && !allocated.contains(id) {
+            retained.set.push((*id, image_delta.clone()));
+            needs_repaint = true;
+            continue;
+        }
+        renderer.update_texture(device, queue, *id, image_delta);
+        allocated.insert(*id);
+    }
+    (needs_repaint, retained)
+}
+
+fn free_pending_egui_textures(
+    renderer: &mut Renderer,
+    pending: &egui::TexturesDelta,
+    allocated: &mut HashSet<egui::TextureId>,
+) {
+    for id in &pending.free {
+        if allocated.remove(id) {
+            renderer.free_texture(id);
+        }
+    }
+}
+
+fn desired_panel_size(
+    window: &Window,
+    desired_points: egui::Vec2,
+    pixels_per_point: f32,
+    min_width: u32,
+    min_height: u32,
+    max_width_factor: f32,
+    max_width_cap: u32,
+    max_height_factor: f32,
+    fallback_height: u32,
+) -> Option<PhysicalSize<u32>> {
+    if desired_points.x <= 0.0 || desired_points.y <= 0.0 {
+        return None;
+    }
+    let monitor_size = window.current_monitor().map(|monitor| monitor.size());
+    let max_width = monitor_size
+        .map(|size| ((size.width as f32 * max_width_factor) as u32).min(max_width_cap))
+        .unwrap_or(max_width_cap)
+        .max(min_width);
+    let max_height = monitor_size
+        .map(|size| (size.height as f32 * max_height_factor) as u32)
+        .unwrap_or(fallback_height)
+        .max(min_height);
+    Some(PhysicalSize::new(
+        ((desired_points.x * pixels_per_point).ceil() as u32).clamp(min_width, max_width),
+        ((desired_points.y * pixels_per_point).ceil() as u32).clamp(min_height, max_height),
+    ))
+}
+
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+pub(super) fn symmetric_value_range(range: ValueRange) -> ValueRange {
     if range.min < 0.0 && range.max > 0.0 {
         let extent = range.min.abs().max(range.max.abs());
         ValueRange {
@@ -7747,8 +7718,8 @@ mod tests {
         assert_eq!(build.mapped_nodes, 2);
         assert!(build.appearance.node_colors[1].is_some());
         assert!(build.appearance.node_colors[4].is_some());
-        assert_eq!(build.node_labels[1], vec!["left-roi (1)"]);
-        assert_eq!(build.node_labels[4], vec!["right-roi (2)"]);
+        assert_eq!(build.node_labels.get(&1).unwrap(), &vec!["left-roi (1)"]);
+        assert_eq!(build.node_labels.get(&4).unwrap(), &vec!["right-roi (2)"]);
     }
 
     #[test]
