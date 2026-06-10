@@ -52,16 +52,24 @@ pub(super) fn pick_surface(
 
         if hit.distance < best_distance {
             let hit_position = ray.origin + ray.direction * hit.distance;
+            let surface_position = hit_position / scale + center;
             let node_index = closest_triangle_node(triangle, positions, hit_position);
             let overlay_value = overlay
                 .and_then(|overlay| overlay.values.get(node_index as usize))
+                .copied();
+            let threshold_value = overlay
+                .and_then(|overlay| overlay.threshold_values.as_ref())
+                .and_then(|values| values.get(node_index as usize))
                 .copied();
 
             best_distance = hit.distance;
             best_pick = Some(SurfacePick {
                 node_index,
                 face_index,
+                surface_position: surface_position.to_array(),
+                normalized_position: hit_position.to_array(),
                 overlay_value,
+                threshold_value,
             });
         }
     }
@@ -236,7 +244,7 @@ mod tests {
                 min: 10.0,
                 max: 30.0,
             },
-            threshold_values: None,
+            threshold_values: Some(vec![1.0, 2.0, 3.0]),
             threshold_pvalues: None,
             brightness_values: None,
             brightness_range: None,
@@ -255,7 +263,10 @@ mod tests {
 
         assert_eq!(pick.node_index, 2);
         assert_eq!(pick.face_index, 0);
+        assert_vec3_close(Vec3::from_array(pick.surface_position), Vec3::ZERO);
+        assert_vec3_close(Vec3::from_array(pick.normalized_position), Vec3::ZERO);
         assert_eq!(pick.overlay_value, Some(30.0));
+        assert_eq!(pick.threshold_value, Some(3.0));
     }
 
     fn assert_vec3_close(actual: Vec3, expected: Vec3) {

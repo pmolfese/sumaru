@@ -48,16 +48,16 @@ interop, and volume rendering.
 
 ### Tier 2 — ROI loop
 
-- [ ] Add persistent node/triangle selection highlighting and crosshair state
+- [x] Add persistent node/triangle selection highlighting and crosshair state
   (from Phase 4) on top of the existing right-click pick.
-- [ ] Load and display `.niml.roi` regions (from Phases 3/5), including a
+- [x] Load and display `.niml.roi` regions (from Phases 3/5), including a
   second color layer composited over the scalar overlay.
 - [ ] Drawing, editing, undo/redo, and `.niml.roi` save (from Phase 5),
   exercising the Phase 2 node/edge/triangle paths, fill-to-mask, and geodesics.
 
 ### Tier 3 — Sessions and anatomy
 
-- [ ] Parse `.spec` files and load multi-surface scenes with visibility toggles
+- [x] Parse `.spec` files and load multi-surface scenes with visibility toggles
   and pial/inflated/sphere state switching (from Phases 3/5), with required
   surface-volume parent context for spec launches.
   - [x] Parse single- and both-hemisphere `.spec` files into surface entries,
@@ -66,6 +66,8 @@ interop, and volume rendering.
     the surface-volume parent on loaded spec surfaces.
   - [x] Load single-hemisphere spec scenes and switch the active surface with
     `.` and `,`.
+  - [x] Add an `Active` controller dropdown for direct pial/inflated/sphere or
+    spec-state selection.
   - [x] Load `both` specs as paired left/right surfaces rendered together.
   - [x] Add closed/acorn paired-hemisphere view presets and Control-drag
     controls for opening angle and hemisphere gap.
@@ -207,77 +209,48 @@ the next rung.
   surface/dataset behavior covered by focused unit tests. Use
   AFNI/nibabel/Python readers as reference tools for future test expectations,
   not runtime dependencies.
-  - Why: Neuroimaging files have many edge cases, and fixtures keep reader
-    behavior from drifting silently.
 
 ## Phase 2: Surface Geometry Core
 
 - [x] Compute bounding boxes, centers, and radius for loaded surfaces.
 - [x] Compute vertex normals for triangle meshes.
 - [x] Compute face normals, polygon areas, node areas, and total mesh area.
-  - Why: These are basic mesh facts needed for lighting, validation, smoothing,
-    statistics, and quality checks.
 - [x] Detect normal direction and triangle winding; add utilities to flip or
   orient triangles consistently when source files disagree.
-  - Why: Some files disagree about triangle order, and wrong winding makes
-    lighting, picking, and inside/outside tests misleading.
 - [x] Build topology caches analogous to SUMA's `MF`, `FN`, and `EL`: per-node
   member faces, first-order neighbors, neighbor distances, unique edge list,
   edge-to-host-face mapping, and boundary edges/triangles.
-  - Why: Many surface operations need fast neighbor and edge lookup; rebuilding
-    those lists every time would be slow.
 - [x] Validate meshes beyond bounds checks: empty geometry, duplicate or
   degenerate triangles, non-manifold edges, invalid polygon dimensions where
   representable, disconnected components, boundary edges/loops, and winding
   diagnostics.
-  - Why: Bad meshes should fail early with useful errors instead of producing
-    strange overlays or viewer behavior later.
 - [x] Add robust node/row lookup helpers so sparse datasets, overlays, ROI
   paths, and full-node arrays can all agree on node IDs versus row indices.
-  - Why: Sparse data often says "this row is node 123"; we need that mapping to
-    avoid coloring or editing the wrong node.
 - [x] Implement masks and patches: node masks, face masks derived from node
   masks, patch extraction, patch bounds, and mask composition.
-  - Why: Masks and patches are the practical building blocks for ROIs,
-    thresholded views, focused analysis, and exports.
 - [x] Add geometry operations for ROI workflows: node paths, edge paths,
   triangle paths, contour edges, fill-to-mask behavior, path lengths, and basic
   geodesic distance reporting.
-  - Why: Drawing and editing ROIs depends on paths over the mesh, not just
-    freehand screen coordinates.
 - [x] Implement graph/geodesic operations used by SUMA workflows: Dijkstra
   shortest path, k-ring neighborhoods, distance-limited neighborhoods, and
   approximate spherical neighborhoods for fast region queries.
-  - Why: Users often ask questions in surface distance, and Euclidean distance
-    through the brain is the wrong measure.
 - [x] Add curvature and shape metrics needed for common overlays: convexity,
   curvature-style scalar fields, and parent-aware shape data.
-  - Why: Curvature-like maps are standard context for seeing folds, sulci, and
-    anatomy on cortical surfaces.
 - [x] Add first smoothing primitives for surface data and geometry:
   nearest-neighbor smoothing, weighted smoothing, mask-respecting smoothing,
   and vertex smoothing.
-  - Why: Smoothing is a common preprocessing and visualization step, and doing
-    it on the surface preserves cortical topology.
 - [x] Add coordinate-space transforms and affine composition for surface
   geometry, including load-time transforms and interactive/display transforms.
-  - Why: Surfaces, volumes, templates, and viewers need a shared way to move
-    between coordinate spaces.
 - [x] Add surface-volume geometry primitives needed later by AFNI interop and
   volume rendering: voxel/index/world conversion, nearest surface node to
   voxel/world position, surface voxelization, voxel-to-surface distance, and
   volume-to-surface sampling hooks.
-  - Why: Surface and volume data often need to talk to each other, especially
-    for AFNI-style workflows.
 - [x] Add clipping and intersection geometry: plane/surface intersections,
   clipped contours, visible patch extraction, and screenshot/export-friendly
   render masks.
-  - Why: Clipping and cuts make dense surfaces easier to inspect and export.
 - [x] Add surface-to-surface mapping support: same-topology transfer,
   nearest-neighbor transfer, barycentric/triangle transfer, and domain-kinship
   checks before values move between surfaces.
-  - Why: Data often needs to move between pial, inflated, sphere, native, and
-    standard surfaces without unsafe assumptions.
 
 ## Phase 3: SUMA Compatibility Layer
 
@@ -303,13 +276,9 @@ the next rung.
 - [x] Parse `.spec` files into surface groups, states, hemispheres, labels,
   topology/coordinate file pairs, local domain parents, curvature parents, and
   surface-volume parent references.
-  - Why: `.spec` files describe how a SUMA scene fits together, so they are the
-    bridge from single-file loading to real sessions.
 - [x] Parse `.niml.dset` and AFNI-converted `.gii.dset` into the canonical
   `Dataset` model with column labels, column roles, typed values, node-index
   columns, ranges, stat metadata, and parent/domain ids.
-  - Why: AFNI datasets can arrive as NIML or GIFTI, and both carry the rich
-    table structure that overlays, thresholds, and statistics need.
 - [ ] Parse `.niml.roi` into `Roi`/`RoiDatum` with stroke history, node
   paths, triangle paths, labels, colors, and parent-surface metadata.
   - Why: Reading ROI files lets users bring existing SUMA annotations into
@@ -354,17 +323,11 @@ the next rung.
 - [x] Add first scalar overlay coloring from a GIFTI data array.
 - [x] Introduce `egui` with `egui-winit`/`egui-wgpu` for the first native
   viewer control panel.
-  - Why: Panels are easier and more consistent with a real UI toolkit than
-    with hand-drawn overlay text.
 - [x] Add a first in-viewer workbench for loading surface and overlay paths,
   showing load errors, displaying scene stats, and driving camera/background
   controls.
-  - Why: Faster visual testing makes it much easier to evaluate real surfaces
-    and overlays while the deeper SUMA features are still being built.
 - [x] Move the first workbench into a separate native controls window so it no
   longer consumes surface viewport space or intercepts surface clicks.
-  - Why: Surface inspection needs as much uninterrupted viewport area as
-    possible, while controls should remain available beside it.
 - [ ] Move camera, background, overlay, and selection settings into a shared
   controller/command state instead of leaving them as viewer-only state.
   - Why: Shared command state lets keys, panels, scripts, and AFNI messages
@@ -388,16 +351,12 @@ the next rung.
     controller mockup and implementation notes.
 - [x] Add native file picker support for loading surfaces, overlays, specs, and
   surface volumes from the first viewer workbench.
-  - Why: File dialogs make visual testing faster while exact fixture paths and
-    scripted workflows remain command-line workflows.
 - [ ] Add recent-file support if repeated manual loading becomes annoying.
   - Why: File dialogs are simple and reliable for testing, but repeated manual
     loading will eventually want remembered recent files and working folders.
 - [ ] Add label-table-aware coloring.
   - Why: Label datasets should display named regions with their intended colors.
 - [x] Add selectable color maps.
-  - Why: Different scalar data needs different visual encodings, and users need
-    control over that choice.
 - [ ] Add threshold, clipping, opacity, and symmetric-range controls.
   - Why: These controls are how users turn dense scalar maps into interpretable
     surface overlays.
@@ -406,16 +365,9 @@ the next rung.
     should be predictable.
 - [x] Add first right-click node/triangle inspection with scalar overlay
   values.
-  - Why: Users need to click the surface and know exactly which node or face
-    they are inspecting.
-- [ ] Add persistent node/triangle selection highlighting.
-  - Why: Inspection answers what is under the cursor; selection should also
-    remember and visually mark the active node or face for later commands.
-- [ ] Add crosshair state and display.
-  - Why: Crosshairs link the viewer to coordinates, selections, and later AFNI
-    or volume views.
+- [x] Add persistent node/triangle selection highlighting.
+- [x] Add crosshair state and display.
 - [x] Add screenshot export.
-  - Why: Users need a direct way to save figures for notes, QA, and papers.
 - [ ] Add viewer tests or screenshot/pixel checks for nonblank rendering once
   automated graphics verification is practical.
   - Why: Rendering bugs are easy to miss in code review, so pixel checks give
@@ -428,15 +380,11 @@ the next rung.
 
 - [x] Add multi-surface scenes: pial, smoothwm, inflated, sphere, and
   registered template surfaces.
-  - Why: SUMA's power comes from switching among related surfaces in one scene,
-    not opening one mesh at a time.
 - [ ] Add surface visibility toggles and current-surface focus.
   - Why: Multi-surface scenes need simple controls for hiding, showing, and
     choosing the active surface.
 - [x] Add state switching across related surfaces, such as anatomical,
   inflated, spherical, and template states.
-  - Why: State switching lets users inspect the same data on surfaces that make
-    different anatomical features easier to see.
 - [ ] Add node/triangle inspection panels backed by shared selection state.
   - Why: Clicking a node should reveal useful facts like coordinates, labels,
     overlay values, and topology.

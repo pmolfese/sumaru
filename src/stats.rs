@@ -60,6 +60,44 @@ impl AfniStatSpec {
             _ => None,
         }
     }
+
+    pub fn statistic_for_p_value(&self, p_value: f64) -> Option<f64> {
+        if !(0.0..=1.0).contains(&p_value) || !p_value.is_finite() {
+            return None;
+        }
+        if p_value == 1.0 {
+            return Some(0.0);
+        }
+        if p_value == 0.0 {
+            return None;
+        }
+
+        let mut high = 1.0;
+        for _ in 0..128 {
+            if self.two_sided_p_value(high)? <= p_value {
+                break;
+            }
+            high *= 2.0;
+            if !high.is_finite() || high > 1.0e12 {
+                return None;
+            }
+        }
+        if self.two_sided_p_value(high)? > p_value {
+            return None;
+        }
+
+        let mut low = 0.0;
+        for _ in 0..96 {
+            let midpoint = (low + high) * 0.5;
+            if self.two_sided_p_value(midpoint)? <= p_value {
+                high = midpoint;
+            } else {
+                low = midpoint;
+            }
+        }
+
+        Some(high)
+    }
 }
 
 fn t_two_tailed_p_value(t: f64, df: f64) -> Option<f64> {
@@ -317,18 +355,36 @@ mod tests {
         assert_close(spec.two_sided_p_value(0.0).unwrap(), 1.0, 0.000_001);
         assert_close(spec.two_sided_p_value(2.010_635).unwrap(), 0.05, 0.000_1);
         assert!(spec.two_sided_p_value(8.997_519).unwrap() < 1.0e-10);
+        assert_close(
+            spec.statistic_for_p_value(0.05).unwrap(),
+            2.010_635,
+            0.000_1,
+        );
     }
 
     #[test]
     fn f_z_and_chi_square_p_values_match_reference_points() {
         let f = AfniStatSpec::parse("Ftest(1,48)").unwrap();
         assert_close(f.two_sided_p_value(4.042_652).unwrap(), 0.05, 0.000_1);
+        assert_close(f.statistic_for_p_value(0.05).unwrap(), 4.042_652, 0.000_1);
 
         let z = AfniStatSpec::parse("Zscore()").unwrap();
         assert_close(z.two_sided_p_value(1.959_964).unwrap(), 0.05, 0.000_1);
+        assert_close(z.statistic_for_p_value(0.05).unwrap(), 1.959_964, 0.000_1);
 
         let chi = AfniStatSpec::parse("ChiSq(1)").unwrap();
         assert_close(chi.two_sided_p_value(3.841_459).unwrap(), 0.05, 0.000_1);
+        assert_close(chi.statistic_for_p_value(0.05).unwrap(), 3.841_459, 0.000_1);
+    }
+
+    #[test]
+    fn invalid_or_impossible_p_value_thresholds_are_rejected() {
+        let spec = AfniStatSpec::parse("Ttest(48)").unwrap();
+
+        assert_eq!(spec.statistic_for_p_value(1.0), Some(0.0));
+        assert!(spec.statistic_for_p_value(0.0).is_none());
+        assert!(spec.statistic_for_p_value(-0.1).is_none());
+        assert!(spec.statistic_for_p_value(1.1).is_none());
     }
 
     fn assert_close(actual: f64, expected: f64, tolerance: f64) {

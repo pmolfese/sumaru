@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -18,10 +18,11 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
-use crate::io::{read_gifti_dataset, read_niml_dataset};
+use crate::io::{read_gifti_dataset, read_niml_dataset, read_niml_roi};
 use crate::overlay::{
     ColumnSelection, MaskMode, Overlay, OverlayColumns, OverlayRange, RangeSelection, Threshold,
 };
+use crate::roi::{Roi, RoiBrushAction, RoiDatum, RoiElementKind};
 use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, read_spec};
 use crate::stats::AfniStatSpec;
 use crate::surface::{
@@ -34,7 +35,7 @@ use gpu::{
 };
 use mesh::{
     OverlayAppearance, OverlayColorMap, PreparedGeometry, PreparedGeometryVertex, PreparedSurface,
-    sample_colormap,
+    RoiAppearance, SelectionHighlight, sample_colormap,
 };
 use pick::pick_surface;
 use screenshot::ScreenshotImage;
@@ -54,11 +55,13 @@ const STARTUP_REDRAW_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const CONTROL_CONTENT_WIDTH_POINTS: f32 = 560.0;
 const CONTROL_MIN_INNER_WIDTH: u32 = 620;
 const CONTROL_MIN_INNER_HEIGHT: u32 = 420;
+const CONTROL_INITIAL_INNER_HEIGHT: u32 = 720;
 const CONTROL_MAX_INNER_WIDTH: u32 = 900;
 const CONTROL_RESIZE_THRESHOLD: u32 = 12;
+const INITIAL_WINDOW_RAISE_PIXELS: i32 = 100;
 const OVERLAY_THRESHOLD_COLUMN_WIDTH_POINTS: f32 = 96.0;
-const OVERLAY_THRESHOLD_RAIL_HEIGHT_POINTS: f32 = 390.0;
-const OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS: f32 = 320.0;
+const OVERLAY_THRESHOLD_RAIL_HEIGHT_POINTS: f32 = 315.0;
+const OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS: f32 = 255.0;
 const OVERLAY_SELECTOR_WIDTH_POINTS: f32 = 250.0;
 const DEFAULT_OVERLAY_RANGE: ValueRange = ValueRange {
     min: -1.0,
@@ -97,6 +100,9 @@ pub struct LaunchOptions {
     pub spec_path: Option<PathBuf>,
     pub surface_volume_path: Option<PathBuf>,
     pub overlay_path: Option<PathBuf>,
+    pub roi_path: Option<PathBuf>,
+    pub overlay_subs: Option<Vec<String>>,
+    pub overlay_p_value: Option<f64>,
     pub verbose: bool,
     pub preload: bool,
 }
@@ -123,6 +129,9 @@ struct ViewerApp {
     initial_spec_path: Option<PathBuf>,
     initial_surface_volume_path: Option<PathBuf>,
     initial_overlay_path: Option<PathBuf>,
+    initial_roi_path: Option<PathBuf>,
+    initial_overlay_subs: Option<Vec<String>>,
+    initial_overlay_p_value: Option<f64>,
     verbose: bool,
     preload: bool,
     event_proxy: EventLoopProxy<ViewerEvent>,
@@ -137,6 +146,9 @@ impl ViewerApp {
             initial_spec_path: options.spec_path,
             initial_surface_volume_path: options.surface_volume_path,
             initial_overlay_path: options.overlay_path,
+            initial_roi_path: options.roi_path,
+            initial_overlay_subs: options.overlay_subs,
+            initial_overlay_p_value: options.overlay_p_value,
             verbose: options.verbose,
             preload: options.preload,
             event_proxy,
@@ -157,11 +169,16 @@ impl ViewerApp {
             event_loop.create_window(
                 Window::default_attributes()
                     .with_title("sumaru controls")
-                    .with_inner_size(PhysicalSize::new(CONTROL_MIN_INNER_WIDTH, 720)),
+                    .with_inner_size(PhysicalSize::new(
+                        CONTROL_MIN_INNER_WIDTH,
+                        CONTROL_INITIAL_INNER_HEIGHT,
+                    )),
             )?,
         );
         if let Ok(position) = view_window.outer_position() {
-            control_window.set_outer_position(PhysicalPosition::new(position.x + 1320, position.y));
+            let raised_y = position.y.saturating_sub(INITIAL_WINDOW_RAISE_PIXELS);
+            view_window.set_outer_position(PhysicalPosition::new(position.x, raised_y));
+            control_window.set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y));
         }
         self.state = Some(pollster::block_on(ViewerState::new(
             view_window,
@@ -170,6 +187,9 @@ impl ViewerApp {
             self.initial_spec_path.take(),
             self.initial_surface_volume_path.take(),
             self.initial_overlay_path.take(),
+            self.initial_roi_path.take(),
+            self.initial_overlay_subs.take(),
+            self.initial_overlay_p_value.take(),
             self.verbose,
             self.preload,
             self.event_proxy.clone(),
@@ -357,7 +377,10 @@ struct ViewerState {
     overlay_symmetric_range: bool,
     surface_path: Option<PathBuf>,
     overlay_path: Option<PathBuf>,
+    roi_path: Option<PathBuf>,
     overlay_display_name: Option<String>,
+    roi_layer: Option<RoiLayer>,
+    roi_visible: bool,
     surface_volume_path: Option<PathBuf>,
     hemisphere_layout: HemisphereLayout,
     hemisphere_open_angle_degrees: f32,
@@ -396,6 +419,9 @@ impl ViewerState {
         initial_spec_path: Option<PathBuf>,
         initial_surface_volume_path: Option<PathBuf>,
         initial_overlay_path: Option<PathBuf>,
+        initial_roi_path: Option<PathBuf>,
+        initial_overlay_subs: Option<Vec<String>>,
+        initial_overlay_p_value: Option<f64>,
         verbose: bool,
         preload_enabled: bool,
         event_proxy: EventLoopProxy<ViewerEvent>,
@@ -579,7 +605,10 @@ impl ViewerState {
             overlay_symmetric_range: true,
             surface_path: None,
             overlay_path: None,
+            roi_path: None,
             overlay_display_name: None,
+            roi_layer: None,
+            roi_visible: true,
             surface_volume_path: initial_surface_volume_path.clone(),
             hemisphere_layout: HemisphereLayout::Closed,
             hemisphere_open_angle_degrees: 0.0,
@@ -615,6 +644,13 @@ impl ViewerState {
         }
         if let Some(path) = initial_overlay_path {
             state.load_overlay_path(path)?;
+            state.apply_initial_overlay_options(
+                initial_overlay_subs.as_deref(),
+                initial_overlay_p_value,
+            )?;
+        }
+        if let Some(path) = initial_roi_path {
+            state.load_roi_path(path)?;
         }
         state.arm_startup_redraw_guard();
         state.log_status("Viewer initialized.");
@@ -1224,7 +1260,9 @@ impl ViewerState {
         let actions_present = !ui_actions.is_empty();
         self.egui_state
             .handle_platform_output(&self.control_window, full_output.platform_output);
-        self.fit_control_window(desired_control_size_points, full_output.pixels_per_point);
+        if repaint_delay != Duration::ZERO {
+            self.fit_control_window(desired_control_size_points, full_output.pixels_per_point);
+        }
         self.apply_ui_actions(ui_actions);
         if actions_present {
             self.view_window.request_redraw();
@@ -1389,7 +1427,7 @@ impl ViewerState {
     }
 
     fn draw_surface_dataset_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
-        controller_section(ui, "SURFACE / DATASET", |ui| {
+        controller_section(ui, "SURFACE / DATASET", true, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Open:");
                 if ui
@@ -1406,6 +1444,13 @@ impl ViewerState {
                 {
                     actions.push(UiAction::PickOverlay);
                 }
+                if ui
+                    .add_enabled(self.mesh.is_some(), egui::Button::new("ROI"))
+                    .on_hover_text("Open SUMA ROI")
+                    .clicked()
+                {
+                    actions.push(UiAction::PickRoi);
+                }
                 if ui.button("Spec").on_hover_text("Open SUMA spec").clicked() {
                     actions.push(UiAction::PickSpec);
                 }
@@ -1418,8 +1463,8 @@ impl ViewerState {
                 }
             });
 
+            ui.add_space(8.0);
             if let Some(scene) = self.surface_scene.as_ref() {
-                ui.add_space(8.0);
                 egui::Grid::new("spec_scene_grid")
                     .num_columns(2)
                     .spacing([8.0, 5.0])
@@ -1430,34 +1475,34 @@ impl ViewerState {
                             "SurfVol",
                             file_display(scene.surface_volume_path.as_ref()),
                         );
-                        stat_row(
-                            ui,
-                            "Hemi",
-                            format!(
-                                "{}{}",
-                                spec_hemisphere_label(scene.hemisphere),
-                                scene
-                                    .group
-                                    .as_ref()
-                                    .map_or_else(String::new, |group| format!(" / {group}"))
-                            ),
-                        );
                         let active = scene.active_index + 1;
                         let total = scene.surfaces.len();
                         let surface = &scene.surfaces[scene.active_index];
-                        stat_row(
-                            ui,
-                            "Active",
-                            format!(
-                                "{active}/{total} {}{}",
-                                surface.name,
-                                surface
-                                    .state
-                                    .as_ref()
-                                    .map_or_else(String::new, |state| format!(" ({state})"))
-                            ),
-                        );
+                        let mut selected_index = scene.active_index;
+                        let selected_text =
+                            scene_surface_display_label(scene.active_index, total, surface);
+                        ui.label("Active");
+                        let mut changed = false;
+                        egui::ComboBox::from_id_salt("spec_active_surface")
+                            .selected_text(selected_text)
+                            .width(320.0)
+                            .show_ui(ui, |ui| {
+                                for (index, surface) in scene.surfaces.iter().enumerate() {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut selected_index,
+                                            index,
+                                            scene_surface_display_label(index, total, surface),
+                                        )
+                                        .changed();
+                                }
+                            });
+                        ui.end_row();
+                        if changed && selected_index + 1 != active {
+                            actions.push(UiAction::SelectSceneSurface(selected_index));
+                        }
                         stat_row(ui, "Overlay", self.overlay_display_text());
+                        stat_row(ui, "ROI", self.roi_display_text());
                         if scene.skipped_surfaces > 0 {
                             stat_row(ui, "Skipped files", scene.skipped_surfaces.to_string());
                         }
@@ -1465,20 +1510,21 @@ impl ViewerState {
                             stat_row(ui, "Skipped states", scene.skipped_states.to_string());
                         }
                     });
+            } else {
+                egui::Grid::new("surface_file_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 5.0])
+                    .show(ui, |ui| {
+                        stat_row(ui, "Surface", file_display(self.surface_path.as_ref()));
+                        stat_row(ui, "Overlay", self.overlay_display_text());
+                        stat_row(ui, "ROI", self.roi_display_text());
+                    });
             }
         });
     }
 
     fn draw_overlay_workbench(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
         let overlay_loaded = self.overlay.is_some();
-        let overlay_row_count = self.overlay_dataset.as_ref().map_or_else(
-            || {
-                self.overlay_values
-                    .as_ref()
-                    .map_or(0, |overlay| overlay.values.len())
-            },
-            |dataset| dataset.row_count,
-        );
         let column_options = self
             .overlay_dataset
             .as_ref()
@@ -1487,7 +1533,7 @@ impl ViewerState {
         let mut columns_changed = false;
         let mut changed = false;
 
-        controller_section(ui, "OVERLAY WORKBENCH", |ui| {
+        controller_section(ui, "OVERLAY WORKBENCH", true, |ui| {
             if !overlay_loaded {
                 ui.label(egui::RichText::new("No overlay loaded").color(muted_color()));
                 return;
@@ -1526,8 +1572,6 @@ impl ViewerState {
                         .num_columns(2)
                         .spacing([10.0, 5.0])
                         .show(ui, |ui| {
-                            stat_row(ui, "Dset", self.overlay_display_text());
-                            stat_row(ui, "Rows", overlay_row_count.to_string());
                             if column_options.is_empty() {
                                 stat_row(ui, "I", "scalar column 0");
                                 stat_row(ui, "T", "scalar column 0");
@@ -1699,7 +1743,7 @@ impl ViewerState {
     }
 
     fn draw_view_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
-        controller_section(ui, "VIEW", |ui| {
+        controller_section(ui, "VIEW", false, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Mode");
                 ui.monospace(self.camera.mode().label());
@@ -1774,7 +1818,7 @@ impl ViewerState {
     }
 
     fn draw_scene_section(&self, ui: &mut egui::Ui) {
-        controller_section(ui, "SCENE", |ui| {
+        controller_section(ui, "SCENE", false, |ui| {
             if let Some(stats) = self.scene_stats.as_ref() {
                 egui::Grid::new("scene_stats_grid")
                     .num_columns(2)
@@ -1788,16 +1832,20 @@ impl ViewerState {
                             "Normals",
                             normal_direction_label(stats.geometry.normal_direction),
                         );
-                        stat_row(
-                            ui,
-                            "Boundary edges",
-                            stats.geometry.boundary_edges.to_string(),
-                        );
-                        stat_row(
-                            ui,
-                            "Non-manifold",
-                            stats.geometry.non_manifold_edges.to_string(),
-                        );
+                        if stats.geometry.boundary_edges > 0 {
+                            stat_row(
+                                ui,
+                                "Boundary edges",
+                                stats.geometry.boundary_edges.to_string(),
+                            );
+                        }
+                        if stats.geometry.non_manifold_edges > 0 {
+                            stat_row(
+                                ui,
+                                "Non-manifold",
+                                stats.geometry.non_manifold_edges.to_string(),
+                            );
+                        }
                         if let Some(range) = stats.overlay_range {
                             stat_row(
                                 ui,
@@ -1813,17 +1861,22 @@ impl ViewerState {
     }
 
     fn draw_pick_section(&self, ui: &mut egui::Ui) {
-        controller_section(ui, "PICK", |ui| {
-            if let Some(pick) = self.surface_pick {
-                egui::Grid::new("pick_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 5.0])
-                    .show(ui, |ui| {
+        controller_section(ui, "PICK", false, |ui| {
+            egui::Grid::new("pick_grid")
+                .num_columns(2)
+                .spacing([10.0, 5.0])
+                .show(ui, |ui| {
+                    stat_row(ui, "Surface file", self.pick_surface_display_text());
+                    stat_row(ui, "Overlay file", self.pick_overlay_display_text());
+                    if let Some(pick) = self.surface_pick {
                         stat_row(ui, "Node", pick.node_index.to_string());
                         stat_row(ui, "Triangle", pick.face_index.to_string());
-                        stat_row(ui, "Overlay", overlay_value_label(pick.overlay_value));
-                    });
-            } else {
+                        stat_row(ui, "Surf x,y,z", coordinate_label(pick.surface_position));
+                        stat_row(ui, "Overlay Value", picked_overlay_value_label(pick));
+                        stat_row(ui, "ROI", self.pick_roi_display_text(pick));
+                    }
+                });
+            if self.surface_pick.is_none() {
                 ui.label(egui::RichText::new("No pick").color(muted_color()));
             }
         });
@@ -1925,6 +1978,15 @@ impl ViewerState {
                         }
                     }
                 }
+                UiAction::PickRoi => {
+                    if let Some(path) =
+                        pick_roi_file(self.roi_path.as_ref().or(self.surface_path.as_ref()))
+                    {
+                        if let Err(error) = self.load_roi_path(path) {
+                            self.set_error(error);
+                        }
+                    }
+                }
                 UiAction::PickSpec => {
                     let current_path = self
                         .surface_scene
@@ -1975,6 +2037,11 @@ impl ViewerState {
                         self.set_error(error);
                     }
                 }
+                UiAction::SelectSceneSurface(index) => {
+                    if let Err(error) = self.activate_scene_surface(index) {
+                        self.set_error(error);
+                    }
+                }
                 UiAction::SaveScreenshot => {
                     if let Err(error) = self.save_current_view_screenshot() {
                         self.set_error(error);
@@ -2009,6 +2076,9 @@ impl ViewerState {
         self.overlay_symmetric_range = true;
         self.overlay_path = None;
         self.overlay_display_name = None;
+        self.roi_path = None;
+        self.roi_layer = None;
+        self.roi_visible = true;
         self.surface_pick = None;
         self.pair_visibility = PairVisibility::both();
         self.upload_surface_buffers();
@@ -2084,7 +2154,6 @@ impl ViewerState {
             spec: spec.clone(),
             spec_path: spec.path.clone(),
             surface_volume_path: Some(surface_volume_path.clone()),
-            group: spec.group.clone(),
             hemisphere: spec.hemisphere,
             surfaces,
             active_index: 0,
@@ -2100,6 +2169,9 @@ impl ViewerState {
         self.overlay_symmetric_range = true;
         self.overlay_path = None;
         self.overlay_display_name = None;
+        self.roi_path = None;
+        self.roi_layer = None;
+        self.roi_visible = true;
         self.surface_pick = None;
         self.pair_visibility = PairVisibility::both();
         self.ensure_scene_surface_loaded(0)?;
@@ -2325,6 +2397,9 @@ impl ViewerState {
         self.set_active_mesh(snapshot.mesh, snapshot.prepared_geometry);
         self.surface_path = Some(path.clone());
         self.surface_pick = None;
+        if self.roi_layer.is_some() {
+            self.refresh_roi_layer()?;
+        }
         if self.has_both_scene() && self.pair_visibility != PairVisibility::both() {
             self.refresh_active_pair_render_geometry()?;
         }
@@ -2413,6 +2488,37 @@ impl ViewerState {
             left.mesh.as_ref()?,
             right.mesh.as_ref()?,
         ))
+    }
+
+    fn roi_component_ranges(&self, mesh: &SurfaceMesh) -> Vec<RoiComponentRange> {
+        if let Some((left, right)) = self.active_paired_components() {
+            if let (Some(left_mesh), Some(right_mesh)) = (left.mesh.as_ref(), right.mesh.as_ref()) {
+                return vec![
+                    RoiComponentRange {
+                        side: SurfaceSide::Left,
+                        node_offset: 0,
+                        node_count: left_mesh.vertices.len(),
+                        triangle_offset: 0,
+                        triangle_count: left_mesh.triangles.len(),
+                    },
+                    RoiComponentRange {
+                        side: SurfaceSide::Right,
+                        node_offset: left_mesh.vertices.len() as u32,
+                        node_count: right_mesh.vertices.len(),
+                        triangle_offset: left_mesh.triangles.len(),
+                        triangle_count: right_mesh.triangles.len(),
+                    },
+                ];
+            }
+        }
+
+        vec![RoiComponentRange {
+            side: mesh.metadata.side.clone(),
+            node_offset: 0,
+            node_count: mesh.vertices.len(),
+            triangle_offset: 0,
+            triangle_count: mesh.triangles.len(),
+        }]
     }
 
     fn hemisphere_layout_state(&self) -> HemisphereLayoutState {
@@ -2535,6 +2641,9 @@ impl ViewerState {
             .as_ref()
             .filter(|_| self.overlay_visible)
             .map(|overlay| overlay.color_cache.colors.as_slice());
+        let roi_colors = self
+            .visible_roi_layer()
+            .map(|layer| layer.appearance.node_colors.as_slice());
         let dim = self.overlay_appearance.dim;
         let aspect = self.view_config.width as f32 / self.view_config.height as f32;
         let init_bytes = self.camera.uniform_bytes(aspect);
@@ -2547,8 +2656,18 @@ impl ViewerState {
                 let end = (offset + component.vertex_count).min(colors.len());
                 &colors[start..end]
             });
-            let vertex_bytes =
-                pair_drag_vertex_bytes(&component.positions, &component.normals, colors, dim);
+            let roi_colors = roi_colors.map(|colors| {
+                let start = offset.min(colors.len());
+                let end = (offset + component.vertex_count).min(colors.len());
+                &colors[start..end]
+            });
+            let vertex_bytes = pair_drag_vertex_bytes(
+                &component.positions,
+                &component.normals,
+                colors,
+                dim,
+                roi_colors,
+            );
             let (index_bytes, index_count) = pair_drag_index_bytes(&component.triangles);
             let vertex_buffer = self
                 .device
@@ -2690,6 +2809,77 @@ impl ViewerState {
             .unwrap_or_else(|| "none".to_string())
     }
 
+    fn roi_display_text(&self) -> String {
+        self.roi_layer
+            .as_ref()
+            .map(|layer| {
+                let suffix = if layer.skipped_nodes > 0 {
+                    format!(
+                        " ({} mapped, {} skipped)",
+                        layer.mapped_nodes, layer.skipped_nodes
+                    )
+                } else {
+                    format!(" ({} nodes)", layer.mapped_nodes)
+                };
+                format!("{}{}", layer.display_name, suffix)
+            })
+            .or_else(|| self.roi_path.as_deref().map(file_name_display))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn pick_surface_display_text(&self) -> String {
+        if let Some(pick) = self.surface_pick
+            && let Some(component) = self.picked_paired_component(pick)
+        {
+            return file_name_display(&component.path);
+        }
+
+        if let Some((left, right)) = self.active_paired_components() {
+            return format!(
+                "{} + {}",
+                file_name_display(&left.path),
+                file_name_display(&right.path)
+            );
+        }
+
+        self.surface_path
+            .as_deref()
+            .map(file_name_display)
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn pick_overlay_display_text(&self) -> String {
+        let Some(path) = self.overlay_path.as_deref() else {
+            return "none".to_string();
+        };
+
+        if let Some(pick) = self.surface_pick
+            && let Some(component) = self.picked_paired_component(pick)
+            && let Some(path) = paired_overlay_path_for_side(path, &component.side)
+        {
+            return file_name_display(&path);
+        }
+
+        file_name_display(path)
+    }
+
+    fn pick_roi_display_text(&self, pick: SurfacePick) -> String {
+        let Some(layer) = self.roi_layer.as_ref() else {
+            return "none".to_string();
+        };
+        let labels = layer.labels_for_node(pick.node_index);
+        if labels.is_empty() {
+            return "none".to_string();
+        }
+
+        labels.join(", ")
+    }
+
+    fn picked_paired_component(&self, pick: SurfacePick) -> Option<&SceneSurfaceComponent> {
+        let (left, right) = self.active_paired_components()?;
+        paired_component_for_node(left, right, pick.node_index)
+    }
+
     fn set_hemisphere_layout(&mut self, layout: HemisphereLayout) -> Result<()> {
         let target = match layout {
             HemisphereLayout::Closed => HemisphereLayoutState::closed(),
@@ -2743,6 +2933,9 @@ impl ViewerState {
         self.set_active_mesh(snapshot.mesh, snapshot.prepared_geometry);
         self.surface_path = Some(path);
         self.surface_pick = None;
+        if self.roi_layer.is_some() {
+            self.refresh_roi_layer()?;
+        }
         if self.has_both_scene() && self.pair_visibility != PairVisibility::both() {
             self.refresh_active_pair_render_geometry()?;
         }
@@ -2788,6 +2981,147 @@ impl ViewerState {
         ));
 
         Ok(())
+    }
+
+    fn load_roi_path(&mut self, path: PathBuf) -> Result<()> {
+        self.mesh
+            .as_ref()
+            .context("load a surface before loading an ROI")?;
+        let payloads = read_niml_roi(&path)
+            .with_context(|| format!("failed to read ROI {}", path.display()))?;
+        ensure!(
+            !payloads.is_empty(),
+            "ROI file {} did not contain any Node_ROI payloads",
+            path.display()
+        );
+        let rois = payloads
+            .into_iter()
+            .map(|payload| payload.to_roi())
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("failed to convert ROI {}", path.display()))?;
+        let layer = self
+            .build_roi_layer(path.clone(), rois)
+            .with_context(|| format!("failed to map ROI {}", path.display()))?;
+        let roi_count = layer.rois.len();
+        let mapped_nodes = layer.mapped_nodes;
+
+        self.roi_path = Some(path.clone());
+        self.roi_layer = Some(layer);
+        self.roi_visible = true;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(format!(
+            "Loaded {roi_count} ROI object(s) from {} on {mapped_nodes} nodes.",
+            path.display()
+        ));
+
+        Ok(())
+    }
+
+    fn build_roi_layer(&self, path: PathBuf, rois: Vec<Roi>) -> Result<RoiLayer> {
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a surface before building ROI display")?;
+        let ranges = self.roi_component_ranges(mesh);
+        let build = roi_appearance_for_mesh(&rois, mesh, &ranges)?;
+
+        Ok(RoiLayer {
+            path: path.clone(),
+            display_name: file_name_display(&path),
+            rois,
+            appearance: build.appearance,
+            node_labels: build.node_labels,
+            mapped_nodes: build.mapped_nodes,
+            skipped_nodes: build.skipped_nodes,
+        })
+    }
+
+    fn refresh_roi_layer(&mut self) -> Result<()> {
+        let Some(existing) = self.roi_layer.take() else {
+            return Ok(());
+        };
+        let path = existing.path;
+        let rois = existing.rois;
+        self.roi_layer = Some(self.build_roi_layer(path, rois)?);
+
+        Ok(())
+    }
+
+    fn apply_initial_overlay_options(
+        &mut self,
+        subs: Option<&[String]>,
+        p_value: Option<f64>,
+    ) -> Result<()> {
+        if let Some(subs) = subs {
+            let dataset = self
+                .overlay_dataset
+                .as_ref()
+                .context("no overlay dataset is loaded")?;
+            self.overlay_columns = resolve_overlay_subs(dataset, subs)?;
+            self.refresh_overlay_columns()?;
+        }
+
+        if let Some(p_value) = p_value {
+            self.apply_initial_overlay_p_value(p_value)?;
+            self.refresh_overlay_appearance()?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_initial_overlay_p_value(&mut self, p_value: f64) -> Result<()> {
+        let Some(dataset) = self.overlay_dataset.as_ref() else {
+            return Ok(());
+        };
+        let Some(threshold_index) = self.overlay_columns.threshold else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} requested, but no T sub-brick is selected"
+            ));
+            return Ok(());
+        };
+        let Some(column) = dataset.columns.get(threshold_index) else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} requested, but T sub-brick #{threshold_index} does not exist"
+            ));
+            return Ok(());
+        };
+        let Some(stat_label) = column.stat.as_deref() else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} requested, but T sub-brick #{} '{}' has no stat metadata",
+                threshold_index, column.label
+            ));
+            return Ok(());
+        };
+        let Some(stat) = AfniStatSpec::parse(stat_label) else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} requested, but stat metadata '{stat_label}' is not supported"
+            ));
+            return Ok(());
+        };
+        let Some(threshold_value) = stat.statistic_for_p_value(p_value) else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} could not be converted with stat metadata '{stat_label}'"
+            ));
+            return Ok(());
+        };
+
+        self.overlay_appearance.threshold.enabled = true;
+        self.overlay_appearance.threshold.absolute = true;
+        self.overlay_appearance.threshold.value = threshold_value as f32;
+        self.sanitize_overlay_appearance();
+        self.log_status(format!(
+            "Initial threshold p <= {p_value:.4} -> T {:.4}.",
+            self.overlay_appearance.threshold.value
+        ));
+
+        Ok(())
+    }
+
+    fn warn_and_disable_initial_threshold(&mut self, message: String) {
+        eprintln!("sumaru warning: {message}; threshold disabled.");
+        self.overlay_appearance.threshold.enabled = false;
     }
 
     fn load_overlay_selection(
@@ -2941,6 +3275,10 @@ impl ViewerState {
         self.overlay.as_ref().filter(|_| self.overlay_visible)
     }
 
+    fn visible_roi_layer(&self) -> Option<&RoiLayer> {
+        self.roi_layer.as_ref().filter(|_| self.roi_visible)
+    }
+
     fn inspect_surface_at_cursor(&mut self) {
         let Some(cursor) = self.view_cursor_position else {
             self.log_status("Move the cursor over the surface before inspecting.");
@@ -2961,9 +3299,11 @@ impl ViewerState {
             Some(pick) => {
                 self.log_status(pick.status_text());
                 self.surface_pick = Some(pick);
+                self.upload_surface_buffers();
             }
             None => {
                 self.surface_pick = None;
+                self.upload_surface_buffers();
                 self.log_status("No surface under the cursor.");
             }
         }
@@ -2975,6 +3315,12 @@ impl ViewerState {
                 .overlay_values
                 .as_ref()
                 .and_then(|overlay| overlay.values.get(pick.node_index as usize))
+                .copied();
+            pick.threshold_value = self
+                .overlay_values
+                .as_ref()
+                .and_then(|overlay| overlay.threshold_values.as_ref())
+                .and_then(|values| values.get(pick.node_index as usize))
                 .copied();
         }
     }
@@ -3006,10 +3352,13 @@ impl ViewerState {
             .expect("prepared geometry cache is populated above")
             .geometry
             .clone();
-        let prepared_surface = PreparedSurface::from_geometry(
+        let selection = self.selection_highlight();
+        let prepared_surface = PreparedSurface::from_geometry_with_selection(
             &geometry,
             self.visible_overlay(),
             self.overlay_appearance.dim,
+            self.visible_roi_layer().map(|layer| &layer.appearance),
+            selection,
         );
         let vertex_bytes = prepared_surface.vertex_bytes();
         let index_bytes = prepared_surface.index_bytes();
@@ -3072,6 +3421,15 @@ impl ViewerState {
             index_bytes_len: index_bytes.len(),
             index_count,
         });
+    }
+
+    fn selection_highlight(&self) -> Option<SelectionHighlight> {
+        let pick = self.surface_pick?;
+        Some(SelectionHighlight {
+            node_index: pick.node_index,
+            face_index: pick.face_index,
+            crosshair_position: pick.normalized_position,
+        })
     }
 
     fn update_scene_stats(&mut self) {
@@ -3184,7 +3542,6 @@ struct SurfaceScene {
     spec: SpecFile,
     spec_path: PathBuf,
     surface_volume_path: Option<PathBuf>,
-    group: Option<String>,
     hemisphere: SpecHemisphere,
     surfaces: Vec<SceneSurface>,
     active_index: usize,
@@ -3557,6 +3914,21 @@ fn paired_preview_geometry(
     Ok(PreparedGeometry { vertices, indices })
 }
 
+fn paired_component_for_node<'a>(
+    left: &'a SceneSurfaceComponent,
+    right: &'a SceneSurfaceComponent,
+    node_index: u32,
+) -> Option<&'a SceneSurfaceComponent> {
+    let left_nodes = left.mesh.as_ref()?.vertices.len() as u32;
+    if node_index < left_nodes {
+        return Some(left);
+    }
+
+    let right_nodes = right.mesh.as_ref()?.vertices.len() as u32;
+    let right_limit = left_nodes.checked_add(right_nodes)?;
+    (node_index < right_limit).then_some(right)
+}
+
 /// O(1) framing (center + radius) for the acorn pair while dragging. It
 /// approximates the exact transformed bounds with per-hemisphere bounding
 /// spheres (transformed component center + the mesh's bounding-sphere radius),
@@ -3643,16 +4015,21 @@ fn pair_drag_vertex_bytes(
     normals: &[[f32; 3]],
     colors: Option<&[[f32; 4]]>,
     dim: f32,
+    roi_colors: Option<&[Option<[f32; 4]>]>,
 ) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(positions.len() * 40);
     for (index, (position, normal)) in positions.iter().zip(normals).enumerate() {
         for value in position.iter().chain(normal.iter()) {
             bytes.extend_from_slice(&value.to_ne_bytes());
         }
-        let color = colors
-            .and_then(|colors| colors.get(index))
-            .map(|color| mesh::compose_overlay_color(*color, dim))
-            .unwrap_or(mesh::DEFAULT_SURFACE_COLOR);
+        let color = mesh::compose_vertex_color(
+            colors.and_then(|colors| colors.get(index)).copied(),
+            dim,
+            roi_colors
+                .and_then(|colors| colors.get(index))
+                .copied()
+                .flatten(),
+        );
         for value in color {
             bytes.extend_from_slice(&value.to_ne_bytes());
         }
@@ -3995,6 +4372,43 @@ struct LoadedOverlaySelection {
     display_name: String,
 }
 
+#[derive(Debug, Clone)]
+struct RoiLayer {
+    path: PathBuf,
+    display_name: String,
+    rois: Vec<Roi>,
+    appearance: RoiAppearance,
+    node_labels: Vec<Vec<String>>,
+    mapped_nodes: usize,
+    skipped_nodes: usize,
+}
+
+impl RoiLayer {
+    fn labels_for_node(&self, node: u32) -> &[String] {
+        self.node_labels
+            .get(node as usize)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RoiAppearanceBuild {
+    appearance: RoiAppearance,
+    node_labels: Vec<Vec<String>>,
+    mapped_nodes: usize,
+    skipped_nodes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RoiComponentRange {
+    side: SurfaceSide,
+    node_offset: u32,
+    node_count: usize,
+    triangle_offset: usize,
+    triangle_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PairedOverlayPaths {
     left_path: PathBuf,
@@ -4020,21 +4434,20 @@ struct OverlayColumnOption {
 struct SurfacePick {
     node_index: u32,
     face_index: usize,
+    surface_position: [f32; 3],
+    normalized_position: [f32; 3],
     overlay_value: Option<f32>,
+    threshold_value: Option<f32>,
 }
 
 impl SurfacePick {
     fn status_text(self) -> String {
-        match self.overlay_value {
-            Some(value) => format!(
-                "Inspected node {}, triangle {}, overlay {:.4}.",
-                self.node_index, self.face_index, value
-            ),
-            None => format!(
-                "Inspected node {}, triangle {}.",
-                self.node_index, self.face_index
-            ),
-        }
+        format!(
+            "Inspected node {}, triangle {}, {}.",
+            self.node_index,
+            self.face_index,
+            picked_overlay_value_label(self)
+        )
     }
 }
 
@@ -4107,6 +4520,7 @@ struct PreloadResult {
 enum UiAction {
     PickSurface,
     PickOverlay,
+    PickRoi,
     PickSpec,
     PickSurfaceVolume,
     RefreshOverlayColumns,
@@ -4116,6 +4530,7 @@ enum UiAction {
     ToggleBackground,
     Preset(PresetOrientation),
     HemisphereLayout(HemisphereLayout),
+    SelectSceneSurface(usize),
     SaveScreenshot,
     SaveMontage,
 }
@@ -4406,15 +4821,6 @@ fn canonical_or_original_path(path: PathBuf) -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
 
-fn spec_hemisphere_label(hemisphere: SpecHemisphere) -> &'static str {
-    match hemisphere {
-        SpecHemisphere::Left => "lh",
-        SpecHemisphere::Right => "rh",
-        SpecHemisphere::Both => "both",
-        SpecHemisphere::Unknown => "unknown",
-    }
-}
-
 fn save_screenshot_file(
     title: &str,
     default_name: &str,
@@ -4521,6 +4927,17 @@ fn pick_overlay_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
+fn pick_roi_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
+    let dialog = dialog_with_start_directory(
+        rfd::FileDialog::new()
+            .set_title("Open ROI")
+            .add_filter("SUMA ROI", &["roi", "niml.roi"]),
+        current_path,
+    );
+
+    dialog.pick_file()
+}
+
 fn pick_spec_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     let dialog = dialog_with_start_directory(
         rfd::FileDialog::new()
@@ -4556,6 +4973,15 @@ fn paired_overlay_paths(path: &Path) -> Option<PairedOverlayPaths> {
     }
 
     None
+}
+
+fn paired_overlay_path_for_side(path: &Path, side: &SurfaceSide) -> Option<PathBuf> {
+    let paths = paired_overlay_paths(path)?;
+    match side {
+        SurfaceSide::Left => Some(paths.left_path),
+        SurfaceSide::Right => Some(paths.right_path),
+        _ => None,
+    }
 }
 
 fn paired_overlay_paths_for_pattern(
@@ -4784,6 +5210,176 @@ fn loaded_overlay_from_dataset(
     })
 }
 
+fn roi_appearance_for_mesh(
+    rois: &[Roi],
+    mesh: &SurfaceMesh,
+    ranges: &[RoiComponentRange],
+) -> Result<RoiAppearanceBuild> {
+    let mut appearance = RoiAppearance::empty(mesh.vertices.len());
+    let mut node_labels = vec![Vec::new(); mesh.vertices.len()];
+    let mut mapped = BTreeSet::new();
+    let mut skipped_nodes = 0usize;
+
+    for roi in rois {
+        for datum in roi.data.iter().filter(|datum| !roi_datum_is_stroke(datum)) {
+            skipped_nodes += paint_roi_datum(
+                roi,
+                datum,
+                mesh,
+                ranges,
+                roi.fill_color.to_array(),
+                &mut appearance,
+                &mut node_labels,
+                &mut mapped,
+            );
+        }
+    }
+    for roi in rois {
+        for datum in roi.data.iter().filter(|datum| roi_datum_is_stroke(datum)) {
+            skipped_nodes += paint_roi_datum(
+                roi,
+                datum,
+                mesh,
+                ranges,
+                roi.edge_color.to_array(),
+                &mut appearance,
+                &mut node_labels,
+                &mut mapped,
+            );
+        }
+    }
+
+    ensure!(
+        !mapped.is_empty(),
+        "ROI nodes did not overlap the active surface"
+    );
+
+    Ok(RoiAppearanceBuild {
+        appearance,
+        node_labels,
+        mapped_nodes: mapped.len(),
+        skipped_nodes,
+    })
+}
+
+fn paint_roi_datum(
+    roi: &Roi,
+    datum: &RoiDatum,
+    mesh: &SurfaceMesh,
+    ranges: &[RoiComponentRange],
+    color: [f32; 4],
+    appearance: &mut RoiAppearance,
+    node_labels: &mut [Vec<String>],
+    mapped: &mut BTreeSet<u32>,
+) -> usize {
+    let mut skipped = 0usize;
+    let label = roi_display_label(roi);
+
+    for node in roi_datum_nodes(roi, datum, mesh, ranges) {
+        match node {
+            Some(node) if appearance.set_node_color(node, color) => {
+                mapped.insert(node);
+                if let Some(labels) = node_labels.get_mut(node as usize)
+                    && !labels.contains(&label)
+                {
+                    labels.push(label.clone());
+                }
+            }
+            _ => skipped += 1,
+        }
+    }
+
+    skipped
+}
+
+fn roi_datum_nodes(
+    roi: &Roi,
+    datum: &RoiDatum,
+    mesh: &SurfaceMesh,
+    ranges: &[RoiComponentRange],
+) -> Vec<Option<u32>> {
+    if !datum.node_path.is_empty() {
+        return datum
+            .node_path
+            .iter()
+            .map(|node| roi_node_to_mesh_node(roi, *node, mesh.vertices.len(), ranges))
+            .collect();
+    }
+
+    datum
+        .triangle_path
+        .iter()
+        .flat_map(|face| {
+            let Some(mesh_face) = roi_face_to_mesh_face(roi, *face, mesh.triangles.len(), ranges)
+            else {
+                return vec![None];
+            };
+            mesh.triangles
+                .get(mesh_face)
+                .map(|triangle| triangle.iter().copied().map(Some).collect())
+                .unwrap_or_else(|| vec![None])
+        })
+        .collect()
+}
+
+fn roi_node_to_mesh_node(
+    roi: &Roi,
+    node: u32,
+    mesh_node_count: usize,
+    ranges: &[RoiComponentRange],
+) -> Option<u32> {
+    if let Some(range) = roi_component_range_for_side(&roi.parent_side, ranges) {
+        return ((node as usize) < range.node_count).then_some(range.node_offset + node);
+    }
+
+    ((node as usize) < mesh_node_count).then_some(node)
+}
+
+fn roi_face_to_mesh_face(
+    roi: &Roi,
+    face: u32,
+    mesh_face_count: usize,
+    ranges: &[RoiComponentRange],
+) -> Option<usize> {
+    if let Some(range) = roi_component_range_for_side(&roi.parent_side, ranges) {
+        let face = face as usize;
+        return (face < range.triangle_count).then_some(range.triangle_offset + face);
+    }
+
+    let face = face as usize;
+    (face < mesh_face_count).then_some(face)
+}
+
+fn roi_component_range_for_side<'a>(
+    side: &SurfaceSide,
+    ranges: &'a [RoiComponentRange],
+) -> Option<&'a RoiComponentRange> {
+    if ranges.len() == 1 {
+        return ranges.first();
+    }
+
+    match side {
+        SurfaceSide::Left | SurfaceSide::Right => ranges.iter().find(|range| range.side == *side),
+        _ => None,
+    }
+}
+
+fn roi_datum_is_stroke(datum: &RoiDatum) -> bool {
+    matches!(
+        datum.kind,
+        RoiElementKind::NodeSegment | RoiElementKind::EdgeGroup
+    ) || matches!(
+        datum.action,
+        RoiBrushAction::AppendStroke
+            | RoiBrushAction::AppendStrokeOrFill
+            | RoiBrushAction::JoinEnds
+    )
+}
+
+fn roi_display_label(roi: &Roi) -> String {
+    format!("{} ({})", roi.label, roi.integer_label)
+}
+
 fn dataset_from_simple_overlay(domain: &SurfaceDomain, values: Vec<f32>) -> Result<Dataset> {
     Dataset::dense(
         DatasetKind::SurfaceScalar,
@@ -4936,6 +5532,136 @@ fn default_overlay_columns(dataset: &Dataset) -> Option<OverlayColumnSelections>
     })
 }
 
+fn resolve_overlay_subs(dataset: &Dataset, specs: &[String]) -> Result<OverlayColumnSelections> {
+    ensure!(
+        (2..=3).contains(&specs.len()),
+        "--subs expects I,T or I,T,B"
+    );
+
+    Ok(OverlayColumnSelections {
+        intensity: resolve_required_overlay_column(dataset, &specs[0], "I")?,
+        threshold: resolve_optional_overlay_column(dataset, &specs[1], "T")?,
+        brightness: specs
+            .get(2)
+            .map(|spec| resolve_optional_overlay_column(dataset, spec, "B"))
+            .transpose()?
+            .flatten(),
+    })
+}
+
+fn resolve_required_overlay_column(dataset: &Dataset, spec: &str, role: &str) -> Result<usize> {
+    ensure!(
+        !spec.trim().eq_ignore_ascii_case("none"),
+        "{role} sub-brick cannot be none"
+    );
+    let index = resolve_overlay_column(dataset, spec)
+        .with_context(|| format!("failed to resolve {role} sub-brick '{spec}'"))?;
+    ensure!(
+        dataset.columns.get(index).is_some_and(column_is_numeric),
+        "{role} sub-brick '{spec}' resolved to non-numeric column #{index}"
+    );
+
+    Ok(index)
+}
+
+fn resolve_optional_overlay_column(
+    dataset: &Dataset,
+    spec: &str,
+    role: &str,
+) -> Result<Option<usize>> {
+    if spec.trim().eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+
+    resolve_required_overlay_column(dataset, spec, role).map(Some)
+}
+
+fn resolve_overlay_column(dataset: &Dataset, spec: &str) -> Result<usize> {
+    let spec = spec.trim();
+    ensure!(!spec.is_empty(), "empty sub-brick selector");
+
+    if let Some(index) = parse_column_index_selector(spec) {
+        ensure!(
+            index < dataset.columns.len(),
+            "sub-brick index #{index} is outside dataset column count {}",
+            dataset.columns.len()
+        );
+        return Ok(index);
+    }
+
+    let needle = normalized_column_selector(spec);
+    let exact = matching_overlay_columns(dataset, |candidate| {
+        normalized_column_selector(candidate) == needle
+    });
+    if let Some(index) = unique_overlay_column_match(spec, exact)? {
+        return Ok(index);
+    }
+
+    let partial = matching_overlay_columns(dataset, |candidate| {
+        normalized_column_selector(candidate).contains(&needle)
+    });
+    unique_overlay_column_match(spec, partial)?
+        .with_context(|| format!("no dataset column matched '{spec}'"))
+}
+
+fn parse_column_index_selector(spec: &str) -> Option<usize> {
+    spec.trim()
+        .strip_prefix('#')
+        .unwrap_or(spec.trim())
+        .parse()
+        .ok()
+}
+
+fn matching_overlay_columns(dataset: &Dataset, matches: impl Fn(&str) -> bool) -> Vec<usize> {
+    let mut matched = Vec::new();
+    for (index, column) in dataset.columns.iter().enumerate() {
+        if overlay_column_match_labels(index, column)
+            .iter()
+            .any(|candidate| matches(candidate))
+            && !matched.contains(&index)
+        {
+            matched.push(index);
+        }
+    }
+
+    matched
+}
+
+fn unique_overlay_column_match(spec: &str, matches: Vec<usize>) -> Result<Option<usize>> {
+    match matches.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(*index)),
+        _ => bail!(
+            "sub-brick selector '{}' is ambiguous; matched columns {:?}",
+            spec,
+            matches
+        ),
+    }
+}
+
+fn overlay_column_match_labels(index: usize, column: &DataColumn) -> Vec<String> {
+    let mut labels = vec![
+        index.to_string(),
+        format!("#{index}"),
+        column.label.clone(),
+        format!("#{index} {}", column.label),
+    ];
+    if let Some(stat) = column.stat.as_ref() {
+        labels.push(format!("{} [{stat}]", column.label));
+        labels.push(format!("#{index} {} [{stat}]", column.label));
+    }
+
+    labels
+}
+
+fn normalized_column_selector(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 fn preferred_overlay_column(dataset: &Dataset) -> Option<usize> {
     dataset
         .columns
@@ -5052,20 +5778,29 @@ fn dialog_start_directory(current_path: Option<&PathBuf>) -> Option<PathBuf> {
         .or_else(|| std::env::current_dir().ok())
 }
 
-fn controller_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+fn controller_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    default_open: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
     ui.add_space(8.0);
-    ui.label(
+    egui::CollapsingHeader::new(
         egui::RichText::new(title)
             .size(11.0)
             .strong()
             .color(egui::Color32::from_rgb(123, 184, 226)),
-    );
-    egui::Frame::new()
-        .fill(egui::Color32::from_rgb(28, 32, 39))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 62, 74)))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, add_contents);
+    )
+    .id_salt(("controller_section", title))
+    .default_open(default_open)
+    .show_unindented(ui, |ui| {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(28, 32, 39))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 62, 74)))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, add_contents);
+    });
 }
 
 fn draw_intensity_column_selector(
@@ -5244,6 +5979,19 @@ fn file_name_display(path: &Path) -> String {
         .map_or_else(|| "none".to_string(), ToString::to_string)
 }
 
+fn scene_surface_display_label(index: usize, total: usize, surface: &SceneSurface) -> String {
+    format!(
+        "{}/{} {}{}",
+        index + 1,
+        total,
+        surface.name,
+        surface
+            .state
+            .as_ref()
+            .map_or_else(String::new, |state| format!(" ({state})"))
+    )
+}
+
 fn surface_side_label(side: &SurfaceSide) -> &str {
     match side {
         SurfaceSide::Left => "left",
@@ -5346,6 +6094,18 @@ fn overlay_value_label(value: Option<f32>) -> String {
     value.map_or_else(|| "not loaded".to_string(), |value| format!("{value:.4}"))
 }
 
+fn picked_overlay_value_label(pick: SurfacePick) -> String {
+    format!(
+        "I {}; T {}",
+        overlay_value_label(pick.overlay_value),
+        overlay_value_label(pick.threshold_value)
+    )
+}
+
+fn coordinate_label(position: [f32; 3]) -> String {
+    format!("{:.3}, {:.3}, {:.3}", position[0], position[1], position[2])
+}
+
 fn size_is_close(current: PhysicalSize<u32>, desired: PhysicalSize<u32>) -> bool {
     current.width.abs_diff(desired.width) <= CONTROL_RESIZE_THRESHOLD
         && current.height.abs_diff(desired.height) <= CONTROL_RESIZE_THRESHOLD
@@ -5356,14 +6116,18 @@ mod tests {
     use super::{
         BackgroundMode, HemisphereLayout, HemisphereLayoutState, MontageCamera, OverlayAppearance,
         OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR, PAIR_MAX_OPEN_DEGREES,
-        PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation, SceneSurface,
-        SceneSurfaceComponent, canonical_overlay_columns, paired_overlay_dataset,
-        paired_overlay_paths, paired_preview_geometry, paired_spec_montage_shots,
-        scene_surfaces_from_components, standard_montage_shots, threshold_and_mask_from_appearance,
+        PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation, RoiComponentRange,
+        SceneSurface, SceneSurfaceComponent, canonical_overlay_columns, paired_component_for_node,
+        paired_overlay_dataset, paired_overlay_path_for_side, paired_overlay_paths,
+        paired_preview_geometry, paired_spec_montage_shots, resolve_overlay_subs,
+        roi_appearance_for_mesh, scene_surface_display_label, scene_surfaces_from_components,
+        standard_montage_shots, threshold_and_mask_from_appearance,
         timestamped_png_name_from_unix_seconds,
     };
+    use crate::color::Rgba;
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{MaskMode, Threshold};
+    use crate::roi::Roi;
     use crate::spec::{SpecFile, SpecHemisphere, SpecSurface};
     use crate::surface::{SurfaceDomain, SurfaceMesh, SurfaceSide, ValueRange};
     use glam::Vec3;
@@ -5477,6 +6241,158 @@ mod tests {
     }
 
     #[test]
+    fn roi_appearance_offsets_right_hemisphere_nodes_in_paired_mesh() {
+        let mesh = SurfaceMesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [11.0, 0.0, 0.0],
+                [10.0, 1.0, 0.0],
+            ],
+            vec![[0, 1, 2], [3, 4, 5]],
+        )
+        .unwrap();
+        let ranges = vec![
+            RoiComponentRange {
+                side: SurfaceSide::Left,
+                node_offset: 0,
+                node_count: 3,
+                triangle_offset: 0,
+                triangle_count: 1,
+            },
+            RoiComponentRange {
+                side: SurfaceSide::Right,
+                node_offset: 3,
+                node_count: 3,
+                triangle_offset: 1,
+                triangle_count: 1,
+            },
+        ];
+        let mut left = Roi::from_nodes("left-roi", 1, vec![1]).unwrap();
+        left.parent_side = SurfaceSide::Left;
+        left = left
+            .with_style(
+                Rgba::from_u8(255, 0, 0, 255),
+                Rgba::from_u8(0, 0, 255, 255),
+                1,
+            )
+            .unwrap();
+        let mut right = Roi::from_nodes("right-roi", 2, vec![1]).unwrap();
+        right.parent_side = SurfaceSide::Right;
+        right = right
+            .with_style(
+                Rgba::from_u8(0, 255, 0, 255),
+                Rgba::from_u8(0, 0, 255, 255),
+                1,
+            )
+            .unwrap();
+
+        let build = roi_appearance_for_mesh(&[left, right], &mesh, &ranges).unwrap();
+
+        assert_eq!(build.mapped_nodes, 2);
+        assert!(build.appearance.node_colors[1].is_some());
+        assert!(build.appearance.node_colors[4].is_some());
+        assert_eq!(build.node_labels[1], vec!["left-roi (1)"]);
+        assert_eq!(build.node_labels[4], vec!["right-roi (2)"]);
+    }
+
+    #[test]
+    fn overlay_subs_resolve_numeric_and_label_selectors() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "Grp_HV",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![0.0, 1.0, 2.0]),
+                )
+                .unwrap(),
+                DataColumn::new(
+                    "Grp_HV t",
+                    ColumnRole::Statistic,
+                    None,
+                    ColumnData::Float32(vec![2.0, 3.0, 4.0]),
+                )
+                .unwrap()
+                .with_stat(Some("Ttest(48)".to_string())),
+                DataColumn::new(
+                    "Grp_HV beta",
+                    ColumnRole::Brightness,
+                    None,
+                    ColumnData::Float32(vec![0.5, 0.6, 0.7]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let numeric = resolve_overlay_subs(&dataset, &["0".into(), "1".into()]).unwrap();
+        assert_eq!(
+            numeric,
+            OverlayColumnSelections {
+                intensity: 0,
+                threshold: Some(1),
+                brightness: None
+            }
+        );
+
+        let labels = resolve_overlay_subs(
+            &dataset,
+            &["Grp_HV".into(), "Grp_HV t".into(), "beta".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            labels,
+            OverlayColumnSelections {
+                intensity: 0,
+                threshold: Some(1),
+                brightness: Some(2)
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_subs_reject_ambiguous_or_non_numeric_selectors() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "Grp",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![0.0, 1.0, 2.0]),
+                )
+                .unwrap(),
+                DataColumn::new(
+                    "Grp t",
+                    ColumnRole::Statistic,
+                    None,
+                    ColumnData::Float32(vec![2.0, 3.0, 4.0]),
+                )
+                .unwrap(),
+                DataColumn::new(
+                    "Grp label",
+                    ColumnRole::Label,
+                    None,
+                    ColumnData::Text(vec!["a".into(), "b".into(), "c".into()]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert!(resolve_overlay_subs(&dataset, &["Gr".into(), "Grp t".into()]).is_err());
+        assert!(resolve_overlay_subs(&dataset, &["Grp label".into(), "Grp t".into()]).is_err());
+    }
+
+    #[test]
     fn viewer_threshold_slider_maps_to_canonical_threshold() {
         let mut appearance = OverlayAppearance::from_range(ValueRange {
             min: -5.0,
@@ -5515,6 +6431,50 @@ mod tests {
             messages
                 .iter()
                 .any(|message| message.contains("missing right hemisphere"))
+        );
+    }
+
+    #[test]
+    fn both_spec_state_selection_follows_spec_order_and_skips_incomplete_pairs() {
+        let spec = both_spec(["std.inflated", "std.smoothwm", "std.pial"]);
+        let (surfaces, skipped_states, messages) = scene_surfaces_from_components(
+            &spec,
+            vec![
+                component("std.smoothwm", SurfaceSide::Right, 0.0),
+                component("std.pial", SurfaceSide::Left, 0.0),
+                component("std.inflated", SurfaceSide::Left, 0.0),
+                component("std.smoothwm", SurfaceSide::Left, 0.0),
+                component("std.inflated", SurfaceSide::Right, 0.0),
+            ],
+        );
+
+        assert_eq!(
+            surfaces
+                .iter()
+                .map(|surface| surface.state.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("std.inflated"), Some("std.smoothwm")]
+        );
+        assert_eq!(skipped_states, 1);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("missing right hemisphere"))
+        );
+    }
+
+    #[test]
+    fn scene_surface_dropdown_labels_include_index_name_and_state() {
+        let surface = SceneSurface::paired(
+            "std.inflated".to_string(),
+            PathBuf::from("both.spec"),
+            component("std.inflated", SurfaceSide::Left, 0.0),
+            component("std.inflated", SurfaceSide::Right, 0.0),
+        );
+
+        assert_eq!(
+            scene_surface_display_label(1, 4, &surface),
+            "2/4 std.inflated (std.inflated)"
         );
     }
 
@@ -5621,6 +6581,22 @@ mod tests {
     }
 
     #[test]
+    fn paired_component_lookup_maps_composite_nodes_to_exact_surface() {
+        let left = component("smoothwm", SurfaceSide::Left, 0.0);
+        let right = component("smoothwm", SurfaceSide::Right, 3.0);
+
+        assert_eq!(
+            paired_component_for_node(&left, &right, 2).unwrap().side,
+            SurfaceSide::Left
+        );
+        assert_eq!(
+            paired_component_for_node(&left, &right, 3).unwrap().side,
+            SurfaceSide::Right
+        );
+        assert!(paired_component_for_node(&left, &right, 6).is_none());
+    }
+
+    #[test]
     fn pair_transform_drag_math_matches_pysuma_direction() {
         let mut open_angle = 0.0_f32;
         let mut separation = 0.0_f32;
@@ -5654,6 +6630,21 @@ mod tests {
         assert_eq!(paths.left_path, PathBuf::from("std.141.lh.curv.gii.dset"));
         assert_eq!(paths.right_path, PathBuf::from("std.141.rh.curv.gii.dset"));
         assert_eq!(paths.display_name, "std.141.?h.curv.gii.dset");
+    }
+
+    #[test]
+    fn paired_overlay_path_lookup_uses_exact_side_file() {
+        let path = PathBuf::from("std.141.ISC_lh_alpha_neg.niml.dset");
+
+        assert_eq!(
+            paired_overlay_path_for_side(&path, &SurfaceSide::Left).unwrap(),
+            PathBuf::from("std.141.ISC_lh_alpha_neg.niml.dset")
+        );
+        assert_eq!(
+            paired_overlay_path_for_side(&path, &SurfaceSide::Right).unwrap(),
+            PathBuf::from("std.141.ISC_rh_alpha_neg.niml.dset")
+        );
+        assert!(paired_overlay_path_for_side(&path, &SurfaceSide::Both).is_none());
     }
 
     #[test]

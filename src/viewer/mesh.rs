@@ -5,6 +5,10 @@ use crate::overlay::Overlay;
 use crate::surface::{SurfaceMesh, ValueRange};
 
 pub(super) const DEFAULT_SURFACE_COLOR: [f32; 4] = [0.76, 0.78, 0.74, 1.0];
+const SELECTED_FACE_COLOR: [f32; 4] = [0.1, 0.85, 1.0, 1.0];
+const CROSSHAIR_COLOR: [f32; 4] = [1.0, 0.92, 0.12, 1.0];
+const SELECTED_FACE_OFFSET: f32 = 0.003;
+const CROSSHAIR_RADIUS: f32 = 0.025;
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedSurface {
@@ -29,6 +33,18 @@ pub(super) struct PreparedVertex {
     pub(super) position: [f32; 3],
     pub(super) normal: [f32; 3],
     pub(super) color: [f32; 4],
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RoiAppearance {
+    pub(super) node_colors: Vec<Option<[f32; 4]>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SelectionHighlight {
+    pub(super) node_index: u32,
+    pub(super) face_index: usize,
+    pub(super) crosshair_position: [f32; 3],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,34 +80,40 @@ impl PreparedSurface {
         overlay_dim: f32,
     ) -> Self {
         let geometry = PreparedGeometry::from_surface(surface);
-        Self::from_geometry(&geometry, overlay, overlay_dim)
+        Self::from_geometry_with_selection(&geometry, overlay, overlay_dim, None, None)
     }
 
-    pub(super) fn from_geometry(
+    pub(super) fn from_geometry_with_selection(
         geometry: &PreparedGeometry,
         overlay: Option<&Overlay>,
         overlay_dim: f32,
+        roi: Option<&RoiAppearance>,
+        selection: Option<SelectionHighlight>,
     ) -> Self {
-        let vertices = geometry
+        let mut vertices = geometry
             .vertices
             .iter()
             .enumerate()
             .map(|(index, vertex)| PreparedVertex {
                 position: vertex.position,
                 normal: vertex.normal,
-                color: overlay
-                    .and_then(|overlay| overlay.color_cache.colors.get(index))
-                    .copied()
-                    .map_or(DEFAULT_SURFACE_COLOR, |color| {
-                        compose_overlay_color(color, overlay_dim)
-                    }),
+                color: compose_vertex_color(
+                    overlay
+                        .and_then(|overlay| overlay.color_cache.colors.get(index))
+                        .copied(),
+                    overlay_dim,
+                    roi.and_then(|roi| roi.node_colors.get(index))
+                        .copied()
+                        .flatten(),
+                ),
             })
             .collect();
-
-        Self {
-            vertices,
-            indices: geometry.indices.clone(),
+        let mut indices = geometry.indices.clone();
+        if let Some(selection) = selection {
+            append_selection_highlight(&mut vertices, &mut indices, geometry, selection);
         }
+
+        Self { vertices, indices }
     }
 
     pub(super) fn index_count(&self) -> u32 {
@@ -119,6 +141,129 @@ impl PreparedSurface {
 
         bytes
     }
+}
+
+impl RoiAppearance {
+    pub(super) fn empty(node_count: usize) -> Self {
+        Self {
+            node_colors: vec![None; node_count],
+        }
+    }
+
+    pub(super) fn set_node_color(&mut self, node: u32, color: [f32; 4]) -> bool {
+        let Some(slot) = self.node_colors.get_mut(node as usize) else {
+            return false;
+        };
+        *slot = Some(color);
+        true
+    }
+}
+
+fn append_selection_highlight(
+    vertices: &mut Vec<PreparedVertex>,
+    indices: &mut Vec<u32>,
+    geometry: &PreparedGeometry,
+    selection: SelectionHighlight,
+) {
+    append_selected_face(vertices, indices, geometry, selection.face_index);
+    append_crosshair_marker(vertices, indices, selection.crosshair_position);
+    append_selected_node_marker(vertices, indices, geometry, selection.node_index);
+}
+
+fn append_selected_face(
+    vertices: &mut Vec<PreparedVertex>,
+    indices: &mut Vec<u32>,
+    geometry: &PreparedGeometry,
+    face_index: usize,
+) -> Option<()> {
+    let base_index = face_index.checked_mul(3)?;
+    let face_indices = [
+        *geometry.indices.get(base_index)?,
+        *geometry.indices.get(base_index + 1)?,
+        *geometry.indices.get(base_index + 2)?,
+    ];
+    let face_vertices = [
+        *geometry.vertices.get(face_indices[0] as usize)?,
+        *geometry.vertices.get(face_indices[1] as usize)?,
+        *geometry.vertices.get(face_indices[2] as usize)?,
+    ];
+    let face_normal = (Vec3::from_array(face_vertices[0].normal)
+        + Vec3::from_array(face_vertices[1].normal)
+        + Vec3::from_array(face_vertices[2].normal))
+    .normalize_or_zero();
+    let offset = face_normal * SELECTED_FACE_OFFSET;
+    let start = vertices.len() as u32;
+    for vertex in face_vertices {
+        vertices.push(PreparedVertex {
+            position: (Vec3::from_array(vertex.position) + offset).to_array(),
+            normal: vertex.normal,
+            color: SELECTED_FACE_COLOR,
+        });
+    }
+    indices.extend_from_slice(&[start, start + 1, start + 2]);
+
+    Some(())
+}
+
+fn append_selected_node_marker(
+    vertices: &mut Vec<PreparedVertex>,
+    indices: &mut Vec<u32>,
+    geometry: &PreparedGeometry,
+    node_index: u32,
+) -> Option<()> {
+    let vertex = geometry.vertices.get(node_index as usize)?;
+    append_crosshair_marker(vertices, indices, vertex.position);
+    Some(())
+}
+
+fn append_crosshair_marker(
+    vertices: &mut Vec<PreparedVertex>,
+    indices: &mut Vec<u32>,
+    position: [f32; 3],
+) {
+    let center = Vec3::from_array(position);
+    let directions = [
+        Vec3::X,
+        Vec3::NEG_X,
+        Vec3::Y,
+        Vec3::NEG_Y,
+        Vec3::Z,
+        Vec3::NEG_Z,
+    ];
+    let start = vertices.len() as u32;
+    for direction in directions {
+        vertices.push(PreparedVertex {
+            position: (center + direction * CROSSHAIR_RADIUS).to_array(),
+            normal: direction.to_array(),
+            color: CROSSHAIR_COLOR,
+        });
+    }
+    indices.extend_from_slice(&[
+        start,
+        start + 2,
+        start + 4,
+        start + 2,
+        start + 1,
+        start + 4,
+        start + 1,
+        start + 3,
+        start + 4,
+        start + 3,
+        start,
+        start + 4,
+        start + 2,
+        start,
+        start + 5,
+        start + 1,
+        start + 2,
+        start + 5,
+        start + 3,
+        start + 1,
+        start + 5,
+        start,
+        start + 3,
+        start + 5,
+    ]);
 }
 
 impl PreparedGeometry {
@@ -205,6 +350,30 @@ pub(super) fn compose_overlay_color(color: [f32; 4], dim: f32) -> [f32; 4] {
     ]
 }
 
+pub(super) fn compose_vertex_color(
+    overlay_color: Option<[f32; 4]>,
+    overlay_dim: f32,
+    roi_color: Option<[f32; 4]>,
+) -> [f32; 4] {
+    let base = overlay_color.map_or(DEFAULT_SURFACE_COLOR, |color| {
+        compose_overlay_color(color, overlay_dim)
+    });
+    roi_color.map_or(base, |color| compose_annotation_color(base, color))
+}
+
+fn compose_annotation_color(base: [f32; 4], annotation: [f32; 4]) -> [f32; 4] {
+    let alpha = finite_or(annotation[3], 0.0).clamp(0.0, 1.0);
+    [
+        finite_or(base[0], DEFAULT_SURFACE_COLOR[0]) * (1.0 - alpha)
+            + finite_or(annotation[0], DEFAULT_SURFACE_COLOR[0]) * alpha,
+        finite_or(base[1], DEFAULT_SURFACE_COLOR[1]) * (1.0 - alpha)
+            + finite_or(annotation[1], DEFAULT_SURFACE_COLOR[1]) * alpha,
+        finite_or(base[2], DEFAULT_SURFACE_COLOR[2]) * (1.0 - alpha)
+            + finite_or(annotation[2], DEFAULT_SURFACE_COLOR[2]) * alpha,
+        1.0,
+    ]
+}
+
 fn symmetric_range_if_signed(range: ValueRange) -> ValueRange {
     if range.min < 0.0 && range.max > 0.0 {
         let extent = range.min.abs().max(range.max.abs());
@@ -242,7 +411,9 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SURFACE_COLOR, PreparedSurface};
+    use super::{
+        DEFAULT_SURFACE_COLOR, PreparedGeometry, PreparedSurface, RoiAppearance, SelectionHighlight,
+    };
     use crate::color::ColorMap;
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{
@@ -275,6 +446,33 @@ mod tests {
             let length = Vec3::from_array(vertex.position).length();
             assert!(length <= 1.0 + f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn prepared_surface_appends_selection_highlight_geometry() {
+        let mesh = triangle_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+
+        let prepared = PreparedSurface::from_geometry_with_selection(
+            &geometry,
+            None,
+            1.0,
+            None,
+            Some(SelectionHighlight {
+                node_index: 2,
+                face_index: 0,
+                crosshair_position: [0.0, 0.0, 0.0],
+            }),
+        );
+
+        assert_eq!(prepared.vertices.len(), geometry.vertices.len() + 15);
+        assert_eq!(prepared.indices.len(), geometry.indices.len() + 51);
+        assert_eq!(&prepared.indices[..3], geometry.indices.as_slice());
+        assert!(
+            prepared.vertices[geometry.vertices.len()..]
+                .iter()
+                .all(|vertex| vertex.color != DEFAULT_SURFACE_COLOR)
+        );
     }
 
     #[test]
@@ -336,6 +534,25 @@ mod tests {
         let dimmed_prepared = PreparedSurface::from_surface(&mesh, Some(&dimmed_overlay), 1.0);
 
         assert_color_close(dimmed_prepared.vertices[1].color, [0.245, 0.24, 0.215, 1.0]);
+    }
+
+    #[test]
+    fn prepared_surface_composes_roi_color_over_overlay_color() {
+        let mesh = triangle_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let (_, overlay) = scalar_overlay(&mesh, vec![-1.0, 0.0, 1.0]);
+        let mut roi = RoiAppearance::empty(mesh.vertices.len());
+        assert!(roi.set_node_color(1, [0.0, 1.0, 0.0, 0.5]));
+
+        let prepared = PreparedSurface::from_geometry_with_selection(
+            &geometry,
+            Some(&overlay),
+            1.0,
+            Some(&roi),
+            None,
+        );
+
+        assert_color_close(prepared.vertices[1].color, [0.49, 0.98, 0.43, 1.0]);
     }
 
     #[test]
