@@ -88,7 +88,8 @@ The binary crate should stay thin. Most behavior should live in the library
 crate so future renderers, GUI experiments, batch tools, and tests can share
 the same data model.
 
-See `docs/ROADMAP.md` for the staged build plan.
+See `docs/ROADMAP.md` for the active to-do plan and `docs/COMPLETED.md` for
+the completed-work ledger.
 
 ## Project File Guide
 
@@ -102,9 +103,11 @@ See `docs/ROADMAP.md` for the staged build plan.
 - `.gitignore` keeps Cargo build output in `target/` out of version control.
 - `README.md` is the project-facing quickstart: scope, commands, controls,
   overlays, design direction, and this file guide.
-- `docs/ROADMAP.md` is the staged development plan for growing from the current
-  reader-backed viewer into a SUMA-class surface, dataset, AFNI interop, and
-  eventual volume-rendering tool.
+- `docs/ROADMAP.md` is the active to-do plan, grouped by shared foundations
+  such as AFNI interop, command state, everyday viewer use, GPU work, and
+  volume support.
+- `docs/COMPLETED.md` is the completed-work ledger for bootstrap, data model,
+  geometry, viewer, ROI, spec, and rendering performance milestones.
 - `src/lib.rs` is the library crate entry point. It exposes the reusable modules
   so the binary, tests, and future tools can share the same implementation.
 - `src/main.rs` is the command-line entry point. It parses `sumaru` arguments,

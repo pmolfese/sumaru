@@ -1,497 +1,204 @@
-# sumaru Roadmap
+# sumaru To-Do Roadmap
 
-This is a working plan for growing `sumaru` from a reader-backed CLI into a
-SUMA-class surface viewer and analysis environment.
+This is the active work plan for growing `sumaru` into a SUMA-class Rust
+surface viewer and analysis environment.
 
-## Principle
+Completed work has moved to [`COMPLETED.md`](COMPLETED.md). This file should
+only contain unfinished work, grouped by the foundations they lean on rather
+than by the order the ideas originally appeared.
 
-Build a Rust-native surface/volume model first, then hang CLIs and viewers from
-that model. Avoid copying AFNI's implementation; use public file formats,
-behavioral tests, and user-visible compatibility as the guide.
+## Current Priority: AFNI Interop And File Formats
 
-Once the model is rich enough to support a real task, prefer building the
-thinnest end-to-end slice that is actually usable (load → view → adjust →
-export), dogfood it, and let real use pull depth into the model — rather than
-pre-building model depth on spec. The "Daily Driver" phase below exists for
-exactly this: it pulls a small set of items forward out of later phases so the
-tool becomes usable day-to-day before those phases are finished in order.
+The next major push is to make `sumaru` communicate with AFNI/SUMA and handle
+AFNI/SUMA file formats with enough fidelity that real sessions can move between
+AFNI, SUMA, SUMAvista, and `sumaru`.
 
-AFNI/SUMA reference points for the early model work include
-`SUMA_define.h` (`SUMA_SurfaceObject`, `SUMA_OVERLAYS`, `SUMA_VOLPAR`, ROI
-records), `suma_datasets.h`, `surface_domain.h`, `SUMA_GeomComp.h`, and
-`SUMA_Color.h`.
+### Format Inventory And Fixtures
 
-## Phase: Daily Driver (current focus)
+- [ ] Inventory the AFNI/SUMA file formats and workflows needed for the first
+  interop-capable release: `.spec`, GIFTI surfaces, `.niml.dset`,
+  `.gii.dset`, `.niml.roi`, label tables, color maps, `.HEAD/.BRIK`, surface
+  volumes, and live AFNI/SUMA messages.
+- [ ] Build a broader compatibility fixture matrix with dense and sparse
+  datasets, ASCII and binary NIML, mixed numeric/string tables, label tables,
+  multi-surface `.spec` sessions, malformed files, and recorded AFNI/SUMA
+  message examples.
+- [ ] Cross-check file semantics against AFNI C code, SUMAvista Python,
+  MATLAB readers where useful, and the external
+  `/Users/molfesepj/Documents/Programming/afni_rust` crate before hardening
+  public APIs.
 
-The near-term goal: make `sumaru` usable for the two most common day-to-day
-SUMA tasks — viewing statistical overlays and drawing/editing ROIs — on real
-AFNI data (`.niml.dset`, `.spec`). Items here are pulled forward from Phases 3,
-4, and 5; the canonical descriptions still live in those phases. Much of this is
-wiring already-built model code (the `Overlay`/`ColorMap` model, the `Roi`
-model, and the Phase 2 path/fill/geodesic geometry) into the viewer, not new
-foundation.
+### NIML Talk With AFNI
 
-Deliberately *not* in scope yet: a standalone controller/command-routing layer
-(wire controls directly to viewer state for now and extract a controller only
-once scripts or AFNI become a second consumer), atlas/label coloring, live AFNI
-interop, and volume rendering.
-
-### Tier 1 — Statistical overlay loop
-
-- [x] Parse `.niml.dset` and AFNI-converted `.gii.dset` into the canonical
-  `Dataset` (from Phase 3) so real AFNI overlays load, not just one-column
-  GIFTI shape files.
-- [x] Wire overlay display controls into the viewer using the existing
-  `color.rs`/`overlay.rs` model: selectable colormap, intensity range,
-  threshold mode/range, symmetric range, and opacity (from Phase 4).
-- [x] Add screenshot export (from Phase 4) for figures and QA.
-
-### Tier 2 — ROI loop
-
-- [x] Add persistent node/triangle selection highlighting and crosshair state
-  (from Phase 4) on top of the existing right-click pick.
-- [x] Load and display `.niml.roi` regions (from Phases 3/5), including a
-  second color layer composited over the scalar overlay.
-- [x] Drawing, editing, undo/redo, and `.niml.roi` save (from Phase 5),
-  exercising the Phase 2 node/edge/triangle paths, fill-to-mask, and geodesics.
-
-### Tier 3 — Sessions and anatomy
-
-- [x] Parse `.spec` files and load multi-surface scenes with visibility toggles
-  and pial/inflated/sphere state switching (from Phases 3/5), with required
-  surface-volume parent context for spec launches.
-  - [x] Parse single- and both-hemisphere `.spec` files into surface entries,
-    states, groups, hemisphere labels, and SUMA parent fields.
-  - [x] Add `-spec/--spec` plus required `-sv/--sv` launch arguments and store
-    the surface-volume parent on loaded spec surfaces.
-  - [x] Load single-hemisphere spec scenes and switch the active surface with
-    `.` and `,`.
-  - [x] Add an `Active` controller dropdown for direct pial/inflated/sphere or
-    spec-state selection.
-  - [x] Load `both` specs as paired left/right surfaces rendered together.
-  - [x] Add closed/acorn paired-hemisphere view presets and Control-drag
-    controls for opening angle and hemisphere gap.
-  - [x] Load the first spec state immediately and use strict on-demand loading
-    by default, with `--preload` for background loading of remaining spec
-    surfaces.
-  - [x] Update screenshot montage behavior for paired-hemisphere scenes.
-
-### Continuous (cheap insurance, do early)
-
-- [x] Add CircleCI building and testing on Linux as a minimal version of the
-  Phase 8 CI item. macOS CircleCI is deferred until hosted macOS resources are
-  available on the project plan.
-
-## Phase: Performance (viewer interaction)
-
-Keeping overlay thresholding and surface/hemisphere toggling responsive on large
-standard-mesh, both-hemisphere scenes. Guiding principle: **build durable data
-once, then express interaction as cheap state on top** (recolor, transforms,
-flags, draw-call selection, GPU uniforms) instead of rebuilding the canonical
-model or re-uploading large per-vertex data on every change.
-
-Always **measure before optimizing** — time the recolor, upload, and rebuild
-paths on a real ~275k-vertex scene to confirm where the cost is before moving to
-the next rung.
-
-### Recolor path hygiene (done)
-
-- [x] Cache geometry-derived scene stats (`winding_report`/`total_area`) per
-  surface id so a recolor no longer recomputes whole-mesh topology; only the
-  cheap overlay range is refreshed.
-- [x] Compute the overlay color cache exactly once per appearance change
-  (`Overlay::without_color_cache` + a single `rebuild_color_cache`) instead of
-  building it once with default settings and again with the real settings.
-
-### Thresholding — Level 2: separate color buffer
-
-- [ ] Split the interleaved vertex buffer into a position+normal buffer
-  (uploaded once) and a separate color buffer. A threshold/colormap change then
-  re-uploads only ~4·N color bytes and never touches geometry. Split
-  `upload_surface_buffers` into a geometry upload (on mesh/visibility change)
-  and a color upload (on recolor). Still does an O(n) CPU recolor per change,
-  but ~10× less upload; often enough on its own.
-
-### Thresholding — Level 3: GPU/shader colormapping
-
-- [ ] Upload the raw per-vertex scalar columns (intensity, threshold, optional
-  brightness) once; put threshold/range/opacity/colormap-id in a small uniform;
-  colormap in the shader against a 1-D LUT texture. A threshold change becomes a
-  tiny uniform write — no CPU recolor, no per-vertex upload — so slider dragging
-  is immediate even on large meshes. Naturally supports SUMA's independent
-  intensity/threshold sub-bricks. Costs: porting threshold semantics (symmetric
-  range, abs, hide-failed vs dim, p-value→stat, NaN) to WGSL, adding pixel/render
-  tests since that logic leaves unit-testable Rust, and a node→vertex expansion
-  for sparse overlays. The Level 2 multi-buffer/bind-group plumbing carries into
-  this.
-
-### Toggling and hemisphere layout — durable mesh residency
-
-- [x] Draw `both`-hemisphere scenes as two resident per-hemisphere GPU mesh
-  instances instead of one rebuilt composite mesh. The logical combined
-  `SurfaceMesh` still backs overlays, ROI node offsets, and scene state, but
-  rendering keeps left and right geometry uploaded separately.
-- [x] Update acorn opening/closing with per-hemisphere model matrices. Opening
-  angle, signed acorn direction, gap, and left/right visibility now change by
-  writing small uniforms and changing the draw list, not by transforming and
-  re-uploading hundreds of thousands of vertices.
-- [x] Make picking layout-aware for resident hemispheres by transforming the
-  pick ray into each hemisphere's current model matrix and testing against that
-  hemisphere's raw mesh. The durable mesh no longer needs rebuilding just so
-  right-click picking can work after an acorn layout change.
-- [x] Add in-view acorn feedback for signed open percentage (`+/-100%`) while
-  Control-dragging, using the render-window overlay rather than the controller
-  window.
-- [ ] Keep all loaded spec states resident as reusable GPU geometry buffers so
-  pial/inflated/sphere switching becomes a draw-list/bind-group swap instead of
-  a surface upload. This should extend the same idea from resident hemispheres
-  to resident spec states.
-- [ ] Split ROI and selection highlighting out of baked vertex colors into
-  separate lightweight GPU layers or buffers, so editing/drawing ROIs does not
-  require rebuilding the full surface color stream.
-- [ ] Add a small viewer performance HUD or verbose timing hooks for mesh
-  upload, color upload, threshold rebuild, and frame time, so future GPU work is
-  guided by measured bottlenecks rather than feel alone.
-
-## Phase 0: Bootstrap
-
-- [x] Create the `sumaru` Cargo package.
-- [x] Pull in GIFTI support from `PennLINC/gifti-rs`.
-- [x] Pull in NIFTI support from `Enet4/nifti-rs`.
-- [x] Add Cargo aliases, README quickstart, and this staged roadmap.
-- [x] Add a first `sumaru inspect` command to prove the reader path works.
-- [x] Add a first `sumaru -i/--surface` viewer path to prove native windowing
-  and GPU rendering work.
-
-## Phase 1: Canonical Data Model
-
-- [x] Define the first file-neutral `SurfaceMesh`, `Bounds`, and
-  `OverlayDataset` types needed by the prototype viewer.
-- [x] Convert GIFTI pointset/triangle arrays into `SurfaceMesh`.
-- [x] Separate durable model types from render-prep types so mesh, dataset,
-  overlay, and scene state can be used by CLIs, tests, and future UIs without
-  depending on `wgpu`.
-- [x] Expand `SurfaceMesh` metadata toward SUMA's `SUMA_SurfaceObject`: stable
-  id, label, source file, node count/dimension, embedding dimension, face
-  dimension, side, group/subject label, state name, surface kind
-  (`pial`, `smoothwm`, `inflated`, `sphere`, etc.), anatomical-correct flag,
-  and sphere radius/center when applicable.
-- [x] Add explicit surface lineage: local domain parent, local curvature
-  parent, domain grandparent, node parent, parent volume id, originator id, and
-  enough domain-kinship information to know when two surfaces share topology,
-  share geometry, can use explicit standard/template node-count compatibility,
-  or need mapping.
-- [x] Add a `SurfaceDomain` concept for topology/geometry domains: optional
-  node IDs, row-index-to-node-index mapping, sorted-node metadata, and
-  triangle topology independent of any one coordinate set.
-- [x] Define `Dataset` as a domain-attached table, not just one vector:
-  dataset kind, domain id, row count, optional sparse node index column, typed
-  data columns, column labels, column roles, ranges, units, and parent ids.
-- [x] Define `Overlay` as display state layered on top of a `Dataset`: selected
-  intensity/threshold/brightness columns, colormap, intensity range,
-  threshold mode/range, masking/clipping, symmetric range, opacity, plane order,
-  foreground/background role, and per-node color cache.
-- [x] Define `LabelTable` and `ColorMap` models for integer label datasets,
-  continuous maps, RGBA label colors, and imported GIFTI/FreeSurfer label
-  tables.
-- [x] Define `Roi`/`RoiDatum` for surface regions from drawing, imported
-  `.niml.roi`, datasets, thresholded overlays, or future tools: parent surface
-  id, side, label, integer label, fill/edge colors, edge thickness, draw
-  status, source/provenance, and optional stroke history as node/triangle
-  paths.
-- [x] Add starter fixture-backed/local-reference tests for representative
-  `.gii`, `.gii.dset`, `.niml.roi`, and `.spec` files, with malformed
-  surface/dataset behavior covered by focused unit tests. Use
-  AFNI/nibabel/Python readers as reference tools for future test expectations,
-  not runtime dependencies.
-
-## Phase 2: Surface Geometry Core
-
-- [x] Compute bounding boxes, centers, and radius for loaded surfaces.
-- [x] Compute vertex normals for triangle meshes.
-- [x] Compute face normals, polygon areas, node areas, and total mesh area.
-- [x] Detect normal direction and triangle winding; add utilities to flip or
-  orient triangles consistently when source files disagree.
-- [x] Build topology caches analogous to SUMA's `MF`, `FN`, and `EL`: per-node
-  member faces, first-order neighbors, neighbor distances, unique edge list,
-  edge-to-host-face mapping, and boundary edges/triangles.
-- [x] Validate meshes beyond bounds checks: empty geometry, duplicate or
-  degenerate triangles, non-manifold edges, invalid polygon dimensions where
-  representable, disconnected components, boundary edges/loops, and winding
-  diagnostics.
-- [x] Add robust node/row lookup helpers so sparse datasets, overlays, ROI
-  paths, and full-node arrays can all agree on node IDs versus row indices.
-- [x] Implement masks and patches: node masks, face masks derived from node
-  masks, patch extraction, patch bounds, and mask composition.
-- [x] Add geometry operations for ROI workflows: node paths, edge paths,
-  triangle paths, contour edges, fill-to-mask behavior, path lengths, and basic
-  geodesic distance reporting.
-- [x] Implement graph/geodesic operations used by SUMA workflows: Dijkstra
-  shortest path, k-ring neighborhoods, distance-limited neighborhoods, and
-  approximate spherical neighborhoods for fast region queries.
-- [x] Add curvature and shape metrics needed for common overlays: convexity,
-  curvature-style scalar fields, and parent-aware shape data.
-- [x] Add first smoothing primitives for surface data and geometry:
-  nearest-neighbor smoothing, weighted smoothing, mask-respecting smoothing,
-  and vertex smoothing.
-- [x] Add coordinate-space transforms and affine composition for surface
-  geometry, including load-time transforms and interactive/display transforms.
-- [x] Add surface-volume geometry primitives needed later by AFNI interop and
-  volume rendering: voxel/index/world conversion, nearest surface node to
-  voxel/world position, surface voxelization, voxel-to-surface distance, and
-  volume-to-surface sampling hooks.
-- [x] Add clipping and intersection geometry: plane/surface intersections,
-  clipped contours, visible patch extraction, and screenshot/export-friendly
-  render masks.
-- [x] Add surface-to-surface mapping support: same-topology transfer,
-  nearest-neighbor transfer, barycentric/triangle transfer, and domain-kinship
-  checks before values move between surfaces.
-
-## Phase 3: SUMA Compatibility Layer
-
-> Top priority (pulled into Daily Driver): `.niml.dset` → `Dataset`, `.spec`
-> parsing, and `.niml.roi` reading.
-
-- [ ] Inventory the SUMA file formats and workflows we want first: `.spec`,
-  GIFTI surfaces, `.niml.dset`, `.niml.roi`, labels, overlays, and AFNI
-  session coordination.
-  - Why: A clear inventory keeps compatibility work focused on real workflows
-    instead of chasing every historical format at once.
-- [ ] Implement native Rust parsers in priority order, starting with
-  `.niml.dset` and `.niml.roi`, with round-trip or golden-output tests.
-  - Why: Native parsers make `sumaru` portable, testable, and usable without a
-    Python or AFNI runtime dependency.
-- [x] Add the first native NIML I/O foundation: ASCII NIML element
-  parser/writer, `.niml.dset`/`.niml.roi` payload extraction, and reference
-  checks that encode the shared C, MATLAB, and SUMAvista Python layout
-  assumptions.
-- [x] Extend NIML I/O with fixed-width binary numeric payloads,
-  mixed numeric/string row tables, and conversion from `.niml.dset` payloads
-  into canonical `Dataset` values.
-- [x] Parse `.spec` files into surface groups, states, hemispheres, labels,
-  topology/coordinate file pairs, local domain parents, curvature parents, and
-  surface-volume parent references.
-- [x] Parse `.niml.dset` and AFNI-converted `.gii.dset` into the canonical
-  `Dataset` model with column labels, column roles, typed values, node-index
-  columns, ranges, stat metadata, and parent/domain ids.
-- [ ] Parse `.niml.roi` into `Roi`/`RoiDatum` with stroke history, node
-  paths, triangle paths, labels, colors, and parent-surface metadata.
-  - Why: Reading ROI files lets users bring existing SUMA annotations into
-    `sumaru` without redrawing them.
-- [ ] Add AFNI `.HEAD/.BRIK` metadata support when the shared `VolumeSpace`
-  model is ready enough to represent AFNI orientation and warp attributes.
-  - Why: AFNI volumes are common in SUMA workflows, but they should wait until
-    the volume coordinate model can represent them correctly.
-- [ ] Incubate AFNI/SUMA readers inside this workspace first, then split them
-  into reusable Rust crates once the APIs and fixture coverage stabilize.
-  - Why: Keeping readers local at first lets the design change quickly before
-    we promise a public crate API.
-- [ ] Expand the compatibility fixture corpus with more real AFNI/SUMA examples:
-  dense and sparse `.niml.dset`, binary NIML variants, label tables,
-  malformed files, multi-surface `.spec` sessions, and small shareable golden
-  summaries generated from AFNI/nibabel/SUMAvista reference readers.
-  - Why: The starter local files prove the pipeline, but broader data is what
-    will catch format edge cases before users do.
-- [ ] Keep compatibility code at the edges so the internal model remains clean.
-  - Why: The core model should describe surfaces and datasets, not every quirk
-    of every file format.
-
-## Phase 4: Rendering Prototype
-
-> Top priority (pulled into Daily Driver): overlay colormap/range/threshold/
-> symmetric-range/opacity controls, persistent selection + crosshair, and
-> screenshot export.
-
-- [x] Start with a desktop viewer using `winit` for windowing and `wgpu` for
-  rendering.
-- [x] Render a single GIFTI mesh in a native window.
-- [x] Upload vertices, normals, colors, and triangle indices to `wgpu`.
-- [x] Add depth testing and basic directional lighting.
-- [x] Normalize loaded surfaces for the first viewer camera.
-- [x] Add mouse orbit camera control.
-- [x] Add scroll-wheel zoom.
-- [x] Add Space camera reset.
-- [x] Add `C` camera-mode switching between orbit and turntable.
-- [x] Add a temporary on-screen camera-mode label.
-- [x] Add Option/Alt + arrow preset orientations.
-- [x] Add `F5` background switching between black and white.
-- [x] Add first scalar overlay coloring from a GIFTI data array.
-- [x] Introduce `egui` with `egui-winit`/`egui-wgpu` for the first native
-  viewer control panel.
-- [x] Add a first in-viewer workbench for loading surface and overlay paths,
-  showing load errors, displaying scene stats, and driving camera/background
-  controls.
-- [x] Move the first workbench into a separate native controls window so it no
-  longer consumes surface viewport space or intercepts surface clicks.
-- [ ] Move camera, background, overlay, and selection settings into a shared
-  controller/command state instead of leaving them as viewer-only state.
-  - Why: Shared command state lets keys, panels, scripts, and AFNI messages
-    control the same viewer behavior.
-- [ ] Add a controller layer for future UI panels and command routing before
-  adding richer controls.
-  - Why: A controller layer keeps interaction logic out of the renderer and
-    makes future UI work less tangled.
-- [ ] Define shared interaction state: selected node, selected face, crosshair
-  location, current surface/object id, and pick results that can be driven from
-  either keyboard shortcuts or a future controller UI.
-  - Why: Keyboard shortcuts, mouse picking, panels, and AFNI messages should all
-    change the same state instead of fighting each other, so this belongs near
-    the controller and `egui` work rather than the file/model foundation.
-- [ ] Split the first `egui` panel into controller-backed widgets once the
-  command state exists.
-  - Why: The current panel is useful for testing, but richer controls should
-    share commands with shortcuts, scripts, and AFNI messages instead of
-    calling viewer methods directly.
-  - Reference: `docs/EGUI_CONTROLLER_REFERENCE.md` preserves the first surface
-    controller mockup and implementation notes.
-- [x] Add native file picker support for loading surfaces, overlays, specs, and
-  surface volumes from the first viewer workbench.
-- [ ] Add recent-file support if repeated manual loading becomes annoying.
-  - Why: File dialogs are simple and reliable for testing, but repeated manual
-    loading will eventually want remembered recent files and working folders.
-- [ ] Add label-table-aware coloring.
-  - Why: Label datasets should display named regions with their intended colors.
-- [x] Add selectable color maps.
-- [ ] Add threshold, clipping, opacity, and symmetric-range controls.
-  - Why: These controls are how users turn dense scalar maps into interpretable
-    surface overlays.
-- [ ] Add multiple overlay planes and explicit foreground/background ordering.
-  - Why: SUMA users often compare several datasets at once, and layer order
-    should be predictable.
-- [x] Add first right-click node/triangle inspection with scalar overlay
-  values.
-- [x] Add persistent node/triangle selection highlighting.
-- [x] Add crosshair state and display.
-- [x] Add screenshot export.
-- [ ] Add viewer tests or screenshot/pixel checks for nonblank rendering once
-  automated graphics verification is practical.
-  - Why: Rendering bugs are easy to miss in code review, so pixel checks give
-    us confidence that the window still draws real content.
-
-## Phase 5: Interactive SUMA Workflows
-
-> Top priority (pulled into Daily Driver): multi-surface scenes + state
-> switching, and ROI display/drawing/editing/undo/save.
-
-- [x] Add multi-surface scenes: pial, smoothwm, inflated, sphere, and
-  registered template surfaces.
-- [ ] Add surface visibility toggles and current-surface focus.
-  - Why: Multi-surface scenes need simple controls for hiding, showing, and
-    choosing the active surface.
-- [x] Add state switching across related surfaces, such as anatomical,
-  inflated, spherical, and template states.
-- [ ] Add node/triangle inspection panels backed by shared selection state.
-  - Why: Clicking a node should reveal useful facts like coordinates, labels,
-    overlay values, and topology.
-- [x] Add ROI loading, display, creation, editing, undo/redo, and save/export.
-- [ ] Add threshold controls and color-map management for loaded overlays.
-  - Why: Real analysis maps need quick adjustment to reveal signal without
-    reloading data.
-- [ ] Add cluster/connected-component views for thresholded overlays.
-  - Why: Clusters help users summarize thresholded results as regions rather
-    than thousands of separate nodes.
-- [ ] Add volume-to-surface and surface-to-volume bridge operations where the
-  data model can support them.
-  - Why: Many workflows start in volume space and end on the surface, or the
-    reverse.
-
-## Phase 6: AFNI Interop
-
-- [ ] Decide how much live AFNI communication matters for the first real
-  release.
-  - Why: Live AFNI sync is useful, but deciding its scope prevents it from
-    delaying the standalone viewer.
-- [ ] Document the subset of AFNI/SUMA messages needed for surface selection,
-  crosshair updates, dataset loading, and controller state.
-  - Why: A small documented protocol target is easier to implement and test
-    than trying to mirror everything.
-- [ ] Add AFNI/SUMA-compatible `BBox` threshold A/B semantics for future
-  multi-threshold transparency and masking controls.
-  - Why: Threshold failures should eventually be controlled as overlay
-    transparency/masking state, not by unexpectedly changing the base surface
-    appearance.
-- [ ] If needed, implement a small protocol crate for AFNI/SUMA messaging
-  rather than burying protocol details inside the viewer.
-  - Why: Protocol code should be reusable by CLIs and tests, not locked inside
-    window-rendering code.
-- [ ] Add command-line conversion and inspection tools that work without the
-  GUI.
-  - Why: Headless tools make batch workflows, debugging, and test fixtures much
-    easier.
+- [ ] Document the minimal AFNI/SUMA message subset for first interop: surface
+  selection, crosshair updates, selected node/triangle, dataset loading,
+  overlay/threshold state, controller commands, and ROI updates.
+- [ ] Add a small NIML communication/session layer that is independent of
+  `wgpu`, so tests and command-line tools can exercise AFNI message handling
+  without launching the viewer.
+- [ ] Route incoming AFNI messages through shared command/controller state
+  rather than directly mutating viewer-only fields.
+- [ ] Emit the matching `sumaru` state back to AFNI where appropriate:
+  crosshair location, selected node, active surface, current dataset, and
+  overlay/threshold settings.
+- [ ] Add debug tools for AFNI interop: record message streams, replay message
+  streams, inspect individual messages, and send small test commands from the
+  CLI.
 - [ ] Add compatibility tests against AFNI-generated messages and representative
   session files.
-  - Why: Interop only matters if it matches real AFNI output, so fixtures should
-    define the contract.
 
-## Phase 7: Volume Rendering
+### File Format Polish In `sumaru`
+
+- [ ] Tighten `.niml.roi` round-trip fidelity for multi-ROI files, finalized
+  versus editable ROI states, stroke/fill metadata, outside fills, per-ROI
+  colors, and SUMA-compatible save output.
+- [ ] Expand `.niml.dset` and `.gii.dset` coverage for more statistical
+  metadata, label-table payloads, sparse node-index conventions, and malformed
+  inputs.
+- [ ] Add AFNI `.HEAD/.BRIK` metadata support once `VolumeSpace` can represent
+  AFNI orientation, transform, and warp attributes accurately.
+- [ ] Add command-line conversion and inspection tools that work without the
+  GUI for surfaces, datasets, ROI files, specs, and recorded NIML messages.
+- [ ] Keep compatibility code at the edges so the internal surface, dataset,
+  overlay, ROI, and scene models remain file-neutral.
+
+### Move Toward `afni_rust`
+
+- [ ] Review `/Users/molfesepj/Documents/Programming/afni_rust` for existing
+  format models, parser/writer APIs, error types, fixture strategy, and places
+  where `sumaru` and the crate disagree.
+- [ ] Decide the boundary between `sumaru`'s canonical runtime models and
+  reusable AFNI/SUMA I/O crate models.
+- [ ] Add adapter traits so `sumaru` can swap local parsers for `afni_rust`
+  readers/writers without changing viewer or analysis code.
+- [ ] Move stable NIML, spec, dataset, ROI, and future AFNI volume I/O into
+  `afni_rust` once APIs and fixtures are stable enough to share.
+- [ ] Keep shared fixtures and golden summaries aligned between `sumaru`,
+  `afni_rust`, AFNI/SUMA, and SUMAvista.
+
+## Shared Controller And Command State
+
+This cluster supports AFNI interop, menus, keyboard shortcuts, controller
+windows, scripts, and future automation. It should happen before wiring a lot
+more UI or protocol behavior into viewer-only fields.
+
+- [ ] Move camera, background, overlay, ROI, surface selection, visibility,
+  crosshair, and pick settings into shared command/controller state.
+- [ ] Add a controller layer for UI panels, keyboard shortcuts, CLI commands,
+  and AFNI messages before adding richer controls.
+- [ ] Define shared interaction state: selected node, selected face, selected
+  triangle, crosshair location, current surface/object id, current overlay id,
+  current ROI id, and latest pick result.
+- [ ] Split the current `egui` panels into controller-backed widgets once the
+  command state exists.
+- [ ] Add a lightweight status/log event stream so `--verbose`, controllers,
+  and future AFNI communication can report the same events consistently.
+
+## Everyday Viewer Use
+
+These are usability features that make `sumaru` easier to use day to day before
+the larger GPU/shader optimization pass.
+
+- [ ] Add recent-file and remembered-working-folder support for surface,
+  overlay, spec, surface-volume, ROI, screenshot, and montage workflows.
+- [ ] Add label-table-aware coloring for atlas/label datasets and imported
+  GIFTI/FreeSurfer label tables.
+- [ ] Add richer node/triangle inspection panels backed by the current pick and
+  crosshair state.
+- [ ] Add explicit surface visibility and focus controls for multi-surface and
+  `.spec` scenes.
+- [ ] Add multiple overlay planes with explicit foreground/background ordering.
+- [ ] Add AFNI/SUMA-compatible `BBox` threshold A/B semantics for future
+  multi-threshold transparency and masking controls.
+- [ ] Add cluster and connected-component views for thresholded overlays.
+- [ ] Add viewer screenshot/pixel checks for nonblank rendering and common
+  overlay/ROI/spec scenes once automated graphics verification is practical.
+
+## Geometry, Mapping, And Analysis Extensions
+
+The core geometry layer is strong enough for ROI work now. These items extend it
+toward richer analysis workflows and cross-space operations.
+
+- [ ] Add node/triangle inspection panels that expose topology, coordinates,
+  labels, overlay values, ROI membership, and surface/domain lineage.
+- [ ] Add volume-to-surface and surface-to-volume bridge operations where the
+  data model can support them.
+- [ ] Add richer cluster summaries for thresholded overlays: size, area,
+  centroid, peak value, peak node, and ROI export.
+- [ ] Expand surface-to-surface transfer tests for standard meshes, same-node
+  standard-surface compatibility, nearest-neighbor transfer, and barycentric
+  transfer.
+
+## GPU/Shader Optimization Bundle
+
+Do this as one coordinated rendering pass after the next everyday-use and AFNI
+interop work. The guiding principle is: build durable data once, then express
+interaction as cheap state on top.
+
+Measure first on a real large `both`-hemisphere scene: recolor time, geometry
+upload time, scalar/color upload time, threshold rebuild time, and frame time.
+
+- [ ] Add a small viewer performance HUD or verbose timing hooks for mesh
+  upload, color/scalar upload, threshold rebuild, spec-state switching, ROI
+  drawing, and frame time.
+- [ ] Split the interleaved vertex buffer into position+normal geometry buffers
+  and separate compact color/scalar buffers.
+- [ ] Upload raw per-vertex scalar columns once; put threshold, range, opacity,
+  and colormap id in small uniforms; sample colormaps in the shader against a
+  1-D LUT texture.
+- [ ] Keep all loaded spec states resident as reusable GPU geometry buffers so
+  pial/inflated/sphere switching becomes a draw-list or bind-group swap instead
+  of a surface upload.
+- [ ] Split ROI and selection highlighting out of baked vertex colors into
+  lightweight GPU layers or buffers, so drawing and editing ROIs does not
+  rebuild the full surface color stream.
+- [ ] Preserve SUMA threshold semantics in WGSL: symmetric range, absolute
+  thresholding, hide-failed versus dim, p-value-to-stat conversion, NaN
+  handling, and sparse node-to-vertex expansion.
+- [ ] Add focused pixel/render tests for shader-side threshold and color
+  behavior.
+
+## Volume And AFNI Volume Space
+
+Volume work stays behind AFNI/file-format interop because AFNI coordinate
+semantics need to be represented correctly before serious rendering begins.
 
 - [ ] Define `Volume` and `VolumeSpace` types from NIFTI/AFNI concepts:
   dimensions, voxel sizes, origin, orientation codes, qform/sform or AFNI
   matrix attributes, and transforms between voxel index/IJK, scanner/world, and
   AFNI-style coordinate spaces.
-  - Why: Volume rendering and AFNI interop need reliable coordinate math before
-    pixels are drawn.
 - [ ] Convert NIFTI headers and affine metadata into the shared `VolumeSpace`
   model.
-  - Why: NIFTI files store orientation and scaling in headers, and we need that
-    information to place volumes correctly.
 - [ ] Add fixture-backed snapshot/golden tests for representative `.nii.gz`,
   `.hdr/.img`, AFNI volume metadata, and malformed volume inputs.
-  - Why: Volume headers are easy to misread, and fixtures catch orientation and
-    datatype mistakes early.
+- [ ] Add AFNI `.HEAD/.BRIK` metadata support once the shared `VolumeSpace`
+  model is ready.
 - [ ] Add `-v/--volume` as a volume-only viewer mode for NIFTI `.nii` and
   `.nii.gz` inputs.
-  - Why: A separate volume entry point lets us prove loading and display before
-    mixing volumes with surfaces.
 - [ ] Start with volume metadata in the viewer and orthogonal slice rendering
   to validate NIFTI loading, intensity normalization, voxel spacing, and
   orientation handling.
-  - Why: Slices are the simplest honest way to check that the volume is loaded
-    and oriented correctly.
 - [ ] Add slice navigation, window/level controls, and crosshair-linked slice
   positions.
-  - Why: Basic volume viewing requires moving through slices and adjusting
-    contrast interactively.
-- [ ] Upload volume data to GPU textures with a clear strategy for scalar
-  datatype conversion and normalization.
-  - Why: GPU rendering needs predictable texture formats even when source files
-    use many numeric datatypes.
+- [ ] Upload volume data to GPU textures with a clear scalar datatype
+  conversion and normalization strategy.
 - [ ] Add true 3D volume rendering with a `wgpu` ray-marching shader, transfer
   functions, opacity/window controls, and 3D texture upload.
-  - Why: Ray marching is the path to actual 3D volume visualization rather than
-    only slice viewing.
 - [ ] Decide how 4D NIFTI data maps into the viewer: first volume by default,
   selectable timepoints/bricks later.
-  - Why: 4D files are common, and the viewer needs a clear rule instead of
-    silently picking the wrong frame.
-- [ ] Integrate surface + overlay + volume scenes once shared spatial
+- [ ] Integrate surface, overlay, ROI, and volume scenes once shared spatial
   transforms and crosshair state are reliable.
-  - Why: Combined scenes are powerful only if the objects align correctly in
-    the same space.
 
-## Phase 8: Packaging and Reliability
+## Packaging, Reliability, And Public Use
 
 - [ ] Ship binaries for macOS, Linux, and Windows.
-  - Why: Users should not need a Rust toolchain just to try the application.
-- [ ] Add continuous integration for `cargo fmt`, `cargo check`, and
-  `cargo test` on supported platforms.
-  - Why: CI catches breakage early and keeps the project buildable across
-    machines.
-- [ ] Add clippy once the codebase is large enough for lint policy to matter.
-  - Why: Clippy helps catch common Rust mistakes once the code is stable enough
-    for a consistent lint bar.
+- [ ] Add macOS and Windows CI when project resources make those runners
+  practical.
+- [ ] Add clippy once the codebase is stable enough for lint policy to matter.
 - [ ] Add fuzz tests for AFNI/SUMA/NIML parsers.
-  - Why: Parsers face messy input, and fuzzing helps find crashes before users
-    do.
-- [ ] Add benchmark coverage for large surfaces, large overlays, and large
-  datasets.
-  - Why: Neuroimaging files can be large, and benchmarks show when changes make
-    loading or rendering slower.
+- [ ] Add benchmark coverage for large surfaces, large overlays, large ROI
+  files, large `.spec` scenes, and large datasets.
 - [ ] Build a small public corpus of open neuroimaging fixtures for regression
   testing.
-  - Why: Shared fixtures make bugs reproducible and give contributors a common
-    test set.
-- [ ] Add crash-report-friendly errors for parser failures and GPU setup
-  failures.
-  - Why: Clear errors help users report problems and help us diagnose failures
-    quickly.
+- [ ] Add crash-report-friendly errors for parser failures, AFNI interop
+  failures, and GPU setup failures.
