@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -17,17 +17,20 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::color::Rgba;
 use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
-use crate::io::{read_gifti_dataset, read_niml_dataset, read_niml_roi};
+use crate::io::{read_gifti_dataset, read_niml_dataset, read_niml_roi, write_niml_roi};
 use crate::overlay::{
     ColumnSelection, MaskMode, Overlay, OverlayColumns, OverlayRange, RangeSelection, Threshold,
 };
-use crate::roi::{Roi, RoiBrushAction, RoiDatum, RoiElementKind};
+use crate::roi::{
+    Roi, RoiBrushAction, RoiDatum, RoiDrawStatus, RoiDrawingType, RoiElementKind, RoiSource,
+};
 use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, read_spec};
 use crate::stats::AfniStatSpec;
 use crate::surface::{
-    AnatomicalCorrectness, NormalDirection, OverlayDataset, SurfaceDomain, SurfaceId, SurfaceMesh,
-    SurfaceSide, ValueRange,
+    AnatomicalCorrectness, NodeMask, NormalDirection, OverlayDataset, SurfaceDomain,
+    SurfaceDomainId, SurfaceId, SurfaceMesh, SurfaceSide, ValueRange,
 };
 use camera::{Camera, CameraMode, PresetOrientation};
 use gpu::{
@@ -461,6 +464,8 @@ struct ViewerState {
     roi_path: Option<PathBuf>,
     overlay_display_name: Option<String>,
     roi_layer: Option<RoiLayer>,
+    roi_loaded_rois: Vec<Roi>,
+    roi_draft: RoiDraft,
     roi_visible: bool,
     surface_volume_path: Option<PathBuf>,
     hemisphere_layout: HemisphereLayout,
@@ -759,6 +764,8 @@ impl ViewerState {
             roi_path: None,
             overlay_display_name: None,
             roi_layer: None,
+            roi_loaded_rois: Vec::new(),
+            roi_draft: RoiDraft::default(),
             roi_visible: true,
             surface_volume_path: initial_surface_volume_path.clone(),
             hemisphere_layout: HemisphereLayout::Closed,
@@ -948,7 +955,13 @@ impl ViewerState {
                 button: MouseButton::Right,
                 ..
             } => {
-                self.inspect_surface_at_cursor();
+                if self.roi_draft.draw_enabled || self.roi_draft.fill_pending {
+                    if let Err(error) = self.handle_roi_draw_click_at_cursor() {
+                        self.set_error(error);
+                    }
+                } else {
+                    self.inspect_surface_at_cursor();
+                }
                 true
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -2093,11 +2106,19 @@ impl ViewerState {
             });
 
             ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Label");
+                ui.text_edit_singleline(&mut self.roi_draft.label);
+                ui.label("Value");
+                ui.add(egui::DragValue::new(&mut self.roi_draft.integer_label).speed(1));
+            });
+            ui.add_space(8.0);
             egui::Grid::new("roi_controller_summary_grid")
                 .num_columns(2)
                 .spacing([10.0, 5.0])
                 .show(ui, |ui| {
                     stat_row(ui, "ROI", self.roi_display_text());
+                    stat_row(ui, "Draft", self.roi_draft_status_text());
                     if let Some(layer) = self.roi_layer.as_ref() {
                         stat_row(ui, "Objects", layer.rois.len().to_string());
                         stat_row(ui, "Nodes", layer.mapped_nodes.to_string());
@@ -2108,11 +2129,56 @@ impl ViewerState {
         ui.add_space(10.0);
         controller_section(ui, "DRAWING", true, |ui| {
             ui.horizontal(|ui| {
-                ui.add_enabled(false, egui::Button::new("Draw"));
-                ui.add_enabled(false, egui::Button::new("Erase"));
-                ui.add_enabled(false, egui::Button::new("Fill"));
-                ui.add_enabled(false, egui::Button::new("Undo"));
-                ui.add_enabled(false, egui::Button::new("Save ROI"));
+                let draw_clicked = ui
+                    .add_enabled(
+                        self.mesh.is_some(),
+                        egui::Button::new("Draw").selected(self.roi_draft.draw_enabled),
+                    )
+                    .on_hover_text("Right-click the surface to add ROI anchor points")
+                    .clicked();
+                if draw_clicked {
+                    actions.push(UiAction::ToggleRoiDraw(!self.roi_draft.draw_enabled));
+                }
+                if ui
+                    .add_enabled(self.roi_draft.can_join(), egui::Button::new("Join"))
+                    .on_hover_text("Close the ROI by joining the last point back to the first")
+                    .clicked()
+                {
+                    actions.push(UiAction::JoinRoiDraft);
+                }
+                if ui
+                    .add_enabled(self.roi_draft.can_fill(), egui::Button::new("Fill"))
+                    .on_hover_text(
+                        "Right-click inside or outside the closed ROI to define the fill",
+                    )
+                    .clicked()
+                {
+                    actions.push(UiAction::ArmRoiFill);
+                }
+                if ui
+                    .add_enabled(self.roi_draft.can_undo(), egui::Button::new("Undo"))
+                    .clicked()
+                {
+                    actions.push(UiAction::UndoRoiDraft);
+                }
+                if ui
+                    .add_enabled(self.roi_draft.can_redo(), egui::Button::new("Redo"))
+                    .clicked()
+                {
+                    actions.push(UiAction::RedoRoiDraft);
+                }
+                if ui
+                    .add_enabled(
+                        !self.roi_draft.is_empty() || !self.roi_loaded_rois.is_empty(),
+                        egui::Button::new("Save"),
+                    )
+                    .on_hover_text(
+                        "Save the current draft ROI, or loaded ROIs if no draft is active",
+                    )
+                    .clicked()
+                {
+                    actions.push(UiAction::SaveRoi);
+                }
             });
         });
     }
@@ -2715,13 +2781,71 @@ impl ViewerState {
                     }
                 }
                 UiAction::ClearRoi => {
-                    if self.roi_layer.is_some() || self.roi_path.is_some() {
+                    if self.roi_layer.is_some()
+                        || self.roi_path.is_some()
+                        || !self.roi_draft.is_empty()
+                    {
                         self.roi_layer = None;
                         self.roi_path = None;
+                        self.roi_loaded_rois.clear();
+                        self.roi_draft.clear();
                         self.roi_visible = true;
                         self.upload_surface_buffers();
                         self.update_scene_stats();
                         self.log_status("ROI cleared.");
+                    }
+                }
+                UiAction::ToggleRoiDraw(active) => {
+                    if self.mesh.is_some() {
+                        self.roi_draft.draw_enabled = active;
+                        if active {
+                            self.log_status("ROI draw on. Right-click the surface to add points.");
+                        } else {
+                            self.log_status("ROI draw off.");
+                        }
+                    }
+                }
+                UiAction::JoinRoiDraft => {
+                    if let Err(error) = self.join_roi_draft() {
+                        self.set_error(error);
+                    }
+                }
+                UiAction::ArmRoiFill => {
+                    if self.roi_draft.can_fill() {
+                        self.roi_draft.fill_pending = true;
+                        self.roi_draft.draw_enabled = true;
+                        self.log_status(
+                            "ROI fill armed. Right-click inside or outside the closed path.",
+                        );
+                    } else {
+                        self.log_status("Join the ROI before filling it.");
+                    }
+                }
+                UiAction::UndoRoiDraft => {
+                    if self.roi_draft.undo() {
+                        if let Err(error) = self.rebuild_roi_layer_from_state() {
+                            self.set_error(error);
+                        } else {
+                            self.upload_surface_buffers();
+                            self.update_scene_stats();
+                            self.log_status("ROI undo.");
+                        }
+                    }
+                }
+                UiAction::RedoRoiDraft => {
+                    if self.roi_draft.redo() {
+                        if let Err(error) = self.rebuild_roi_layer_from_state() {
+                            self.set_error(error);
+                        } else {
+                            self.upload_surface_buffers();
+                            self.update_scene_stats();
+                            self.log_status("ROI redo.");
+                        }
+                    }
+                }
+                UiAction::SaveRoi => {
+                    if let Err(error) = self.save_roi() {
+                        self.set_error(error);
                     }
                 }
                 UiAction::SetSurfaceControllerVisible(visible) => {
@@ -2786,6 +2910,8 @@ impl ViewerState {
         self.overlay_display_name = None;
         self.roi_path = None;
         self.roi_layer = None;
+        self.roi_loaded_rois.clear();
+        self.roi_draft.clear();
         self.roi_visible = true;
         self.surface_pick = None;
         self.pair_visibility = PairVisibility::both();
@@ -2879,6 +3005,8 @@ impl ViewerState {
         self.overlay_display_name = None;
         self.roi_path = None;
         self.roi_layer = None;
+        self.roi_loaded_rois.clear();
+        self.roi_draft.clear();
         self.roi_visible = true;
         self.surface_pick = None;
         self.pair_visibility = PairVisibility::both();
@@ -3535,6 +3663,30 @@ impl ViewerState {
             .unwrap_or_else(|| "none".to_string())
     }
 
+    fn roi_draft_status_text(&self) -> String {
+        if self.roi_draft.is_empty() {
+            if self.roi_draft.draw_enabled {
+                return "draw armed".to_string();
+            }
+            return "none".to_string();
+        }
+
+        let mut parts = vec![
+            format!("{} anchors", self.roi_draft.anchor_nodes.len()),
+            format!("{} segments", self.roi_draft.segments.len()),
+        ];
+        if self.roi_draft.is_joined() {
+            parts.push("joined".to_string());
+        }
+        if let Some(nodes) = &self.roi_draft.fill_nodes {
+            parts.push(format!("{} filled nodes", nodes.len()));
+        } else if self.roi_draft.fill_pending {
+            parts.push("fill armed".to_string());
+        }
+
+        parts.join(", ")
+    }
+
     fn pick_surface_display_text(&self) -> String {
         if let Some(pick) = self.surface_pick
             && let Some(component) = self.picked_paired_component(pick)
@@ -3707,14 +3859,18 @@ impl ViewerState {
             .map(|payload| payload.to_roi())
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("failed to convert ROI {}", path.display()))?;
-        let layer = self
-            .build_roi_layer(path.clone(), rois)
+        self.roi_path = Some(path.clone());
+        self.roi_loaded_rois = rois;
+        self.roi_draft.clear();
+        self.rebuild_roi_layer_from_state()
             .with_context(|| format!("failed to map ROI {}", path.display()))?;
+        let layer = self
+            .roi_layer
+            .as_ref()
+            .context("loaded ROI did not produce a display layer")?;
         let roi_count = layer.rois.len();
         let mapped_nodes = layer.mapped_nodes;
 
-        self.roi_path = Some(path.clone());
-        self.roi_layer = Some(layer);
         self.roi_visible = true;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
@@ -3723,6 +3879,43 @@ impl ViewerState {
             "Loaded {roi_count} ROI object(s) from {} on {mapped_nodes} nodes.",
             path.display()
         ));
+
+        Ok(())
+    }
+
+    fn save_roi(&mut self) -> Result<()> {
+        let saving_draft = !self.roi_draft.is_empty();
+        let rois = if saving_draft {
+            self.roi_draft.to_roi()?.into_iter().collect::<Vec<_>>()
+        } else {
+            self.roi_loaded_rois.clone()
+        };
+        if rois.is_empty() {
+            self.log_status("No ROI is available to save.");
+            return Ok(());
+        }
+
+        let default_name = roi_save_default_name(&rois[0], self.surface_path.as_ref());
+        let Some(path) = save_roi_file(
+            "Save ROI",
+            &default_name,
+            self.roi_path.as_ref().or(self.surface_path.as_ref()),
+        ) else {
+            self.log_status("ROI save cancelled.");
+            return Ok(());
+        };
+
+        write_niml_roi(&path, &rois)?;
+        if saving_draft {
+            self.roi_loaded_rois.extend(rois);
+            self.roi_draft.clear();
+        }
+        self.roi_path = Some(path.clone());
+        self.rebuild_roi_layer_from_state()?;
+        self.roi_visible = true;
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(format!("Saved ROI {}.", path.display()));
 
         Ok(())
     }
@@ -3736,7 +3929,6 @@ impl ViewerState {
         let build = roi_appearance_for_mesh(&rois, mesh, &ranges)?;
 
         Ok(RoiLayer {
-            path: path.clone(),
             display_name: file_name_display(&path),
             rois,
             appearance: build.appearance,
@@ -3747,11 +3939,24 @@ impl ViewerState {
     }
 
     fn refresh_roi_layer(&mut self) -> Result<()> {
-        let Some(existing) = self.roi_layer.take() else {
+        self.rebuild_roi_layer_from_state()
+    }
+
+    fn rebuild_roi_layer_from_state(&mut self) -> Result<()> {
+        let mut rois = self.roi_loaded_rois.clone();
+        if let Some(draft) = self.roi_draft.to_roi()? {
+            rois.push(draft);
+        }
+
+        if rois.is_empty() {
+            self.roi_layer = None;
             return Ok(());
-        };
-        let path = existing.path;
-        let rois = existing.rois;
+        }
+
+        let path = self
+            .roi_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("sumaru_draft.niml.roi"));
         self.roi_layer = Some(self.build_roi_layer(path, rois)?);
 
         Ok(())
@@ -3988,22 +4193,7 @@ impl ViewerState {
     }
 
     fn inspect_surface_at_cursor(&mut self) {
-        let Some(cursor) = self.view_cursor_position else {
-            self.log_status("Move the cursor over the surface before inspecting.");
-            return;
-        };
-        let Some(mesh) = self.mesh.as_ref() else {
-            self.log_status("Load a surface before inspecting nodes.");
-            return;
-        };
-
-        match pick_surface(
-            mesh,
-            self.overlay_values.as_ref(),
-            &self.camera,
-            self.view_size,
-            cursor,
-        ) {
+        match self.pick_surface_at_cursor() {
             Some(pick) => {
                 self.log_status(pick.status_text());
                 self.surface_pick = Some(pick);
@@ -4015,6 +4205,203 @@ impl ViewerState {
                 self.log_status("No surface under the cursor.");
             }
         }
+    }
+
+    fn pick_surface_at_cursor(&self) -> Option<SurfacePick> {
+        let cursor = self.view_cursor_position?;
+        let mesh = self.mesh.as_ref()?;
+        pick_surface(
+            mesh,
+            self.overlay_values.as_ref(),
+            &self.camera,
+            self.view_size,
+            cursor,
+        )
+    }
+
+    fn handle_roi_draw_click_at_cursor(&mut self) -> Result<()> {
+        let Some(pick) = self.pick_surface_at_cursor() else {
+            self.log_status("No surface under the cursor for ROI drawing.");
+            return Ok(());
+        };
+        let target = self.roi_pick_target(pick)?;
+        self.surface_pick = Some(pick);
+
+        if self.roi_draft.fill_pending {
+            self.fill_roi_draft_from_seed(&target)?;
+        } else {
+            self.add_roi_draft_point(&target)?;
+        }
+
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.control_window.request_redraw();
+        if self.roi_controller_open {
+            self.roi_control_window.request_redraw();
+        }
+
+        Ok(())
+    }
+
+    fn roi_pick_target(&self, pick: SurfacePick) -> Result<RoiPickTarget> {
+        if let Some((left, right)) = self.active_paired_components() {
+            let left_mesh = left
+                .mesh
+                .as_ref()
+                .context("left hemisphere surface is still loading")?;
+            let right_mesh = right
+                .mesh
+                .as_ref()
+                .context("right hemisphere surface is still loading")?;
+            let left_node_count = left_mesh.vertices.len() as u32;
+            if pick.node_index < left_node_count {
+                return Ok(RoiPickTarget {
+                    mesh: left_mesh.clone(),
+                    target: RoiDraftTarget {
+                        surface_id: left_mesh.metadata.id.clone(),
+                        domain_id: left_mesh.domain.id.clone(),
+                        side: SurfaceSide::Left,
+                    },
+                    local_node: pick.node_index,
+                });
+            }
+            let local_node = pick
+                .node_index
+                .checked_sub(left_node_count)
+                .context("picked node index is outside the left hemisphere")?;
+            ensure!(
+                (local_node as usize) < right_mesh.vertices.len(),
+                "picked node {} is outside the right hemisphere node count {}",
+                local_node,
+                right_mesh.vertices.len()
+            );
+            return Ok(RoiPickTarget {
+                mesh: right_mesh.clone(),
+                target: RoiDraftTarget {
+                    surface_id: right_mesh.metadata.id.clone(),
+                    domain_id: right_mesh.domain.id.clone(),
+                    side: SurfaceSide::Right,
+                },
+                local_node,
+            });
+        }
+
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a surface before drawing an ROI")?;
+        Ok(RoiPickTarget {
+            mesh: mesh.clone(),
+            target: RoiDraftTarget {
+                surface_id: mesh.metadata.id.clone(),
+                domain_id: mesh.domain.id.clone(),
+                side: mesh.metadata.side.clone(),
+            },
+            local_node: pick.node_index,
+        })
+    }
+
+    fn ensure_roi_draft_target(&self, target: &RoiDraftTarget) -> Result<()> {
+        if let Some(existing) = &self.roi_draft.target {
+            ensure!(
+                existing == target,
+                "ROI draft is tied to the {:?} surface; clear or save it before drawing on {:?}",
+                existing.side,
+                target.side
+            );
+        }
+
+        Ok(())
+    }
+
+    fn add_roi_draft_point(&mut self, target: &RoiPickTarget) -> Result<()> {
+        self.ensure_roi_draft_target(&target.target)?;
+        if self.roi_draft.is_joined() {
+            self.log_status("ROI path is already joined. Undo before adding more points.");
+            return Ok(());
+        }
+
+        self.roi_draft.push_history();
+        self.roi_draft.target = Some(target.target.clone());
+        if let Some(previous) = self.roi_draft.anchor_nodes.last().copied() {
+            let path = target
+                .mesh
+                .shortest_node_path(previous, target.local_node)?
+                .context("no mesh path connects the selected ROI points")?;
+            self.roi_draft.segments.push(path.nodes);
+        }
+        self.roi_draft.anchor_nodes.push(target.local_node);
+        self.roi_draft.fill_nodes = None;
+        self.roi_draft.fill_seed_node = None;
+        self.roi_draft.fill_pending = false;
+        self.rebuild_roi_layer_from_state()?;
+        self.log_status(format!("ROI point added at node {}.", target.local_node));
+
+        Ok(())
+    }
+
+    fn join_roi_draft(&mut self) -> Result<()> {
+        if !self.roi_draft.can_join() {
+            self.log_status("Need at least three ROI points before joining.");
+            return Ok(());
+        }
+        let mesh = self
+            .roi_draft_mesh()
+            .context("active surface for the ROI draft is not available")?;
+        let first = self.roi_draft.anchor_nodes[0];
+        let last = *self
+            .roi_draft
+            .anchor_nodes
+            .last()
+            .context("ROI draft has no last point")?;
+        let closing = mesh
+            .shortest_node_path(last, first)?
+            .context("no mesh path connects the ROI endpoints")?;
+
+        self.roi_draft.push_history();
+        self.roi_draft.segments.push(closing.nodes);
+        self.roi_draft.fill_nodes = None;
+        self.roi_draft.fill_seed_node = None;
+        self.roi_draft.fill_pending = false;
+        self.rebuild_roi_layer_from_state()?;
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status("ROI loop joined. Press Fill, then right-click a seed point.");
+
+        Ok(())
+    }
+
+    fn fill_roi_draft_from_seed(&mut self, target: &RoiPickTarget) -> Result<()> {
+        self.ensure_roi_draft_target(&target.target)?;
+        ensure!(self.roi_draft.can_fill(), "join the ROI before filling it");
+        let boundary = self.roi_draft.boundary_nodes();
+        let nodes = roi_fill_nodes_from_seed(&target.mesh, &boundary, target.local_node)?;
+        let node_count = nodes.len();
+
+        self.roi_draft.push_history();
+        self.roi_draft.fill_nodes = Some(nodes);
+        self.roi_draft.fill_seed_node = Some(target.local_node);
+        self.roi_draft.fill_pending = false;
+        self.rebuild_roi_layer_from_state()?;
+        self.log_status(format!(
+            "ROI fill defined from node {} on {node_count} nodes.",
+            target.local_node
+        ));
+
+        Ok(())
+    }
+
+    fn roi_draft_mesh(&self) -> Option<SurfaceMesh> {
+        let target = self.roi_draft.target.as_ref()?;
+        if let Some((left, right)) = self.active_paired_components() {
+            return match target.side {
+                SurfaceSide::Left => left.mesh.clone(),
+                SurfaceSide::Right => right.mesh.clone(),
+                _ => None,
+            };
+        }
+
+        self.mesh.as_ref().cloned()
     }
 
     fn refresh_pick_overlay_value(&mut self) {
@@ -5082,7 +5469,6 @@ struct LoadedOverlaySelection {
 
 #[derive(Debug, Clone)]
 struct RoiLayer {
-    path: PathBuf,
     display_name: String,
     rois: Vec<Roi>,
     appearance: RoiAppearance,
@@ -5091,12 +5477,222 @@ struct RoiLayer {
     skipped_nodes: usize,
 }
 
+#[derive(Debug, Clone)]
+struct RoiDraft {
+    label: String,
+    integer_label: i32,
+    target: Option<RoiDraftTarget>,
+    anchor_nodes: Vec<u32>,
+    segments: Vec<Vec<u32>>,
+    fill_nodes: Option<Vec<u32>>,
+    fill_seed_node: Option<u32>,
+    fill_pending: bool,
+    draw_enabled: bool,
+    history: Vec<RoiDraftSnapshot>,
+    redo_history: Vec<RoiDraftSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoiDraftTarget {
+    surface_id: SurfaceId,
+    domain_id: SurfaceDomainId,
+    side: SurfaceSide,
+}
+
+#[derive(Debug, Clone)]
+struct RoiDraftSnapshot {
+    target: Option<RoiDraftTarget>,
+    anchor_nodes: Vec<u32>,
+    segments: Vec<Vec<u32>>,
+    fill_nodes: Option<Vec<u32>>,
+    fill_seed_node: Option<u32>,
+    fill_pending: bool,
+    draw_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RoiPickTarget {
+    mesh: SurfaceMesh,
+    target: RoiDraftTarget,
+    local_node: u32,
+}
+
 impl RoiLayer {
     fn labels_for_node(&self, node: u32) -> &[String] {
         self.node_labels
             .get(node as usize)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+}
+
+impl Default for RoiDraft {
+    fn default() -> Self {
+        Self {
+            label: "sumaru_roi".to_string(),
+            integer_label: 1,
+            target: None,
+            anchor_nodes: Vec::new(),
+            segments: Vec::new(),
+            fill_nodes: None,
+            fill_seed_node: None,
+            fill_pending: false,
+            draw_enabled: false,
+            history: Vec::new(),
+            redo_history: Vec::new(),
+        }
+    }
+}
+
+impl RoiDraft {
+    fn is_empty(&self) -> bool {
+        self.anchor_nodes.is_empty() && self.segments.is_empty() && self.fill_nodes.is_none()
+    }
+
+    fn is_joined(&self) -> bool {
+        self.segments.last().is_some_and(|segment| {
+            segment.len() >= 2
+                && self.anchor_nodes.len() >= 3
+                && segment.last().copied() == self.anchor_nodes.first().copied()
+        })
+    }
+
+    fn can_join(&self) -> bool {
+        self.anchor_nodes.len() >= 3 && !self.is_joined()
+    }
+
+    fn can_fill(&self) -> bool {
+        self.is_joined()
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo_history.is_empty()
+    }
+
+    fn clear(&mut self) {
+        let label = self.label.clone();
+        let integer_label = self.integer_label;
+        *self = Self {
+            label,
+            integer_label,
+            ..Self::default()
+        };
+    }
+
+    fn snapshot(&self) -> RoiDraftSnapshot {
+        RoiDraftSnapshot {
+            target: self.target.clone(),
+            anchor_nodes: self.anchor_nodes.clone(),
+            segments: self.segments.clone(),
+            fill_nodes: self.fill_nodes.clone(),
+            fill_seed_node: self.fill_seed_node,
+            fill_pending: self.fill_pending,
+            draw_enabled: self.draw_enabled,
+        }
+    }
+
+    fn restore(&mut self, snapshot: RoiDraftSnapshot) {
+        self.target = snapshot.target;
+        self.anchor_nodes = snapshot.anchor_nodes;
+        self.segments = snapshot.segments;
+        self.fill_nodes = snapshot.fill_nodes;
+        self.fill_seed_node = snapshot.fill_seed_node;
+        self.fill_pending = snapshot.fill_pending;
+        self.draw_enabled = snapshot.draw_enabled;
+    }
+
+    fn push_history(&mut self) {
+        self.history.push(self.snapshot());
+        self.redo_history.clear();
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(snapshot) = self.history.pop() else {
+            return false;
+        };
+        self.redo_history.push(self.snapshot());
+        self.restore(snapshot);
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(snapshot) = self.redo_history.pop() else {
+            return false;
+        };
+        self.history.push(self.snapshot());
+        self.restore(snapshot);
+        true
+    }
+
+    fn boundary_nodes(&self) -> Vec<u32> {
+        let mut nodes = Vec::new();
+        for segment in &self.segments {
+            if segment.is_empty() {
+                continue;
+            }
+            let start = usize::from(nodes.last().copied() == segment.first().copied());
+            nodes.extend(segment.iter().skip(start).copied());
+        }
+        nodes
+    }
+
+    fn to_roi(&self) -> Result<Option<Roi>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(target) = self.target.clone() else {
+            return Ok(None);
+        };
+        let mut data = Vec::new();
+        if self.segments.is_empty() && !self.anchor_nodes.is_empty() {
+            data.push(RoiDatum::node_group(self.anchor_nodes.clone())?);
+        }
+        for (index, segment) in self.segments.iter().enumerate() {
+            let action = if index == self.segments.len().saturating_sub(1) && self.is_joined() {
+                RoiBrushAction::JoinEnds
+            } else {
+                RoiBrushAction::AppendStroke
+            };
+            data.push(RoiDatum::node_segment(segment.clone(), action)?);
+        }
+        if let Some(nodes) = &self.fill_nodes {
+            data.push(RoiDatum::new(
+                RoiElementKind::NodeGroup,
+                RoiBrushAction::FillArea,
+                nodes.clone(),
+                Vec::new(),
+            )?);
+        }
+
+        let drawing_type = if self.fill_nodes.is_some() {
+            RoiDrawingType::FilledArea
+        } else if self.is_joined() {
+            RoiDrawingType::ClosedPath
+        } else {
+            RoiDrawingType::OpenPath
+        };
+        let roi = Roi::new(self.label.clone(), self.integer_label)?
+            .with_parent_surface(target.surface_id, target.domain_id, target.side)
+            .with_source(RoiSource::Drawn, None)?
+            .with_style(
+                Rgba::new_unchecked(0.529412, 0.172549, 0.870588, 1.0),
+                Rgba::new_unchecked(0.0, 0.0, 1.0, 1.0),
+                2,
+            )?
+            .with_draw_status(if self.is_joined() {
+                RoiDrawStatus::Finished
+            } else {
+                RoiDrawStatus::InCreation
+            })
+            .with_drawing_type(drawing_type)
+            .with_data(data)?;
+
+        Ok(Some(roi))
     }
 }
 
@@ -5239,6 +5835,12 @@ enum UiAction {
     SetOverlayVisible(bool),
     SetRoiVisible(bool),
     ClearRoi,
+    ToggleRoiDraw(bool),
+    JoinRoiDraft,
+    ArmRoiFill,
+    UndoRoiDraft,
+    RedoRoiDraft,
+    SaveRoi,
     SetSurfaceControllerVisible(bool),
     SetRoiControllerOpen(bool),
     Preset(PresetOrientation),
@@ -5548,6 +6150,69 @@ fn save_screenshot_file(
     );
 
     dialog.save_file().map(screenshot::append_png_extension)
+}
+
+fn save_roi_file(
+    title: &str,
+    default_name: &str,
+    current_path: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    let dialog = dialog_with_start_directory(
+        rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter("SUMA ROI", &["niml.roi", "roi"])
+            .set_file_name(default_name),
+        current_path,
+    );
+
+    dialog.save_file().map(append_niml_roi_extension)
+}
+
+fn append_niml_roi_extension(path: PathBuf) -> PathBuf {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.with_extension("niml.roi");
+    };
+    let name = name.to_string();
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".niml.roi") {
+        path
+    } else if lower.ends_with(".roi") {
+        path.with_file_name(format!("{name}.niml.roi"))
+    } else {
+        path.with_extension("niml.roi")
+    }
+}
+
+fn roi_save_default_name(roi: &Roi, surface_path: Option<&PathBuf>) -> String {
+    let surface = surface_path
+        .and_then(|path| path.file_stem())
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| "sumaru".to_string());
+    let label = sanitize_file_stem(&roi.label);
+
+    format!("{surface}.{label}.niml.roi")
+}
+
+fn sanitize_file_stem(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        "roi".to_string()
+    } else {
+        out
+    }
 }
 
 fn timestamped_png_name(prefix: &str) -> String {
@@ -6087,6 +6752,61 @@ fn roi_datum_is_stroke(datum: &RoiDatum) -> bool {
             | RoiBrushAction::AppendStrokeOrFill
             | RoiBrushAction::JoinEnds
     )
+}
+
+fn roi_fill_nodes_from_seed(mesh: &SurfaceMesh, boundary: &[u32], seed: u32) -> Result<Vec<u32>> {
+    ensure!(
+        boundary.len() >= 3,
+        "ROI fill requires a joined boundary with at least three nodes"
+    );
+    ensure!(
+        mesh.domain.contains_node(seed),
+        "ROI fill seed node {} is outside node count {}",
+        seed,
+        mesh.domain.node_count
+    );
+
+    let boundary_set = boundary.iter().copied().collect::<HashSet<_>>();
+    ensure!(
+        !boundary_set.contains(&seed),
+        "ROI fill seed cannot be on the boundary"
+    );
+
+    let mut blocked_edges = HashSet::new();
+    for pair in boundary.windows(2) {
+        blocked_edges.insert(edge_pair_key(pair[0], pair[1]));
+    }
+    if boundary.first() != boundary.last()
+        && let (Some(first), Some(last)) = (boundary.first(), boundary.last())
+    {
+        blocked_edges.insert(edge_pair_key(*first, *last));
+    }
+
+    let topology = mesh.topology();
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::from([seed]);
+    visited.insert(seed);
+
+    while let Some(node) = queue.pop_front() {
+        for neighbor in &topology.node_neighbors[node as usize] {
+            if boundary_set.contains(neighbor) {
+                continue;
+            }
+            if blocked_edges.contains(&edge_pair_key(node, *neighbor)) {
+                continue;
+            }
+            if visited.insert(*neighbor) {
+                queue.push_back(*neighbor);
+            }
+        }
+    }
+
+    visited.extend(boundary_set);
+    Ok(NodeMask::from_nodes(mesh.vertices.len(), visited)?.nodes())
+}
+
+fn edge_pair_key(a: u32, b: u32) -> (u32, u32) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 fn roi_display_label(roi: &Roi) -> String {
@@ -6833,8 +7553,8 @@ mod tests {
         SceneSurface, SceneSurfaceComponent, canonical_overlay_columns, paired_component_for_node,
         paired_overlay_dataset, paired_overlay_path_for_side, paired_overlay_paths,
         paired_preview_geometry, paired_spec_montage_shots, resolve_overlay_subs,
-        roi_appearance_for_mesh, scene_surface_display_label, scene_surfaces_from_components,
-        standard_montage_shots, threshold_and_mask_from_appearance,
+        roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
+        scene_surfaces_from_components, standard_montage_shots, threshold_and_mask_from_appearance,
         timestamped_png_name_from_unix_seconds,
     };
     use crate::color::Rgba;
@@ -6883,6 +7603,26 @@ mod tests {
             timestamped_png_name_from_unix_seconds("sumaru_view", 1_709_251_200),
             "sumaru_view_2024-03-01_000000.png"
         );
+    }
+
+    #[test]
+    fn roi_seed_fill_respects_joined_boundary_edges() {
+        let mesh = SurfaceMesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            vec![[0, 1, 2], [0, 2, 3]],
+        )
+        .unwrap();
+        let boundary = vec![0, 2, 3, 0];
+
+        let fill_from_one = roi_fill_nodes_from_seed(&mesh, &boundary, 1).unwrap();
+
+        assert_eq!(fill_from_one, vec![0, 1, 2, 3]);
+        assert!(roi_fill_nodes_from_seed(&mesh, &boundary, 2).is_err());
     }
 
     #[test]

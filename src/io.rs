@@ -233,6 +233,14 @@ pub fn read_niml_roi(path: impl AsRef<Path>) -> Result<Vec<NimlRoiPayload>> {
         .collect()
 }
 
+pub fn write_niml_roi(path: impl AsRef<Path>, rois: &[Roi]) -> Result<()> {
+    let elements = rois
+        .iter()
+        .map(|roi| NimlRoiPayload::from_roi(roi).to_element())
+        .collect::<Vec<_>>();
+    write_niml_ascii(path, &elements)
+}
+
 pub fn niml_reference_checks() -> Vec<NimlReferenceCheck> {
     let mut checks = Vec::new();
 
@@ -941,6 +949,30 @@ impl DatasetKind {
 }
 
 impl NimlRoiPayload {
+    pub fn from_roi(roi: &Roi) -> Self {
+        Self {
+            self_idcode: Some(roi.id.as_str().to_string()),
+            domain_parent_idcode: roi
+                .parent_domain_id
+                .as_ref()
+                .map(|id| id.as_str().to_string()),
+            parent_side: roi.parent_side.clone(),
+            label: roi.label.clone(),
+            integer_label: roi.integer_label,
+            roi_type_code: Some(drawing_type_to_code(roi.drawing_type)),
+            drawing_type: roi.drawing_type,
+            color_plane_name: Some(roi_plane_name(&roi.parent_side)),
+            fill_color: Some(roi.fill_color),
+            edge_color: Some(roi.edge_color),
+            edge_thickness: Some(roi.edge_thickness),
+            records: roi
+                .data
+                .iter()
+                .map(NimlRoiDatumRecord::from_roi_datum)
+                .collect(),
+        }
+    }
+
     pub fn from_element(element: &NimlElement) -> Result<Self> {
         ensure!(
             element.name == "Node_ROI",
@@ -1067,6 +1099,20 @@ impl NimlRoiPayload {
 }
 
 impl NimlRoiDatumRecord {
+    fn from_roi_datum(datum: &RoiDatum) -> Self {
+        let node_path = if datum.kind == RoiElementKind::FaceGroup {
+            datum.triangle_path.clone()
+        } else {
+            datum.node_path.clone()
+        };
+
+        Self {
+            action_code: brush_action_to_code(datum.action),
+            element_type_code: roi_element_kind_to_code(datum.kind),
+            node_path,
+        }
+    }
+
     fn to_roi_datum(&self) -> Result<RoiDatum> {
         let action = brush_action_from_code(self.action_code);
         match roi_element_kind_from_code(self.element_type_code) {
@@ -1941,6 +1987,16 @@ fn drawing_type_to_code(value: RoiDrawingType) -> i32 {
     }
 }
 
+fn roi_element_kind_to_code(value: RoiElementKind) -> i32 {
+    match value {
+        RoiElementKind::NodeGroup => 1,
+        RoiElementKind::EdgeGroup => 2,
+        RoiElementKind::FaceGroup => 3,
+        RoiElementKind::NodeSegment => 4,
+        RoiElementKind::Unknown => 0,
+    }
+}
+
 fn roi_element_kind_from_code(value: i32) -> RoiElementKind {
     match value {
         1 => RoiElementKind::NodeGroup,
@@ -1958,6 +2014,24 @@ fn brush_action_from_code(value: i32) -> RoiBrushAction {
         3 => RoiBrushAction::JoinEnds,
         4 => RoiBrushAction::FillArea,
         _ => RoiBrushAction::Unknown,
+    }
+}
+
+fn brush_action_to_code(value: RoiBrushAction) -> i32 {
+    match value {
+        RoiBrushAction::AppendStroke => 1,
+        RoiBrushAction::AppendStrokeOrFill => 2,
+        RoiBrushAction::JoinEnds => 3,
+        RoiBrushAction::FillArea => 4,
+        RoiBrushAction::Unknown => 0,
+    }
+}
+
+fn roi_plane_name(side: &SurfaceSide) -> String {
+    match side {
+        SurfaceSide::Left => "ROI.L.iS_0".to_string(),
+        SurfaceSide::Right => "ROI.R.iS_0".to_string(),
+        _ => "Sumaru_ROI".to_string(),
     }
 }
 
@@ -2129,7 +2203,7 @@ mod tests {
     };
     use crate::color::Rgba;
     use crate::dataset::{ColumnData, ColumnRole, DatasetKind};
-    use crate::roi::{RoiBrushAction, RoiDrawingType, RoiElementKind};
+    use crate::roi::{Roi, RoiBrushAction, RoiDatum, RoiDrawingType, RoiElementKind, RoiSource};
     use crate::surface::{SurfaceDomain, SurfaceSide};
 
     #[test]
@@ -2410,6 +2484,44 @@ mod tests {
 
         assert_eq!(reparsed[0].label, "V1");
         assert_eq!(reparsed[0].records, payload.records);
+    }
+
+    #[test]
+    fn drawn_roi_exports_suma_edge_join_and_fill_records() {
+        let roi = Roi::new("drawn", 3)
+            .unwrap()
+            .with_source(RoiSource::Drawn, None)
+            .unwrap()
+            .with_drawing_type(RoiDrawingType::FilledArea)
+            .with_data(vec![
+                RoiDatum::node_segment(vec![1, 2, 3], RoiBrushAction::AppendStroke).unwrap(),
+                RoiDatum::node_segment(vec![3, 4, 1], RoiBrushAction::JoinEnds).unwrap(),
+                RoiDatum::new(
+                    RoiElementKind::NodeGroup,
+                    RoiBrushAction::FillArea,
+                    vec![1, 2, 3, 4, 5],
+                    Vec::new(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let payload = super::NimlRoiPayload::from_roi(&roi);
+
+        assert_eq!(payload.records.len(), 3);
+        assert_eq!(
+            payload
+                .records
+                .iter()
+                .map(|record| (record.action_code, record.element_type_code))
+                .collect::<Vec<_>>(),
+            vec![(1, 4), (3, 4), (4, 1)]
+        );
+
+        let serialized = serialize_niml_ascii(&[payload.to_element()]);
+        let reparsed = read_niml_roi_str(&serialized).unwrap();
+        assert_eq!(reparsed[0].label, "drawn");
+        assert_eq!(reparsed[0].records[1].action_code, 3);
+        assert_eq!(reparsed[0].records[2].node_path, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
