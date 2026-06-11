@@ -88,8 +88,10 @@ const MODE_LABEL_DURATION: Duration = Duration::from_secs(2);
 const STARTUP_REDRAW_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_REDRAW_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const SUMA_CONVEXITY_SMOOTHING_ITERATIONS: usize = 5;
-const SUMA_AFNI_GRAY_NODE_COLOR: f32 = 0.30;
-const AFNI_LIVE_COLOR_DIM_FACTOR: f32 = 1.0;
+/// Overlay color for nodes AFNI did not colorize (absent from the `SUMA_irgba`
+/// node list, or sent with zero alpha). Transparent so the anatomical underlay
+/// shows through, matching SUMA.
+const AFNI_TRANSPARENT_NODE_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 const SUMA_CONVEXITY_OPACITY: f32 = 0.85;
 const CONTROL_CONTENT_WIDTH_POINTS: f32 = 560.0;
 const CONTROL_MIN_INNER_WIDTH: u32 = 620;
@@ -565,6 +567,13 @@ struct ViewerState {
     /// resends identical colorizations on every redraw; this lets us skip the
     /// recolor + re-upload when nothing changed.
     afni_rgba_signatures: HashMap<String, u64>,
+    /// Combined-mesh node of the last crosshair we sent to AFNI.
+    sent_crosshair_node: Option<u32>,
+    /// Combined-mesh node of AFNI's most recently reported crosshair. Together
+    /// with [`Self::sent_crosshair_node`] this lets us nudge AFNI into redrawing
+    /// after a surface registration without moving its crosshair to an arbitrary
+    /// location.
+    afni_crosshair_node: Option<u32>,
     camera: Camera,
     view_cursor_position: Option<(f64, f64)>,
     pair_dragging: bool,
@@ -864,6 +873,8 @@ impl ViewerState {
             afni_session: AfniNimlSession::new(),
             afni_rgba_colors: None,
             afni_rgba_signatures: HashMap::new(),
+            sent_crosshair_node: None,
+            afni_crosshair_node: None,
             camera,
             view_cursor_position: None,
             pair_dragging: false,
@@ -3494,7 +3505,46 @@ impl ViewerState {
             self.log_status("No new surface geometry needed to be sent to AFNI/SUMA.");
         }
 
+        // Nudge AFNI to redraw the overlay for the freshly registered surfaces
+        // so the connection is visibly live without waiting for the user to
+        // click. Prefer the current/last crosshair location to avoid moving
+        // AFNI's focus on a plain surface switch.
+        self.send_afni_redraw_crosshair();
+
         Ok(())
+    }
+
+    /// Send a `SUMA_crosshair_xyz` to prompt AFNI to resend its colorization for
+    /// the active surfaces. Targets, in order: the current selection, the last
+    /// crosshair we sent, AFNI's most recently reported crosshair, and finally
+    /// the node nearest the brain's center to trigger an initial draw when none
+    /// of those exist yet.
+    fn send_afni_redraw_crosshair(&mut self) {
+        if self.afni_connection.is_none() {
+            return;
+        }
+        let Some(mesh) = self.mesh.as_ref() else {
+            return;
+        };
+        if mesh.vertices.is_empty() {
+            return;
+        }
+        let node = self
+            .controller
+            .interaction
+            .pick
+            .map(|pick| pick.node_index)
+            .or(self.sent_crosshair_node)
+            .or(self.afni_crosshair_node)
+            .or_else(|| node_nearest_bounds_center(mesh))
+            .unwrap_or(0);
+        let Some(pick) = surface_pick_for_mesh_node(mesh, self.overlay_values.as_ref(), node)
+        else {
+            return;
+        };
+        if let Err(error) = self.send_afni_crosshair_for_pick(pick) {
+            self.set_error(error);
+        }
     }
 
     fn afni_surface_exports(&self) -> Result<Vec<(SurfaceMesh, AfniSurfaceInfo)>> {
@@ -3672,16 +3722,9 @@ impl ViewerState {
         self.controller.surface.current_overlay_path = None;
         self.overlay_display_name = Some("AFNI SUMA_irgba".to_string());
         self.controller.overlay.visible = true;
-        if let Some(threshold) = overlay
-            .threshold
-            .as_deref()
-            .and_then(|value| value.parse::<f32>().ok())
-        {
-            self.overlay_appearance.threshold.enabled = true;
-            self.overlay_appearance.threshold.absolute = true;
-            self.overlay_appearance.threshold.value = threshold;
-            self.sync_controller_overlay_display_state();
-        }
+        // AFNI bakes its threshold into the colors it sends (sub-threshold nodes
+        // are simply absent from the sparse list), so we do not re-apply a
+        // scalar threshold to this already-resolved color cache.
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
@@ -3738,6 +3781,7 @@ impl ViewerState {
             })?;
 
         self.controller.interaction.set_pick(Some(pick));
+        self.afni_crosshair_node = Some(node_index);
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.control_window.request_redraw();
@@ -3779,6 +3823,7 @@ impl ViewerState {
             self.disconnect_afni_talk();
             return Err(error.context("AFNI/SUMA crosshair write failed"));
         }
+        self.sent_crosshair_node = Some(pick.node_index);
         if self.verbose {
             self.log_status(format!(
                 "Sent AFNI/SUMA crosshair for node {}.",
@@ -4150,8 +4195,12 @@ impl ViewerState {
                 .as_ref()
                 .map_or_else(String::new, |state| format!(" ({state})"))
         ));
+        // Switching the displayed state (e.g. smoothwm -> inflated) does not
+        // change the surfaces AFNI already holds, so send only ones it has not
+        // seen yet rather than force-resending and tripping its duplicate-
+        // surface warning.
         if self.afni_connection.is_some()
-            && let Err(error) = self.force_resend_afni_surfaces()
+            && let Err(error) = self.send_afni_surfaces(false)
         {
             self.set_error(error);
         }
@@ -5474,9 +5523,18 @@ impl ViewerState {
         let afni_surface_colors = (self.controller.overlay.visible)
             .then(|| self.afni_rgba_colors.clone())
             .flatten();
-        let surface_colors = afni_surface_colors
-            .map(Arc::new)
-            .or_else(|| self.visible_anatomical_shading_colors());
+        let surface_colors = if let Some(afni) = afni_surface_colors {
+            // AFNI colors replace the surface color, so resolve their alpha
+            // against the anatomical underlay now: sub-threshold nodes show the
+            // underlay instead of painting the surface black.
+            let underlay = self.visible_anatomical_shading_colors();
+            Some(Arc::new(afni_colors_over_underlay(
+                &afni,
+                underlay.as_deref().map(Vec::as_slice),
+            )))
+        } else {
+            self.visible_anatomical_shading_colors()
+        };
         if self.mesh.is_none() {
             self.surface_buffers = None;
             self.surface_render_set = None;
@@ -6255,6 +6313,21 @@ fn paired_component_for_node<'a>(
     let right_nodes = right.mesh.as_ref()?.vertices.len() as u32;
     let right_limit = left_nodes.checked_add(right_nodes)?;
     (node_index < right_limit).then_some(right)
+}
+
+/// Node closest to the surface's bounding-box center (½ x, ½ y, ½ z), used as
+/// the default crosshair target when nothing has been picked yet.
+fn node_nearest_bounds_center(mesh: &SurfaceMesh) -> Option<u32> {
+    let center = Vec3::from_array(mesh.bounds.center);
+    mesh.vertices
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| {
+            let left = Vec3::from_array(**left).distance_squared(center);
+            let right = Vec3::from_array(**right).distance_squared(center);
+            left.total_cmp(&right)
+        })
+        .and_then(|(index, _)| u32::try_from(index).ok())
 }
 
 fn surface_pick_for_mesh_node(
@@ -7609,12 +7682,39 @@ fn afni_rgba_overlay_signature(overlay: &AfniRgbaOverlay) -> u64 {
 }
 
 fn afni_rgba_to_suma_node_color(rgba: [u8; 4]) -> [f32; 4] {
+    // Honor AFNI's alpha: a == 0 means "not colored, show the underlay", and
+    // intermediate alphas blend the overlay over the underlay (see
+    // [`afni_colors_over_underlay`]).
     [
-        rgba[0] as f32 / 255.0 * AFNI_LIVE_COLOR_DIM_FACTOR,
-        rgba[1] as f32 / 255.0 * AFNI_LIVE_COLOR_DIM_FACTOR,
-        rgba[2] as f32 / 255.0 * AFNI_LIVE_COLOR_DIM_FACTOR,
-        1.0,
+        rgba[0] as f32 / 255.0,
+        rgba[1] as f32 / 255.0,
+        rgba[2] as f32 / 255.0,
+        rgba[3] as f32 / 255.0,
     ]
+}
+
+/// Flatten AFNI's per-node RGBA color cache into opaque surface colors by
+/// blending each node over the anatomical underlay using its alpha. AFNI colors
+/// are rendered as the surface itself (not a separate overlay plane), so a
+/// sub-threshold node (alpha 0) must resolve to the underlay here or it would
+/// paint the surface black.
+fn afni_colors_over_underlay(afni: &[[f32; 4]], underlay: Option<&[[f32; 4]]>) -> Vec<[f32; 4]> {
+    afni.iter()
+        .enumerate()
+        .map(|(index, color)| {
+            let base = underlay
+                .and_then(|colors| colors.get(index))
+                .copied()
+                .unwrap_or(mesh::DEFAULT_SURFACE_COLOR);
+            let alpha = color[3].clamp(0.0, 1.0);
+            [
+                base[0] * (1.0 - alpha) + color[0] * alpha,
+                base[1] * (1.0 - alpha) + color[1] * alpha,
+                base[2] * (1.0 - alpha) + color[2] * alpha,
+                1.0,
+            ]
+        })
+        .collect()
 }
 
 fn apply_afni_rgba_to_color_cache(
@@ -7626,16 +7726,18 @@ fn apply_afni_rgba_to_color_cache(
     let total_node_count = mesh.vertices.len();
     let mut colors = existing
         .filter(|colors| colors.len() == total_node_count)
-        .unwrap_or_else(|| vec![afni_gray_node_color(); total_node_count]);
+        .unwrap_or_else(|| vec![AFNI_TRANSPARENT_NODE_COLOR; total_node_count]);
     let start = target.node_offset.min(total_node_count);
     let end = target
         .node_offset
         .saturating_add(target.node_count)
         .min(total_node_count);
+    // Clear this surface's slice to transparent so any node AFNI does not send
+    // falls back to the underlay (SUMA leaves un-sent nodes uncolored rather
+    // than smearing nearby colors across them).
     for color in &mut colors[start..end] {
-        *color = afni_gray_node_color();
+        *color = AFNI_TRANSPARENT_NODE_COLOR;
     }
-    let mut colored = vec![false; end.saturating_sub(start)];
 
     let mut applied = 0usize;
     let mut skipped = 0usize;
@@ -7651,192 +7753,12 @@ fn apply_afni_rgba_to_color_cache(
         };
         if let Some(color) = colors.get_mut(index) {
             *color = afni_rgba_to_suma_node_color(*rgba);
-            if let Some(is_colored) = colored.get_mut(index.saturating_sub(start)) {
-                *is_colored = true;
-            }
             applied += 1;
         } else {
             skipped += 1;
         }
     }
-    fill_missing_afni_rgba_colors(mesh, start, end, &colored, &mut colors);
     (colors, applied, skipped)
-}
-
-fn fill_missing_afni_rgba_colors(
-    mesh: &SurfaceMesh,
-    start: usize,
-    end: usize,
-    colored: &[bool],
-    colors: &mut [[f32; 4]],
-) {
-    if start >= end || colored.is_empty() {
-        return;
-    }
-
-    let colored_count = colored.iter().filter(|is_colored| **is_colored).count();
-    if colored_count == 0 || colored_count == colored.len() {
-        return;
-    }
-
-    let mut colored_points = Vec::with_capacity(colored_count);
-    for (local_index, is_colored) in colored.iter().copied().enumerate() {
-        if !is_colored {
-            continue;
-        }
-        let index = start + local_index;
-        if let Some(position) = mesh.vertices.get(index) {
-            colored_points.push(AfniColorPoint {
-                local_index,
-                position: *position,
-            });
-        }
-    }
-    let Some(nearest) = AfniNearestColorTree::new(colored_points) else {
-        return;
-    };
-
-    for (local_index, is_colored) in colored.iter().copied().enumerate() {
-        if is_colored {
-            continue;
-        }
-        let index = start + local_index;
-        let Some(position) = mesh.vertices.get(index) else {
-            continue;
-        };
-        if let Some(colored_local) = nearest.nearest_index(*position) {
-            colors[index] = colors[start + colored_local];
-        }
-    }
-}
-
-fn afni_gray_node_color() -> [f32; 4] {
-    [
-        SUMA_AFNI_GRAY_NODE_COLOR,
-        SUMA_AFNI_GRAY_NODE_COLOR,
-        SUMA_AFNI_GRAY_NODE_COLOR,
-        1.0,
-    ]
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AfniColorPoint {
-    local_index: usize,
-    position: [f32; 3],
-}
-
-#[derive(Debug)]
-struct AfniNearestColorTree {
-    root: Option<Box<AfniNearestColorNode>>,
-}
-
-#[derive(Debug)]
-struct AfniNearestColorNode {
-    point: AfniColorPoint,
-    axis: usize,
-    left: Option<Box<AfniNearestColorNode>>,
-    right: Option<Box<AfniNearestColorNode>>,
-}
-
-impl AfniNearestColorTree {
-    fn new(mut points: Vec<AfniColorPoint>) -> Option<Self> {
-        points.retain(|point| point.position.iter().all(|value| value.is_finite()));
-        if points.is_empty() {
-            return None;
-        }
-        Some(Self {
-            root: build_afni_nearest_color_node(&mut points, 0),
-        })
-    }
-
-    fn nearest_index(&self, position: [f32; 3]) -> Option<usize> {
-        if !position.iter().all(|value| value.is_finite()) {
-            return None;
-        }
-        let mut best = AfniNearestSearch {
-            local_index: 0,
-            distance_squared: f32::INFINITY,
-        };
-        search_afni_nearest_color_node(&self.root, position, &mut best);
-        best.distance_squared
-            .is_finite()
-            .then_some(best.local_index)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AfniNearestSearch {
-    local_index: usize,
-    distance_squared: f32,
-}
-
-fn build_afni_nearest_color_node(
-    points: &mut [AfniColorPoint],
-    depth: usize,
-) -> Option<Box<AfniNearestColorNode>> {
-    if points.is_empty() {
-        return None;
-    }
-    let axis = afni_widest_axis(points).unwrap_or(depth % 3);
-    let middle = points.len() / 2;
-    points.select_nth_unstable_by(middle, |left, right| {
-        left.position[axis].total_cmp(&right.position[axis])
-    });
-    let (left, middle_and_right) = points.split_at_mut(middle);
-    let (middle_point, right) = middle_and_right.split_at_mut(1);
-    Some(Box::new(AfniNearestColorNode {
-        point: middle_point[0],
-        axis,
-        left: build_afni_nearest_color_node(left, depth + 1),
-        right: build_afni_nearest_color_node(right, depth + 1),
-    }))
-}
-
-fn afni_widest_axis(points: &[AfniColorPoint]) -> Option<usize> {
-    if points.is_empty() {
-        return None;
-    }
-    let mut min = points[0].position;
-    let mut max = points[0].position;
-    for point in points.iter().skip(1) {
-        for axis in 0..3 {
-            min[axis] = min[axis].min(point.position[axis]);
-            max[axis] = max[axis].max(point.position[axis]);
-        }
-    }
-    let span = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-    (0..3).max_by(|left, right| span[*left].total_cmp(&span[*right]))
-}
-
-fn search_afni_nearest_color_node(
-    node: &Option<Box<AfniNearestColorNode>>,
-    position: [f32; 3],
-    best: &mut AfniNearestSearch,
-) {
-    let Some(node) = node else {
-        return;
-    };
-
-    let distance_squared = squared_distance(position, node.point.position);
-    if distance_squared < best.distance_squared {
-        best.distance_squared = distance_squared;
-        best.local_index = node.point.local_index;
-    }
-
-    let axis_delta = position[node.axis] - node.point.position[node.axis];
-    let (near, far) = if axis_delta <= 0.0 {
-        (&node.left, &node.right)
-    } else {
-        (&node.right, &node.left)
-    };
-    search_afni_nearest_color_node(near, position, best);
-    if axis_delta * axis_delta <= best.distance_squared {
-        search_afni_nearest_color_node(far, position, best);
-    }
-}
-
-fn squared_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
-    (left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2) + (left[2] - right[2]).powi(2)
 }
 
 fn afni_surface_target_in_scene_surface(
@@ -9719,12 +9641,11 @@ mod tests {
         PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation,
         RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
         SurfacePick, afni_component_is_sendable, afni_rgba_overlay_signature,
-        apply_afni_rgba_to_color_cache,
-        canonical_overlay_columns, component_transforms, pair_hemisphere_matrices,
-        paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
-        paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
-        roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
-        scene_surfaces_from_components, selection_for_component,
+        apply_afni_rgba_to_color_cache, canonical_overlay_columns, component_transforms,
+        pair_hemisphere_matrices, paired_component_for_node, paired_overlay_dataset,
+        paired_overlay_path_for_side, paired_overlay_paths, paired_spec_montage_shots,
+        resolve_overlay_subs, roi_appearance_for_mesh, roi_fill_nodes_from_seed,
+        scene_surface_display_label, scene_surfaces_from_components, selection_for_component,
         selection_scale_from_model_matrices, standard_montage_shots, surface_pick_for_mesh_node,
         threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
     };
@@ -9847,14 +9768,17 @@ mod tests {
 
         assert_eq!(applied, 1);
         assert_eq!(skipped, 0);
-        assert_eq!(colors[0], [1.0, 0.0, 0.0, 1.0]);
+        // Un-sent node inside the target slice clears to transparent...
+        assert_eq!(colors[0], [0.0, 0.0, 0.0, 0.0]);
+        // ...the sent node takes its color...
         assert_eq!(colors[1], [1.0, 0.0, 0.0, 1.0]);
+        // ...and nodes outside the target slice are left untouched.
         assert_eq!(colors[2], [0.3, 0.3, 0.3, 1.0]);
         assert_eq!(colors[3], [0.4, 0.4, 0.4, 1.0]);
     }
 
     #[test]
-    fn afni_rgba_sparse_packets_fill_nearest_coordinate_missing_nodes() {
+    fn afni_rgba_sparse_packets_honor_alpha_and_leave_unsent_transparent() {
         let mesh = SurfaceMesh::new(
             vec![
                 [0.0, 0.0, 0.0],
@@ -9869,7 +9793,7 @@ mod tests {
             surface_idcode: "lh".to_string(),
             local_domain_parent_id: None,
             node_indices: vec![0, 2],
-            rgba: vec![[64, 128, 255, 255], [255, 0, 0, 255]],
+            rgba: vec![[64, 128, 255, 255], [200, 10, 10, 0]],
             threshold: None,
             function_idcode: None,
             volume_idcode: None,
@@ -9887,10 +9811,39 @@ mod tests {
 
         assert_eq!(applied, 2);
         assert_eq!(skipped, 0);
+        // Sent node keeps its color at full alpha.
         assert_eq!(colors[0], [64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]);
-        assert_eq!(colors[1], [1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(colors[2], [1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(colors[3], [1.0, 0.0, 0.0, 1.0]);
+        // Sent node with zero alpha is honored as transparent (shows underlay).
+        assert_eq!(colors[2], [200.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 0.0]);
+        // Un-sent nodes are left transparent rather than filled by proximity.
+        assert_eq!(colors[1], [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(colors[3], [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn afni_colors_resolve_alpha_against_the_underlay() {
+        let afni = vec![
+            [1.0, 0.0, 0.0, 1.0], // opaque: keeps its own color
+            [0.0, 1.0, 0.0, 0.0], // transparent: falls back to underlay
+            [0.0, 0.0, 1.0, 0.5], // half: blends with underlay
+        ];
+        let underlay = vec![
+            [0.2, 0.2, 0.2, 1.0],
+            [0.4, 0.4, 0.4, 1.0],
+            [0.6, 0.6, 0.6, 1.0],
+        ];
+
+        let composed = super::afni_colors_over_underlay(&afni, Some(&underlay));
+
+        assert_eq!(composed[0], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(composed[1], [0.4, 0.4, 0.4, 1.0]);
+        assert_eq!(composed[2], [0.3, 0.3, 0.8, 1.0]);
+
+        // With no underlay, transparent nodes resolve to the default surface so
+        // the surface is never painted black.
+        let without = super::afni_colors_over_underlay(&afni, None);
+        assert_eq!(without[1], super::mesh::DEFAULT_SURFACE_COLOR);
+        assert_eq!(without[0], [1.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]
