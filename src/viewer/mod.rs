@@ -561,6 +561,10 @@ struct ViewerState {
     afni_connection: Option<AfniConnection>,
     afni_session: AfniNimlSession,
     afni_rgba_colors: Option<Vec<[f32; 4]>>,
+    /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
+    /// resends identical colorizations on every redraw; this lets us skip the
+    /// recolor + re-upload when nothing changed.
+    afni_rgba_signatures: HashMap<String, u64>,
     camera: Camera,
     view_cursor_position: Option<(f64, f64)>,
     pair_dragging: bool,
@@ -859,6 +863,7 @@ impl ViewerState {
             afni_connection: None,
             afni_session: AfniNimlSession::new(),
             afni_rgba_colors: None,
+            afni_rgba_signatures: HashMap::new(),
             camera,
             view_cursor_position: None,
             pair_dragging: false,
@@ -3221,6 +3226,7 @@ impl ViewerState {
         self.overlay_pair_paths = None;
         self.overlay_display_name = None;
         self.afni_rgba_colors = None;
+        self.afni_rgba_signatures.clear();
         self.controller.surface.current_overlay_path = None;
         self.roi_path = None;
         self.controller.surface.current_roi_path = None;
@@ -3592,10 +3598,7 @@ impl ViewerState {
                 self.load_overlay_path(path)?;
                 Ok(true)
             }
-            AfniRouteAction::RgbaOverlay(overlay) => {
-                self.apply_afni_rgba_overlay(overlay)?;
-                Ok(true)
-            }
+            AfniRouteAction::RgbaOverlay(overlay) => self.apply_afni_rgba_overlay(overlay),
             AfniRouteAction::SurfaceCrosshair(crosshair) => {
                 self.apply_afni_surface_crosshair(crosshair)
             }
@@ -3611,7 +3614,7 @@ impl ViewerState {
         }
     }
 
-    fn apply_afni_rgba_overlay(&mut self, overlay: AfniRgbaOverlay) -> Result<()> {
+    fn apply_afni_rgba_overlay(&mut self, overlay: AfniRgbaOverlay) -> Result<bool> {
         let mesh = self
             .mesh
             .as_ref()
@@ -3629,8 +3632,28 @@ impl ViewerState {
                     .map(|parent| format!(" (domain parent {parent})"))
                     .unwrap_or_default()
             ));
-            return Ok(());
+            return Ok(false);
         };
+
+        // AFNI resends an identical irgba colorization on every redraw. When the
+        // payload for this surface matches the one we last applied, skip the
+        // whole O(n) recolor + vertex re-upload and report "no change" so we
+        // don't even trigger a redraw.
+        let signature = afni_rgba_overlay_signature(&overlay);
+        let previous_signature = self
+            .afni_rgba_signatures
+            .get(&overlay.surface_idcode)
+            .copied();
+        if self.afni_rgba_colors.is_some() && previous_signature == Some(signature) {
+            if self.verbose {
+                self.log_status(format!(
+                    "Skipped unchanged AFNI/SUMA RGBA overlay for {}.",
+                    overlay.surface_idcode
+                ));
+            }
+            return Ok(false);
+        }
+
         let (colors, applied, skipped) =
             apply_afni_rgba_to_color_cache(self.afni_rgba_colors.take(), mesh, target, &overlay);
 
@@ -3662,6 +3685,8 @@ impl ViewerState {
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
+        self.afni_rgba_signatures
+            .insert(overlay.surface_idcode.clone(), signature);
         self.log_status(format!(
             "Applied AFNI/SUMA RGBA overlay to {applied} nodes{}.",
             if skipped > 0 {
@@ -3670,8 +3695,20 @@ impl ViewerState {
                 String::new()
             }
         ));
+        if self.verbose {
+            self.log_status(match previous_signature {
+                Some(_) => format!(
+                    "AFNI/SUMA RGBA overlay for {} changed; re-applied.",
+                    overlay.surface_idcode
+                ),
+                None => format!(
+                    "AFNI/SUMA RGBA overlay for {} applied for the first time.",
+                    overlay.surface_idcode
+                ),
+            });
+        }
 
-        Ok(())
+        Ok(true)
     }
 
     fn apply_afni_surface_crosshair(&mut self, crosshair: AfniSurfaceCrosshair) -> Result<bool> {
@@ -4506,6 +4543,7 @@ impl ViewerState {
 
         self.overlay = None;
         self.afni_rgba_colors = None;
+        self.afni_rgba_signatures.clear();
         self.overlay_values = Some(overlay_values);
         self.overlay_dataset = Some(loaded_overlay.dataset);
         self.overlay_columns = loaded_overlay.columns;
@@ -4550,6 +4588,7 @@ impl ViewerState {
 
         self.overlay = None;
         self.afni_rgba_colors = None;
+        self.afni_rgba_signatures.clear();
         self.overlay_values = Some(overlay_values);
         self.overlay_dataset = Some(loaded_overlay.dataset);
         self.overlay_columns = loaded_overlay.columns;
@@ -7557,6 +7596,18 @@ fn decorate_afni_surface_volume_info(
     }
 }
 
+/// Content hash of an incoming `SUMA_irgba` payload, used to drop AFNI's
+/// redundant re-sends of an unchanged colorization for a given surface.
+fn afni_rgba_overlay_signature(overlay: &AfniRgbaOverlay) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    overlay.function_idcode.hash(&mut hasher);
+    overlay.threshold.hash(&mut hasher);
+    overlay.node_indices.hash(&mut hasher);
+    overlay.rgba.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn afni_rgba_to_suma_node_color(rgba: [u8; 4]) -> [f32; 4] {
     [
         rgba[0] as f32 / 255.0 * AFNI_LIVE_COLOR_DIM_FACTOR,
@@ -9667,7 +9718,8 @@ mod tests {
         OverlayAppearance, OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR,
         PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation,
         RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
-        SurfacePick, afni_component_is_sendable, apply_afni_rgba_to_color_cache,
+        SurfacePick, afni_component_is_sendable, afni_rgba_overlay_signature,
+        apply_afni_rgba_to_color_cache,
         canonical_overlay_columns, component_transforms, pair_hemisphere_matrices,
         paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
         paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
@@ -9710,6 +9762,49 @@ mod tests {
             winit::dpi::PhysicalSize::new(420, 700),
             winit::dpi::PhysicalSize::new(460, 700)
         ));
+    }
+
+    #[test]
+    fn afni_rgba_overlay_signature_detects_payload_changes() {
+        let base = AfniRgbaOverlay {
+            surface_idcode: "lh".to_string(),
+            local_domain_parent_id: Some("lh.smoothwm".to_string()),
+            node_indices: vec![1, 2],
+            rgba: vec![[255, 0, 0, 255], [0, 255, 0, 255]],
+            threshold: Some("0.0001".to_string()),
+            function_idcode: Some("func-a".to_string()),
+            volume_idcode: Some("vol".to_string()),
+        };
+
+        // A resend of the identical colorization hashes the same.
+        assert_eq!(
+            afni_rgba_overlay_signature(&base),
+            afni_rgba_overlay_signature(&base.clone())
+        );
+
+        // Differences in any colorization-relevant field change the hash.
+        let mut recolored = base.clone();
+        recolored.rgba[0] = [254, 0, 0, 255];
+        assert_ne!(
+            afni_rgba_overlay_signature(&base),
+            afni_rgba_overlay_signature(&recolored)
+        );
+
+        let mut new_function = base.clone();
+        new_function.function_idcode = Some("func-b".to_string());
+        assert_ne!(
+            afni_rgba_overlay_signature(&base),
+            afni_rgba_overlay_signature(&new_function)
+        );
+
+        // The wire surface idcode keys the cache separately, so it is not part
+        // of the payload hash itself.
+        let mut renamed = base.clone();
+        renamed.surface_idcode = "rh".to_string();
+        assert_eq!(
+            afni_rgba_overlay_signature(&base),
+            afni_rgba_overlay_signature(&renamed)
+        );
     }
 
     #[test]
