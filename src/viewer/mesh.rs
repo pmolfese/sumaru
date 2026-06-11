@@ -45,6 +45,39 @@ pub(super) struct SelectionHighlight {
     pub(super) node_index: u32,
     pub(super) face_index: usize,
     pub(super) crosshair_position: [f32; 3],
+    pub(super) marker_radius: f32,
+    pub(super) face_offset: f32,
+}
+
+impl SelectionHighlight {
+    pub(super) fn normalized(
+        node_index: u32,
+        face_index: usize,
+        crosshair_position: [f32; 3],
+    ) -> Self {
+        Self::scaled(node_index, face_index, crosshair_position, 1.0)
+    }
+
+    pub(super) fn scaled(
+        node_index: u32,
+        face_index: usize,
+        crosshair_position: [f32; 3],
+        scale: f32,
+    ) -> Self {
+        let scale = if scale.is_finite() && scale > f32::EPSILON {
+            scale
+        } else {
+            1.0
+        };
+
+        Self {
+            node_index,
+            face_index,
+            crosshair_position,
+            marker_radius: CROSSHAIR_RADIUS * scale,
+            face_offset: SELECTED_FACE_OFFSET * scale,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,6 +171,39 @@ impl PreparedSurface {
         Self { vertices, indices }
     }
 
+    pub(super) fn from_geometry_cell_colors(
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        selection: Option<SelectionHighlight>,
+    ) -> Self {
+        let mut vertices = Vec::with_capacity(geometry.indices.len());
+        let mut indices = Vec::with_capacity(geometry.indices.len());
+
+        for triangle in geometry.indices.chunks_exact(3) {
+            let face_color = cell_color_for_triangle(triangle, surface_colors, roi_colors);
+            let start = vertices.len() as u32;
+            for index in triangle {
+                if let Some(vertex) = geometry.vertices.get(*index as usize) {
+                    vertices.push(PreparedVertex {
+                        position: vertex.position,
+                        normal: vertex.normal,
+                        color: face_color,
+                    });
+                }
+            }
+            if vertices.len() >= start as usize + 3 {
+                indices.extend_from_slice(&[start, start + 1, start + 2]);
+            }
+        }
+
+        if let Some(selection) = selection {
+            append_selection_highlight(&mut vertices, &mut indices, geometry, selection);
+        }
+
+        Self { vertices, indices }
+    }
+
     pub(super) fn index_count(&self) -> u32 {
         self.indices.len() as u32
     }
@@ -187,9 +253,26 @@ fn append_selection_highlight(
     geometry: &PreparedGeometry,
     selection: SelectionHighlight,
 ) {
-    append_selected_face(vertices, indices, geometry, selection.face_index);
-    append_crosshair_marker(vertices, indices, selection.crosshair_position);
-    append_selected_node_marker(vertices, indices, geometry, selection.node_index);
+    append_selected_face(
+        vertices,
+        indices,
+        geometry,
+        selection.face_index,
+        selection.face_offset,
+    );
+    append_crosshair_marker(
+        vertices,
+        indices,
+        selection.crosshair_position,
+        selection.marker_radius,
+    );
+    append_selected_node_marker(
+        vertices,
+        indices,
+        geometry,
+        selection.node_index,
+        selection.marker_radius,
+    );
 }
 
 fn append_selected_face(
@@ -197,6 +280,7 @@ fn append_selected_face(
     indices: &mut Vec<u32>,
     geometry: &PreparedGeometry,
     face_index: usize,
+    face_offset: f32,
 ) -> Option<()> {
     let base_index = face_index.checked_mul(3)?;
     let face_indices = [
@@ -213,7 +297,7 @@ fn append_selected_face(
         + Vec3::from_array(face_vertices[1].normal)
         + Vec3::from_array(face_vertices[2].normal))
     .normalize_or_zero();
-    let offset = face_normal * SELECTED_FACE_OFFSET;
+    let offset = face_normal * face_offset;
     let start = vertices.len() as u32;
     for vertex in face_vertices {
         vertices.push(PreparedVertex {
@@ -232,9 +316,10 @@ fn append_selected_node_marker(
     indices: &mut Vec<u32>,
     geometry: &PreparedGeometry,
     node_index: u32,
+    marker_radius: f32,
 ) -> Option<()> {
     let vertex = geometry.vertices.get(node_index as usize)?;
-    append_crosshair_marker(vertices, indices, vertex.position);
+    append_crosshair_marker(vertices, indices, vertex.position, marker_radius);
     Some(())
 }
 
@@ -242,6 +327,7 @@ fn append_crosshair_marker(
     vertices: &mut Vec<PreparedVertex>,
     indices: &mut Vec<u32>,
     position: [f32; 3],
+    radius: f32,
 ) {
     let center = Vec3::from_array(position);
     let directions = [
@@ -255,7 +341,7 @@ fn append_crosshair_marker(
     let start = vertices.len() as u32;
     for direction in directions {
         vertices.push(PreparedVertex {
-            position: (center + direction * CROSSHAIR_RADIUS).to_array(),
+            position: (center + direction * radius).to_array(),
             normal: direction.to_array(),
             color: CROSSHAIR_COLOR,
         });
@@ -400,6 +486,39 @@ fn compose_annotation_color(base: [f32; 4], annotation: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+fn cell_color_for_triangle(
+    triangle: &[u32],
+    surface_colors: Option<&[[f32; 4]]>,
+    roi_colors: Option<&[Option<[f32; 4]>]>,
+) -> [f32; 4] {
+    let color = |index: u32| {
+        let index = index as usize;
+        compose_vertex_color(
+            surface_colors
+                .and_then(|colors| colors.get(index))
+                .copied()
+                .unwrap_or(DEFAULT_SURFACE_COLOR),
+            None,
+            1.0,
+            roi_colors
+                .and_then(|colors| colors.get(index))
+                .copied()
+                .flatten(),
+        )
+    };
+
+    let v0 = color(triangle[0]);
+    let v1 = color(triangle[1]);
+    let v2 = color(triangle[2]);
+    if colors_match(v1, v2) { v1 } else { v0 }
+}
+
+fn colors_match(left: [f32; 4], right: [f32; 4]) -> bool {
+    left.iter()
+        .zip(right)
+        .all(|(left, right)| (*left - right).abs() <= 1.0e-6)
+}
+
 pub(super) fn sample_colormap(colormap: OverlayColorMap, t: f32) -> [f32; 4] {
     colormap
         .to_color_map()
@@ -463,11 +582,7 @@ mod tests {
             None,
             1.0,
             None,
-            Some(SelectionHighlight {
-                node_index: 2,
-                face_index: 0,
-                crosshair_position: [0.0, 0.0, 0.0],
-            }),
+            Some(SelectionHighlight::normalized(2, 0, [0.0, 0.0, 0.0])),
         );
 
         assert_eq!(prepared.vertices.len(), geometry.vertices.len() + 15);
@@ -492,6 +607,26 @@ mod tests {
         assert_color_close(prepared.vertices[2].color, [0.45, 0.09, 0.07, 1.0]);
 
         assert_eq!(overlay.color_cache.colors.len(), dataset.row_count);
+    }
+
+    #[test]
+    fn prepared_surface_cell_colors_use_triangle_face_color() {
+        let mesh = triangle_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let colors = vec![
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ];
+
+        let prepared =
+            PreparedSurface::from_geometry_cell_colors(&geometry, Some(&colors), None, None);
+
+        assert_eq!(prepared.indices, vec![0, 1, 2]);
+        assert_eq!(prepared.vertices.len(), 3);
+        for vertex in prepared.vertices {
+            assert_eq!(vertex.color, [0.0, 0.0, 1.0, 1.0]);
+        }
     }
 
     #[test]

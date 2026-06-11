@@ -30,17 +30,20 @@ AFNI, SUMA, SUMAvista, and `sumaru`.
 
 ### NIML Talk With AFNI
 
-- [ ] Document the minimal AFNI/SUMA message subset for first interop: surface
+- [x] Document the minimal AFNI/SUMA message subset for first interop: surface
   selection, crosshair updates, selected node/triangle, dataset loading,
   overlay/threshold state, controller commands, and ROI updates.
-- [ ] Add a small NIML communication/session layer that is independent of
+- [x] Add a small NIML communication/session layer that is independent of
   `wgpu`, so tests and command-line tools can exercise AFNI message handling
   without launching the viewer.
-- [ ] Route incoming AFNI messages through shared command/controller state
+- [x] Route incoming AFNI messages through shared command/controller state
   rather than directly mutating viewer-only fields.
-- [ ] Emit the matching `sumaru` state back to AFNI where appropriate:
+- [x] Emit the matching `sumaru` state back to AFNI where appropriate:
   crosshair location, selected node, active surface, current dataset, and
   overlay/threshold settings.
+- [x] Wire the first live viewer bridge: launch with `--talk-afni`, toggle with
+  `T`, force-resend active surface geometry with `Control+T`, and display
+  incoming `SUMA_irgba` color overlays.
 - [ ] Add debug tools for AFNI interop: record message streams, replay message
   streams, inspect individual messages, and send small test commands from the
   CLI.
@@ -82,16 +85,16 @@ This cluster supports AFNI interop, menus, keyboard shortcuts, controller
 windows, scripts, and future automation. It should happen before wiring a lot
 more UI or protocol behavior into viewer-only fields.
 
-- [ ] Move camera, background, overlay, ROI, surface selection, visibility,
+- [x] Move camera, background, overlay, ROI, surface selection, visibility,
   crosshair, and pick settings into shared command/controller state.
-- [ ] Add a controller layer for UI panels, keyboard shortcuts, CLI commands,
+- [x] Add a controller layer for UI panels, keyboard shortcuts, CLI commands,
   and AFNI messages before adding richer controls.
-- [ ] Define shared interaction state: selected node, selected face, selected
+- [x] Define shared interaction state: selected node, selected face, selected
   triangle, crosshair location, current surface/object id, current overlay id,
   current ROI id, and latest pick result.
-- [ ] Split the current `egui` panels into controller-backed widgets once the
+- [x] Split the current `egui` panels into controller-backed widgets once the
   command state exists.
-- [ ] Add a lightweight status/log event stream so `--verbose`, controllers,
+- [x] Add a lightweight status/log event stream so `--verbose`, controllers,
   and future AFNI communication can report the same events consistently.
 
 ## Everyday Viewer Use
@@ -111,8 +114,11 @@ the larger GPU/shader optimization pass.
 - [ ] Add AFNI/SUMA-compatible `BBox` threshold A/B semantics for future
   multi-threshold transparency and masking controls.
 - [ ] Add cluster and connected-component views for thresholded overlays.
-- [ ] Add viewer screenshot/pixel checks for nonblank rendering and common
-  overlay/ROI/spec scenes once automated graphics verification is practical.
+- [ ] Add automated GUI regression coverage once graphics verification is
+  practical:
+  state/command tests for shortcuts and controller actions, render-prep tests
+  for markers/ROI/overlay data, headless offscreen render tests for visible
+  pixels, and tolerant golden-image tests for montage/acorn/ROI scenes.
 
 ## Geometry, Mapping, And Analysis Extensions
 

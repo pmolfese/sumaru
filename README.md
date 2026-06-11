@@ -46,6 +46,39 @@ choose intensity, threshold, and brightness columns from the dataset. If the
 selected threshold column carries an AFNI stat label such as `Ttest(48)`, the
 threshold control can operate in p-value mode.
 
+## AFNI NIML Talk
+
+`sumaru` now has a non-`wgpu` AFNI/SUMA NIML talk layer in the library crate and
+a first live viewer bridge. The first concrete AFNI-compatible message subset
+is the same practical path used by SUMA and PySuma:
+
+- `SUMA_ixyz`: surface node index and XYZ coordinates sent to AFNI
+- `SUMA_node_normals`: per-node normals sent to AFNI
+- `SUMA_ijk`: triangle indices sent to AFNI
+- `SUMA_irgba`: sparse node RGBA colors and optional threshold/function/volume
+  metadata sent from AFNI back to the surface viewer
+
+Launch with `--talk-afni` to connect on startup, or press `T` in the viewer to
+toggle AFNI/SUMA NIML talk. Press `Control+T` to force-resend the active surface
+geometry. Port selection follows AFNI/SUMA conventions: `--afni-port PORT` uses
+an explicit port, while `-np OFFSET`/`--np OFFSET` and `-npb BLOC`/`--npb BLOC`
+resolve the same AFNI-style port offsets. `--afni-host` defaults to `127.0.0.1`.
+AFNI must be listening for NIML before Sumaru can connect: launch AFNI with
+`-niml` (and usually `-yesplugouts` for SUMA-style sessions), or press the
+`NIML+PO` button in the AFNI GUI after launch.
+
+Example:
+
+```sh
+cargo run -- --spec path/to/fsaverage_lh.spec --sv path/to/SurfVol.nii --talk-afni
+```
+
+The same module also defines Sumaru-side NIML state messages for active surface,
+crosshair and selected node/triangle, dataset loading, overlay/threshold
+settings, controller commands, and ROI state. Those messages route through
+shared controller/command state rather than directly mutating viewer-only
+fields, so they can be tested without launching the GUI.
+
 ## Viewer Controls
 
 - Launch with `cargo run` to open an empty viewer and a separate controls
@@ -110,6 +143,13 @@ the completed-work ledger.
   geometry, viewer, ROI, spec, and rendering performance milestones.
 - `src/lib.rs` is the library crate entry point. It exposes the reusable modules
   so the binary, tests, and future tools can share the same implementation.
+- `src/afni.rs` contains the first AFNI/SUMA NIML talk layer. It resolves
+  AFNI-style ports, builds `SUMA_ixyz`/`SUMA_node_normals`/`SUMA_ijk` surface
+  registration elements, parses `SUMA_irgba` overlays, maps incoming NIML
+  messages to shared controller actions, and emits Sumaru state messages.
+- `src/command.rs` contains the shared controller and command state used to
+  route viewer menus, keyboard shortcuts, controller panels, and future AFNI
+  messages through the same non-`wgpu` model.
 - `src/main.rs` is the command-line entry point. It parses `sumaru` arguments,
   launches the viewer with an initial surface or `.spec` scene, requires `-sv`
   surface-volume context for `.spec` launches, handles `--overlay`, passes

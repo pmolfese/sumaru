@@ -108,6 +108,9 @@ This is the completed-work ledger for `sumaru`. The active to-do plan lives in
   for background loading.
 - [x] Automatically paired opposite-hemisphere overlays where matching files are
   available.
+- [x] Added the first live AFNI/SUMA NIML viewer bridge: `--talk-afni` connects
+  on launch, `T` toggles the connection, `Control+T` resends active surface
+  geometry, and incoming `SUMA_irgba` messages display as AFNI color overlays.
 
 ## Viewer, Controllers, And Interaction
 
@@ -142,6 +145,12 @@ This is the completed-work ledger for `sumaru`. The active to-do plan lives in
   closed bottom, open medial-in, and open outer-out views.
 - [x] Added menu entries for viewer actions and controller windows.
 - [x] Added keyboard shortcuts for showing/hiding surface and ROI controllers.
+- [x] Added shared controller and command state for camera mode/presets,
+  background, overlay/ROI visibility, paired-hemisphere state, surface context,
+  crosshair/pick state, controller-window state, and bounded status events.
+- [x] Routed `egui` menus, controller panels, and keyboard shortcuts through a
+  common `ViewerCommand` path so future AFNI/NIML messages can drive the same
+  behavior without depending on `wgpu`.
 
 ## ROI Workflows
 

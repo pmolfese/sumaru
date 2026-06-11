@@ -313,6 +313,34 @@ fn local_spec_fixture_exposes_expected_surface_entries() -> Result<()> {
 }
 
 #[test]
+fn local_afni_label_volume_fixture_is_detected_with_label_table() -> Result<()> {
+    let Some(volume_path) = local_fixture("SUMA/aparc+aseg_REN_all.nii.gz") else {
+        eprintln!(
+            "skipping local AFNI label volume test: testing/SUMA/aparc+aseg_REN_all.nii.gz is absent"
+        );
+        return Ok(());
+    };
+    let Some(label_table_path) = local_fixture("SUMA/aparc+aseg_REN_all.niml.lt") else {
+        bail!(
+            "testing/SUMA/aparc+aseg_REN_all.nii.gz is present but its matching .niml.lt label table is missing"
+        );
+    };
+
+    assert_eq!(detect_file_kind(&volume_path), Some(FileKind::Nifti));
+    let report = inspect_path(&volume_path)?;
+    assert_eq!(report.kind, FileKind::Nifti);
+    assert!(report.summary.contains("dimensions: [256, 256, 256]"));
+    assert!(report.summary.contains("datatype code: 16"));
+
+    let label_table = std::fs::read_to_string(label_table_path)?;
+    assert!(label_table.contains("<VALUE_LABEL_DTABLE"));
+    assert!(label_table.contains("\"47\" \"ctx-lh-bankssts\""));
+    assert!(label_table.contains("\"115\" \"ctx-rh-insula\""));
+
+    Ok(())
+}
+
+#[test]
 fn local_reference_folder_contains_expected_starter_files() -> Result<()> {
     let Some(testing_dir) = local_fixture(".").and_then(|path| path.canonicalize().ok()) else {
         // On CI the fixtures must be present, otherwise every other test in this

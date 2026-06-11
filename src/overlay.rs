@@ -130,6 +130,41 @@ impl Overlay {
         })
     }
 
+    /// Builds an overlay directly from already-computed per-node colors.
+    ///
+    /// AFNI's live `SUMA_irgba` messages arrive as sparse RGBA color updates,
+    /// not as a full dataset table. Keeping this constructor explicit lets the
+    /// live AFNI path display those colors without pretending they are a
+    /// canonical `Dataset`.
+    pub fn from_color_cache(
+        domain: &SurfaceDomain,
+        colors: Vec<[f32; 4]>,
+        dataset_id: Option<String>,
+    ) -> Result<Self> {
+        ensure!(
+            colors.len() == domain.node_count,
+            "overlay color cache length {} does not match domain node count {}",
+            colors.len(),
+            domain.node_count
+        );
+
+        Ok(Self {
+            dataset_id,
+            domain_id: domain.id.clone(),
+            columns: OverlayColumns::new(0),
+            colormap: ColorMap::blue_white_red(),
+            intensity_range: RangeSelection::Auto,
+            threshold: Threshold::off(),
+            mask_mode: MaskMode::None,
+            clip_mode: ClipMode::ClampToIntensityRange,
+            symmetric_range: false,
+            opacity: 1.0,
+            plane_order: 0,
+            layer_role: OverlayLayerRole::Foreground,
+            color_cache: PerNodeColorCache { colors },
+        })
+    }
+
     pub fn rebuild_color_cache(&mut self, dataset: &Dataset, domain: &SurfaceDomain) -> Result<()> {
         ensure!(
             self.domain_id == dataset.domain_id && dataset.domain_id == domain.id,

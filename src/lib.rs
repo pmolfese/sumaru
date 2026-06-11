@@ -1,4 +1,6 @@
+pub mod afni;
 pub mod color;
+pub mod command;
 pub mod dataset;
 pub mod inspect;
 pub mod io;

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -17,9 +18,20 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::afni::{
+    AfniConnection, AfniConnectionEvent, AfniNimlSession, AfniPortConfig, AfniRgbaOverlay,
+    AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo, DEFAULT_AFNI_HOST,
+    DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
+};
 use crate::color::Rgba;
+use crate::command::{
+    BackgroundMode, CameraControlMode, ControllerState, HemisphereLayout, HemisphereLayoutState,
+    PairVisibility, SurfacePick, ViewPreset, ViewerCommand,
+};
 use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
-use crate::io::{read_gifti_dataset, read_niml_dataset, read_niml_roi, write_niml_roi};
+use crate::io::{
+    NimlElement, read_gifti_dataset, read_niml_dataset, read_niml_roi, write_niml_roi,
+};
 use crate::overlay::{
     ColumnSelection, MaskMode, Overlay, OverlayColumns, OverlayRange, RangeSelection, Threshold,
 };
@@ -49,6 +61,26 @@ mod mesh;
 mod pick;
 mod screenshot;
 
+impl From<CameraMode> for CameraControlMode {
+    fn from(mode: CameraMode) -> Self {
+        match mode {
+            CameraMode::Orbit => Self::Orbit,
+            CameraMode::Turntable => Self::Turntable,
+        }
+    }
+}
+
+impl From<ViewPreset> for PresetOrientation {
+    fn from(preset: ViewPreset) -> Self {
+        match preset {
+            ViewPreset::Left => Self::Left,
+            ViewPreset::Right => Self::Right,
+            ViewPreset::Top => Self::Top,
+            ViewPreset::Bottom => Self::Bottom,
+        }
+    }
+}
+
 const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
 const VERTEX_STRIDE: wgpu::BufferAddress = 40;
@@ -56,6 +88,8 @@ const MODE_LABEL_DURATION: Duration = Duration::from_secs(2);
 const STARTUP_REDRAW_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_REDRAW_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const SUMA_CONVEXITY_SMOOTHING_ITERATIONS: usize = 5;
+const SUMA_AFNI_GRAY_NODE_COLOR: f32 = 0.30;
+const AFNI_LIVE_COLOR_DIM_FACTOR: f32 = 1.0;
 const SUMA_CONVEXITY_OPACITY: f32 = 0.85;
 const CONTROL_CONTENT_WIDTH_POINTS: f32 = 560.0;
 const CONTROL_MIN_INNER_WIDTH: u32 = 620;
@@ -80,7 +114,6 @@ const DEFAULT_OVERLAY_RANGE: ValueRange = ValueRange {
 };
 const PAIR_OPEN_DEGREES_PER_PIXEL: f32 = 0.18;
 const PAIR_MAX_OPEN_DEGREES: f32 = 85.0;
-const PAIR_ACORN_EXTRA_GAP: f32 = 50.0;
 const PAIR_MIN_CLEARANCE_FRACTION: f32 = 0.02;
 const PAIR_MIN_SURFACE_CLEARANCE: f32 = 2.0;
 const PAIR_MAX_DRAG_GAP_FACTOR: f32 = 1.5;
@@ -111,11 +144,39 @@ pub struct LaunchOptions {
     pub spec_path: Option<PathBuf>,
     pub surface_volume_path: Option<PathBuf>,
     pub overlay_path: Option<PathBuf>,
+    pub overlay_pair_paths: Option<ExplicitOverlayPair>,
     pub roi_path: Option<PathBuf>,
     pub overlay_subs: Option<Vec<String>>,
     pub overlay_p_value: Option<f64>,
     pub verbose: bool,
     pub preload: bool,
+    pub afni: AfniViewerOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitOverlayPair {
+    pub left_path: PathBuf,
+    pub right_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct AfniViewerOptions {
+    pub connect_on_launch: bool,
+    pub port_config: AfniPortConfig,
+}
+
+impl Default for AfniViewerOptions {
+    fn default() -> Self {
+        Self {
+            connect_on_launch: false,
+            port_config: AfniPortConfig {
+                host: DEFAULT_AFNI_HOST.to_string(),
+                port: DEFAULT_AFNI_NIML_PORT,
+                port_offset: None,
+                port_bloc: None,
+            },
+        }
+    }
 }
 
 pub fn run(options: LaunchOptions) -> Result<()> {
@@ -140,11 +201,13 @@ struct ViewerApp {
     initial_spec_path: Option<PathBuf>,
     initial_surface_volume_path: Option<PathBuf>,
     initial_overlay_path: Option<PathBuf>,
+    initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
     initial_roi_path: Option<PathBuf>,
     initial_overlay_subs: Option<Vec<String>>,
     initial_overlay_p_value: Option<f64>,
     verbose: bool,
     preload: bool,
+    afni: AfniViewerOptions,
     event_proxy: EventLoopProxy<ViewerEvent>,
     state: Option<ViewerState>,
     setup_error: Option<anyhow::Error>,
@@ -157,11 +220,13 @@ impl ViewerApp {
             initial_spec_path: options.spec_path,
             initial_surface_volume_path: options.surface_volume_path,
             initial_overlay_path: options.overlay_path,
+            initial_overlay_pair_paths: options.overlay_pair_paths,
             initial_roi_path: options.roi_path,
             initial_overlay_subs: options.overlay_subs,
             initial_overlay_p_value: options.overlay_p_value,
             verbose: options.verbose,
             preload: options.preload,
+            afni: options.afni,
             event_proxy,
             state: None,
             setup_error: None,
@@ -212,11 +277,13 @@ impl ViewerApp {
             self.initial_spec_path.take(),
             self.initial_surface_volume_path.take(),
             self.initial_overlay_path.take(),
+            self.initial_overlay_pair_paths.take(),
             self.initial_roi_path.take(),
             self.initial_overlay_subs.take(),
             self.initial_overlay_p_value.take(),
             self.verbose,
             self.preload,
+            self.afni.clone(),
             self.event_proxy.clone(),
         ))?);
 
@@ -326,7 +393,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             }
             match event {
                 WindowEvent::CloseRequested => {
-                    state.apply_ui_actions(vec![UiAction::SetRoiControllerOpen(false)]);
+                    state.apply_commands(vec![ViewerCommand::SetRoiControllerOpen(false)]);
                 }
                 WindowEvent::Resized(size) => {
                     state.resize_roi_control(size);
@@ -355,7 +422,16 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             ViewerEvent::SpecPreloadReady => {
                 if state.drain_preload_results() {
                     state.control_window().request_redraw();
-                    if state.roi_controller_open {
+                    if state.controller.panels.roi_controller_open {
+                        state.roi_control_window().request_redraw();
+                    }
+                    state.view_window().request_redraw();
+                }
+            }
+            ViewerEvent::AfniMessagesReady => {
+                if state.drain_afni_events() {
+                    state.control_window().request_redraw();
+                    if state.controller.panels.roi_controller_open {
                         state.roi_control_window().request_redraw();
                     }
                     state.view_window().request_redraw();
@@ -382,6 +458,8 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         let next_view = state.view_repaint_at;
         let next_control = state.control_repaint_at;
         let next_roi_control = state
+            .controller
+            .panels
             .roi_controller_open
             .then_some(state.roi_control_repaint_at)
             .flatten();
@@ -455,46 +533,41 @@ struct ViewerState {
     anatomical_shading_cache: Option<AnatomicalShadingCache>,
     surface_scene: Option<SurfaceScene>,
     scene_generation: u64,
+    controller: ControllerState,
     overlay: Option<Overlay>,
     overlay_values: Option<OverlayDataset>,
     overlay_dataset: Option<Dataset>,
     overlay_columns: OverlayColumnSelections,
-    overlay_visible: bool,
-    anatomical_shading_visible: bool,
     overlay_appearance: OverlayAppearance,
-    overlay_symmetric_range: bool,
     surface_path: Option<PathBuf>,
     overlay_path: Option<PathBuf>,
+    overlay_pair_paths: Option<ExplicitOverlayPair>,
     roi_path: Option<PathBuf>,
     overlay_display_name: Option<String>,
     roi_layer: Option<RoiLayer>,
     roi_workspace: RoiWorkspace,
-    roi_visible: bool,
     surface_volume_path: Option<PathBuf>,
-    hemisphere_layout: HemisphereLayout,
-    hemisphere_open_angle_degrees: f32,
-    hemisphere_separation_distance: f32,
-    pair_visibility: PairVisibility,
+    surface_volume_idcode: Option<String>,
     scene_stats: Option<SceneStats>,
     /// Cached geometry-derived stats (winding/area/counts) keyed by surface id,
     /// so recolors do not recompute the expensive `winding_report`.
     scene_geometry_stats: Option<(SurfaceId, SceneGeometryStats)>,
-    surface_pick: Option<SurfacePick>,
     verbose: bool,
     preload_enabled: bool,
     preload_sender: Sender<PreloadResult>,
     preload_receiver: Receiver<PreloadResult>,
     event_proxy: EventLoopProxy<ViewerEvent>,
+    afni_options: AfniViewerOptions,
+    afni_connection: Option<AfniConnection>,
+    afni_session: AfniNimlSession,
+    afni_rgba_colors: Option<Vec<[f32; 4]>>,
     camera: Camera,
     view_cursor_position: Option<(f64, f64)>,
     pair_dragging: bool,
     pair_drag_last_cursor: Option<(f64, f64)>,
     pair_drag_changed: bool,
-    background: BackgroundMode,
     modifiers: ModifiersState,
     mode_label: Option<ModeLabel>,
-    surface_controller_visible: bool,
-    roi_controller_open: bool,
     view_egui_ctx: egui::Context,
     view_egui_state: egui_winit::State,
     view_egui_renderer: Renderer,
@@ -521,11 +594,13 @@ impl ViewerState {
         initial_spec_path: Option<PathBuf>,
         initial_surface_volume_path: Option<PathBuf>,
         initial_overlay_path: Option<PathBuf>,
+        initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
         initial_roi_path: Option<PathBuf>,
         initial_overlay_subs: Option<Vec<String>>,
         initial_overlay_p_value: Option<f64>,
         verbose: bool,
         preload_enabled: bool,
+        afni_options: AfniViewerOptions,
         event_proxy: EventLoopProxy<ViewerEvent>,
     ) -> Result<Self> {
         let view_size = view_window.inner_size();
@@ -719,6 +794,8 @@ impl ViewerState {
         let roi_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
         let initial_surface_volume_path =
             initial_surface_volume_path.map(canonical_or_original_path);
+        let initial_surface_volume_idcode =
+            query_afni_dataset_idcode_optional(initial_surface_volume_path.as_deref())?;
         let (preload_sender, preload_receiver) = mpsc::channel();
 
         let mut state = Self {
@@ -756,44 +833,39 @@ impl ViewerState {
             anatomical_shading_cache: None,
             surface_scene: None,
             scene_generation: 0,
+            controller: ControllerState::default(),
             overlay: None,
             overlay_values: None,
             overlay_dataset: None,
             overlay_columns: OverlayColumnSelections::default(),
-            overlay_visible: true,
-            anatomical_shading_visible: false,
             overlay_appearance: OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE),
-            overlay_symmetric_range: true,
             surface_path: None,
             overlay_path: None,
+            overlay_pair_paths: None,
             roi_path: None,
             overlay_display_name: None,
             roi_layer: None,
             roi_workspace: RoiWorkspace::default(),
-            roi_visible: true,
             surface_volume_path: initial_surface_volume_path.clone(),
-            hemisphere_layout: HemisphereLayout::Closed,
-            hemisphere_open_angle_degrees: 0.0,
-            hemisphere_separation_distance: 0.0,
-            pair_visibility: PairVisibility::both(),
+            surface_volume_idcode: initial_surface_volume_idcode,
             scene_stats: None,
             scene_geometry_stats: None,
-            surface_pick: None,
             verbose,
             preload_enabled,
             preload_sender,
             preload_receiver,
             event_proxy,
+            afni_options,
+            afni_connection: None,
+            afni_session: AfniNimlSession::new(),
+            afni_rgba_colors: None,
             camera,
             view_cursor_position: None,
             pair_dragging: false,
             pair_drag_last_cursor: None,
             pair_drag_changed: false,
-            background: BackgroundMode::Black,
             modifiers: ModifiersState::empty(),
             mode_label: None,
-            surface_controller_visible: true,
-            roi_controller_open: false,
             view_egui_ctx,
             view_egui_state,
             view_egui_renderer,
@@ -822,12 +894,23 @@ impl ViewerState {
                 initial_overlay_subs.as_deref(),
                 initial_overlay_p_value,
             )?;
+        } else if let Some(pair) = initial_overlay_pair_paths {
+            state.load_overlay_pair_paths(pair)?;
+            state.apply_initial_overlay_options(
+                initial_overlay_subs.as_deref(),
+                initial_overlay_p_value,
+            )?;
         }
         if let Some(path) = initial_roi_path {
             state.load_roi_path(path)?;
         }
         state.arm_startup_redraw_guard();
         state.log_status("Viewer initialized.");
+        if state.afni_options.connect_on_launch
+            && let Err(error) = state.connect_afni_talk()
+        {
+            state.set_error(error);
+        }
 
         Ok(state)
     }
@@ -981,20 +1064,36 @@ impl ViewerState {
                         true
                     }
                     PhysicalKey::Code(KeyCode::KeyS) if self.modifiers.control_key() => {
-                        self.set_surface_controller_visible(!self.surface_controller_visible);
+                        self.set_surface_controller_visible(
+                            !self.controller.panels.surface_controller_visible,
+                        );
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::KeyT) if self.modifiers.control_key() => {
+                        if let Err(error) = self.force_resend_afni_surfaces() {
+                            self.set_error(error);
+                        }
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::KeyT) => {
+                        if let Err(error) = self.toggle_afni_talk() {
+                            self.set_error(error);
+                        }
                         true
                     }
                     PhysicalKey::Code(KeyCode::KeyC) => {
                         let mode = self.camera.toggle_mode();
+                        self.controller.camera.mode = mode.into();
                         self.show_mode_label(mode);
                         true
                     }
                     PhysicalKey::Code(KeyCode::Space) => {
                         self.camera.reset();
+                        self.controller.camera.note_reset();
                         true
                     }
                     PhysicalKey::Code(KeyCode::F5) => {
-                        self.background.toggle();
+                        self.controller.display.background.toggle();
                         true
                     }
                     PhysicalKey::Code(KeyCode::KeyR) if self.modifiers.shift_key() => {
@@ -1045,18 +1144,22 @@ impl ViewerState {
                     },
                     PhysicalKey::Code(KeyCode::ArrowLeft) if self.modifiers.alt_key() => {
                         self.camera.set_preset(PresetOrientation::Left);
+                        self.controller.camera.set_preset(ViewPreset::Left);
                         true
                     }
                     PhysicalKey::Code(KeyCode::ArrowRight) if self.modifiers.alt_key() => {
                         self.camera.set_preset(PresetOrientation::Right);
+                        self.controller.camera.set_preset(ViewPreset::Right);
                         true
                     }
                     PhysicalKey::Code(KeyCode::ArrowUp) if self.modifiers.alt_key() => {
                         self.camera.set_preset(PresetOrientation::Top);
+                        self.controller.camera.set_preset(ViewPreset::Top);
                         true
                     }
                     PhysicalKey::Code(KeyCode::ArrowDown) if self.modifiers.alt_key() => {
                         self.camera.set_preset(PresetOrientation::Bottom);
+                        self.controller.camera.set_preset(ViewPreset::Bottom);
                         true
                     }
                     _ => false,
@@ -1133,11 +1236,11 @@ impl ViewerState {
         let actions_present = !ui_actions.is_empty();
         self.view_egui_state
             .handle_platform_output(&self.view_window, full_output.platform_output);
-        self.apply_ui_actions(ui_actions);
+        self.apply_commands(ui_actions);
         if actions_present {
             self.view_window.request_redraw();
             self.control_window.request_redraw();
-            if self.roi_controller_open {
+            if self.controller.panels.roi_controller_open {
                 self.roi_control_window.request_redraw();
             }
         }
@@ -1241,7 +1344,7 @@ impl ViewerState {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(self.background.color()),
+                    load: wgpu::LoadOp::Clear(self.controller.display.background.color()),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -1261,7 +1364,12 @@ impl ViewerState {
         if let Some(render_set) = &self.surface_render_set {
             render_pass.set_pipeline(&self.render_pipeline);
             for instance in &render_set.instances {
-                if !self.pair_visibility.is_visible(&instance.side) {
+                if !self
+                    .controller
+                    .display
+                    .pair_visibility
+                    .is_visible(&instance.side)
+                {
                     continue;
                 }
                 render_pass.set_bind_group(0, &instance.bind_group, &[]);
@@ -1342,8 +1450,8 @@ impl ViewerState {
     }
 
     fn capture_paired_spec_montage(&mut self) -> Result<ScreenshotImage> {
-        let original_layout = self.hemisphere_layout;
-        let original_state = self.hemisphere_layout_state();
+        let original_layout = self.controller.display.pair_layout;
+        let original_state = self.controller.display.pair_state;
         let shots = paired_spec_montage_shots();
         let result = self.capture_paired_montage_shots(&shots);
 
@@ -1353,7 +1461,7 @@ impl ViewerState {
 
     fn capture_paired_montage_shots(&mut self, shots: &[MontageShot]) -> Result<ScreenshotImage> {
         let mut images = Vec::with_capacity(shots.len());
-        let background = self.background.rgba8();
+        let background = self.controller.display.background.rgba8();
         for shot in shots {
             if let Some(layout) = shot.layout {
                 self.apply_hemisphere_layout_state(layout.layout, layout.state)?;
@@ -1450,8 +1558,8 @@ impl ViewerState {
         };
         let matrices = pair_hemisphere_matrices(
             &surface.components,
-            self.hemisphere_layout_state(),
-            self.pair_visibility,
+            self.controller.display.pair_state,
+            self.controller.display.pair_visibility,
         );
         if matrices.is_empty() {
             return false;
@@ -1468,7 +1576,12 @@ impl ViewerState {
         let mut any = false;
 
         for component in &surface.components {
-            if !self.pair_visibility.is_visible(&component.side) {
+            if !self
+                .controller
+                .display
+                .pair_visibility
+                .is_visible(&component.side)
+            {
                 continue;
             }
             let Some(mesh) = component.mesh.as_ref() else {
@@ -1613,11 +1726,11 @@ impl ViewerState {
         if repaint_delay != Duration::ZERO {
             self.fit_control_window(desired_control_size_points, full_output.pixels_per_point);
         }
-        self.apply_ui_actions(ui_actions);
+        self.apply_commands(ui_actions);
         if actions_present {
             self.view_window.request_redraw();
             self.control_window.request_redraw();
-            if self.roi_controller_open {
+            if self.controller.panels.roi_controller_open {
                 self.roi_control_window.request_redraw();
             }
         }
@@ -1752,11 +1865,11 @@ impl ViewerState {
                 full_output.pixels_per_point,
             );
         }
-        self.apply_ui_actions(ui_actions);
+        self.apply_commands(ui_actions);
         if actions_present {
             self.view_window.request_redraw();
             self.control_window.request_redraw();
-            if self.roi_controller_open {
+            if self.controller.panels.roi_controller_open {
                 self.roi_control_window.request_redraw();
             }
         }
@@ -1890,7 +2003,7 @@ impl ViewerState {
         }
     }
 
-    fn draw_view_overlay_ui(&mut self, ctx: &egui::Context) -> Vec<UiAction> {
+    fn draw_view_overlay_ui(&mut self, ctx: &egui::Context) -> Vec<ViewerCommand> {
         let mut actions = Vec::new();
 
         #[allow(deprecated)]
@@ -1900,15 +2013,15 @@ impl ViewerState {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("File", |ui| {
                         if ui.button("Open Surface...").clicked() {
-                            actions.push(UiAction::PickSurface);
+                            actions.push(ViewerCommand::PickSurface);
                             ui.close();
                         }
                         if ui.button("Open Spec...").clicked() {
-                            actions.push(UiAction::PickSpec);
+                            actions.push(ViewerCommand::PickSpec);
                             ui.close();
                         }
                         if ui.button("Open Surface Volume...").clicked() {
-                            actions.push(UiAction::PickSurfaceVolume);
+                            actions.push(ViewerCommand::PickSurfaceVolume);
                             ui.close();
                         }
                         ui.separator();
@@ -1916,14 +2029,14 @@ impl ViewerState {
                             .add_enabled(self.mesh.is_some(), egui::Button::new("Open Overlay..."))
                             .clicked()
                         {
-                            actions.push(UiAction::PickOverlay);
+                            actions.push(ViewerCommand::PickOverlay);
                             ui.close();
                         }
                         if ui
                             .add_enabled(self.mesh.is_some(), egui::Button::new("Open ROI..."))
                             .clicked()
                         {
-                            actions.push(UiAction::PickRoi);
+                            actions.push(ViewerCommand::PickRoi);
                             ui.close();
                         }
                         ui.separator();
@@ -1934,7 +2047,7 @@ impl ViewerState {
                             )
                             .clicked()
                         {
-                            actions.push(UiAction::SaveScreenshot);
+                            actions.push(ViewerCommand::SaveScreenshot);
                             ui.close();
                         }
                         if ui
@@ -1944,7 +2057,7 @@ impl ViewerState {
                             )
                             .clicked()
                         {
-                            actions.push(UiAction::SaveMontage);
+                            actions.push(ViewerCommand::SaveMontage);
                             ui.close();
                         }
                     });
@@ -1953,18 +2066,22 @@ impl ViewerState {
                         ui.label(format!("Mode: {}", self.camera.mode().label()));
                         ui.separator();
                         if ui.button("Reset").clicked() {
-                            actions.push(UiAction::ResetCamera);
+                            actions.push(ViewerCommand::ResetCamera);
                             ui.close();
                         }
                         if ui.button("Cycle Camera").clicked() {
-                            actions.push(UiAction::ToggleCameraMode);
+                            actions.push(ViewerCommand::ToggleCameraMode);
                             ui.close();
                         }
-                        if ui.button(self.background.next_label()).clicked() {
-                            actions.push(UiAction::ToggleBackground);
+                        if ui
+                            .button(self.controller.display.background.next_label())
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::ToggleBackground);
                             ui.close();
                         }
-                        let mut anatomical_shading_visible = self.anatomical_shading_visible;
+                        let mut anatomical_shading_visible =
+                            self.controller.display.anatomical_shading_visible;
                         if ui
                             .add_enabled_ui(self.mesh.is_some(), |ui| {
                                 ui.checkbox(&mut anatomical_shading_visible, "Anatomical Shading")
@@ -1972,30 +2089,30 @@ impl ViewerState {
                             .inner
                             .changed()
                         {
-                            actions.push(UiAction::SetAnatomicalShadingVisible(
+                            actions.push(ViewerCommand::SetAnatomicalShadingVisible(
                                 anatomical_shading_visible,
                             ));
                             ui.close();
                         }
                         ui.separator();
                         if ui.button("Left").clicked() {
-                            actions.push(UiAction::Preset(PresetOrientation::Left));
+                            actions.push(ViewerCommand::Preset(ViewPreset::Left));
                             ui.close();
                         }
                         if ui.button("Right").clicked() {
-                            actions.push(UiAction::Preset(PresetOrientation::Right));
+                            actions.push(ViewerCommand::Preset(ViewPreset::Right));
                             ui.close();
                         }
                         if ui.button("Top").clicked() {
-                            actions.push(UiAction::Preset(PresetOrientation::Top));
+                            actions.push(ViewerCommand::Preset(ViewPreset::Top));
                             ui.close();
                         }
                         if ui.button("Bottom").clicked() {
-                            actions.push(UiAction::Preset(PresetOrientation::Bottom));
+                            actions.push(ViewerCommand::Preset(ViewPreset::Bottom));
                             ui.close();
                         }
                         ui.separator();
-                        let mut overlay_visible = self.overlay_visible;
+                        let mut overlay_visible = self.controller.overlay.visible;
                         if ui
                             .add_enabled_ui(self.overlay.is_some(), |ui| {
                                 ui.checkbox(&mut overlay_visible, "Overlay Visible")
@@ -2003,7 +2120,7 @@ impl ViewerState {
                             .inner
                             .changed()
                         {
-                            actions.push(UiAction::SetOverlayVisible(overlay_visible));
+                            actions.push(ViewerCommand::SetOverlayVisible(overlay_visible));
                             ui.close();
                         }
                         let can_layout_hemispheres = self.has_both_scene();
@@ -2011,20 +2128,20 @@ impl ViewerState {
                             .add_enabled(can_layout_hemispheres, egui::Button::new("Close Pair"))
                             .clicked()
                         {
-                            actions.push(UiAction::HemisphereLayout(HemisphereLayout::Closed));
+                            actions.push(ViewerCommand::HemisphereLayout(HemisphereLayout::Closed));
                             ui.close();
                         }
                         if ui
                             .add_enabled(can_layout_hemispheres, egui::Button::new("Open Pair"))
                             .clicked()
                         {
-                            actions.push(UiAction::HemisphereLayout(HemisphereLayout::Open));
+                            actions.push(ViewerCommand::HemisphereLayout(HemisphereLayout::Open));
                             ui.close();
                         }
                     });
 
                     ui.menu_button("Controllers", |ui| {
-                        let mut surface_visible = self.surface_controller_visible;
+                        let mut surface_visible = self.controller.panels.surface_controller_visible;
                         if ui
                             .checkbox(
                                 &mut surface_visible,
@@ -2032,15 +2149,16 @@ impl ViewerState {
                             )
                             .changed()
                         {
-                            actions.push(UiAction::SetSurfaceControllerVisible(surface_visible));
+                            actions
+                                .push(ViewerCommand::SetSurfaceControllerVisible(surface_visible));
                             ui.close();
                         }
-                        let mut roi_open = self.roi_controller_open;
+                        let mut roi_open = self.controller.panels.roi_controller_open;
                         if ui
                             .checkbox(&mut roi_open, "ROI Drawing Controller    Ctrl+R")
                             .changed()
                         {
-                            actions.push(UiAction::SetRoiControllerOpen(roi_open));
+                            actions.push(ViewerCommand::SetRoiControllerOpen(roi_open));
                             ui.close();
                         }
                     });
@@ -2116,14 +2234,14 @@ impl ViewerState {
         }
     }
 
-    fn draw_roi_control_contents(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+    fn draw_roi_control_contents(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ViewerCommand>) {
         controller_section(ui, "ROI", true, |ui| {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(self.mesh.is_some(), egui::Button::new("Open ROI"))
                     .clicked()
                 {
-                    actions.push(UiAction::PickRoi);
+                    actions.push(ViewerCommand::PickRoi);
                 }
                 if ui
                     .add_enabled(
@@ -2132,7 +2250,7 @@ impl ViewerState {
                     )
                     .clicked()
                 {
-                    actions.push(UiAction::ClearRoi);
+                    actions.push(ViewerCommand::ClearRoi);
                 }
                 if ui
                     .add_enabled(
@@ -2142,9 +2260,9 @@ impl ViewerState {
                     .on_hover_text("Save every ROI object in one .niml.roi file")
                     .clicked()
                 {
-                    actions.push(UiAction::SaveAllRois);
+                    actions.push(ViewerCommand::SaveAllRois);
                 }
-                let mut visible = self.roi_visible;
+                let mut visible = self.controller.roi.visible;
                 if ui
                     .add_enabled_ui(self.roi_layer.is_some(), |ui| {
                         ui.checkbox(&mut visible, "Visible")
@@ -2152,7 +2270,7 @@ impl ViewerState {
                     .inner
                     .changed()
                 {
-                    actions.push(UiAction::SetRoiVisible(visible));
+                    actions.push(ViewerCommand::SetRoiVisible(visible));
                 }
             });
 
@@ -2196,7 +2314,7 @@ impl ViewerState {
                                 ui.add_space(8.0);
                                 let mut visible = slot.visible;
                                 if ui.checkbox(&mut visible, "Visible").changed() {
-                                    actions.push(UiAction::SetRoiSlotVisible(index, visible));
+                                    actions.push(ViewerCommand::SetRoiSlotVisible(index, visible));
                                 }
                             });
 
@@ -2242,7 +2360,7 @@ impl ViewerState {
                                         )
                                         .clicked();
                                     if draw_clicked {
-                                        actions.push(UiAction::ToggleRoiDraw(
+                                        actions.push(ViewerCommand::ToggleRoiDraw(
                                             index,
                                             !slot.draft.draw_enabled,
                                         ));
@@ -2254,7 +2372,7 @@ impl ViewerState {
                                         )
                                         .clicked()
                                     {
-                                        actions.push(UiAction::JoinRoiDraft(index));
+                                        actions.push(ViewerCommand::JoinRoiDraft(index));
                                     }
                                     if ui
                                         .add_enabled(slot.draft.can_fill(), egui::Button::new("Fill"))
@@ -2263,37 +2381,37 @@ impl ViewerState {
                                         )
                                         .clicked()
                                     {
-                                        actions.push(UiAction::ArmRoiFill(index));
+                                        actions.push(ViewerCommand::ArmRoiFill(index));
                                     }
                                     if ui
                                         .add_enabled(slot.draft.can_undo(), egui::Button::new("Undo"))
                                         .clicked()
                                     {
-                                        actions.push(UiAction::UndoRoiDraft(index));
+                                        actions.push(ViewerCommand::UndoRoiDraft(index));
                                     }
                                     if ui
                                         .add_enabled(slot.draft.can_redo(), egui::Button::new("Redo"))
                                         .clicked()
                                     {
-                                        actions.push(UiAction::RedoRoiDraft(index));
+                                        actions.push(ViewerCommand::RedoRoiDraft(index));
                                     }
                                     if ui
                                         .add_enabled(!slot.draft.is_empty(), egui::Button::new("Finalize"))
                                         .on_hover_text("Finish this ROI and start a new one")
                                         .clicked()
                                     {
-                                        actions.push(UiAction::FinalizeRoiSlot(index));
+                                        actions.push(ViewerCommand::FinalizeRoiSlot(index));
                                     }
                                 } else {
                                     if ui.button("Edit").clicked() {
-                                        actions.push(UiAction::EditRoiSlot(index));
+                                        actions.push(ViewerCommand::EditRoiSlot(index));
                                     }
                                     if ui
                                         .add_enabled(slot.has_roi(), egui::Button::new("Delete"))
                                         .on_hover_text("Remove only this ROI object")
                                         .clicked()
                                     {
-                                        actions.push(UiAction::DeleteRoiSlot(index));
+                                        actions.push(ViewerCommand::DeleteRoiSlot(index));
                                     }
                                 }
 
@@ -2302,7 +2420,7 @@ impl ViewerState {
                                     .on_hover_text("Save only this ROI object")
                                     .clicked()
                                 {
-                                    actions.push(UiAction::SaveRoiSlot(index));
+                                    actions.push(ViewerCommand::SaveRoiSlot(index));
                                 }
                             });
                         });
@@ -2312,7 +2430,11 @@ impl ViewerState {
         });
     }
 
-    fn draw_surface_dataset_section(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+    fn draw_surface_dataset_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<ViewerCommand>,
+    ) {
         controller_section(ui, "SURFACE / DATASET", true, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Open:");
@@ -2321,31 +2443,31 @@ impl ViewerState {
                     .on_hover_text("Open GIFTI surface")
                     .clicked()
                 {
-                    actions.push(UiAction::PickSurface);
+                    actions.push(ViewerCommand::PickSurface);
                 }
                 if ui
                     .add_enabled(self.mesh.is_some(), egui::Button::new("Olay"))
                     .on_hover_text("Open overlay dataset")
                     .clicked()
                 {
-                    actions.push(UiAction::PickOverlay);
+                    actions.push(ViewerCommand::PickOverlay);
                 }
                 if ui
                     .add_enabled(self.mesh.is_some(), egui::Button::new("ROI"))
                     .on_hover_text("Open SUMA ROI")
                     .clicked()
                 {
-                    actions.push(UiAction::PickRoi);
+                    actions.push(ViewerCommand::PickRoi);
                 }
                 if ui.button("Spec").on_hover_text("Open SUMA spec").clicked() {
-                    actions.push(UiAction::PickSpec);
+                    actions.push(ViewerCommand::PickSpec);
                 }
                 if ui
                     .button("SV")
                     .on_hover_text("Open surface volume")
                     .clicked()
                 {
-                    actions.push(UiAction::PickSurfaceVolume);
+                    actions.push(ViewerCommand::PickSurfaceVolume);
                 }
             });
 
@@ -2385,7 +2507,7 @@ impl ViewerState {
                             });
                         ui.end_row();
                         if changed && selected_index + 1 != active {
-                            actions.push(UiAction::SelectSceneSurface(selected_index));
+                            actions.push(ViewerCommand::SelectSceneSurface(selected_index));
                         }
                         stat_row(ui, "Overlay", self.overlay_display_text());
                         stat_row(ui, "ROI", self.roi_display_text());
@@ -2409,7 +2531,7 @@ impl ViewerState {
         });
     }
 
-    fn draw_overlay_workbench(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+    fn draw_overlay_workbench(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ViewerCommand>) {
         let overlay_loaded = self.overlay.is_some();
         let column_options = self
             .overlay_dataset
@@ -2532,11 +2654,11 @@ impl ViewerState {
         });
 
         if columns_changed {
-            actions.push(UiAction::RefreshOverlayColumns);
+            actions.push(ViewerCommand::RefreshOverlayColumns);
         }
         if changed {
             self.sanitize_overlay_appearance();
-            actions.push(UiAction::RefreshOverlayAppearance);
+            actions.push(ViewerCommand::RefreshOverlayAppearance);
         }
     }
 
@@ -2545,10 +2667,10 @@ impl ViewerState {
 
         ui.horizontal(|ui| {
             changed |= ui
-                .checkbox(&mut self.overlay_symmetric_range, "Symmetric")
+                .checkbox(&mut self.controller.overlay.symmetric_range, "Symmetric")
                 .changed();
 
-            if self.overlay_symmetric_range {
+            if self.controller.overlay.symmetric_range {
                 let mut extent = self
                     .overlay_appearance
                     .range
@@ -2679,7 +2801,7 @@ impl ViewerState {
                 .show(ui, |ui| {
                     stat_row(ui, "Surface file", self.pick_surface_display_text());
                     stat_row(ui, "Overlay file", self.pick_overlay_display_text());
-                    if let Some(pick) = self.surface_pick {
+                    if let Some(pick) = self.controller.interaction.pick {
                         stat_row(ui, "Node", pick.node_index.to_string());
                         stat_row(ui, "Triangle", pick.face_index.to_string());
                         stat_row(ui, "Surf x,y,z", coordinate_label(pick.surface_position));
@@ -2687,7 +2809,7 @@ impl ViewerState {
                         stat_row(ui, "ROI", self.pick_roi_display_text(pick));
                     }
                 });
-            if self.surface_pick.is_none() {
+            if self.controller.interaction.pick.is_none() {
                 ui.label(egui::RichText::new("No pick").color(muted_color()));
             }
         });
@@ -2699,7 +2821,7 @@ impl ViewerState {
             *range = DEFAULT_OVERLAY_RANGE;
         }
 
-        if self.overlay_symmetric_range {
+        if self.controller.overlay.symmetric_range {
             let extent = range.min.abs().max(range.max.abs()).max(0.0001);
             *range = ValueRange {
                 min: -extent,
@@ -2789,17 +2911,17 @@ impl ViewerState {
         self.roi_control_window.request_redraw();
     }
 
-    fn apply_ui_actions(&mut self, actions: Vec<UiAction>) {
+    fn apply_commands(&mut self, actions: Vec<ViewerCommand>) {
         for action in actions {
             match action {
-                UiAction::PickSurface => {
+                ViewerCommand::PickSurface => {
                     if let Some(path) = pick_surface_file(self.surface_path.as_ref()) {
                         if let Err(error) = self.load_surface_path(path) {
                             self.set_error(error);
                         }
                     }
                 }
-                UiAction::PickOverlay => {
+                ViewerCommand::PickOverlay => {
                     if let Some(path) =
                         pick_overlay_file(self.overlay_path.as_ref().or(self.surface_path.as_ref()))
                     {
@@ -2808,7 +2930,7 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::PickRoi => {
+                ViewerCommand::PickRoi => {
                     if let Some(path) =
                         pick_roi_file(self.roi_path.as_ref().or(self.surface_path.as_ref()))
                     {
@@ -2817,7 +2939,7 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::PickSpec => {
+                ViewerCommand::PickSpec => {
                     let current_path = self
                         .surface_scene
                         .as_ref()
@@ -2829,7 +2951,7 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::PickSurfaceVolume => {
+                ViewerCommand::PickSurfaceVolume => {
                     let current_path = self
                         .surface_volume_path
                         .as_ref()
@@ -2845,24 +2967,28 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::RefreshOverlayColumns => {
+                ViewerCommand::RefreshOverlayColumns => {
                     if let Err(error) = self.refresh_overlay_columns() {
                         self.set_error(error);
                     }
                 }
-                UiAction::RefreshOverlayAppearance => {
+                ViewerCommand::RefreshOverlayAppearance => {
                     if let Err(error) = self.refresh_overlay_appearance() {
                         self.set_error(error);
                     }
                 }
-                UiAction::ResetCamera => self.camera.reset(),
-                UiAction::ToggleCameraMode => {
+                ViewerCommand::ResetCamera => {
+                    self.camera.reset();
+                    self.controller.camera.note_reset();
+                }
+                ViewerCommand::ToggleCameraMode => {
                     let mode = self.camera.toggle_mode();
+                    self.controller.camera.mode = mode.into();
                     self.show_mode_label(mode);
                 }
-                UiAction::ToggleBackground => self.background.toggle(),
-                UiAction::SetAnatomicalShadingVisible(visible) => {
-                    self.anatomical_shading_visible = visible;
+                ViewerCommand::ToggleBackground => self.controller.display.background.toggle(),
+                ViewerCommand::SetAnatomicalShadingVisible(visible) => {
+                    self.controller.display.anatomical_shading_visible = visible;
                     self.upload_surface_buffers();
                     self.update_scene_stats();
                     self.log_status(if visible {
@@ -2871,9 +2997,9 @@ impl ViewerState {
                         "Anatomical shading hidden."
                     });
                 }
-                UiAction::SetOverlayVisible(visible) => {
+                ViewerCommand::SetOverlayVisible(visible) => {
                     if self.overlay.is_some() {
-                        self.overlay_visible = visible;
+                        self.controller.overlay.visible = visible;
                         self.upload_surface_buffers();
                         self.update_scene_stats();
                         self.log_status(if visible {
@@ -2883,9 +3009,9 @@ impl ViewerState {
                         });
                     }
                 }
-                UiAction::SetRoiVisible(visible) => {
+                ViewerCommand::SetRoiVisible(visible) => {
                     if self.roi_layer.is_some() {
-                        self.roi_visible = visible;
+                        self.controller.roi.visible = visible;
                         self.upload_surface_buffers();
                         self.update_scene_stats();
                         self.log_status(if visible {
@@ -2895,7 +3021,7 @@ impl ViewerState {
                         });
                     }
                 }
-                UiAction::SetRoiSlotVisible(index, visible) => {
+                ViewerCommand::SetRoiSlotVisible(index, visible) => {
                     if let Some(slot) = self.roi_workspace.slots.get_mut(index) {
                         slot.visible = visible;
                         if let Err(error) = self.rebuild_roi_layer_from_state() {
@@ -2906,22 +3032,24 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::ClearRoi => {
+                ViewerCommand::ClearRoi => {
                     if self.roi_layer.is_some()
                         || self.roi_path.is_some()
                         || self.roi_workspace.has_saveable_rois()
                     {
                         self.roi_layer = None;
                         self.roi_path = None;
+                        self.controller.surface.current_roi_path = None;
                         self.roi_workspace.clear();
-                        self.roi_visible = true;
+                        self.controller.roi.visible = true;
                         self.upload_surface_buffers();
                         self.update_scene_stats();
                         self.log_status("ROI cleared.");
                     }
                 }
-                UiAction::ToggleRoiDraw(index, active) => {
+                ViewerCommand::ToggleRoiDraw(index, active) => {
                     if self.mesh.is_some() && self.roi_workspace.set_active(index) {
+                        self.controller.roi.active_slot = index;
                         if let Some(draft) = self.roi_workspace.active_draft_mut() {
                             draft.draw_enabled = active;
                             draft.fill_pending = false;
@@ -2933,14 +3061,16 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::JoinRoiDraft(index) => {
+                ViewerCommand::JoinRoiDraft(index) => {
                     self.roi_workspace.set_active(index);
+                    self.controller.roi.active_slot = index;
                     if let Err(error) = self.join_roi_draft() {
                         self.set_error(error);
                     }
                 }
-                UiAction::ArmRoiFill(index) => {
+                ViewerCommand::ArmRoiFill(index) => {
                     self.roi_workspace.set_active(index);
+                    self.controller.roi.active_slot = index;
                     if let Some(draft) = self.roi_workspace.active_draft_mut()
                         && draft.can_fill()
                     {
@@ -2953,8 +3083,9 @@ impl ViewerState {
                         self.log_status("Join the ROI before filling it.");
                     }
                 }
-                UiAction::UndoRoiDraft(index) => {
+                ViewerCommand::UndoRoiDraft(index) => {
                     self.roi_workspace.set_active(index);
+                    self.controller.roi.active_slot = index;
                     let changed = self
                         .roi_workspace
                         .active_draft_mut()
@@ -2970,8 +3101,9 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::RedoRoiDraft(index) => {
+                ViewerCommand::RedoRoiDraft(index) => {
                     self.roi_workspace.set_active(index);
+                    self.controller.roi.active_slot = index;
                     let changed = self
                         .roi_workspace
                         .active_draft_mut()
@@ -2987,22 +3119,25 @@ impl ViewerState {
                         }
                     }
                 }
-                UiAction::FinalizeRoiSlot(index) => match self.roi_workspace.finalize_slot(index) {
-                    Ok(true) => {
-                        if let Err(error) = self.rebuild_roi_layer_from_state() {
-                            self.set_error(error);
-                        } else {
-                            self.surface_pick = None;
-                            self.upload_surface_buffers();
-                            self.update_scene_stats();
-                            self.log_status("ROI finalized. Started a new ROI slot.");
+                ViewerCommand::FinalizeRoiSlot(index) => {
+                    match self.roi_workspace.finalize_slot(index) {
+                        Ok(true) => {
+                            if let Err(error) = self.rebuild_roi_layer_from_state() {
+                                self.set_error(error);
+                            } else {
+                                self.controller.interaction.set_pick(None);
+                                self.upload_surface_buffers();
+                                self.update_scene_stats();
+                                self.log_status("ROI finalized. Started a new ROI slot.");
+                            }
                         }
+                        Ok(false) => self.log_status("No ROI draft is available to finalize."),
+                        Err(error) => self.set_error(error),
                     }
-                    Ok(false) => self.log_status("No ROI draft is available to finalize."),
-                    Err(error) => self.set_error(error),
-                },
-                UiAction::EditRoiSlot(index) => match self.roi_workspace.edit_slot(index) {
+                }
+                ViewerCommand::EditRoiSlot(index) => match self.roi_workspace.edit_slot(index) {
                     Ok(true) => {
+                        self.controller.roi.active_slot = index;
                         self.sync_pick_to_roi_draft_anchor();
                         self.log_status(format!("Editing ROI {}.", index + 1));
                     }
@@ -3011,54 +3146,58 @@ impl ViewerState {
                     }
                     Err(error) => self.set_error(error),
                 },
-                UiAction::DeleteRoiSlot(index) => {
+                ViewerCommand::DeleteRoiSlot(index) => {
                     if self.roi_workspace.delete_slot(index) {
                         if let Err(error) = self.rebuild_roi_layer_from_state() {
                             self.set_error(error);
                         } else {
                             if !self.roi_workspace.has_saveable_rois() {
                                 self.roi_path = None;
+                                self.controller.surface.current_roi_path = None;
                             }
-                            self.surface_pick = None;
+                            self.controller.interaction.set_pick(None);
                             self.upload_surface_buffers();
                             self.update_scene_stats();
                             self.log_status(format!("Deleted ROI {}.", index + 1));
                         }
                     }
                 }
-                UiAction::SaveRoiSlot(index) => {
+                ViewerCommand::SaveRoiSlot(index) => {
                     if let Err(error) = self.save_roi_slot(index) {
                         self.set_error(error);
                     }
                 }
-                UiAction::SaveAllRois => {
+                ViewerCommand::SaveAllRois => {
                     if let Err(error) = self.save_all_rois() {
                         self.set_error(error);
                     }
                 }
-                UiAction::SetSurfaceControllerVisible(visible) => {
+                ViewerCommand::SetSurfaceControllerVisible(visible) => {
                     self.set_surface_controller_visible(visible);
                 }
-                UiAction::SetRoiControllerOpen(open) => {
+                ViewerCommand::SetRoiControllerOpen(open) => {
                     self.set_roi_controller_open(open);
                 }
-                UiAction::Preset(preset) => self.camera.set_preset(preset),
-                UiAction::HemisphereLayout(layout) => {
+                ViewerCommand::Preset(preset) => {
+                    self.controller.camera.set_preset(preset);
+                    self.camera.set_preset(preset.into());
+                }
+                ViewerCommand::HemisphereLayout(layout) => {
                     if let Err(error) = self.set_hemisphere_layout(layout) {
                         self.set_error(error);
                     }
                 }
-                UiAction::SelectSceneSurface(index) => {
+                ViewerCommand::SelectSceneSurface(index) => {
                     if let Err(error) = self.activate_scene_surface(index) {
                         self.set_error(error);
                     }
                 }
-                UiAction::SaveScreenshot => {
+                ViewerCommand::SaveScreenshot => {
                     if let Err(error) = self.save_current_view_screenshot() {
                         self.set_error(error);
                     }
                 }
-                UiAction::SaveMontage => {
+                ViewerCommand::SaveMontage => {
                     if let Err(error) = self.save_preset_montage_screenshot() {
                         self.set_error(error);
                     }
@@ -3072,24 +3211,31 @@ impl ViewerState {
         self.overlay_values = None;
         self.overlay_dataset = None;
         self.overlay_columns = OverlayColumnSelections::default();
-        self.overlay_visible = true;
+        self.controller.overlay.visible = true;
         self.overlay_appearance = OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE);
-        self.overlay_symmetric_range = true;
+        self.controller.overlay.symmetric_range = true;
+        self.controller.overlay.intensity_range = None;
+        self.controller.overlay.threshold = None;
+        self.controller.overlay.opacity = self.overlay_appearance.opacity;
         self.overlay_path = None;
+        self.overlay_pair_paths = None;
         self.overlay_display_name = None;
+        self.afni_rgba_colors = None;
+        self.controller.surface.current_overlay_path = None;
         self.roi_path = None;
+        self.controller.surface.current_roi_path = None;
         self.roi_layer = None;
         self.roi_workspace.clear();
-        self.roi_visible = true;
-        self.surface_pick = None;
-        self.pair_visibility = PairVisibility::both();
+        self.controller.roi.visible = true;
+        self.controller.interaction.set_pick(None);
+        self.controller.display.pair_visibility = PairVisibility::both();
         self.surface_render_set = None;
     }
 
     fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
         let mut mesh = SurfaceMesh::from_gifti_path(&path)
             .with_context(|| format!("failed to load surface {}", path.display()))?;
-        apply_surface_volume_parent(&mut mesh, self.surface_volume_path.as_ref());
+        apply_surface_volume_parent(&mut mesh, self.surface_volume_idcode.as_deref());
         let node_count = mesh.vertices.len();
         let face_count = mesh.triangles.len();
 
@@ -3098,14 +3244,24 @@ impl ViewerState {
         self.surface_scene = None;
         self.surface_path = Some(path.clone());
         self.reset_scene_state();
+        self.controller.surface.current_surface_id =
+            self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone());
+        self.controller.surface.current_surface_path = Some(path.clone());
+        self.controller.surface.current_scene_surface_index = None;
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.camera.reset();
+        self.controller.camera.note_reset();
         self.view_window
             .set_title(&window_title(self.surface_path.as_ref()));
         self.log_status(format!(
             "Loaded surface with {node_count} nodes and {face_count} triangles."
         ));
+        if self.afni_connection.is_some()
+            && let Err(error) = self.force_resend_afni_surfaces()
+        {
+            self.set_error(error);
+        }
 
         Ok(())
     }
@@ -3122,6 +3278,8 @@ impl ViewerState {
             .map(canonical_or_original_path);
         let surface_volume_path =
             surface_volume_path.context("loading a SUMA spec requires -sv/--sv")?;
+        let surface_volume_idcode =
+            query_afni_dataset_idcode_optional(Some(surface_volume_path.as_path()))?;
         let mut components = Vec::new();
         let mut skipped_surfaces = 0;
 
@@ -3167,10 +3325,13 @@ impl ViewerState {
             "surfaces"
         };
         self.surface_volume_path = Some(surface_volume_path.clone());
+        self.surface_volume_idcode = surface_volume_idcode.clone();
+        self.controller.surface.current_surface_volume_path = Some(surface_volume_path.clone());
         self.surface_scene = Some(SurfaceScene {
             spec: spec.clone(),
             spec_path: spec.path.clone(),
             surface_volume_path: Some(surface_volume_path.clone()),
+            surface_volume_idcode: surface_volume_idcode.clone(),
             hemisphere: spec.hemisphere,
             surfaces,
             active_index: 0,
@@ -3182,6 +3343,7 @@ impl ViewerState {
         self.activate_scene_surface(0)?;
         self.start_scene_preload(generation);
         self.camera.reset();
+        self.controller.camera.note_reset();
         self.log_status(format!(
             "Loaded {loaded_count} {loaded_label} from spec {} (skipped {skipped_surfaces} files, {skipped_states} states).",
             spec.path.display()
@@ -3192,31 +3354,548 @@ impl ViewerState {
 
     fn set_surface_volume_path(&mut self, path: PathBuf) -> Result<()> {
         let path = canonical_or_original_path(path);
+        let idcode = query_afni_dataset_idcode_optional(Some(path.as_path()))?;
         self.surface_volume_path = Some(path.clone());
+        self.surface_volume_idcode = idcode.clone();
+        self.controller.surface.current_surface_volume_path = Some(path.clone());
 
         if let Some(scene) = self.surface_scene.as_mut() {
             scene.surface_volume_path = Some(path.clone());
+            scene.surface_volume_idcode = idcode.clone();
             for surface in &mut scene.surfaces {
                 surface.display_cache = None;
                 for component in &mut surface.components {
                     if let Some(mesh) = component.mesh.as_mut() {
-                        apply_surface_volume_parent(mesh, Some(&path));
+                        apply_surface_volume_parent(mesh, idcode.as_deref());
                     }
                 }
             }
         }
 
         if let Some(mesh) = self.mesh.as_mut() {
-            apply_surface_volume_parent(mesh, Some(&path));
+            apply_surface_volume_parent(mesh, idcode.as_deref());
         }
 
-        self.log_status(format!("Surface volume set to {}.", path.display()));
+        self.log_status(format!(
+            "Surface volume set to {}{}.",
+            path.display(),
+            idcode
+                .as_deref()
+                .map(|idcode| format!(" (AFNI idcode {idcode})"))
+                .unwrap_or_else(|| "; AFNI idcode unavailable".to_string())
+        ));
+        if self.afni_connection.is_some()
+            && let Err(error) = self.force_resend_afni_surfaces()
+        {
+            self.set_error(error);
+        }
+
+        Ok(())
+    }
+
+    fn toggle_afni_talk(&mut self) -> Result<()> {
+        if self.afni_connection.is_some() {
+            self.disconnect_afni_talk();
+            return Ok(());
+        }
+
+        self.connect_afni_talk()
+    }
+
+    fn connect_afni_talk(&mut self) -> Result<()> {
+        if self.afni_connection.is_some() {
+            self.log_status("AFNI/SUMA NIML talk is already connected.");
+            return Ok(());
+        }
+
+        let config = self.afni_options.port_config.clone();
+        let event_proxy = self.event_proxy.clone();
+        let connection = AfniConnection::connect(&config, self.verbose, move || {
+            let _ = event_proxy.send_event(ViewerEvent::AfniMessagesReady);
+        })
+        .with_context(|| {
+            format!(
+                "failed to connect to AFNI/SUMA NIML talk at {}:{}",
+                config.host, config.port
+            )
+        })?;
+        self.afni_connection = Some(connection);
+        self.afni_session = AfniNimlSession::new();
+        self.log_status(format!(
+            "Connected AFNI/SUMA NIML talk at {}:{}.",
+            config.host, config.port
+        ));
+        self.send_afni_surfaces(false)
+    }
+
+    fn disconnect_afni_talk(&mut self) {
+        if let Some(mut connection) = self.afni_connection.take() {
+            connection.disconnect();
+            self.afni_session = AfniNimlSession::new();
+            self.log_status("Disconnected AFNI/SUMA NIML talk.");
+        }
+    }
+
+    fn force_resend_afni_surfaces(&mut self) -> Result<()> {
+        if self.afni_connection.is_none() {
+            self.connect_afni_talk()?;
+            return Ok(());
+        }
+
+        self.afni_session = AfniNimlSession::new();
+        self.send_afni_surfaces(true)
+    }
+
+    fn send_afni_surfaces(&mut self, force: bool) -> Result<()> {
+        if self.afni_connection.is_none() {
+            return Ok(());
+        }
+        if self.mesh.is_none() {
+            self.log_status("AFNI/SUMA NIML talk connected; no surface is loaded yet.");
+            return Ok(());
+        }
+
+        if force {
+            self.afni_session = AfniNimlSession::new();
+        }
+
+        self.ensure_scene_surfaces_loaded_for_afni()?;
+        let exports = self.afni_surface_exports()?;
+        let mut sent_count = 0usize;
+        for (mesh, info) in exports {
+            let Some(elements) = self.afni_session.register_surface_once(&mesh, &info)? else {
+                continue;
+            };
+            let connection = self
+                .afni_connection
+                .as_mut()
+                .context("AFNI/SUMA NIML talk is not connected")?;
+            for element in elements {
+                if let Err(error) = connection.send_elements(std::slice::from_ref(&element)) {
+                    self.disconnect_afni_talk();
+                    return Err(error.context("AFNI/SUMA NIML write failed"));
+                }
+            }
+            sent_count += 1;
+        }
+
+        if sent_count > 0 {
+            self.log_status(format!(
+                "Sent {sent_count} surface registration{} to AFNI/SUMA.",
+                if sent_count == 1 { "" } else { "s" }
+            ));
+        } else if force {
+            self.log_status("No new surface geometry needed to be sent to AFNI/SUMA.");
+        }
+
+        Ok(())
+    }
+
+    fn afni_surface_exports(&self) -> Result<Vec<(SurfaceMesh, AfniSurfaceInfo)>> {
+        if let Some(scene) = self.surface_scene.as_ref() {
+            let mut exports = Vec::new();
+            for surface in &scene.surfaces {
+                for component in &surface.components {
+                    let Some(mesh) = component.mesh.as_ref() else {
+                        continue;
+                    };
+                    if !afni_component_is_sendable(component, Some(mesh)) {
+                        continue;
+                    }
+                    let mut info = AfniSurfaceInfo::from_mesh(mesh);
+                    decorate_afni_surface_info(&mut info, Some(scene), Some(component));
+                    exports.push((mesh.clone(), info));
+                }
+            }
+            if !exports.is_empty() {
+                return Ok(exports);
+            }
+        }
+
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a surface before connecting to AFNI/SUMA NIML talk")?;
+        let mut info = AfniSurfaceInfo::from_mesh(mesh);
+        decorate_afni_surface_info(&mut info, self.surface_scene.as_ref(), None);
+        decorate_afni_surface_volume_info(
+            &mut info,
+            self.surface_volume_path.as_ref(),
+            self.surface_volume_idcode.as_deref(),
+        );
+        Ok(vec![(mesh.clone(), info)])
+    }
+
+    fn drain_afni_events(&mut self) -> bool {
+        let mut events = Vec::new();
+        if let Some(connection) = self.afni_connection.as_ref() {
+            while let Some(event) = connection.try_recv() {
+                events.push(event);
+            }
+        }
+
+        let mut changed = false;
+        for event in events {
+            match event {
+                AfniConnectionEvent::Elements(elements) => {
+                    match self.handle_afni_elements(elements) {
+                        Ok(event_changed) => changed |= event_changed,
+                        Err(error) => self.set_error(error),
+                    }
+                }
+                AfniConnectionEvent::Error(message) => {
+                    self.log_status(format!("AFNI/SUMA NIML talk error: {message}"));
+                }
+                AfniConnectionEvent::Disconnected => {
+                    self.afni_connection = None;
+                    self.afni_session = AfniNimlSession::new();
+                    self.log_status("AFNI/SUMA NIML talk disconnected.");
+                    changed = true;
+                }
+            }
+        }
+
+        changed
+    }
+
+    fn handle_afni_elements(&mut self, elements: Vec<NimlElement>) -> Result<bool> {
+        let mut actions = Vec::new();
+        let mut changed = false;
+        for element in elements {
+            let Some(outcome) = self
+                .afni_session
+                .receive_element(&mut self.controller, &element)?
+            else {
+                if self.verbose {
+                    self.log_status(format!("Ignored AFNI/SUMA NIML element {}.", element.name));
+                }
+                continue;
+            };
+            changed |= outcome.applied_state;
+            actions.extend(outcome.actions);
+        }
+
+        for action in actions {
+            changed |= self.apply_afni_route_action(action)?;
+        }
+
+        Ok(changed)
+    }
+
+    fn apply_afni_route_action(&mut self, action: AfniRouteAction) -> Result<bool> {
+        match action {
+            AfniRouteAction::ViewerCommand(command) => {
+                self.apply_commands(vec![command]);
+                Ok(true)
+            }
+            AfniRouteAction::LoadDataset(path) => {
+                self.load_overlay_path(path)?;
+                Ok(true)
+            }
+            AfniRouteAction::RgbaOverlay(overlay) => {
+                self.apply_afni_rgba_overlay(overlay)?;
+                Ok(true)
+            }
+            AfniRouteAction::SurfaceCrosshair(crosshair) => {
+                self.apply_afni_surface_crosshair(crosshair)
+            }
+            AfniRouteAction::RoiUpdate(update) => {
+                if let Some(visible) = update.visible {
+                    self.apply_commands(vec![ViewerCommand::SetRoiVisible(visible)]);
+                }
+                if let Some(path) = update.path {
+                    self.load_roi_path(path)?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn apply_afni_rgba_overlay(&mut self, overlay: AfniRgbaOverlay) -> Result<()> {
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a surface before applying AFNI/SUMA RGBA overlay")?;
+        let Some(target) = self.afni_surface_target_for_message(
+            &overlay.surface_idcode,
+            overlay.local_domain_parent_id.as_deref(),
+        ) else {
+            self.log_status(format!(
+                "Ignored AFNI/SUMA RGBA overlay for unknown surface {}{}.",
+                overlay.surface_idcode,
+                overlay
+                    .local_domain_parent_id
+                    .as_deref()
+                    .map(|parent| format!(" (domain parent {parent})"))
+                    .unwrap_or_default()
+            ));
+            return Ok(());
+        };
+        let (colors, applied, skipped) =
+            apply_afni_rgba_to_color_cache(self.afni_rgba_colors.take(), mesh, target, &overlay);
+
+        let dataset_id = overlay
+            .function_idcode
+            .clone()
+            .or_else(|| Some("AFNI SUMA_irgba".to_string()));
+        let overlay_model = Overlay::from_color_cache(&mesh.domain, colors.clone(), dataset_id)?;
+        self.afni_rgba_colors = Some(colors);
+        self.overlay = Some(overlay_model);
+        self.overlay_values = None;
+        self.overlay_dataset = None;
+        self.overlay_columns = OverlayColumnSelections::default();
+        self.overlay_path = None;
+        self.overlay_pair_paths = None;
+        self.controller.surface.current_overlay_path = None;
+        self.overlay_display_name = Some("AFNI SUMA_irgba".to_string());
+        self.controller.overlay.visible = true;
+        if let Some(threshold) = overlay
+            .threshold
+            .as_deref()
+            .and_then(|value| value.parse::<f32>().ok())
+        {
+            self.overlay_appearance.threshold.enabled = true;
+            self.overlay_appearance.threshold.absolute = true;
+            self.overlay_appearance.threshold.value = threshold;
+            self.sync_controller_overlay_display_state();
+        }
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(format!(
+            "Applied AFNI/SUMA RGBA overlay to {applied} nodes{}.",
+            if skipped > 0 {
+                format!(" ({skipped} skipped)")
+            } else {
+                String::new()
+            }
+        ));
+
+        Ok(())
+    }
+
+    fn apply_afni_surface_crosshair(&mut self, crosshair: AfniSurfaceCrosshair) -> Result<bool> {
+        let Some(local_node) = crosshair.node_index else {
+            self.log_status(format!(
+                "AFNI/SUMA crosshair at {} did not include a surface node id.",
+                coordinate_label(crosshair.surface_position)
+            ));
+            return Ok(false);
+        };
+        let node_offset = crosshair
+            .surface_idcode
+            .as_deref()
+            .and_then(|surface_idcode| self.afni_node_offset_for_surface(surface_idcode))
+            .unwrap_or(0);
+        let node_index = node_offset
+            .checked_add(local_node as usize)
+            .and_then(|node| u32::try_from(node).ok())
+            .context("AFNI/SUMA crosshair node index is outside Sumaru node range")?;
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a surface before applying AFNI/SUMA crosshair")?;
+        let pick = surface_pick_for_mesh_node(mesh, self.overlay_values.as_ref(), node_index)
+            .with_context(|| {
+                format!("AFNI/SUMA crosshair references unavailable node {node_index}")
+            })?;
+
+        self.controller.interaction.set_pick(Some(pick));
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.control_window.request_redraw();
+        if self.controller.panels.roi_controller_open {
+            self.roi_control_window.request_redraw();
+        }
+        self.log_status(format!(
+            "Applied AFNI/SUMA crosshair to node {}{}.",
+            node_index,
+            crosshair
+                .surface_idcode
+                .as_deref()
+                .map(|idcode| format!(" on {idcode}"))
+                .unwrap_or_default()
+        ));
+
+        Ok(true)
+    }
+
+    fn send_afni_crosshair_for_pick(&mut self, pick: SurfacePick) -> Result<()> {
+        if self.afni_connection.is_none() {
+            return Ok(());
+        }
+        let Some(element) = self.afni_crosshair_element_for_pick(pick)? else {
+            if self.verbose {
+                self.log_status(format!(
+                    "Could not map node {} to an AFNI/SUMA surface crosshair.",
+                    pick.node_index
+                ));
+            }
+            return Ok(());
+        };
+
+        let connection = self
+            .afni_connection
+            .as_mut()
+            .context("AFNI/SUMA NIML talk is not connected")?;
+        if let Err(error) = connection.send_elements(std::slice::from_ref(&element)) {
+            self.disconnect_afni_talk();
+            return Err(error.context("AFNI/SUMA crosshair write failed"));
+        }
+        if self.verbose {
+            self.log_status(format!(
+                "Sent AFNI/SUMA crosshair for node {}.",
+                pick.node_index
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn afni_crosshair_element_for_pick(&self, pick: SurfacePick) -> Result<Option<NimlElement>> {
+        if let Some(scene) = self.surface_scene.as_ref() {
+            let Some(surface) = scene.surfaces.get(scene.active_index) else {
+                return Ok(None);
+            };
+            let mut node_offset = 0u32;
+            for component in &surface.components {
+                let Some(mesh) = component.mesh.as_ref() else {
+                    continue;
+                };
+                let node_count = u32::try_from(mesh.vertices.len())
+                    .context("surface has too many vertices for AFNI/SUMA node ids")?;
+                let Some(node_limit) = node_offset.checked_add(node_count) else {
+                    return Ok(None);
+                };
+                if (node_offset..node_limit).contains(&pick.node_index) {
+                    let local_node = pick.node_index - node_offset;
+                    let mut info = AfniSurfaceInfo::from_mesh(mesh);
+                    decorate_afni_surface_info(&mut info, Some(scene), Some(component));
+                    return surface_crosshair_element(
+                        mesh,
+                        &info,
+                        local_node,
+                        pick.surface_position,
+                    )
+                    .map(Some);
+                }
+                node_offset = node_limit;
+            }
+        }
+
+        let Some(mesh) = self.mesh.as_ref() else {
+            return Ok(None);
+        };
+        if (pick.node_index as usize) >= mesh.vertices.len() {
+            return Ok(None);
+        }
+        let mut info = AfniSurfaceInfo::from_mesh(mesh);
+        decorate_afni_surface_info(&mut info, self.surface_scene.as_ref(), None);
+        decorate_afni_surface_volume_info(
+            &mut info,
+            self.surface_volume_path.as_ref(),
+            self.surface_volume_idcode.as_deref(),
+        );
+        surface_crosshair_element(mesh, &info, pick.node_index, pick.surface_position).map(Some)
+    }
+
+    fn afni_node_offset_for_surface(&self, surface_idcode: &str) -> Option<usize> {
+        self.afni_surface_target_for_message(surface_idcode, None)
+            .map(|target| target.node_offset)
+    }
+
+    fn afni_surface_target_for_message(
+        &self,
+        surface_idcode: &str,
+        local_domain_parent_id: Option<&str>,
+    ) -> Option<AfniSurfaceTarget> {
+        if let Some(scene) = self.surface_scene.as_ref() {
+            if let Some(target) = afni_surface_target_in_scene_surface(
+                scene,
+                scene.active_index,
+                |component, mesh| {
+                    afni_component_matches_surface_id(component, mesh, surface_idcode)
+                },
+            ) {
+                return Some(target);
+            }
+
+            if let Some(parent_id) = local_domain_parent_id
+                && let Some(target) = afni_surface_target_in_scene_surface(
+                    scene,
+                    scene.active_index,
+                    |component, mesh| {
+                        afni_component_matches_domain_parent(component, mesh, parent_id)
+                    },
+                )
+            {
+                return Some(target);
+            }
+        }
+
+        let mesh = self.mesh.as_ref()?;
+        if mesh.metadata.id.as_str() == surface_idcode
+            || local_domain_parent_id
+                .is_some_and(|parent_id| afni_mesh_matches_domain_parent(mesh, parent_id))
+        {
+            return Some(AfniSurfaceTarget {
+                node_offset: 0,
+                node_count: mesh.vertices.len(),
+            });
+        }
+
+        None
+    }
+
+    fn ensure_scene_surfaces_loaded_for_afni(&mut self) -> Result<()> {
+        let Some(scene) = self.surface_scene.as_ref() else {
+            return Ok(());
+        };
+        let mut tasks = Vec::new();
+        for (surface_index, surface) in scene.surfaces.iter().enumerate() {
+            for (component_index, component) in surface.components.iter().enumerate() {
+                if !afni_component_is_sendable(component, component.mesh.as_ref()) {
+                    continue;
+                }
+                if component.mesh.is_none() {
+                    tasks.push((
+                        surface_index,
+                        component_index,
+                        component.spec_surface.clone(),
+                    ));
+                }
+            }
+        }
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let spec = scene.spec.clone();
+        let surface_volume_idcode = scene.surface_volume_idcode.clone();
+        self.log_status(format!(
+            "Loading {} spec surface component{} for AFNI/SUMA registration.",
+            tasks.len(),
+            if tasks.len() == 1 { "" } else { "s" }
+        ));
+
+        for (surface_index, component_index, surface) in tasks {
+            let mesh = load_spec_component_mesh(&spec, &surface, surface_volume_idcode.as_deref())?;
+            if let Some(scene) = self.surface_scene.as_mut()
+                && let Some(component) = scene
+                    .surfaces
+                    .get_mut(surface_index)
+                    .and_then(|surface| surface.components.get_mut(component_index))
+                && component.mesh.is_none()
+            {
+                component.mesh = Some(mesh);
+            }
+        }
 
         Ok(())
     }
 
     fn ensure_scene_surface_loaded(&mut self, index: usize) -> Result<()> {
-        let (spec, surface_volume_path, tasks) = {
+        let (spec, surface_volume_idcode, tasks) = {
             let scene = self
                 .surface_scene
                 .as_ref()
@@ -3235,11 +3914,15 @@ impl ViewerState {
                 })
                 .collect::<Vec<_>>();
 
-            (scene.spec.clone(), scene.surface_volume_path.clone(), tasks)
+            (
+                scene.spec.clone(),
+                scene.surface_volume_idcode.clone(),
+                tasks,
+            )
         };
 
         for (component_index, surface) in tasks {
-            let mesh = load_spec_component_mesh(&spec, &surface, surface_volume_path.as_ref())?;
+            let mesh = load_spec_component_mesh(&spec, &surface, surface_volume_idcode.as_deref())?;
             if let Some(scene) = self.surface_scene.as_mut()
                 && let Some(component) = scene
                     .surfaces
@@ -3273,7 +3956,7 @@ impl ViewerState {
                         component_index,
                         spec: scene.spec.clone(),
                         surface: component.spec_surface.clone(),
-                        surface_volume_path: scene.surface_volume_path.clone(),
+                        surface_volume_idcode: scene.surface_volume_idcode.clone(),
                     });
                 }
             }
@@ -3294,7 +3977,7 @@ impl ViewerState {
                 let result = load_spec_component_mesh(
                     &task.spec,
                     &task.surface,
-                    task.surface_volume_path.as_ref(),
+                    task.surface_volume_idcode.as_deref(),
                 )
                 .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(PreloadResult {
@@ -3325,7 +4008,7 @@ impl ViewerState {
 
         match result.result {
             Ok(mesh) => {
-                let layout = self.hemisphere_layout_state();
+                let layout = self.controller.display.pair_state;
                 let mut warmed_cache = false;
                 let mut cache_error = None;
                 {
@@ -3379,7 +4062,7 @@ impl ViewerState {
 
     fn activate_scene_surface(&mut self, index: usize) -> Result<()> {
         self.ensure_scene_surface_loaded(index)?;
-        let layout = self.hemisphere_layout_state();
+        let layout = self.controller.display.pair_state;
         let (surface_count, name, state, path, snapshot) = {
             let Some(scene) = self.surface_scene.as_mut() else {
                 bail!("no SUMA spec scene is loaded");
@@ -3400,11 +4083,17 @@ impl ViewerState {
 
         self.set_active_mesh(snapshot.mesh, snapshot.prepared_geometry);
         self.surface_path = Some(path.clone());
-        self.surface_pick = None;
+        self.controller.interaction.set_pick(None);
+        self.controller.surface.current_surface_id =
+            self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone());
+        self.controller.surface.current_surface_path = Some(path.clone());
+        self.controller.surface.current_scene_surface_index = Some(index);
         if self.roi_layer.is_some() {
             self.rebuild_roi_layer_from_state()?;
         }
-        if self.has_both_scene() && self.pair_visibility != PairVisibility::both() {
+        if self.has_both_scene()
+            && self.controller.display.pair_visibility != PairVisibility::both()
+        {
             self.refresh_active_pair_render_geometry()?;
         }
         if self.overlay_dataset.is_some() {
@@ -3424,6 +4113,11 @@ impl ViewerState {
                 .as_ref()
                 .map_or_else(String::new, |state| format!(" ({state})"))
         ));
+        if self.afni_connection.is_some()
+            && let Err(error) = self.force_resend_afni_surfaces()
+        {
+            self.set_error(error);
+        }
 
         Ok(())
     }
@@ -3526,13 +4220,6 @@ impl ViewerState {
         }]
     }
 
-    fn hemisphere_layout_state(&self) -> HemisphereLayoutState {
-        HemisphereLayoutState {
-            open_angle_degrees: self.hemisphere_open_angle_degrees,
-            separation_distance: self.hemisphere_separation_distance,
-        }
-    }
-
     fn begin_pair_drag(&mut self) {
         self.pair_dragging = true;
         self.pair_drag_last_cursor = self.view_cursor_position;
@@ -3566,9 +4253,9 @@ impl ViewerState {
         if self.pair_drag_changed {
             self.log_status(format!(
                 "Hemisphere layout: open {}, angle {:.1} deg, gap {:.1}.",
-                pair_open_percent_label(self.hemisphere_open_angle_degrees),
-                self.hemisphere_open_angle_degrees,
-                self.hemisphere_separation_distance
+                pair_open_percent_label(self.controller.display.pair_state.open_angle_degrees),
+                self.controller.display.pair_state.open_angle_degrees,
+                self.controller.display.pair_state.separation_distance
             ));
         }
         self.pair_drag_changed = false;
@@ -3582,23 +4269,25 @@ impl ViewerState {
             return Ok(());
         };
         let vertical_scale = (pair_width / 700.0).max(0.05);
-        self.hemisphere_open_angle_degrees = (self.hemisphere_open_angle_degrees
-            + dx * PAIR_OPEN_DEGREES_PER_PIXEL)
-            .clamp(-PAIR_MAX_OPEN_DEGREES, PAIR_MAX_OPEN_DEGREES);
-        self.hemisphere_separation_distance = (self.hemisphere_separation_distance
-            + -dy * vertical_scale)
-            .clamp(0.0, pair_width * PAIR_MAX_DRAG_GAP_FACTOR);
-        self.hemisphere_layout = if self.hemisphere_open_angle_degrees.abs() <= f32::EPSILON
-            && self.hemisphere_separation_distance <= f32::EPSILON
-        {
-            HemisphereLayout::Closed
-        } else {
-            HemisphereLayout::Open
-        };
+        self.controller.display.pair_state.open_angle_degrees =
+            (self.controller.display.pair_state.open_angle_degrees
+                + dx * PAIR_OPEN_DEGREES_PER_PIXEL)
+                .clamp(-PAIR_MAX_OPEN_DEGREES, PAIR_MAX_OPEN_DEGREES);
+        self.controller.display.pair_state.separation_distance =
+            (self.controller.display.pair_state.separation_distance + -dy * vertical_scale)
+                .clamp(0.0, pair_width * PAIR_MAX_DRAG_GAP_FACTOR);
+        self.controller.display.pair_layout =
+            if self.controller.display.pair_state.open_angle_degrees.abs() <= f32::EPSILON
+                && self.controller.display.pair_state.separation_distance <= f32::EPSILON
+            {
+                HemisphereLayout::Closed
+            } else {
+                HemisphereLayout::Open
+            };
         self.pair_drag_changed = true;
         self.show_transient_label(format!(
             "Open {}",
-            pair_open_percent_label(self.hemisphere_open_angle_degrees)
+            pair_open_percent_label(self.controller.display.pair_state.open_angle_degrees)
         ));
         self.preview_active_pair_transform()
     }
@@ -3619,8 +4308,10 @@ impl ViewerState {
     }
 
     fn refresh_surface_render_set_matrices(&mut self) {
-        let matrices = self
-            .active_pair_matrices_for_layout(self.hemisphere_layout_state(), self.pair_visibility);
+        let matrices = self.active_pair_matrices_for_layout(
+            self.controller.display.pair_state,
+            self.controller.display.pair_visibility,
+        );
         let Some(render_set) = self.surface_render_set.as_mut() else {
             return;
         };
@@ -3652,20 +4343,25 @@ impl ViewerState {
             self.log_status("Load a both-hemisphere spec before toggling hemisphere visibility.");
             return Ok(());
         }
-        let Some(next) = self.pair_visibility.toggled(side.clone()) else {
+        let Some(next) = self
+            .controller
+            .display
+            .pair_visibility
+            .toggled(side.clone())
+        else {
             return Ok(());
         };
-        if next == self.pair_visibility {
+        if next == self.controller.display.pair_visibility {
             return Ok(());
         }
 
-        self.pair_visibility = next;
+        self.controller.display.pair_visibility = next;
         self.refresh_active_pair_render_geometry()?;
         self.update_scene_stats();
         self.log_status(format!(
             "{} hemisphere toggled; visible hemispheres: {}.",
             surface_side_label(&side),
-            self.pair_visibility.label()
+            self.controller.display.pair_visibility.label()
         ));
 
         Ok(())
@@ -3697,7 +4393,7 @@ impl ViewerState {
     }
 
     fn pick_surface_display_text(&self) -> String {
-        if let Some(pick) = self.surface_pick
+        if let Some(pick) = self.controller.interaction.pick
             && let Some(component) = self.picked_paired_component(pick)
         {
             return file_name_display(&component.path);
@@ -3722,7 +4418,18 @@ impl ViewerState {
             return "none".to_string();
         };
 
-        if let Some(pick) = self.surface_pick
+        if let Some(pick) = self.controller.interaction.pick
+            && let Some(component) = self.picked_paired_component(pick)
+            && let Some(pair) = self.overlay_pair_paths.as_ref()
+        {
+            return match component.side {
+                SurfaceSide::Left => file_name_display(&pair.left_path),
+                SurfaceSide::Right => file_name_display(&pair.right_path),
+                _ => file_name_display(path),
+            };
+        }
+
+        if let Some(pick) = self.controller.interaction.pick
             && let Some(component) = self.picked_paired_component(pick)
             && let Some(path) = paired_overlay_path_for_side(path, &component.side)
         {
@@ -3754,7 +4461,9 @@ impl ViewerState {
             HemisphereLayout::Closed => HemisphereLayoutState::closed(),
             HemisphereLayout::Open => HemisphereLayoutState::acorn(),
         };
-        if self.hemisphere_layout == layout && self.hemisphere_layout_state() == target {
+        if self.controller.display.pair_layout == layout
+            && self.controller.display.pair_state == target
+        {
             return Ok(());
         }
 
@@ -3769,9 +4478,9 @@ impl ViewerState {
         layout: HemisphereLayout,
         state: HemisphereLayoutState,
     ) -> Result<()> {
-        self.hemisphere_layout = layout;
-        self.hemisphere_open_angle_degrees = state.open_angle_degrees;
-        self.hemisphere_separation_distance = state.separation_distance;
+        self.controller.display.pair_layout = layout;
+        self.controller.display.pair_state.open_angle_degrees = state.open_angle_degrees;
+        self.controller.display.pair_state.separation_distance = state.separation_distance;
         if let Some(scene) = self.surface_scene.as_ref()
             && scene.hemisphere == SpecHemisphere::Both
         {
@@ -3796,13 +4505,16 @@ impl ViewerState {
         let range = overlay_values.range;
 
         self.overlay = None;
+        self.afni_rgba_colors = None;
         self.overlay_values = Some(overlay_values);
         self.overlay_dataset = Some(loaded_overlay.dataset);
         self.overlay_columns = loaded_overlay.columns;
-        self.overlay_visible = true;
+        self.controller.overlay.visible = true;
         self.overlay_appearance = OverlayAppearance::from_range(range);
-        self.overlay_symmetric_range = range.min < 0.0 && range.max > 0.0;
+        self.controller.overlay.symmetric_range = range.min < 0.0 && range.max > 0.0;
         self.overlay_path = Some(path.clone());
+        self.overlay_pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
+        self.controller.surface.current_overlay_path = Some(path.clone());
         self.overlay_display_name = Some(loaded_selection.display_name);
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
@@ -3810,6 +4522,50 @@ impl ViewerState {
         self.update_scene_stats();
         self.log_status(format!(
             "Loaded overlay range {:.4} to {:.4}. {column_summary}",
+            range.min, range.max
+        ));
+
+        Ok(())
+    }
+
+    fn load_overlay_pair_paths(&mut self, pair: ExplicitOverlayPair) -> Result<()> {
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a both-hemisphere spec before loading explicit paired overlays")?;
+        let loaded_selection = self
+            .load_explicit_paired_overlay_selection(&pair, mesh)
+            .with_context(|| {
+                format!(
+                    "failed to load paired overlays {} and {}",
+                    pair.left_path.display(),
+                    pair.right_path.display()
+                )
+            })?;
+        let loaded_overlay = loaded_selection.overlay;
+        let column_summary =
+            overlay_column_summary(&loaded_overlay.dataset, loaded_overlay.columns);
+        let overlay_values = loaded_overlay.overlay_values;
+        let range = overlay_values.range;
+
+        self.overlay = None;
+        self.afni_rgba_colors = None;
+        self.overlay_values = Some(overlay_values);
+        self.overlay_dataset = Some(loaded_overlay.dataset);
+        self.overlay_columns = loaded_overlay.columns;
+        self.controller.overlay.visible = true;
+        self.overlay_appearance = OverlayAppearance::from_range(range);
+        self.controller.overlay.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        self.overlay_path = Some(pair.left_path.clone());
+        self.overlay_pair_paths = Some(pair.clone());
+        self.controller.surface.current_overlay_path = Some(pair.left_path.clone());
+        self.overlay_display_name = Some(loaded_selection.display_name);
+        self.rebuild_overlay_model()?;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(format!(
+            "Loaded paired overlays range {:.4} to {:.4}. {column_summary}",
             range.min, range.max
         ));
 
@@ -3837,6 +4593,7 @@ impl ViewerState {
             .map(|roi| self.attach_roi_to_current_surface(roi))
             .collect::<Vec<_>>();
         self.roi_path = Some(path.clone());
+        self.controller.surface.current_roi_path = Some(path.clone());
         self.roi_workspace = RoiWorkspace::from_rois(rois);
         self.rebuild_roi_layer_from_state()
             .with_context(|| format!("failed to map ROI {}", path.display()))?;
@@ -3847,7 +4604,7 @@ impl ViewerState {
         let roi_count = layer.rois.len();
         let mapped_nodes = layer.mapped_nodes;
 
-        self.roi_visible = true;
+        self.controller.roi.visible = true;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
@@ -3904,8 +4661,9 @@ impl ViewerState {
 
         write_niml_roi(&path, &rois)?;
         self.roi_path = Some(path.clone());
+        self.controller.surface.current_roi_path = Some(path.clone());
         self.rebuild_roi_layer_from_state()?;
-        self.roi_visible = true;
+        self.controller.roi.visible = true;
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.log_status(format!(
@@ -4114,6 +4872,60 @@ impl ViewerState {
         })
     }
 
+    fn load_explicit_paired_overlay_selection(
+        &self,
+        pair: &ExplicitOverlayPair,
+        mesh: &SurfaceMesh,
+    ) -> Result<LoadedOverlaySelection> {
+        let (left, right) = self
+            .active_paired_components()
+            .context("--overlay-lh/--overlay-rh require an active both-hemisphere spec")?;
+        let left_mesh = left
+            .mesh
+            .as_ref()
+            .context("left hemisphere surface is still loading")?;
+        let right_mesh = right
+            .mesh
+            .as_ref()
+            .context("right hemisphere surface is still loading")?;
+        ensure!(
+            pair.left_path.exists(),
+            "left hemisphere overlay {} does not exist",
+            pair.left_path.display()
+        );
+        ensure!(
+            pair.right_path.exists(),
+            "right hemisphere overlay {} does not exist",
+            pair.right_path.display()
+        );
+
+        let left_dataset = load_dataset_from_path(&pair.left_path, left_mesh)
+            .with_context(|| format!("failed to load {}", pair.left_path.display()))?;
+        let right_dataset = load_dataset_from_path(&pair.right_path, right_mesh)
+            .with_context(|| format!("failed to load {}", pair.right_path.display()))?;
+        let dataset = paired_overlay_dataset(
+            left_dataset,
+            right_dataset,
+            &mesh.domain,
+            left_mesh.vertices.len() as u32,
+        )?;
+        let overlay = loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "paired NIML")?;
+
+        Ok(LoadedOverlaySelection {
+            overlay,
+            display_name: explicit_overlay_pair_display_name(pair),
+        })
+    }
+
+    fn explicit_overlay_pair_for_loaded_path(&self, path: &Path) -> Option<ExplicitOverlayPair> {
+        self.active_paired_components()?;
+        let paths = paired_overlay_paths(path)?;
+        Some(ExplicitOverlayPair {
+            left_path: paths.left_path,
+            right_path: paths.right_path,
+        })
+    }
+
     fn refresh_overlay_columns(&mut self) -> Result<()> {
         let dataset = self
             .overlay_dataset
@@ -4132,7 +4944,7 @@ impl ViewerState {
         let range = overlay.range;
         let column_summary = overlay_column_summary(dataset, self.overlay_columns);
         self.overlay_values = Some(overlay);
-        self.overlay_appearance.range = if self.overlay_symmetric_range {
+        self.overlay_appearance.range = if self.controller.overlay.symmetric_range {
             symmetric_value_range(range)
         } else {
             range
@@ -4184,14 +4996,30 @@ impl ViewerState {
             .with_intensity_range(RangeSelection::Manual(overlay_range_from_value_range(
                 self.overlay_appearance.range,
             )))
-            .with_symmetric_range(self.overlay_symmetric_range)
+            .with_symmetric_range(self.controller.overlay.symmetric_range)
             .with_threshold(threshold, mask_mode)
             .with_opacity(self.overlay_appearance.opacity);
 
         overlay.rebuild_color_cache(dataset, domain)?;
         self.overlay = Some(overlay);
+        self.sync_controller_overlay_display_state();
 
         Ok(())
+    }
+
+    fn sync_controller_overlay_display_state(&mut self) {
+        self.controller.overlay.intensity_range = Some([
+            self.overlay_appearance.range.min,
+            self.overlay_appearance.range.max,
+        ]);
+        self.controller.overlay.threshold = self.overlay_appearance.threshold.enabled.then_some(
+            crate::command::OverlayThresholdCommandState {
+                value: self.overlay_appearance.threshold.value,
+                absolute: self.overlay_appearance.threshold.absolute,
+                hide_failed: self.overlay_appearance.threshold.hide_failed,
+            },
+        );
+        self.controller.overlay.opacity = self.overlay_appearance.opacity;
     }
 
     fn toggle_overlay_visibility(&mut self) {
@@ -4200,10 +5028,10 @@ impl ViewerState {
             return;
         }
 
-        self.overlay_visible = !self.overlay_visible;
+        self.controller.overlay.visible = !self.controller.overlay.visible;
         self.upload_surface_buffers();
         self.update_scene_stats();
-        self.log_status(if self.overlay_visible {
+        self.log_status(if self.controller.overlay.visible {
             "Overlay visible."
         } else {
             "Overlay hidden."
@@ -4211,7 +5039,7 @@ impl ViewerState {
     }
 
     fn set_surface_controller_visible(&mut self, visible: bool) {
-        self.surface_controller_visible = visible;
+        self.controller.panels.surface_controller_visible = visible;
         self.control_window.set_visible(visible);
         if visible {
             self.control_window.request_redraw();
@@ -4220,7 +5048,7 @@ impl ViewerState {
     }
 
     fn set_roi_controller_open(&mut self, open: bool) {
-        self.roi_controller_open = open;
+        self.controller.panels.roi_controller_open = open;
         self.roi_control_window.set_visible(open);
         if open {
             self.roi_control_window.request_redraw();
@@ -4229,22 +5057,29 @@ impl ViewerState {
     }
 
     fn visible_overlay(&self) -> Option<&Overlay> {
-        self.overlay.as_ref().filter(|_| self.overlay_visible)
+        self.overlay
+            .as_ref()
+            .filter(|_| self.controller.overlay.visible)
     }
 
     fn visible_roi_layer(&self) -> Option<&RoiLayer> {
-        self.roi_layer.as_ref().filter(|_| self.roi_visible)
+        self.roi_layer
+            .as_ref()
+            .filter(|_| self.controller.roi.visible)
     }
 
     fn inspect_surface_at_cursor(&mut self) {
         match self.pick_surface_at_cursor() {
             Some(pick) => {
                 self.log_status(pick.status_text());
-                self.surface_pick = Some(pick);
+                self.controller.interaction.set_pick(Some(pick));
+                if let Err(error) = self.send_afni_crosshair_for_pick(pick) {
+                    self.set_error(error);
+                }
                 self.upload_surface_buffers();
             }
             None => {
-                self.surface_pick = None;
+                self.controller.interaction.set_pick(None);
                 self.upload_surface_buffers();
                 self.log_status("No surface under the cursor.");
             }
@@ -4275,8 +5110,8 @@ impl ViewerState {
         let surface = scene.surfaces.get(scene.active_index)?;
         let matrices = pair_hemisphere_matrices(
             &surface.components,
-            self.hemisphere_layout_state(),
-            self.pair_visibility,
+            self.controller.display.pair_state,
+            self.controller.display.pair_visibility,
         );
         let mut best = None;
         let mut best_distance = f32::INFINITY;
@@ -4285,7 +5120,11 @@ impl ViewerState {
 
         for component in &surface.components {
             let mesh = component.mesh.as_ref()?;
-            if self.pair_visibility.is_visible(&component.side)
+            if self
+                .controller
+                .display
+                .pair_visibility
+                .is_visible(&component.side)
                 && let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == component.side)
                 && let Some((pick, distance)) = pick_surface_with_model(
                     mesh,
@@ -4315,7 +5154,8 @@ impl ViewerState {
             return Ok(());
         };
         let target = self.roi_pick_target(pick)?;
-        self.surface_pick = Some(pick);
+        self.controller.interaction.set_pick(Some(pick));
+        self.send_afni_crosshair_for_pick(pick)?;
 
         let fill_pending = self
             .roi_workspace
@@ -4330,7 +5170,7 @@ impl ViewerState {
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.control_window.request_redraw();
-        if self.roi_controller_open {
+        if self.controller.panels.roi_controller_open {
             self.roi_control_window.request_redraw();
         }
 
@@ -4543,7 +5383,8 @@ impl ViewerState {
     }
 
     fn sync_pick_to_roi_draft_anchor(&mut self) {
-        self.surface_pick = self.roi_draft_anchor_pick();
+        let pick = self.roi_draft_anchor_pick();
+        self.controller.interaction.set_pick(pick);
     }
 
     fn roi_draft_anchor_pick(&self) -> Option<SurfacePick> {
@@ -4575,7 +5416,7 @@ impl ViewerState {
     }
 
     fn refresh_pick_overlay_value(&mut self) {
-        if let Some(pick) = &mut self.surface_pick {
+        if let Some(pick) = &mut self.controller.interaction.pick {
             pick.overlay_value = self
                 .overlay_values
                 .as_ref()
@@ -4591,7 +5432,12 @@ impl ViewerState {
     }
 
     fn upload_surface_buffers(&mut self) {
-        let surface_colors = self.visible_anatomical_shading_colors();
+        let afni_surface_colors = (self.controller.overlay.visible)
+            .then(|| self.afni_rgba_colors.clone())
+            .flatten();
+        let surface_colors = afni_surface_colors
+            .map(Arc::new)
+            .or_else(|| self.visible_anatomical_shading_colors());
         if self.mesh.is_none() {
             self.surface_buffers = None;
             self.surface_render_set = None;
@@ -4631,14 +5477,32 @@ impl ViewerState {
             .geometry
             .clone();
         let selection = self.selection_highlight();
-        let prepared_surface = PreparedSurface::from_geometry_with_selection(
-            &geometry,
-            surface_colors.as_deref().map(Vec::as_slice),
-            self.visible_overlay(),
-            self.overlay_appearance.dim,
-            self.visible_roi_layer().map(|layer| &layer.appearance),
-            selection,
-        );
+        let use_afni_cell_colors =
+            self.afni_rgba_colors.is_some() && self.controller.overlay.visible;
+        let visible_overlay = self
+            .afni_rgba_colors
+            .is_none()
+            .then(|| self.visible_overlay())
+            .flatten();
+        let surface_color_slice = surface_colors.as_deref().map(Vec::as_slice);
+        let roi = self.visible_roi_layer().map(|layer| &layer.appearance);
+        let prepared_surface = if use_afni_cell_colors {
+            PreparedSurface::from_geometry_cell_colors(
+                &geometry,
+                surface_color_slice,
+                roi.map(|roi| roi.node_colors.as_slice()),
+                selection,
+            )
+        } else {
+            PreparedSurface::from_geometry_with_selection(
+                &geometry,
+                surface_color_slice,
+                visible_overlay,
+                self.overlay_appearance.dim,
+                roi,
+                selection,
+            )
+        };
         let vertex_bytes = prepared_surface.vertex_bytes();
         let index_bytes = prepared_surface.index_bytes();
         let surface_id = mesh.metadata.id.clone();
@@ -4753,17 +5617,23 @@ impl ViewerState {
             return false;
         }
 
-        let overlay_colors = self
-            .visible_overlay()
-            .map(|overlay| overlay.color_cache.colors.clone());
+        let visible_overlay = self
+            .afni_rgba_colors
+            .is_none()
+            .then(|| self.visible_overlay())
+            .flatten();
+        let use_afni_cell_colors =
+            self.afni_rgba_colors.is_some() && self.controller.overlay.visible;
+        let overlay_colors = visible_overlay.map(|overlay| overlay.color_cache.colors.clone());
         let roi_colors = self
             .visible_roi_layer()
             .map(|layer| layer.appearance.node_colors.clone());
-        let selection = self.surface_pick;
+        let selection = self.controller.interaction.pick;
         let dim = self.overlay_appearance.dim;
-        let layout = self.hemisphere_layout_state();
-        let visibility = self.pair_visibility;
+        let layout = self.controller.display.pair_state;
+        let visibility = self.controller.display.pair_visibility;
         let matrices = self.active_pair_matrices_for_layout(layout, visibility);
+        let selection_scale = selection_scale_from_model_matrices(&matrices);
         let aspect = self.view_config.width as f32 / self.view_config.height as f32;
 
         let mut instances = Vec::with_capacity(raw.len());
@@ -4783,20 +5653,30 @@ impl ViewerState {
                 component.node_offset,
                 component.face_offset,
                 &component.positions,
+                selection_scale,
             );
             let geometry = prepared_geometry_from_raw_component(
                 &component.positions,
                 &component.normals,
                 &component.triangles,
             );
-            let prepared_surface = PreparedSurface::from_geometry_color_slices(
-                &geometry,
-                surface_color_slice,
-                overlay_color_slice,
-                dim,
-                roi_color_slice,
-                selection,
-            );
+            let prepared_surface = if use_afni_cell_colors {
+                PreparedSurface::from_geometry_cell_colors(
+                    &geometry,
+                    surface_color_slice,
+                    roi_color_slice,
+                    selection,
+                )
+            } else {
+                PreparedSurface::from_geometry_color_slices(
+                    &geometry,
+                    surface_color_slice,
+                    overlay_color_slice,
+                    dim,
+                    roi_color_slice,
+                    selection,
+                )
+            };
             let vertex_bytes = prepared_surface.vertex_bytes();
             let index_bytes = prepared_surface.index_bytes();
             let model_matrix = matrices
@@ -4851,7 +5731,7 @@ impl ViewerState {
     }
 
     fn visible_anatomical_shading_colors(&mut self) -> Option<Arc<Vec<[f32; 4]>>> {
-        if !self.anatomical_shading_visible {
+        if !self.controller.display.anatomical_shading_visible {
             return None;
         }
 
@@ -4891,12 +5771,12 @@ impl ViewerState {
     }
 
     fn selection_highlight(&self) -> Option<SelectionHighlight> {
-        let pick = self.surface_pick?;
-        Some(SelectionHighlight {
-            node_index: pick.node_index,
-            face_index: pick.face_index,
-            crosshair_position: pick.normalized_position,
-        })
+        let pick = self.controller.interaction.pick?;
+        Some(SelectionHighlight::normalized(
+            pick.node_index,
+            pick.face_index,
+            pick.normalized_position,
+        ))
     }
 
     fn update_scene_stats(&mut self) {
@@ -4960,6 +5840,7 @@ impl ViewerState {
     }
 
     fn log_status(&self, message: impl AsRef<str>) {
+        self.controller.record_status(message.as_ref());
         if self.verbose {
             eprintln!("sumaru: {}", message.as_ref());
         }
@@ -5029,6 +5910,7 @@ struct SurfaceScene {
     spec: SpecFile,
     spec_path: PathBuf,
     surface_volume_path: Option<PathBuf>,
+    surface_volume_idcode: Option<String>,
     hemisphere: SpecHemisphere,
     surfaces: Vec<SceneSurface>,
     active_index: usize,
@@ -5479,6 +6361,7 @@ fn selection_for_component(
     node_offset: u32,
     face_offset: usize,
     positions: &[[f32; 3]],
+    scale: f32,
 ) -> Option<SelectionHighlight> {
     let selection = selection?;
     let local_node = selection.node_index.checked_sub(node_offset)?;
@@ -5487,11 +6370,22 @@ fn selection_for_component(
     }
     let local_face = selection.face_index.checked_sub(face_offset)?;
 
-    Some(SelectionHighlight {
-        node_index: local_node,
-        face_index: local_face,
-        crosshair_position: positions[local_node as usize],
-    })
+    Some(SelectionHighlight::scaled(
+        local_node,
+        local_face,
+        positions[local_node as usize],
+        scale,
+    ))
+}
+
+fn selection_scale_from_model_matrices(matrices: &[(SurfaceSide, Mat4)]) -> f32 {
+    matrices
+        .iter()
+        .find_map(|(_, matrix)| {
+            let inv_radius = matrix.transform_vector3(Vec3::X).length();
+            (inv_radius.is_finite() && inv_radius > f32::EPSILON).then_some(1.0 / inv_radius)
+        })
+        .unwrap_or(1.0)
 }
 
 fn ensure_component_normals(component: &mut SceneSurfaceComponent) -> Result<Arc<Vec<[f32; 3]>>> {
@@ -6325,27 +7219,6 @@ struct OverlayColumnOption {
     is_numeric: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SurfacePick {
-    node_index: u32,
-    face_index: usize,
-    surface_position: [f32; 3],
-    normalized_position: [f32; 3],
-    overlay_value: Option<f32>,
-    threshold_value: Option<f32>,
-}
-
-impl SurfacePick {
-    fn status_text(self) -> String {
-        format!(
-            "Inspected node {}, triangle {}, {}.",
-            self.node_index,
-            self.face_index,
-            picked_overlay_value_label(self)
-        )
-    }
-}
-
 #[derive(Debug, Clone)]
 struct SceneStats {
     geometry: SceneGeometryStats,
@@ -6386,13 +7259,14 @@ struct InputResponse {
 }
 
 struct ControlUiOutput {
-    actions: Vec<UiAction>,
+    actions: Vec<ViewerCommand>,
     desired_control_size_points: egui::Vec2,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ViewerEvent {
     SpecPreloadReady,
+    AfniMessagesReady,
 }
 
 struct PreloadTask {
@@ -6401,7 +7275,7 @@ struct PreloadTask {
     component_index: usize,
     spec: SpecFile,
     surface: SpecSurface,
-    surface_volume_path: Option<PathBuf>,
+    surface_volume_idcode: Option<String>,
 }
 
 struct PreloadResult {
@@ -6412,39 +7286,10 @@ struct PreloadResult {
     result: std::result::Result<SurfaceMesh, String>,
 }
 
-enum UiAction {
-    PickSurface,
-    PickOverlay,
-    PickRoi,
-    PickSpec,
-    PickSurfaceVolume,
-    RefreshOverlayColumns,
-    RefreshOverlayAppearance,
-    ResetCamera,
-    ToggleCameraMode,
-    ToggleBackground,
-    SetAnatomicalShadingVisible(bool),
-    SetOverlayVisible(bool),
-    SetRoiVisible(bool),
-    SetRoiSlotVisible(usize, bool),
-    ClearRoi,
-    ToggleRoiDraw(usize, bool),
-    JoinRoiDraft(usize),
-    ArmRoiFill(usize),
-    UndoRoiDraft(usize),
-    RedoRoiDraft(usize),
-    FinalizeRoiSlot(usize),
-    EditRoiSlot(usize),
-    DeleteRoiSlot(usize),
-    SaveRoiSlot(usize),
-    SaveAllRois,
-    SetSurfaceControllerVisible(bool),
-    SetRoiControllerOpen(bool),
-    Preset(PresetOrientation),
-    HemisphereLayout(HemisphereLayout),
-    SelectSceneSurface(usize),
-    SaveScreenshot,
-    SaveMontage,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AfniSurfaceTarget {
+    node_offset: usize,
+    node_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6542,89 +7387,6 @@ enum RenderStatus {
     ValidationError,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HemisphereLayout {
-    Closed,
-    Open,
-}
-
-impl HemisphereLayout {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Closed => "closed",
-            Self::Open => "open",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PairVisibility {
-    left: bool,
-    right: bool,
-}
-
-impl PairVisibility {
-    fn both() -> Self {
-        Self {
-            left: true,
-            right: true,
-        }
-    }
-
-    fn is_visible(self, side: &SurfaceSide) -> bool {
-        match side {
-            SurfaceSide::Left => self.left,
-            SurfaceSide::Right => self.right,
-            _ => true,
-        }
-    }
-
-    fn toggled(self, side: SurfaceSide) -> Option<Self> {
-        let mut next = self;
-        match side {
-            SurfaceSide::Left => next.left = !next.left,
-            SurfaceSide::Right => next.right = !next.right,
-            _ => return None,
-        }
-        (next.left || next.right).then_some(next)
-    }
-
-    fn label(self) -> &'static str {
-        match (self.left, self.right) {
-            (true, true) => "left+right",
-            (true, false) => "left only",
-            (false, true) => "right only",
-            (false, false) => "none",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct HemisphereLayoutState {
-    open_angle_degrees: f32,
-    separation_distance: f32,
-}
-
-impl HemisphereLayoutState {
-    fn closed() -> Self {
-        Self {
-            open_angle_degrees: 0.0,
-            separation_distance: 0.0,
-        }
-    }
-
-    fn acorn() -> Self {
-        Self::acorn_signed(1.0)
-    }
-
-    fn acorn_signed(sign: f32) -> Self {
-        Self {
-            open_angle_degrees: PAIR_MAX_OPEN_DEGREES * sign.signum(),
-            separation_distance: PAIR_ACORN_EXTRA_GAP,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ComponentTransform {
     offset: Vec3,
@@ -6647,38 +7409,11 @@ struct ModeLabel {
     until: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackgroundMode {
-    Black,
-    White,
-}
-
 impl BackgroundMode {
-    fn toggle(&mut self) {
-        *self = match self {
-            Self::Black => Self::White,
-            Self::White => Self::Black,
-        };
-    }
-
     fn color(self) -> wgpu::Color {
         match self {
             Self::Black => BLACK_BACKGROUND,
             Self::White => WHITE_BACKGROUND,
-        }
-    }
-
-    fn next_label(self) -> &'static str {
-        match self {
-            Self::Black => "White background",
-            Self::White => "Black background",
-        }
-    }
-
-    fn rgba8(self) -> [u8; 4] {
-        match self {
-            Self::Black => [0, 0, 0, 255],
-            Self::White => [255, 255, 255, 255],
         }
     }
 }
@@ -6694,7 +7429,7 @@ fn apply_spec_surface_metadata(
     mesh: &mut SurfaceMesh,
     spec: &SpecFile,
     surface: &SpecSurface,
-    surface_volume_path: Option<&PathBuf>,
+    surface_volume_idcode: Option<&str>,
 ) {
     mesh.metadata.label = Some(surface.name.clone());
     mesh.metadata.group_label = spec.group.clone();
@@ -6719,24 +7454,437 @@ fn apply_spec_surface_metadata(
     }
     mesh.metadata.lineage.local_domain_parent = surface.local_domain_parent.clone();
     mesh.metadata.lineage.local_curvature_parent = surface.local_curvature_parent.clone();
-    apply_surface_volume_parent(mesh, surface_volume_path);
+    apply_surface_volume_parent(mesh, surface_volume_idcode);
 }
 
 fn load_spec_component_mesh(
     spec: &SpecFile,
     surface: &SpecSurface,
-    surface_volume_path: Option<&PathBuf>,
+    surface_volume_idcode: Option<&str>,
 ) -> Result<SurfaceMesh> {
     let mut mesh = SurfaceMesh::from_gifti_path(&surface.path)
         .with_context(|| format!("failed to load spec surface {}", surface.path.display()))?;
-    apply_spec_surface_metadata(&mut mesh, spec, surface, surface_volume_path);
+    apply_spec_surface_metadata(&mut mesh, spec, surface, surface_volume_idcode);
 
     Ok(mesh)
 }
 
-fn apply_surface_volume_parent(mesh: &mut SurfaceMesh, surface_volume_path: Option<&PathBuf>) {
-    mesh.metadata.lineage.parent_volume_id =
-        surface_volume_path.map(|path| path.display().to_string());
+fn afni_component_is_sendable(
+    component: &SceneSurfaceComponent,
+    mesh: Option<&SurfaceMesh>,
+) -> bool {
+    if component.spec_surface.anatomical == Some(false) {
+        return false;
+    }
+
+    if let Some(mesh) = mesh {
+        if mesh.metadata.anatomically_correct == AnatomicalCorrectness::Incorrect {
+            return false;
+        }
+
+        if component.spec_surface.anatomical.is_none()
+            && mesh.metadata.anatomically_correct == AnatomicalCorrectness::Unknown
+            && matches!(
+                mesh.metadata.surface_kind,
+                SurfaceKind::Inflated
+                    | SurfaceKind::VeryInflated
+                    | SurfaceKind::Sphere
+                    | SurfaceKind::Flat
+            )
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn apply_surface_volume_parent(mesh: &mut SurfaceMesh, surface_volume_idcode: Option<&str>) {
+    mesh.metadata.lineage.parent_volume_id = surface_volume_idcode.map(ToString::to_string);
+}
+
+fn decorate_afni_surface_info(
+    info: &mut AfniSurfaceInfo,
+    scene: Option<&SurfaceScene>,
+    component: Option<&SceneSurfaceComponent>,
+) {
+    if let Some(scene) = scene {
+        info.specfile_name = scene
+            .spec_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToString::to_string);
+        info.specfile_path = scene
+            .spec_path
+            .parent()
+            .map(|path| path.display().to_string());
+        decorate_afni_surface_volume_info(
+            info,
+            scene.surface_volume_path.as_ref(),
+            scene.surface_volume_idcode.as_deref(),
+        );
+    }
+
+    if let Some(component) = component {
+        info.surface_label = component.name.clone();
+        info.local_domain_parent = component
+            .spec_surface
+            .local_domain_parent
+            .clone()
+            .unwrap_or_else(|| info.local_domain_parent.clone());
+    }
+}
+
+fn decorate_afni_surface_volume_info(
+    info: &mut AfniSurfaceInfo,
+    surface_volume_path: Option<&PathBuf>,
+    surface_volume_idcode: Option<&str>,
+) {
+    if let Some(idcode) = surface_volume_idcode {
+        info.volume_idcode = info
+            .volume_idcode
+            .clone()
+            .or_else(|| Some(idcode.to_string()));
+    }
+
+    if let Some(path) = surface_volume_path {
+        info.volume_headname = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToString::to_string);
+        info.volume_filecode = Some(path.display().to_string());
+        info.volume_dirname = path.parent().map(|parent| parent.display().to_string());
+    }
+}
+
+fn afni_rgba_to_suma_node_color(rgba: [u8; 4]) -> [f32; 4] {
+    [
+        rgba[0] as f32 / 255.0 * AFNI_LIVE_COLOR_DIM_FACTOR,
+        rgba[1] as f32 / 255.0 * AFNI_LIVE_COLOR_DIM_FACTOR,
+        rgba[2] as f32 / 255.0 * AFNI_LIVE_COLOR_DIM_FACTOR,
+        1.0,
+    ]
+}
+
+fn apply_afni_rgba_to_color_cache(
+    existing: Option<Vec<[f32; 4]>>,
+    mesh: &SurfaceMesh,
+    target: AfniSurfaceTarget,
+    overlay: &AfniRgbaOverlay,
+) -> (Vec<[f32; 4]>, usize, usize) {
+    let total_node_count = mesh.vertices.len();
+    let mut colors = existing
+        .filter(|colors| colors.len() == total_node_count)
+        .unwrap_or_else(|| vec![afni_gray_node_color(); total_node_count]);
+    let start = target.node_offset.min(total_node_count);
+    let end = target
+        .node_offset
+        .saturating_add(target.node_count)
+        .min(total_node_count);
+    for color in &mut colors[start..end] {
+        *color = afni_gray_node_color();
+    }
+    let mut colored = vec![false; end.saturating_sub(start)];
+
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+    for (node, rgba) in overlay.node_indices.iter().zip(&overlay.rgba) {
+        let local_node = *node as usize;
+        if local_node >= target.node_count {
+            skipped += 1;
+            continue;
+        }
+        let Some(index) = target.node_offset.checked_add(local_node) else {
+            skipped += 1;
+            continue;
+        };
+        if let Some(color) = colors.get_mut(index) {
+            *color = afni_rgba_to_suma_node_color(*rgba);
+            if let Some(is_colored) = colored.get_mut(index.saturating_sub(start)) {
+                *is_colored = true;
+            }
+            applied += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+    fill_missing_afni_rgba_colors(mesh, start, end, &colored, &mut colors);
+    (colors, applied, skipped)
+}
+
+fn fill_missing_afni_rgba_colors(
+    mesh: &SurfaceMesh,
+    start: usize,
+    end: usize,
+    colored: &[bool],
+    colors: &mut [[f32; 4]],
+) {
+    if start >= end || colored.is_empty() {
+        return;
+    }
+
+    let colored_count = colored.iter().filter(|is_colored| **is_colored).count();
+    if colored_count == 0 || colored_count == colored.len() {
+        return;
+    }
+
+    let mut colored_points = Vec::with_capacity(colored_count);
+    for (local_index, is_colored) in colored.iter().copied().enumerate() {
+        if !is_colored {
+            continue;
+        }
+        let index = start + local_index;
+        if let Some(position) = mesh.vertices.get(index) {
+            colored_points.push(AfniColorPoint {
+                local_index,
+                position: *position,
+            });
+        }
+    }
+    let Some(nearest) = AfniNearestColorTree::new(colored_points) else {
+        return;
+    };
+
+    for (local_index, is_colored) in colored.iter().copied().enumerate() {
+        if is_colored {
+            continue;
+        }
+        let index = start + local_index;
+        let Some(position) = mesh.vertices.get(index) else {
+            continue;
+        };
+        if let Some(colored_local) = nearest.nearest_index(*position) {
+            colors[index] = colors[start + colored_local];
+        }
+    }
+}
+
+fn afni_gray_node_color() -> [f32; 4] {
+    [
+        SUMA_AFNI_GRAY_NODE_COLOR,
+        SUMA_AFNI_GRAY_NODE_COLOR,
+        SUMA_AFNI_GRAY_NODE_COLOR,
+        1.0,
+    ]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AfniColorPoint {
+    local_index: usize,
+    position: [f32; 3],
+}
+
+#[derive(Debug)]
+struct AfniNearestColorTree {
+    root: Option<Box<AfniNearestColorNode>>,
+}
+
+#[derive(Debug)]
+struct AfniNearestColorNode {
+    point: AfniColorPoint,
+    axis: usize,
+    left: Option<Box<AfniNearestColorNode>>,
+    right: Option<Box<AfniNearestColorNode>>,
+}
+
+impl AfniNearestColorTree {
+    fn new(mut points: Vec<AfniColorPoint>) -> Option<Self> {
+        points.retain(|point| point.position.iter().all(|value| value.is_finite()));
+        if points.is_empty() {
+            return None;
+        }
+        Some(Self {
+            root: build_afni_nearest_color_node(&mut points, 0),
+        })
+    }
+
+    fn nearest_index(&self, position: [f32; 3]) -> Option<usize> {
+        if !position.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        let mut best = AfniNearestSearch {
+            local_index: 0,
+            distance_squared: f32::INFINITY,
+        };
+        search_afni_nearest_color_node(&self.root, position, &mut best);
+        best.distance_squared
+            .is_finite()
+            .then_some(best.local_index)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AfniNearestSearch {
+    local_index: usize,
+    distance_squared: f32,
+}
+
+fn build_afni_nearest_color_node(
+    points: &mut [AfniColorPoint],
+    depth: usize,
+) -> Option<Box<AfniNearestColorNode>> {
+    if points.is_empty() {
+        return None;
+    }
+    let axis = afni_widest_axis(points).unwrap_or(depth % 3);
+    let middle = points.len() / 2;
+    points.select_nth_unstable_by(middle, |left, right| {
+        left.position[axis].total_cmp(&right.position[axis])
+    });
+    let (left, middle_and_right) = points.split_at_mut(middle);
+    let (middle_point, right) = middle_and_right.split_at_mut(1);
+    Some(Box::new(AfniNearestColorNode {
+        point: middle_point[0],
+        axis,
+        left: build_afni_nearest_color_node(left, depth + 1),
+        right: build_afni_nearest_color_node(right, depth + 1),
+    }))
+}
+
+fn afni_widest_axis(points: &[AfniColorPoint]) -> Option<usize> {
+    if points.is_empty() {
+        return None;
+    }
+    let mut min = points[0].position;
+    let mut max = points[0].position;
+    for point in points.iter().skip(1) {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(point.position[axis]);
+            max[axis] = max[axis].max(point.position[axis]);
+        }
+    }
+    let span = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    (0..3).max_by(|left, right| span[*left].total_cmp(&span[*right]))
+}
+
+fn search_afni_nearest_color_node(
+    node: &Option<Box<AfniNearestColorNode>>,
+    position: [f32; 3],
+    best: &mut AfniNearestSearch,
+) {
+    let Some(node) = node else {
+        return;
+    };
+
+    let distance_squared = squared_distance(position, node.point.position);
+    if distance_squared < best.distance_squared {
+        best.distance_squared = distance_squared;
+        best.local_index = node.point.local_index;
+    }
+
+    let axis_delta = position[node.axis] - node.point.position[node.axis];
+    let (near, far) = if axis_delta <= 0.0 {
+        (&node.left, &node.right)
+    } else {
+        (&node.right, &node.left)
+    };
+    search_afni_nearest_color_node(near, position, best);
+    if axis_delta * axis_delta <= best.distance_squared {
+        search_afni_nearest_color_node(far, position, best);
+    }
+}
+
+fn squared_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
+    (left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2) + (left[2] - right[2]).powi(2)
+}
+
+fn afni_surface_target_in_scene_surface(
+    scene: &SurfaceScene,
+    surface_index: usize,
+    matches: impl Fn(&SceneSurfaceComponent, &SurfaceMesh) -> bool,
+) -> Option<AfniSurfaceTarget> {
+    let surface = scene.surfaces.get(surface_index)?;
+    let mut node_offset = 0usize;
+    for component in &surface.components {
+        let mesh = component.mesh.as_ref()?;
+        let node_count = mesh.vertices.len();
+        if matches(component, mesh) {
+            return Some(AfniSurfaceTarget {
+                node_offset,
+                node_count,
+            });
+        }
+        node_offset = node_offset.checked_add(node_count)?;
+    }
+
+    None
+}
+
+fn afni_component_matches_surface_id(
+    component: &SceneSurfaceComponent,
+    mesh: &SurfaceMesh,
+    surface_idcode: &str,
+) -> bool {
+    mesh.metadata.id.as_str() == surface_idcode || component.name == surface_idcode
+}
+
+fn afni_component_matches_domain_parent(
+    component: &SceneSurfaceComponent,
+    mesh: &SurfaceMesh,
+    parent_id: &str,
+) -> bool {
+    afni_component_domain_parent_candidates(component, mesh)
+        .into_iter()
+        .any(|candidate| candidate == parent_id)
+}
+
+fn afni_mesh_matches_domain_parent(mesh: &SurfaceMesh, parent_id: &str) -> bool {
+    mesh.metadata
+        .lineage
+        .local_domain_parent
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(mesh.metadata.lineage.domain.id.as_str()))
+        .chain(std::iter::once(mesh.metadata.id.as_str()))
+        .any(|candidate| candidate == parent_id)
+}
+
+fn afni_component_domain_parent_candidates<'a>(
+    component: &'a SceneSurfaceComponent,
+    mesh: &'a SurfaceMesh,
+) -> Vec<&'a str> {
+    let mut candidates = Vec::new();
+    push_unique_candidate(&mut candidates, mesh.metadata.id.as_str());
+    push_unique_candidate(&mut candidates, component.name.as_str());
+    push_unique_candidate(&mut candidates, mesh.metadata.lineage.domain.id.as_str());
+    if let Some(parent) = mesh.metadata.lineage.local_domain_parent.as_deref() {
+        push_unique_candidate(&mut candidates, parent);
+    }
+    if let Some(parent) = component.spec_surface.local_domain_parent.as_deref() {
+        push_unique_candidate(&mut candidates, parent);
+    }
+    candidates
+}
+
+fn push_unique_candidate<'a>(candidates: &mut Vec<&'a str>, value: &'a str) {
+    if !value.is_empty() && !candidates.contains(&value) {
+        candidates.push(value);
+    }
+}
+
+fn query_afni_dataset_idcode_optional(path: Option<&Path>) -> Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    let output = match Command::new("3dinfo").arg("-id").arg(path).output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to query AFNI idcode for {}", path.display()));
+        }
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() || value == "NO-DSET" {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 fn canonical_or_original_path(path: PathBuf) -> PathBuf {
@@ -6978,6 +8126,14 @@ fn paired_overlay_path_for_side(path: &Path, side: &SurfaceSide) -> Option<PathB
     }
 }
 
+fn explicit_overlay_pair_display_name(pair: &ExplicitOverlayPair) -> String {
+    format!(
+        "LH {} / RH {}",
+        file_name_display(&pair.left_path),
+        file_name_display(&pair.right_path)
+    )
+}
+
 fn paired_overlay_paths_for_pattern(
     parent: &Path,
     file_name: &str,
@@ -7013,6 +8169,11 @@ struct HemisphereFilePattern {
 }
 
 const HEMISPHERE_FILE_PATTERNS: &[HemisphereFilePattern] = &[
+    HemisphereFilePattern {
+        left: "lh.",
+        right: "rh.",
+        wildcard: "?h.",
+    },
     HemisphereFilePattern {
         left: "_lh_",
         right: "_rh_",
@@ -8502,24 +9663,30 @@ fn size_is_close(current: PhysicalSize<u32>, desired: PhysicalSize<u32>) -> bool
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundMode, HemisphereLayout, HemisphereLayoutState, MontageCamera, OverlayAppearance,
-        OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR, PAIR_MAX_OPEN_DEGREES,
-        PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation, RoiComponentRange,
-        RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
+        AfniSurfaceTarget, BackgroundMode, HemisphereLayout, HemisphereLayoutState, MontageCamera,
+        OverlayAppearance, OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR,
+        PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation,
+        RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
+        SurfacePick, afni_component_is_sendable, apply_afni_rgba_to_color_cache,
         canonical_overlay_columns, component_transforms, pair_hemisphere_matrices,
         paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
         paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
         roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
-        scene_surfaces_from_components, standard_montage_shots, surface_pick_for_mesh_node,
+        scene_surfaces_from_components, selection_for_component,
+        selection_scale_from_model_matrices, standard_montage_shots, surface_pick_for_mesh_node,
         threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
     };
+    use crate::afni::AfniRgbaOverlay;
     use crate::color::Rgba;
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{MaskMode, Threshold};
     use crate::roi::Roi;
     use crate::spec::{SpecFile, SpecHemisphere, SpecSurface};
-    use crate::surface::{OverlayDataset, SurfaceDomain, SurfaceMesh, SurfaceSide, ValueRange};
-    use glam::Vec3;
+    use crate::surface::{
+        AnatomicalCorrectness, OverlayDataset, SurfaceDomain, SurfaceKind, SurfaceMesh,
+        SurfaceSide, ValueRange,
+    };
+    use glam::{Mat4, Vec3};
     use std::path::PathBuf;
 
     #[test]
@@ -8543,6 +9710,92 @@ mod tests {
             winit::dpi::PhysicalSize::new(420, 700),
             winit::dpi::PhysicalSize::new(460, 700)
         ));
+    }
+
+    #[test]
+    fn afni_rgba_sparse_packets_clear_only_the_target_surface_slice() {
+        let mesh = SurfaceMesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+            ],
+            vec![[0, 2, 3]],
+        )
+        .unwrap();
+        let existing = vec![
+            [0.1, 0.1, 0.1, 1.0],
+            [0.2, 0.2, 0.2, 1.0],
+            [0.3, 0.3, 0.3, 1.0],
+            [0.4, 0.4, 0.4, 1.0],
+        ];
+        let overlay = AfniRgbaOverlay {
+            surface_idcode: "lh".to_string(),
+            local_domain_parent_id: Some("lh.smoothwm".to_string()),
+            node_indices: vec![1],
+            rgba: vec![[255, 0, 0, 255]],
+            threshold: None,
+            function_idcode: None,
+            volume_idcode: None,
+        };
+
+        let (colors, applied, skipped) = apply_afni_rgba_to_color_cache(
+            Some(existing),
+            &mesh,
+            AfniSurfaceTarget {
+                node_offset: 0,
+                node_count: 2,
+            },
+            &overlay,
+        );
+
+        assert_eq!(applied, 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(colors[0], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(colors[1], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(colors[2], [0.3, 0.3, 0.3, 1.0]);
+        assert_eq!(colors[3], [0.4, 0.4, 0.4, 1.0]);
+    }
+
+    #[test]
+    fn afni_rgba_sparse_packets_fill_nearest_coordinate_missing_nodes() {
+        let mesh = SurfaceMesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [100.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            vec![[0, 1, 3], [1, 2, 3]],
+        )
+        .unwrap();
+        let overlay = AfniRgbaOverlay {
+            surface_idcode: "lh".to_string(),
+            local_domain_parent_id: None,
+            node_indices: vec![0, 2],
+            rgba: vec![[64, 128, 255, 255], [255, 0, 0, 255]],
+            threshold: None,
+            function_idcode: None,
+            volume_idcode: None,
+        };
+
+        let (colors, applied, skipped) = apply_afni_rgba_to_color_cache(
+            None,
+            &mesh,
+            AfniSurfaceTarget {
+                node_offset: 0,
+                node_count: 4,
+            },
+            &overlay,
+        );
+
+        assert_eq!(applied, 2);
+        assert_eq!(skipped, 0);
+        assert_eq!(colors[0], [64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]);
+        assert_eq!(colors[1], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(colors[2], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(colors[3], [1.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -9239,6 +10492,32 @@ mod tests {
     }
 
     #[test]
+    fn paired_selection_highlight_uses_local_indices_and_model_scale() {
+        let pick = SurfacePick {
+            node_index: 4,
+            face_index: 8,
+            surface_position: [11.0, 2.0, 3.0],
+            normalized_position: [0.0, 0.0, 0.0],
+            overlay_value: Some(1.25),
+            threshold_value: Some(2.5),
+        };
+        let positions = vec![[10.0, 0.0, 0.0], [11.0, 2.0, 3.0], [12.0, 0.0, 0.0]];
+        let matrices = vec![(
+            SurfaceSide::Right,
+            Mat4::from_scale(Vec3::splat(1.0 / 100.0)),
+        )];
+        let scale = selection_scale_from_model_matrices(&matrices);
+
+        let highlight = selection_for_component(Some(pick), 3, 7, &positions, scale).unwrap();
+
+        assert_eq!(highlight.node_index, 1);
+        assert_eq!(highlight.face_index, 1);
+        assert_eq!(highlight.crosshair_position, positions[1]);
+        assert!((highlight.marker_radius - 2.5).abs() < 1e-5);
+        assert!((highlight.face_offset - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
     fn paired_component_lookup_maps_composite_nodes_to_exact_surface() {
         let left = component("smoothwm", SurfaceSide::Left, 0.0);
         let right = component("smoothwm", SurfaceSide::Right, 3.0);
@@ -9295,6 +10574,30 @@ mod tests {
         assert_eq!(paths.left_path, PathBuf::from("std.141.lh.curv.gii.dset"));
         assert_eq!(paths.right_path, PathBuf::from("std.141.rh.curv.gii.dset"));
         assert_eq!(paths.display_name, "std.141.?h.curv.gii.dset");
+
+        let paths = paired_overlay_paths(&PathBuf::from("lh.aparc.a2009s.annot.niml.dset"))
+            .expect("start-of-filename lh overlay should pair");
+        assert_eq!(
+            paths.left_path,
+            PathBuf::from("lh.aparc.a2009s.annot.niml.dset")
+        );
+        assert_eq!(
+            paths.right_path,
+            PathBuf::from("rh.aparc.a2009s.annot.niml.dset")
+        );
+        assert_eq!(paths.display_name, "?h.aparc.a2009s.annot.niml.dset");
+
+        let paths = paired_overlay_paths(&PathBuf::from("rh.aparc.a2009s.annot.niml.dset"))
+            .expect("start-of-filename rh overlay should pair");
+        assert_eq!(
+            paths.left_path,
+            PathBuf::from("lh.aparc.a2009s.annot.niml.dset")
+        );
+        assert_eq!(
+            paths.right_path,
+            PathBuf::from("rh.aparc.a2009s.annot.niml.dset")
+        );
+        assert_eq!(paths.display_name, "?h.aparc.a2009s.annot.niml.dset");
     }
 
     #[test]
@@ -9329,6 +10632,33 @@ mod tests {
             panic!("expected float values");
         };
         assert_eq!(values, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn afni_registration_skips_non_anatomical_spec_surfaces() {
+        let mut smoothwm = component("smoothwm", SurfaceSide::Left, 0.0);
+        smoothwm.spec_surface.anatomical = Some(true);
+        assert!(afni_component_is_sendable(
+            &smoothwm,
+            smoothwm.mesh.as_ref()
+        ));
+
+        let mut inflated = component("inflated", SurfaceSide::Left, 0.0);
+        inflated.spec_surface.anatomical = Some(false);
+        assert!(!afni_component_is_sendable(
+            &inflated,
+            inflated.mesh.as_ref()
+        ));
+
+        let mut unknown_sphere = component("sphere", SurfaceSide::Left, 0.0);
+        if let Some(mesh) = unknown_sphere.mesh.as_mut() {
+            mesh.metadata.surface_kind = SurfaceKind::Sphere;
+            mesh.metadata.anatomically_correct = AnatomicalCorrectness::Unknown;
+        }
+        assert!(!afni_component_is_sendable(
+            &unknown_sphere,
+            unknown_sphere.mesh.as_ref()
+        ));
     }
 
     fn both_spec<const N: usize>(states: [&str; N]) -> SpecFile {

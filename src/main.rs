@@ -1,10 +1,13 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use std::collections::BTreeMap;
+
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use sumaru::afni::{DEFAULT_AFNI_HOST, resolve_afni_port_config};
 use sumaru::inspect::inspect_path;
-use sumaru::viewer;
+use sumaru::viewer::{self, AfniViewerOptions, ExplicitOverlayPair};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "SUMA in Rust")]
@@ -24,6 +27,24 @@ struct Cli {
     /// Load this GIFTI data array as a per-vertex surface overlay.
     #[arg(long = "overlay", value_name = "PATH")]
     overlay: Option<PathBuf>,
+
+    /// Explicit left-hemisphere overlay for both-hemisphere spec launches.
+    #[arg(
+        long = "overlay-lh",
+        value_name = "PATH",
+        conflicts_with = "overlay",
+        requires = "overlay_rh"
+    )]
+    overlay_lh: Option<PathBuf>,
+
+    /// Explicit right-hemisphere overlay for both-hemisphere spec launches.
+    #[arg(
+        long = "overlay-rh",
+        value_name = "PATH",
+        conflicts_with = "overlay",
+        requires = "overlay_lh"
+    )]
+    overlay_rh: Option<PathBuf>,
 
     /// Load this SUMA .niml.roi annotation over the active surface.
     #[arg(long = "roi", value_name = "PATH")]
@@ -51,6 +72,27 @@ struct Cli {
     #[arg(long = "no-preload", hide = true, conflicts_with = "preload")]
     no_preload: bool,
 
+    /// Connect to AFNI/SUMA NIML talk on launch. Press `t` in the viewer to
+    /// toggle the same connection interactively.
+    #[arg(long = "talk-afni")]
+    talk_afni: bool,
+
+    /// AFNI/SUMA NIML host.
+    #[arg(long = "afni-host", default_value = DEFAULT_AFNI_HOST)]
+    afni_host: String,
+
+    /// Explicit AFNI/SUMA NIML port. Overrides --np/--npb and AFNI env vars.
+    #[arg(long = "afni-port", value_name = "PORT", conflicts_with_all = ["np", "npb"])]
+    afni_port: Option<u16>,
+
+    /// AFNI-style NIML port offset.
+    #[arg(long = "np", value_name = "PORT_OFFSET", conflicts_with = "npb")]
+    np: Option<u16>,
+
+    /// AFNI-style NIML port bloc.
+    #[arg(long = "npb", value_name = "PORT_BLOC", conflicts_with = "np")]
+    npb: Option<u16>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -73,23 +115,43 @@ fn main() -> Result<()> {
     let preload = cli.preload && !cli.no_preload;
     let subs = cli.subs.map(|subs| subs.0);
     let p_value = cli.p_value;
+    let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
+    let afni_requested = cli.talk_afni
+        || cli.afni_port.is_some()
+        || cli.np.is_some()
+        || cli.npb.is_some()
+        || cli.afni_host != DEFAULT_AFNI_HOST;
+    let environ = std::env::vars().collect::<BTreeMap<_, _>>();
+    let afni = AfniViewerOptions {
+        connect_on_launch: cli.talk_afni,
+        port_config: resolve_afni_port_config(
+            cli.afni_host,
+            cli.afni_port,
+            cli.np,
+            cli.npb,
+            &environ,
+        )?,
+    };
 
     match (
         cli.surface,
         cli.spec,
         cli.surface_volume,
         cli.overlay,
+        overlay_pair,
         cli.roi,
         subs,
         p_value,
         cli.command,
+        afni_requested,
     ) {
-        (surface, spec, surface_volume, overlay, roi, subs, p_value, None) => {
+        (surface, spec, surface_volume, overlay, overlay_pair, roi, subs, p_value, None, _) => {
             validate_viewer_launch(
                 &surface,
                 &spec,
                 &surface_volume,
                 &overlay,
+                &overlay_pair,
                 &roi,
                 &subs,
                 &p_value,
@@ -99,14 +161,27 @@ fn main() -> Result<()> {
                 spec_path: spec,
                 surface_volume_path: surface_volume,
                 overlay_path: overlay,
+                overlay_pair_paths: overlay_pair,
                 roi_path: roi,
                 overlay_subs: subs,
                 overlay_p_value: p_value,
                 verbose,
                 preload,
+                afni,
             })?;
         }
-        (None, None, None, None, None, None, None, Some(Commands::Inspect { path })) => {
+        (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Commands::Inspect { path }),
+            false,
+        ) => {
             let report = inspect_path(path)?;
             println!("{report}");
         }
@@ -123,10 +198,12 @@ fn validate_viewer_launch(
     spec: &Option<PathBuf>,
     surface_volume: &Option<PathBuf>,
     overlay: &Option<PathBuf>,
+    overlay_pair: &Option<ExplicitOverlayPair>,
     roi: &Option<PathBuf>,
     subs: &Option<Vec<String>>,
     p_value: &Option<f64>,
 ) -> Result<()> {
+    let has_overlay = overlay.is_some() || overlay_pair.is_some();
     if surface.is_some() && spec.is_some() {
         bail!("use either -i/--surface or -spec/--spec, not both");
     }
@@ -136,20 +213,36 @@ fn validate_viewer_launch(
     if surface.is_none() && spec.is_none() && overlay.is_some() {
         bail!("--overlay requires -i/--surface or -spec/--spec");
     }
+    if overlay_pair.is_some() && spec.is_none() {
+        bail!("--overlay-lh/--overlay-rh require -spec/--spec");
+    }
     if surface.is_none() && spec.is_none() && roi.is_some() {
         bail!("--roi requires -i/--surface or -spec/--spec");
     }
     if surface.is_none() && spec.is_none() && surface_volume.is_some() {
         bail!("-sv/--sv requires -i/--surface or -spec/--spec");
     }
-    if overlay.is_none() && subs.is_some() {
-        bail!("--subs requires --overlay");
+    if !has_overlay && subs.is_some() {
+        bail!("--subs requires --overlay or --overlay-lh/--overlay-rh");
     }
-    if overlay.is_none() && p_value.is_some() {
-        bail!("--p-val requires --overlay");
+    if !has_overlay && p_value.is_some() {
+        bail!("--p-val requires --overlay or --overlay-lh/--overlay-rh");
     }
 
     Ok(())
+}
+
+fn explicit_overlay_pair(
+    left_path: Option<PathBuf>,
+    right_path: Option<PathBuf>,
+) -> Option<ExplicitOverlayPair> {
+    match (left_path, right_path) {
+        (Some(left_path), Some(right_path)) => Some(ExplicitOverlayPair {
+            left_path,
+            right_path,
+        }),
+        _ => None,
+    }
 }
 
 fn parse_subs(value: &str) -> Result<SubSpec, String> {
@@ -178,23 +271,31 @@ fn parse_p_value(value: &str) -> Result<f64, String> {
 }
 
 fn normalized_afni_style_args() -> Vec<OsString> {
-    std::env::args_os()
-        .map(|arg| {
-            if arg == "-spec" {
-                OsString::from("--spec")
-            } else if arg == "-sv" {
-                OsString::from("--sv")
-            } else {
-                arg
-            }
-        })
-        .collect()
+    std::env::args_os().map(normalize_afni_style_arg).collect()
+}
+
+fn normalize_afni_style_arg(arg: OsString) -> OsString {
+    if arg == "-spec" {
+        OsString::from("--spec")
+    } else if arg == "-sv" {
+        OsString::from("--sv")
+    } else if arg == "-np" {
+        OsString::from("--np")
+    } else if arg == "-npb" {
+        OsString::from("--npb")
+    } else {
+        arg
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, SubSpec, parse_p_value, parse_subs, validate_viewer_launch};
+    use super::{
+        Cli, SubSpec, explicit_overlay_pair, normalize_afni_style_arg, parse_p_value, parse_subs,
+        validate_viewer_launch,
+    };
     use clap::Parser;
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     fn path(value: &str) -> Option<PathBuf> {
@@ -206,6 +307,7 @@ mod tests {
         assert!(
             validate_viewer_launch(
                 &path("surface.gii"),
+                &None,
                 &None,
                 &None,
                 &None,
@@ -227,6 +329,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &None,
                 &None
             )
             .is_err()
@@ -236,6 +339,7 @@ mod tests {
                 &None,
                 &path("surface.spec"),
                 &path("SurfVol.nii"),
+                &None,
                 &None,
                 &None,
                 &None,
@@ -255,6 +359,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &None,
                 &None
             )
             .is_ok()
@@ -268,6 +373,7 @@ mod tests {
                 &None,
                 &None,
                 &path("SurfVol.nii"),
+                &None,
                 &None,
                 &None,
                 &None,
@@ -287,6 +393,7 @@ mod tests {
                 &path("stats.niml.dset"),
                 &None,
                 &None,
+                &None,
                 &None
             )
             .is_err()
@@ -301,6 +408,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &None,
                 &path("roi.niml.roi"),
                 &None,
                 &None
@@ -310,6 +418,7 @@ mod tests {
         assert!(
             validate_viewer_launch(
                 &path("surface.gii"),
+                &None,
                 &None,
                 &None,
                 &None,
@@ -327,6 +436,7 @@ mod tests {
             validate_viewer_launch(
                 &path("surface.gii"),
                 &path("surface.spec"),
+                &None,
                 &None,
                 &None,
                 &None,
@@ -363,10 +473,84 @@ mod tests {
     }
 
     #[test]
+    fn explicit_paired_overlay_launch_options_parse_and_validate() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--spec",
+            "scene_both.spec",
+            "--sv",
+            "SurfVol.nii",
+            "--overlay-lh",
+            "left.weird.name.niml.dset",
+            "--overlay-rh",
+            "right.other.name.niml.dset",
+            "--subs",
+            "0,1",
+            "--p-val",
+            "0.01",
+        ]);
+
+        let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
+        assert_eq!(
+            overlay_pair.as_ref().map(|pair| &pair.left_path),
+            Some(&PathBuf::from("left.weird.name.niml.dset"))
+        );
+        assert_eq!(
+            overlay_pair.as_ref().map(|pair| &pair.right_path),
+            Some(&PathBuf::from("right.other.name.niml.dset"))
+        );
+        assert!(
+            validate_viewer_launch(
+                &cli.surface,
+                &cli.spec,
+                &cli.surface_volume,
+                &cli.overlay,
+                &overlay_pair,
+                &cli.roi,
+                &cli.subs.map(|subs| subs.0),
+                &cli.p_value,
+            )
+            .is_ok()
+        );
+
+        assert!(Cli::try_parse_from(["sumaru", "--overlay-lh", "left.niml.dset"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "sumaru",
+                "--surface",
+                "surface.gii",
+                "--overlay",
+                "stats.niml.dset",
+                "--overlay-lh",
+                "left.niml.dset",
+                "--overlay-rh",
+                "right.niml.dset",
+            ])
+            .is_err()
+        );
+
+        let pair = explicit_overlay_pair(path("left.niml.dset"), path("right.niml.dset"));
+        assert!(
+            validate_viewer_launch(
+                &path("surface.gii"),
+                &None,
+                &None,
+                &None,
+                &pair,
+                &None,
+                &None,
+                &None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn subs_and_p_value_require_overlay() {
         assert!(
             validate_viewer_launch(
                 &path("surface.gii"),
+                &None,
                 &None,
                 &None,
                 &None,
@@ -379,6 +563,7 @@ mod tests {
         assert!(
             validate_viewer_launch(
                 &path("surface.gii"),
+                &None,
                 &None,
                 &None,
                 &None,
@@ -439,5 +624,43 @@ mod tests {
 
         assert!(!cli.preload);
         assert!(cli.no_preload);
+    }
+
+    #[test]
+    fn afni_talk_launch_options_parse() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--surface",
+            "surface.gii",
+            "--talk-afni",
+            "--afni-port",
+            "53211",
+        ]);
+
+        assert!(cli.talk_afni);
+        assert_eq!(cli.afni_port, Some(53211));
+    }
+
+    #[test]
+    fn afni_style_port_flags_normalize_for_clap() {
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-np")),
+            OsString::from("--np")
+        );
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-npb")),
+            OsString::from("--npb")
+        );
+
+        let cli = Cli::parse_from([
+            OsString::from("sumaru"),
+            normalize_afni_style_arg(OsString::from("-spec")),
+            OsString::from("scene.spec"),
+            normalize_afni_style_arg(OsString::from("-sv")),
+            OsString::from("SurfVol.nii"),
+            normalize_afni_style_arg(OsString::from("-npb")),
+            OsString::from("1"),
+        ]);
+        assert_eq!(cli.npb, Some(1));
     }
 }
