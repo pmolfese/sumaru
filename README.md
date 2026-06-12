@@ -67,17 +67,25 @@ AFNI must be listening for NIML before Sumaru can connect: launch AFNI with
 `-niml` (and usually `-yesplugouts` for SUMA-style sessions), or press the
 `NIML+PO` button in the AFNI GUI after launch.
 
-For reproducible debugging, add `--niml-record path/to/session.nimlrec` to a
-viewer launch. Sumaru records each sent and received NIML event with direction,
-timestamp, and the serialized payload. The saved trace can be inspected or
-replayed without launching the viewer:
+For a quick look at any supported file, use the generic inspector. It covers
+GIFTI, NIFTI, raw NIML datasets/ROIs/label tables, and recorded NIML traces:
+
+```sh
+cargo run -- inspect path/to/file
+```
+
+For reproducible AFNI talk debugging, add
+`--niml-record path/to/session.nimlrec` to a viewer launch. Sumaru records each
+sent and received NIML event with direction, timestamp, and the serialized
+payload. Recording is intentionally plain `.nimlrec` for live-session speed;
+gzip the file afterward if you want to archive or share it. The debug readers
+accept both `.nimlrec` and `.nimlrec.gz`:
 
 ```sh
 cargo run -- niml inspect path/to/session.nimlrec
-cargo run -- niml replay path/to/session.nimlrec
+cargo run -- niml replay path/to/session.nimlrec.gz
 ```
 
-The same `niml inspect` and `niml replay` commands also accept raw NIML files.
 Small test messages can be sent directly to an AFNI/SUMA NIML socket:
 
 ```sh
