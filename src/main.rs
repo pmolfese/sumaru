@@ -7,6 +7,9 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use sumaru::afni::{DEFAULT_AFNI_HOST, resolve_afni_port_config};
 use sumaru::inspect::inspect_path;
+use sumaru::niml_debug::{
+    NimlSendCommand, inspect_debug_path, replay_debug_path, send_debug_command,
+};
 use sumaru::viewer::{self, AfniViewerOptions, ExplicitOverlayPair};
 
 #[derive(Debug, Parser)]
@@ -77,6 +80,10 @@ struct Cli {
     #[arg(long = "talk-afni")]
     talk_afni: bool,
 
+    /// Record every live AFNI/SUMA NIML message sent and received by Sumaru.
+    #[arg(long = "niml-record", value_name = "PATH")]
+    niml_record: Option<PathBuf>,
+
     /// AFNI/SUMA NIML host.
     #[arg(long = "afni-host", default_value = DEFAULT_AFNI_HOST)]
     afni_host: String,
@@ -104,6 +111,63 @@ enum Commands {
         /// Path to a GIFTI or NIFTI file.
         path: PathBuf,
     },
+    /// Inspect, replay, or send AFNI/SUMA NIML debug messages.
+    Niml {
+        #[command(subcommand)]
+        command: NimlCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NimlCommands {
+    /// Print an offline summary of a raw NIML file or Sumaru NIML recording.
+    Inspect {
+        /// Path to a raw NIML file or a --niml-record trace.
+        path: PathBuf,
+    },
+    /// Replay a raw NIML file or Sumaru NIML recording through the parser/router.
+    Replay {
+        /// Path to a raw NIML file or a --niml-record trace.
+        path: PathBuf,
+    },
+    /// Send a small NIML test message to an AFNI/SUMA NIML socket.
+    Send {
+        #[command(subcommand)]
+        command: NimlSendCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NimlSendCommands {
+    /// Send every NIML element parsed from a file.
+    Raw {
+        /// Path to a raw NIML file.
+        path: PathBuf,
+    },
+    /// Send a SUMA_crosshair_xyz test message.
+    Crosshair {
+        /// AFNI/SUMA surface idcode to target.
+        #[arg(long = "surface-id")]
+        surface_idcode: String,
+
+        /// Optional domain parent idcode.
+        #[arg(long = "domain-parent-id")]
+        domain_parent_idcode: Option<String>,
+
+        /// Surface-local node index.
+        #[arg(long = "node")]
+        node_index: u32,
+
+        /// AFNI-space XYZ coordinate, formatted as x,y,z.
+        #[arg(long = "xyz", value_parser = parse_xyz)]
+        xyz: [f32; 3],
+    },
+    /// Send a small Sumaru-prefixed viewer command.
+    Command {
+        /// Command name, for example reset-camera or toggle-overlay.
+        #[arg(value_parser = parse_niml_viewer_command)]
+        command: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +179,7 @@ fn main() -> Result<()> {
     let preload = cli.preload && !cli.no_preload;
     let subs = cli.subs.map(|subs| subs.0);
     let p_value = cli.p_value;
+    let niml_record_path = cli.niml_record;
     let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
     let afni_requested = cli.talk_afni
         || cli.afni_port.is_some()
@@ -133,19 +198,14 @@ fn main() -> Result<()> {
         )?,
     };
 
-    match (
-        cli.surface,
-        cli.spec,
-        cli.surface_volume,
-        cli.overlay,
-        overlay_pair,
-        cli.roi,
-        subs,
-        p_value,
-        cli.command,
-        afni_requested,
-    ) {
-        (surface, spec, surface_volume, overlay, overlay_pair, roi, subs, p_value, None, _) => {
+    let surface = cli.surface;
+    let spec = cli.spec;
+    let surface_volume = cli.surface_volume;
+    let overlay = cli.overlay;
+    let roi = cli.roi;
+
+    match cli.command {
+        None => {
             validate_viewer_launch(
                 &surface,
                 &spec,
@@ -168,25 +228,81 @@ fn main() -> Result<()> {
                 verbose,
                 preload,
                 afni,
+                niml_record_path,
             })?;
         }
-        (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(Commands::Inspect { path }),
-            false,
-        ) => {
+        Some(Commands::Inspect { path }) => {
+            validate_no_viewer_launch_options(
+                &surface,
+                &spec,
+                &surface_volume,
+                &overlay,
+                &overlay_pair,
+                &roi,
+                &subs,
+                &p_value,
+                &niml_record_path,
+            )?;
+            if afni_requested {
+                bail!("AFNI connection flags only apply to viewer launches and `niml send`");
+            }
             let report = inspect_path(path)?;
             println!("{report}");
         }
-        _ => {
-            bail!("viewer launch options and subcommands cannot be mixed");
+        Some(Commands::Niml { command }) => {
+            validate_no_viewer_launch_options(
+                &surface,
+                &spec,
+                &surface_volume,
+                &overlay,
+                &overlay_pair,
+                &roi,
+                &subs,
+                &p_value,
+                &niml_record_path,
+            )?;
+            run_niml_command(command, &afni.port_config, verbose)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_niml_command(
+    command: NimlCommands,
+    afni: &sumaru::afni::AfniPortConfig,
+    verbose: bool,
+) -> Result<()> {
+    match command {
+        NimlCommands::Inspect { path } => {
+            println!("{}", inspect_debug_path(path)?);
+        }
+        NimlCommands::Replay { path } => {
+            println!("{}", replay_debug_path(path)?.to_text());
+        }
+        NimlCommands::Send { command } => {
+            let command = match command {
+                NimlSendCommands::Raw { path } => NimlSendCommand::Raw(path),
+                NimlSendCommands::Crosshair {
+                    surface_idcode,
+                    domain_parent_idcode,
+                    node_index,
+                    xyz,
+                } => NimlSendCommand::Crosshair {
+                    surface_idcode,
+                    domain_parent_idcode,
+                    node_index,
+                    xyz,
+                },
+                NimlSendCommands::Command { command } => NimlSendCommand::ViewerCommand(command),
+            };
+            let count = send_debug_command(afni, verbose, command)?;
+            println!(
+                "Sent {count} NIML element{} to {}:{}.",
+                if count == 1 { "" } else { "s" },
+                afni.host,
+                afni.port
+            );
         }
     }
 
@@ -232,6 +348,33 @@ fn validate_viewer_launch(
     Ok(())
 }
 
+fn validate_no_viewer_launch_options(
+    surface: &Option<PathBuf>,
+    spec: &Option<PathBuf>,
+    surface_volume: &Option<PathBuf>,
+    overlay: &Option<PathBuf>,
+    overlay_pair: &Option<ExplicitOverlayPair>,
+    roi: &Option<PathBuf>,
+    subs: &Option<Vec<String>>,
+    p_value: &Option<f64>,
+    niml_record_path: &Option<PathBuf>,
+) -> Result<()> {
+    if surface.is_some()
+        || spec.is_some()
+        || surface_volume.is_some()
+        || overlay.is_some()
+        || overlay_pair.is_some()
+        || roi.is_some()
+        || subs.is_some()
+        || p_value.is_some()
+        || niml_record_path.is_some()
+    {
+        bail!("viewer launch options and subcommands cannot be mixed");
+    }
+
+    Ok(())
+}
+
 fn explicit_overlay_pair(
     left_path: Option<PathBuf>,
     right_path: Option<PathBuf>,
@@ -270,6 +413,45 @@ fn parse_p_value(value: &str) -> Result<f64, String> {
     Ok(p_value)
 }
 
+fn parse_xyz(value: &str) -> Result<[f32; 3], String> {
+    let pieces = value
+        .split(',')
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| {
+            piece
+                .parse::<f32>()
+                .map_err(|_| format!("'{piece}' is not a valid XYZ coordinate"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if pieces.len() != 3 {
+        return Err("--xyz expects x,y,z".to_string());
+    }
+    if pieces.iter().any(|value| !value.is_finite()) {
+        return Err("--xyz coordinates must be finite".to_string());
+    }
+    Ok([pieces[0], pieces[1], pieces[2]])
+}
+
+fn parse_niml_viewer_command(value: &str) -> Result<String, String> {
+    let normalized = value.trim().replace('-', "_");
+    match normalized.as_str() {
+        "reset_camera"
+        | "toggle_overlay"
+        | "background_black"
+        | "background_white"
+        | "surface_controller_open"
+        | "surface_controller_closed"
+        | "roi_controller_open"
+        | "roi_controller_closed" => Ok(normalized),
+        _ => Err(format!(
+            "unknown NIML viewer command '{value}'; expected one of reset-camera, \
+             toggle-overlay, background-black, background-white, surface-controller-open, \
+             surface-controller-closed, roi-controller-open, roi-controller-closed"
+        )),
+    }
+}
+
 fn normalized_afni_style_args() -> Vec<OsString> {
     std::env::args_os().map(normalize_afni_style_arg).collect()
 }
@@ -291,8 +473,9 @@ fn normalize_afni_style_arg(arg: OsString) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, SubSpec, explicit_overlay_pair, normalize_afni_style_arg, parse_p_value, parse_subs,
-        validate_viewer_launch,
+        Cli, Commands, NimlCommands, NimlSendCommands, SubSpec, explicit_overlay_pair,
+        normalize_afni_style_arg, parse_niml_viewer_command, parse_p_value, parse_subs, parse_xyz,
+        validate_no_viewer_launch_options, validate_viewer_launch,
     };
     use clap::Parser;
     use std::ffi::OsString;
@@ -639,6 +822,90 @@ mod tests {
 
         assert!(cli.talk_afni);
         assert_eq!(cli.afni_port, Some(53211));
+    }
+
+    #[test]
+    fn niml_record_path_is_viewer_only() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--surface",
+            "surface.gii",
+            "--niml-record",
+            "session.nimlrec",
+        ]);
+        assert_eq!(cli.niml_record, Some(PathBuf::from("session.nimlrec")));
+
+        assert!(
+            validate_no_viewer_launch_options(
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &Some(PathBuf::from("session.nimlrec")),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn niml_subcommands_parse() {
+        let cli = Cli::parse_from(["sumaru", "niml", "inspect", "session.nimlrec"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Niml {
+                command: NimlCommands::Inspect { .. }
+            })
+        ));
+
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--afni-port",
+            "53211",
+            "niml",
+            "send",
+            "crosshair",
+            "--surface-id",
+            "surf",
+            "--node",
+            "42",
+            "--xyz",
+            "1,2,3",
+        ]);
+        assert_eq!(cli.afni_port, Some(53211));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Niml {
+                command: NimlCommands::Send {
+                    command: NimlSendCommands::Crosshair {
+                        surface_idcode,
+                        node_index: 42,
+                        xyz,
+                        ..
+                    }
+                }
+            }) if surface_idcode == "surf" && xyz == [1.0, 2.0, 3.0]
+        ));
+    }
+
+    #[test]
+    fn niml_send_parsers_validate_commands_and_xyz() {
+        assert_eq!(parse_xyz("1,2.5,-3").unwrap(), [1.0, 2.5, -3.0]);
+        assert!(parse_xyz("1,2").is_err());
+        assert!(parse_xyz("1,nan,3").is_err());
+
+        assert_eq!(
+            parse_niml_viewer_command("reset-camera").unwrap(),
+            "reset_camera"
+        );
+        assert_eq!(
+            parse_niml_viewer_command("toggle_overlay").unwrap(),
+            "toggle_overlay"
+        );
+        assert!(parse_niml_viewer_command("do-anything").is_err());
     }
 
     #[test]

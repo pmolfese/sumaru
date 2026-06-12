@@ -354,6 +354,7 @@ impl From<SurfacePick> for CrosshairState {
 pub struct PanelState {
     pub surface_controller_visible: bool,
     pub roi_controller_open: bool,
+    pub graph_window_open: bool,
 }
 
 impl Default for PanelState {
@@ -361,6 +362,7 @@ impl Default for PanelState {
         Self {
             surface_controller_visible: true,
             roi_controller_open: false,
+            graph_window_open: false,
         }
     }
 }
@@ -430,6 +432,8 @@ pub enum ViewerCommand {
     SaveAllRois,
     SetSurfaceControllerVisible(bool),
     SetRoiControllerOpen(bool),
+    OpenGraphForPick,
+    SetGraphWindowOpen(bool),
     Preset(ViewPreset),
     HemisphereLayout(HemisphereLayout),
     SelectSceneSurface(usize),

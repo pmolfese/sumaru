@@ -44,11 +44,15 @@ AFNI, SUMA, SUMAvista, and `sumaru`.
 - [x] Wire the first live viewer bridge: launch with `--talk-afni`, toggle with
   `T`, force-resend active surface geometry with `Control+T`, and display
   incoming `SUMA_irgba` color overlays.
-- [ ] Add debug tools for AFNI interop: record message streams, replay message
+- [x] Add debug tools for AFNI interop: record message streams, replay message
   streams, inspect individual messages, and send small test commands from the
   CLI.
 - [ ] Add compatibility tests against AFNI-generated messages and representative
   session files.
+  - [ ] Replace the large local `sub-3_both.spec` AFNI talk recording with a
+    compact committed `.nimlrec.gz` fixture.
+  - [ ] Functional overlay `SUMA_irgba` recording.
+  - [ ] Atlas/label overlay `SUMA_irgba` recording.
 
 ### File Format Polish In `sumaru`
 
@@ -108,6 +112,15 @@ the larger GPU/shader optimization pass.
   GIFTI/FreeSurfer label tables.
 - [ ] Add richer node/triangle inspection panels backed by the current pick and
   crosshair state.
+- [ ] Promote picked-node graphing into a daily-driver workflow: persistent
+  graph windows opened from `G`, clear column/timepoint labeling, multiple
+  picked-node traces, graph export, and live refresh when the active overlay or
+  selected node changes.
+- [ ] Add a `sumaru graph` or `sumaru plot` command for non-GUI graphing and
+  inspection of surface datasets by node, ROI, column range, or saved pick.
+  Start with a compact form like `sumaru graph <vertex> <dataset>` and expand
+  to optional surface/domain context, output image export, and multi-column
+  plotting.
 - [ ] Add explicit surface visibility and focus controls for multi-surface and
   `.spec` scenes.
 - [ ] Add multiple overlay planes with explicit foreground/background ordering.
@@ -194,6 +207,36 @@ semantics need to be represented correctly before serious rendering begins.
   selectable timepoints/bricks later.
 - [ ] Integrate surface, overlay, ROI, and volume scenes once shared spatial
   transforms and crosshair state are reliable.
+
+## Linked Sumaru Sessions And Session Restore
+
+- [ ] Add Sumaru-to-Sumaru NIML/session communication so multiple viewer
+  windows can share crosshair position, selected node, active surface, active
+  overlays, ROI edits, graph windows, and controller state.
+  - [ ] Define the first Sumaru-to-Sumaru message subset: crosshair position,
+    picked node/face, active surface/state, active overlay identity, threshold
+    state, and graph-open requests.
+  - [ ] Add CLI launch options for linked sessions: join an existing Sumaru
+    session, create a new session group, name an instance, and choose whether
+    it starts as a master or follower.
+  - [ ] Add controller/menu controls for selecting the active master for a
+    window, following one master, temporarily unlinking, and reconnecting.
+  - [ ] Support flexible group layouts, including one master with several
+    followers and multiple master/follower groups in the same desktop session.
+  - [ ] Add subtle per-instance color identity across the render window,
+    surface controller, ROI controller, and graph overlay. Use the default
+    current black theme for the original instance, then blue, orange, green,
+    and generated fallback accents for additional windows.
+  - [ ] Keep linked-session state in the shared controller/command layer so
+    AFNI talk, keyboard shortcuts, graph windows, and future scripts can use
+    the same event path.
+  - [ ] Add verbose/debug logging and record/replay support for Sumaru-to-Sumaru
+    messages, modeled after the AFNI NIML recording tools.
+- [ ] Add session save/restore support for launch paths, spec state, active
+  surfaces, surface-volume context, overlays, ROI files, camera/view state,
+  thresholds, graph windows, and linked AFNI/NIML talk settings.
+- [ ] Add `sumaru session save` and `sumaru session restore` commands, with
+  matching menu/controller entries once the format is stable.
 
 ## Packaging, Reliability, And Public Use
 

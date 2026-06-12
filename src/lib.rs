@@ -4,6 +4,7 @@ pub mod command;
 pub mod dataset;
 pub mod inspect;
 pub mod io;
+pub mod niml_debug;
 pub mod overlay;
 pub mod roi;
 pub mod spec;

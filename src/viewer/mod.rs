@@ -32,6 +32,7 @@ use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
 use crate::io::{
     NimlElement, read_gifti_dataset, read_niml_dataset, read_niml_roi, write_niml_roi,
 };
+use crate::niml_debug::NimlRecorder;
 use crate::overlay::{
     ColumnSelection, MaskMode, Overlay, OverlayColumns, OverlayRange, RangeSelection, Threshold,
 };
@@ -105,6 +106,17 @@ const ROI_CONTROL_INNER_WIDTH: u32 = 430;
 const ROI_CONTROL_INNER_HEIGHT: u32 = 260;
 const ROI_CONTROL_MAX_INNER_WIDTH: u32 = 1100;
 const ROI_CONTROL_MIN_INNER_HEIGHT: u32 = 260;
+const GRAPH_WINDOW_INNER_WIDTH: u32 = 600;
+const GRAPH_WINDOW_INNER_HEIGHT: u32 = 400;
+const GRAPH_MIN_INITIAL_INNER_WIDTH: u32 = 420;
+const GRAPH_MIN_INITIAL_INNER_HEIGHT: u32 = 160;
+const GRAPH_MIN_PLOT_WIDTH_POINTS: f32 = 320.0;
+const GRAPH_MIN_PLOT_HEIGHT_POINTS: f32 = 96.0;
+const GRAPH_DEFAULT_PLOT_HEIGHT_POINTS: f32 = 138.0;
+const GRAPH_DOCK_DEFAULT_HEIGHT_POINTS: f32 = 360.0;
+const GRAPH_DOCK_MIN_HEIGHT_POINTS: f32 = 180.0;
+const GRAPH_MAX_VIEW_WIDTH_FRACTION: f32 = 0.75;
+const GRAPH_MAX_VIEW_HEIGHT_FRACTION: f32 = 0.25;
 const INITIAL_WINDOW_RAISE_PIXELS: i32 = 100;
 const OVERLAY_THRESHOLD_COLUMN_WIDTH_POINTS: f32 = 96.0;
 const OVERLAY_THRESHOLD_RAIL_HEIGHT_POINTS: f32 = 315.0;
@@ -153,6 +165,7 @@ pub struct LaunchOptions {
     pub verbose: bool,
     pub preload: bool,
     pub afni: AfniViewerOptions,
+    pub niml_record_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +223,7 @@ struct ViewerApp {
     verbose: bool,
     preload: bool,
     afni: AfniViewerOptions,
+    niml_record_path: Option<PathBuf>,
     event_proxy: EventLoopProxy<ViewerEvent>,
     state: Option<ViewerState>,
     setup_error: Option<anyhow::Error>,
@@ -229,6 +243,7 @@ impl ViewerApp {
             verbose: options.verbose,
             preload: options.preload,
             afni: options.afni,
+            niml_record_path: options.niml_record_path,
             event_proxy,
             state: None,
             setup_error: None,
@@ -264,17 +279,27 @@ impl ViewerApp {
                     .with_visible(false),
             )?,
         );
+        let graph_window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("sumaru graph")
+                    .with_inner_size(graph_initial_inner_size(view_window.inner_size()))
+                    .with_visible(false),
+            )?,
+        );
         if let Ok(position) = view_window.outer_position() {
             let raised_y = position.y.saturating_sub(INITIAL_WINDOW_RAISE_PIXELS);
             view_window.set_outer_position(PhysicalPosition::new(position.x, raised_y));
             control_window.set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y));
             roi_control_window
                 .set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y + 760));
+            graph_window.set_outer_position(PhysicalPosition::new(position.x + 80, raised_y + 80));
         }
         self.state = Some(pollster::block_on(ViewerState::new(
             view_window,
             control_window,
             roi_control_window,
+            graph_window,
             self.initial_surface_path.take(),
             self.initial_spec_path.take(),
             self.initial_surface_volume_path.take(),
@@ -286,6 +311,7 @@ impl ViewerApp {
             self.verbose,
             self.preload,
             self.afni.clone(),
+            self.niml_record_path.clone(),
             self.event_proxy.clone(),
         ))?);
 
@@ -412,6 +438,37 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 },
                 _ => {}
             }
+            return;
+        }
+
+        if window_id == state.graph_window().id() {
+            let input = state.graph_input(&event);
+            if input.repaint {
+                state.graph_window().request_redraw();
+            }
+            if input.consumed {
+                state.graph_window().request_redraw();
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested => {
+                    state.apply_commands(vec![ViewerCommand::SetGraphWindowOpen(false)]);
+                }
+                WindowEvent::Resized(size) => {
+                    state.resize_graph(size);
+                    state.graph_window().request_redraw();
+                }
+                WindowEvent::RedrawRequested => match state.render_graph() {
+                    RenderStatus::Rendered => {}
+                    RenderStatus::Skipped => {}
+                    RenderStatus::Reconfigure => {
+                        state.resize_graph(state.graph_size);
+                        state.graph_window().request_redraw();
+                    }
+                    RenderStatus::ValidationError => eprintln!("graph validation error"),
+                },
+                _ => {}
+            }
         }
     }
 
@@ -427,6 +484,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     if state.controller.panels.roi_controller_open {
                         state.roi_control_window().request_redraw();
                     }
+                    if state.controller.panels.graph_window_open {
+                        state.view_window().request_redraw();
+                    }
                     state.view_window().request_redraw();
                 }
             }
@@ -435,6 +495,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     state.control_window().request_redraw();
                     if state.controller.panels.roi_controller_open {
                         state.roi_control_window().request_redraw();
+                    }
+                    if state.controller.panels.graph_window_open {
+                        state.view_window().request_redraw();
                     }
                     state.view_window().request_redraw();
                 }
@@ -497,19 +560,24 @@ struct ViewerState {
     view_window: Arc<Window>,
     control_window: Arc<Window>,
     roi_control_window: Arc<Window>,
+    graph_window: Arc<Window>,
     view_surface: wgpu::Surface<'static>,
     control_surface: wgpu::Surface<'static>,
     roi_control_surface: wgpu::Surface<'static>,
+    graph_surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     view_config: wgpu::SurfaceConfiguration,
     control_config: wgpu::SurfaceConfiguration,
     roi_control_config: wgpu::SurfaceConfiguration,
+    graph_config: wgpu::SurfaceConfiguration,
     view_size: PhysicalSize<u32>,
     control_size: PhysicalSize<u32>,
     roi_control_size: PhysicalSize<u32>,
+    graph_size: PhysicalSize<u32>,
     last_requested_control_size: Option<PhysicalSize<u32>>,
     last_requested_roi_control_size: Option<PhysicalSize<u32>>,
+    graph_dock_pre_open_size: Option<PhysicalSize<u32>>,
     /// When the view window should next repaint for menu animations, or `None`
     /// if its egui overlay is idle.
     view_repaint_at: Option<Instant>,
@@ -517,6 +585,7 @@ struct ViewerState {
     /// `None` if it is idle. Drives `ControlFlow::WaitUntil`.
     control_repaint_at: Option<Instant>,
     roi_control_repaint_at: Option<Instant>,
+    graph_repaint_at: Option<Instant>,
     view_frame_rendered: bool,
     control_frame_rendered: bool,
     startup_redraw_until: Instant,
@@ -548,6 +617,7 @@ struct ViewerState {
     overlay_display_name: Option<String>,
     roi_layer: Option<RoiLayer>,
     roi_workspace: RoiWorkspace,
+    graph_snapshot: Option<GraphSnapshot>,
     surface_volume_path: Option<PathBuf>,
     surface_volume_idcode: Option<String>,
     scene_stats: Option<SceneStats>,
@@ -562,6 +632,7 @@ struct ViewerState {
     afni_options: AfniViewerOptions,
     afni_connection: Option<AfniConnection>,
     afni_session: AfniNimlSession,
+    afni_recorder: Option<NimlRecorder>,
     afni_rgba_colors: Option<Vec<[f32; 4]>>,
     /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
     /// resends identical colorizations on every redraw; this lets us skip the
@@ -596,6 +667,11 @@ struct ViewerState {
     roi_egui_renderer: Renderer,
     roi_pending_egui_textures: egui::TexturesDelta,
     roi_allocated_egui_textures: HashSet<egui::TextureId>,
+    graph_egui_ctx: egui::Context,
+    graph_egui_state: egui_winit::State,
+    graph_egui_renderer: Renderer,
+    graph_pending_egui_textures: egui::TexturesDelta,
+    graph_allocated_egui_textures: HashSet<egui::TextureId>,
 }
 
 impl ViewerState {
@@ -603,6 +679,7 @@ impl ViewerState {
         view_window: Arc<Window>,
         control_window: Arc<Window>,
         roi_control_window: Arc<Window>,
+        graph_window: Arc<Window>,
         initial_surface_path: Option<PathBuf>,
         initial_spec_path: Option<PathBuf>,
         initial_surface_volume_path: Option<PathBuf>,
@@ -614,15 +691,18 @@ impl ViewerState {
         verbose: bool,
         preload_enabled: bool,
         afni_options: AfniViewerOptions,
+        niml_record_path: Option<PathBuf>,
         event_proxy: EventLoopProxy<ViewerEvent>,
     ) -> Result<Self> {
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
         let roi_control_size = roi_control_window.inner_size();
+        let graph_size = graph_window.inner_size();
         let instance = wgpu::Instance::default();
         let view_surface = instance.create_surface(view_window.clone())?;
         let control_surface = instance.create_surface(control_window.clone())?;
         let roi_control_surface = instance.create_surface(roi_control_window.clone())?;
+        let graph_surface = instance.create_surface(graph_window.clone())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -642,6 +722,7 @@ impl ViewerState {
         let view_caps = view_surface.get_capabilities(&adapter);
         let control_caps = control_surface.get_capabilities(&adapter);
         let roi_control_caps = roi_control_surface.get_capabilities(&adapter);
+        let graph_caps = graph_surface.get_capabilities(&adapter);
         let surface_format = choose_surface_format(&view_caps, &control_caps);
         let present_mode = choose_present_mode(&view_caps, &control_caps);
         let alpha_mode = choose_alpha_mode(&view_caps, &control_caps);
@@ -656,6 +737,18 @@ impl ViewerState {
         ensure!(
             roi_control_caps.alpha_modes.contains(&alpha_mode),
             "ROI controller surface does not support selected alpha mode {alpha_mode:?}"
+        );
+        ensure!(
+            graph_caps.formats.contains(&surface_format),
+            "graph surface does not support selected format {surface_format:?}"
+        );
+        ensure!(
+            graph_caps.present_modes.contains(&present_mode),
+            "graph surface does not support selected present mode {present_mode:?}"
+        );
+        ensure!(
+            graph_caps.alpha_modes.contains(&alpha_mode),
+            "graph surface does not support selected alpha mode {alpha_mode:?}"
         );
         let view_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -687,9 +780,20 @@ impl ViewerState {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        let graph_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: graph_size.width.max(1),
+            height: graph_size.height.max(1),
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
         view_surface.configure(&device, &view_config);
         control_surface.configure(&device, &control_config);
         roi_control_surface.configure(&device, &roi_control_config);
+        graph_surface.configure(&device, &graph_config);
 
         let camera = Camera::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -805,32 +909,52 @@ impl ViewerState {
         );
         roi_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
         let roi_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
+        let graph_egui_ctx = egui::Context::default();
+        graph_egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut graph_egui_state = egui_winit::State::new(
+            graph_egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            graph_window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        graph_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
+        let graph_egui_renderer =
+            Renderer::new(&device, surface_format, RendererOptions::default());
         let initial_surface_volume_path =
             initial_surface_volume_path.map(canonical_or_original_path);
         let initial_surface_volume_idcode =
             query_afni_dataset_idcode_optional(initial_surface_volume_path.as_deref())?;
         let (preload_sender, preload_receiver) = mpsc::channel();
+        let afni_recorder = niml_record_path.map(NimlRecorder::create).transpose()?;
 
         let mut state = Self {
             view_window,
             control_window,
             roi_control_window,
+            graph_window,
             view_surface,
             control_surface,
             roi_control_surface,
+            graph_surface,
             device,
             queue,
             view_config,
             control_config,
             roi_control_config,
+            graph_config,
             view_size,
             control_size,
             roi_control_size,
+            graph_size,
             last_requested_control_size: None,
             last_requested_roi_control_size: None,
+            graph_dock_pre_open_size: None,
             view_repaint_at: None,
             control_repaint_at: None,
             roi_control_repaint_at: None,
+            graph_repaint_at: None,
             view_frame_rendered: false,
             control_frame_rendered: false,
             startup_redraw_until: Instant::now(),
@@ -859,6 +983,7 @@ impl ViewerState {
             overlay_display_name: None,
             roi_layer: None,
             roi_workspace: RoiWorkspace::default(),
+            graph_snapshot: None,
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             scene_stats: None,
@@ -871,6 +996,7 @@ impl ViewerState {
             afni_options,
             afni_connection: None,
             afni_session: AfniNimlSession::new(),
+            afni_recorder,
             afni_rgba_colors: None,
             afni_rgba_signatures: HashMap::new(),
             sent_crosshair_node: None,
@@ -897,6 +1023,11 @@ impl ViewerState {
             roi_egui_renderer,
             roi_pending_egui_textures: egui::TexturesDelta::default(),
             roi_allocated_egui_textures: HashSet::new(),
+            graph_egui_ctx,
+            graph_egui_state,
+            graph_egui_renderer,
+            graph_pending_egui_textures: egui::TexturesDelta::default(),
+            graph_allocated_egui_textures: HashSet::new(),
         };
 
         if let Some(path) = initial_surface_path {
@@ -941,6 +1072,10 @@ impl ViewerState {
 
     fn roi_control_window(&self) -> &Window {
         &self.roi_control_window
+    }
+
+    fn graph_window(&self) -> &Window {
+        &self.graph_window
     }
 
     fn arm_startup_redraw_guard(&mut self) {
@@ -1001,6 +1136,18 @@ impl ViewerState {
         self.roi_control_config.height = size.height;
         self.roi_control_surface
             .configure(&self.device, &self.roi_control_config);
+    }
+
+    fn resize_graph(&mut self, size: PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+
+        self.graph_size = size;
+        self.graph_config.width = size.width;
+        self.graph_config.height = size.height;
+        self.graph_surface
+            .configure(&self.device, &self.graph_config);
     }
 
     fn view_input(&mut self, event: &WindowEvent) -> bool {
@@ -1128,6 +1275,12 @@ impl ViewerState {
                         self.toggle_overlay_visibility();
                         true
                     }
+                    PhysicalKey::Code(KeyCode::KeyG) => {
+                        if let Err(error) = self.open_graph_for_current_pick() {
+                            self.set_error(error);
+                        }
+                        true
+                    }
                     PhysicalKey::Code(KeyCode::BracketLeft) => {
                         if let Err(error) =
                             self.toggle_pair_hemisphere_visibility(SurfaceSide::Left)
@@ -1205,6 +1358,17 @@ impl ViewerState {
         }
     }
 
+    fn graph_input(&mut self, event: &WindowEvent) -> InputResponse {
+        let egui_response = self
+            .graph_egui_state
+            .on_window_event(&self.graph_window, event);
+
+        InputResponse {
+            consumed: egui_response.consumed,
+            repaint: egui_response.repaint,
+        }
+    }
+
     fn update(&mut self) {
         let camera = self.camera.clone();
         self.update_render_uniforms_for_camera(&camera);
@@ -1214,8 +1378,26 @@ impl ViewerState {
         self.surface_render_set.is_some() || self.surface_buffers.is_some()
     }
 
+    fn scene_viewport_size(&self) -> PhysicalSize<u32> {
+        if self.controller.panels.graph_window_open
+            && let Some(pre_open_size) = self.graph_dock_pre_open_size
+        {
+            return PhysicalSize::new(
+                self.view_size.width.max(1),
+                pre_open_size.height.min(self.view_size.height).max(1),
+            );
+        }
+
+        PhysicalSize::new(self.view_size.width.max(1), self.view_size.height.max(1))
+    }
+
+    fn scene_viewport_aspect(&self) -> f32 {
+        let size = self.scene_viewport_size();
+        size.width.max(1) as f32 / size.height.max(1) as f32
+    }
+
     fn update_render_uniforms_for_camera(&mut self, camera: &Camera) {
-        let aspect = self.view_config.width as f32 / self.view_config.height as f32;
+        let aspect = self.scene_viewport_aspect();
         if let Some(render_set) = self.surface_render_set.as_ref() {
             for instance in &render_set.instances {
                 self.queue.write_buffer(
@@ -1258,6 +1440,9 @@ impl ViewerState {
             self.control_window.request_redraw();
             if self.controller.panels.roi_controller_open {
                 self.roi_control_window.request_redraw();
+            }
+            if self.controller.panels.graph_window_open {
+                self.view_window.request_redraw();
             }
         }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -1376,6 +1561,16 @@ impl ViewerState {
             timestamp_writes: None,
             multiview_mask: None,
         });
+        let viewport_size = self.scene_viewport_size();
+        render_pass.set_viewport(
+            0.0,
+            0.0,
+            viewport_size.width as f32,
+            viewport_size.height as f32,
+            0.0,
+            1.0,
+        );
+        render_pass.set_scissor_rect(0, 0, viewport_size.width, viewport_size.height);
 
         if let Some(render_set) = &self.surface_render_set {
             render_pass.set_pipeline(&self.render_pipeline);
@@ -1545,7 +1740,7 @@ impl ViewerState {
             return;
         }
 
-        let aspect = self.view_config.width.max(1) as f32 / self.view_config.height.max(1) as f32;
+        let aspect = self.scene_viewport_aspect();
         let tan_y = (camera::CAMERA_FOV_Y_RADIANS * 0.5).tan();
         let tan_x = tan_y * aspect.max(0.01);
         let (eye_direction, up) = camera.view_axes();
@@ -1581,7 +1776,7 @@ impl ViewerState {
             return false;
         }
 
-        let aspect = self.view_config.width.max(1) as f32 / self.view_config.height.max(1) as f32;
+        let aspect = self.scene_viewport_aspect();
         let tan_y = (camera::CAMERA_FOV_Y_RADIANS * 0.5).tan();
         let tan_x = tan_y * aspect.max(0.01);
         let (eye_direction, up) = camera.view_axes();
@@ -1749,6 +1944,9 @@ impl ViewerState {
             if self.controller.panels.roi_controller_open {
                 self.roi_control_window.request_redraw();
             }
+            if self.controller.panels.graph_window_open {
+                self.view_window.request_redraw();
+            }
         }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
@@ -1888,6 +2086,9 @@ impl ViewerState {
             if self.controller.panels.roi_controller_open {
                 self.roi_control_window.request_redraw();
             }
+            if self.controller.panels.graph_window_open {
+                self.view_window.request_redraw();
+            }
         }
 
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -1974,6 +2175,117 @@ impl ViewerState {
         self.roi_pending_egui_textures = retained_textures;
         if needs_texture_repaint {
             self.roi_control_repaint_at = Some(Instant::now());
+        }
+
+        command_buffers.push(encoder.finish());
+        self.queue.submit(command_buffers);
+        output.present();
+
+        RenderStatus::Rendered
+    }
+
+    fn render_graph(&mut self) -> RenderStatus {
+        egui_winit::update_viewport_info(
+            self.graph_egui_state
+                .egui_input_mut()
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default(),
+            &self.graph_egui_ctx,
+            &self.graph_window,
+            false,
+        );
+        let raw_input = self.graph_egui_state.take_egui_input(&self.graph_window);
+        let egui_ctx = self.graph_egui_ctx.clone();
+        #[allow(deprecated)]
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            self.draw_graph_ui(ctx);
+        });
+        self.graph_repaint_at = repaint_delay_to_instant(&full_output);
+        self.graph_egui_state
+            .handle_platform_output(&self.graph_window, full_output.platform_output);
+
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [self.graph_config.width, self.graph_config.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        self.graph_pending_egui_textures
+            .append(full_output.textures_delta);
+
+        let output = match self.graph_surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(output)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return RenderStatus::Skipped;
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                return RenderStatus::Reconfigure;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => return RenderStatus::ValidationError,
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("graph render encoder"),
+            });
+
+        let (needs_texture_repaint, retained_textures) = upload_pending_egui_textures(
+            &self.device,
+            &self.queue,
+            &mut self.graph_egui_renderer,
+            &self.graph_pending_egui_textures,
+            &mut self.graph_allocated_egui_textures,
+        );
+        let mut command_buffers = self.graph_egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        {
+            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("graph egui render pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.06,
+                            g: 0.07,
+                            b: 0.08,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            self.graph_egui_renderer.render(
+                &mut egui_pass.forget_lifetime(),
+                &paint_jobs,
+                &screen_descriptor,
+            );
+        }
+
+        free_pending_egui_textures(
+            &mut self.graph_egui_renderer,
+            &self.graph_pending_egui_textures,
+            &mut self.graph_allocated_egui_textures,
+        );
+        self.graph_pending_egui_textures = retained_textures;
+        if needs_texture_repaint {
+            self.graph_repaint_at = Some(Instant::now());
         }
 
         command_buffers.push(encoder.finish());
@@ -2177,13 +2489,51 @@ impl ViewerState {
                             actions.push(ViewerCommand::SetRoiControllerOpen(roi_open));
                             ui.close();
                         }
+                        if ui
+                            .add_enabled(
+                                self.controller.interaction.pick.is_some(),
+                                egui::Button::new("Graph Pick    G"),
+                            )
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::OpenGraphForPick);
+                            ui.close();
+                        }
                     });
                 });
             });
 
+        if self.controller.panels.graph_window_open {
+            self.draw_graph_dock_ui(ctx, &mut actions);
+        }
+
         self.draw_view_transient_label(ctx);
 
         actions
+    }
+
+    fn draw_graph_dock_ui(&self, ctx: &egui::Context, actions: &mut Vec<ViewerCommand>) {
+        #[allow(deprecated)]
+        egui::TopBottomPanel::bottom("graph_dock")
+            .resizable(true)
+            .default_height(GRAPH_DOCK_DEFAULT_HEIGHT_POINTS)
+            .min_height(GRAPH_DOCK_MIN_HEIGHT_POINTS)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Graph").strong().color(accent_color()));
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("picked node overlay values").color(muted_color()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            actions.push(ViewerCommand::SetGraphWindowOpen(false));
+                        }
+                    });
+                });
+                ui.separator();
+                self.draw_graph_contents(ui);
+            });
     }
 
     fn draw_view_transient_label(&mut self, ctx: &egui::Context) {
@@ -2248,6 +2598,55 @@ impl ViewerState {
             actions,
             desired_control_size_points,
         }
+    }
+
+    fn draw_graph_ui(&self, ctx: &egui::Context) {
+        #[allow(deprecated)]
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.draw_graph_contents(ui);
+        });
+    }
+
+    fn draw_graph_contents(&self, ui: &mut egui::Ui) {
+        ui.set_min_width(GRAPH_MIN_PLOT_WIDTH_POINTS);
+        let Some(snapshot) = self.graph_snapshot.as_ref() else {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.35).max(24.0));
+                ui.label(
+                    egui::RichText::new("Pick a node, then press G")
+                        .size(18.0)
+                        .color(muted_color()),
+                );
+            });
+            return;
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Node").color(accent_color()));
+            ui.monospace(snapshot.node_index.to_string());
+            ui.separator();
+            ui.label(egui::RichText::new("Surf x,y,z").color(accent_color()));
+            ui.monospace(coordinate_label(snapshot.surface_position));
+        });
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Surface").color(accent_color()));
+            ui.monospace(truncate_middle(&snapshot.surface_label, 44));
+            ui.separator();
+            ui.label(egui::RichText::new("Overlay").color(accent_color()));
+            ui.monospace(truncate_middle(&snapshot.overlay_label, 44));
+        });
+        ui.add_space(6.0);
+
+        if snapshot.points.is_empty() {
+            ui.label(
+                egui::RichText::new("No numeric overlay columns are available for this node.")
+                    .color(muted_color()),
+            );
+            return;
+        }
+
+        draw_graph_snapshot(ui, snapshot, self.overlay_columns);
     }
 
     fn draw_roi_control_contents(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ViewerCommand>) {
@@ -3194,6 +3593,14 @@ impl ViewerState {
                 ViewerCommand::SetRoiControllerOpen(open) => {
                     self.set_roi_controller_open(open);
                 }
+                ViewerCommand::OpenGraphForPick => {
+                    if let Err(error) = self.open_graph_for_current_pick() {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::SetGraphWindowOpen(open) => {
+                    self.set_graph_window_open(open);
+                }
                 ViewerCommand::Preset(preset) => {
                     self.controller.camera.set_preset(preset);
                     self.camera.set_preset(preset.into());
@@ -3243,6 +3650,8 @@ impl ViewerState {
         self.controller.surface.current_roi_path = None;
         self.roi_layer = None;
         self.roi_workspace.clear();
+        self.graph_snapshot = None;
+        self.set_graph_window_open(false);
         self.controller.roi.visible = true;
         self.controller.interaction.set_pick(None);
         self.controller.display.pair_visibility = PairVisibility::both();
@@ -3427,9 +3836,14 @@ impl ViewerState {
 
         let config = self.afni_options.port_config.clone();
         let event_proxy = self.event_proxy.clone();
-        let connection = AfniConnection::connect(&config, self.verbose, move || {
-            let _ = event_proxy.send_event(ViewerEvent::AfniMessagesReady);
-        })
+        let connection = AfniConnection::connect(
+            &config,
+            self.verbose,
+            self.afni_recorder.clone(),
+            move || {
+                let _ = event_proxy.send_event(ViewerEvent::AfniMessagesReady);
+            },
+        )
         .with_context(|| {
             format!(
                 "failed to connect to AFNI/SUMA NIML talk at {}:{}",
@@ -5176,6 +5590,14 @@ impl ViewerState {
 
     fn pick_surface_at_cursor(&self) -> Option<SurfacePick> {
         let cursor = self.view_cursor_position?;
+        let scene_size = self.scene_viewport_size();
+        if cursor.0 < 0.0
+            || cursor.1 < 0.0
+            || cursor.0 > f64::from(scene_size.width)
+            || cursor.1 > f64::from(scene_size.height)
+        {
+            return None;
+        }
         if let Some(pick) = self.pick_active_pair_surface_at_cursor(cursor) {
             return Some(pick);
         }
@@ -5185,7 +5607,7 @@ impl ViewerState {
             mesh,
             self.overlay_values.as_ref(),
             &self.camera,
-            self.view_size,
+            scene_size,
             cursor,
         )
     }
@@ -5218,7 +5640,7 @@ impl ViewerState {
                     mesh,
                     self.overlay_values.as_ref(),
                     &self.camera,
-                    self.view_size,
+                    self.scene_viewport_size(),
                     cursor,
                     *matrix,
                     node_offset,
@@ -5519,6 +5941,138 @@ impl ViewerState {
         }
     }
 
+    fn open_graph_for_current_pick(&mut self) -> Result<()> {
+        let Some(pick) = self.controller.interaction.pick else {
+            self.log_status("Pick a surface node before opening a graph.");
+            return Ok(());
+        };
+        let snapshot = self
+            .graph_snapshot_for_pick(pick)
+            .context("no plottable overlay values are available for the picked node")?;
+        self.graph_snapshot = Some(snapshot);
+        self.set_graph_window_open(true);
+        self.log_status(format!("Opened graph for node {}.", pick.node_index));
+        Ok(())
+    }
+
+    fn set_graph_window_open(&mut self, open: bool) {
+        let was_open = self.controller.panels.graph_window_open;
+        if open && !was_open {
+            self.grow_view_window_for_graph_dock();
+        } else if !open && was_open {
+            self.shrink_view_window_after_graph_dock();
+        }
+        self.controller.panels.graph_window_open = open;
+        self.graph_window.set_visible(false);
+        if open {
+            self.view_window.request_redraw();
+        }
+        self.view_window.request_redraw();
+    }
+
+    fn grow_view_window_for_graph_dock(&mut self) {
+        if self.graph_dock_pre_open_size.is_some() {
+            return;
+        }
+
+        let growth = self.graph_dock_height_pixels();
+        if growth == 0 {
+            return;
+        }
+
+        let desired_size = PhysicalSize::new(
+            self.view_size.width.max(1),
+            self.view_size.height.saturating_add(growth).max(1),
+        );
+        self.graph_dock_pre_open_size = Some(self.view_size);
+        if let Some(actual_size) = self.view_window.request_inner_size(desired_size) {
+            self.resize_view(actual_size);
+        }
+    }
+
+    fn shrink_view_window_after_graph_dock(&mut self) {
+        let Some(previous_size) = self.graph_dock_pre_open_size.take() else {
+            return;
+        };
+        let desired_height = previous_size.height.max(1);
+        let desired_size = PhysicalSize::new(self.view_size.width.max(1), desired_height);
+        if let Some(actual_size) = self.view_window.request_inner_size(desired_size) {
+            self.resize_view(actual_size);
+        }
+    }
+
+    fn graph_dock_height_pixels(&self) -> u32 {
+        (GRAPH_DOCK_DEFAULT_HEIGHT_POINTS * self.view_egui_ctx.pixels_per_point())
+            .round()
+            .max(1.0) as u32
+    }
+
+    fn graph_snapshot_for_pick(&self, pick: SurfacePick) -> Option<GraphSnapshot> {
+        let mut points = Vec::new();
+        if let Some(dataset) = self.overlay_dataset.as_ref()
+            && let Some(row) = dataset_row_for_node(dataset, pick.node_index)
+        {
+            for (column_index, column) in dataset.columns.iter().enumerate() {
+                let Some(value) = numeric_column_value_as_f32(column, row) else {
+                    continue;
+                };
+                points.push(GraphPoint {
+                    column_index,
+                    label: graph_column_label(column_index, column),
+                    value,
+                });
+            }
+        }
+
+        if points.is_empty() {
+            if let Some(value) = pick.overlay_value {
+                points.push(GraphPoint {
+                    column_index: self.overlay_columns.intensity,
+                    label: "I".to_string(),
+                    value,
+                });
+            }
+            if let Some(value) = pick.threshold_value {
+                points.push(GraphPoint {
+                    column_index: self.overlay_columns.threshold.unwrap_or(1),
+                    label: "T".to_string(),
+                    value,
+                });
+            }
+        }
+
+        if points.is_empty() {
+            return None;
+        }
+
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for point in &points {
+            min = min.min(point.value);
+            max = max.max(point.value);
+        }
+        if !min.is_finite() || !max.is_finite() {
+            return None;
+        }
+        if (max - min).abs() <= f32::EPSILON {
+            min -= 1.0;
+            max += 1.0;
+        } else {
+            let padding = (max - min) * 0.08;
+            min -= padding;
+            max += padding;
+        }
+
+        Some(GraphSnapshot {
+            node_index: pick.node_index,
+            surface_position: pick.surface_position,
+            surface_label: self.pick_surface_display_text(),
+            overlay_label: self.pick_overlay_display_text(),
+            points,
+            y_range: ValueRange { min, max },
+        })
+    }
+
     fn upload_surface_buffers(&mut self) {
         let afni_surface_colors = (self.controller.overlay.visible)
             .then(|| self.afni_rgba_colors.clone())
@@ -5731,7 +6285,7 @@ impl ViewerState {
         let visibility = self.controller.display.pair_visibility;
         let matrices = self.active_pair_matrices_for_layout(layout, visibility);
         let selection_scale = selection_scale_from_model_matrices(&matrices);
-        let aspect = self.view_config.width as f32 / self.view_config.height as f32;
+        let aspect = self.scene_viewport_aspect();
 
         let mut instances = Vec::with_capacity(raw.len());
         for component in raw {
@@ -7396,6 +7950,23 @@ struct PreloadResult {
     component_index: usize,
     path: PathBuf,
     result: std::result::Result<SurfaceMesh, String>,
+}
+
+#[derive(Debug, Clone)]
+struct GraphSnapshot {
+    node_index: u32,
+    surface_position: [f32; 3],
+    surface_label: String,
+    overlay_label: String,
+    points: Vec<GraphPoint>,
+    y_range: ValueRange,
+}
+
+#[derive(Debug, Clone)]
+struct GraphPoint {
+    column_index: usize,
+    label: String,
+    value: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9145,6 +9716,26 @@ fn numeric_column_value_as_f32(column: &DataColumn, row: usize) -> Option<f32> {
     value.is_finite().then_some(value)
 }
 
+fn dataset_row_for_node(dataset: &Dataset, node: u32) -> Option<usize> {
+    if let Some(indices) = dataset.node_indices.as_ref() {
+        indices.iter().position(|candidate| *candidate == node)
+    } else {
+        let row = node as usize;
+        (row < dataset.row_count).then_some(row)
+    }
+}
+
+fn graph_column_label(index: usize, column: &DataColumn) -> String {
+    column.stat.as_ref().map_or_else(
+        || format!("#{index} {}", column.label),
+        |stat| format!("#{index} {} [{}]", column.label, compact_stat_label(stat)),
+    )
+}
+
+fn compact_stat_label(stat: &str) -> &str {
+    stat.split_once('(').map_or(stat, |(label, _)| label).trim()
+}
+
 fn overlay_column_summary(dataset: &Dataset, columns: OverlayColumnSelections) -> String {
     format!(
         "I {}, T {}, B {}.",
@@ -9299,6 +9890,207 @@ fn draw_threshold_column_selector(
     changed
 }
 
+fn draw_graph_snapshot(
+    ui: &mut egui::Ui,
+    snapshot: &GraphSnapshot,
+    columns: OverlayColumnSelections,
+) {
+    let available_height = ui.available_height();
+    let plot_height = (available_height - 32.0).clamp(
+        GRAPH_MIN_PLOT_HEIGHT_POINTS,
+        GRAPH_DEFAULT_PLOT_HEIGHT_POINTS.max(available_height),
+    );
+    let plot_size = egui::vec2(
+        ui.available_width().max(GRAPH_MIN_PLOT_WIDTH_POINTS),
+        plot_height,
+    );
+    let (rect, _) = ui.allocate_exact_size(plot_size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let plot_rect = egui::Rect::from_min_max(
+        rect.min + egui::vec2(54.0, 14.0),
+        rect.max - egui::vec2(70.0, 56.0),
+    );
+    let axis_color = egui::Color32::from_rgb(92, 103, 122);
+    let grid_color = egui::Color32::from_rgb(43, 50, 62);
+    let line_color = egui::Color32::from_rgb(123, 184, 226);
+
+    painter.rect_filled(rect, egui::CornerRadius::same(6), panel_fill_color());
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(6),
+        egui::Stroke::new(1.0, border_color()),
+        egui::StrokeKind::Outside,
+    );
+
+    for step in 0..=4 {
+        let t = step as f32 / 4.0;
+        let y = egui::lerp(plot_rect.bottom()..=plot_rect.top(), t);
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), y),
+                egui::pos2(plot_rect.right(), y),
+            ],
+            egui::Stroke::new(1.0, grid_color),
+        );
+    }
+    painter.line_segment(
+        [
+            egui::pos2(plot_rect.left(), plot_rect.top()),
+            egui::pos2(plot_rect.left(), plot_rect.bottom()),
+        ],
+        egui::Stroke::new(1.0, axis_color),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(plot_rect.left(), plot_rect.bottom()),
+            egui::pos2(plot_rect.right(), plot_rect.bottom()),
+        ],
+        egui::Stroke::new(1.0, axis_color),
+    );
+
+    let y_min = snapshot.y_range.min;
+    let y_max = snapshot.y_range.max;
+    painter.text(
+        egui::pos2(rect.left() + 8.0, plot_rect.top() - 6.0),
+        egui::Align2::LEFT_TOP,
+        format!("{y_max:.4}"),
+        egui::FontId::monospace(12.0),
+        muted_color(),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 8.0, plot_rect.bottom() - 12.0),
+        egui::Align2::LEFT_TOP,
+        format!("{y_min:.4}"),
+        egui::FontId::monospace(12.0),
+        muted_color(),
+    );
+
+    let points = graph_plot_positions(snapshot, plot_rect);
+    for pair in points.windows(2) {
+        painter.line_segment([pair[0].1, pair[1].1], egui::Stroke::new(2.0, line_color));
+    }
+
+    for (index, position) in &points {
+        let point = &snapshot.points[*index];
+        let (color, radius) = graph_point_style(columns, point.column_index);
+        painter.circle_filled(*position, radius, color);
+        painter.circle_stroke(
+            *position,
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::BLACK),
+        );
+    }
+
+    for (index, position) in points.iter().step_by(graph_label_stride(points.len())) {
+        let label = &snapshot.points[*index].label;
+        draw_rotated_graph_label(
+            &painter,
+            egui::pos2(position.x, plot_rect.bottom() + 8.0),
+            &truncate_middle(label, 18),
+        );
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        graph_legend_chip(ui, "I", egui::Color32::from_rgb(123, 184, 226));
+        graph_legend_chip(ui, "T", egui::Color32::from_rgb(246, 199, 94));
+        graph_legend_chip(ui, "B", egui::Color32::from_rgb(170, 132, 255));
+        ui.label(egui::RichText::new("other numeric sub-bricks").color(muted_color()));
+        if let Some(current) = snapshot
+            .points
+            .iter()
+            .find(|point| point.column_index == columns.intensity)
+        {
+            ui.separator();
+            ui.label(format!(
+                "I {} = {:.6}",
+                truncate_middle(&current.label, 24),
+                current.value
+            ));
+        }
+        if let Some(current) = snapshot
+            .points
+            .iter()
+            .find(|point| Some(point.column_index) == columns.threshold)
+        {
+            ui.separator();
+            ui.label(format!(
+                "T {} = {:.6}",
+                truncate_middle(&current.label, 24),
+                current.value
+            ));
+        }
+        if let Some(current) = snapshot
+            .points
+            .iter()
+            .find(|point| Some(point.column_index) == columns.brightness)
+        {
+            ui.separator();
+            ui.label(format!(
+                "B {} = {:.6}",
+                truncate_middle(&current.label, 24),
+                current.value
+            ));
+        }
+    });
+}
+
+fn draw_rotated_graph_label(painter: &egui::Painter, anchor: egui::Pos2, label: &str) {
+    let font_id = egui::FontId::monospace(10.0);
+    let color = muted_color();
+    let galley = painter.layout_no_wrap(label.to_string(), font_id, color);
+    let rect = egui::Align2::CENTER_TOP.anchor_size(anchor, galley.size());
+    let text_shape = egui::epaint::TextShape::new(rect.min, galley, color)
+        .with_override_text_color(color)
+        .with_angle_and_anchor(std::f32::consts::FRAC_PI_4, egui::Align2::CENTER_TOP);
+    painter.add(egui::Shape::Text(text_shape));
+}
+
+fn graph_plot_positions(snapshot: &GraphSnapshot, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
+    let count = snapshot.points.len();
+    let denominator = count.saturating_sub(1).max(1) as f32;
+    snapshot
+        .points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            let x_t = index as f32 / denominator;
+            let y_t = ((point.value - snapshot.y_range.min)
+                / (snapshot.y_range.max - snapshot.y_range.min))
+                .clamp(0.0, 1.0);
+            let x = egui::lerp(rect.left()..=rect.right(), x_t);
+            let y = egui::lerp(rect.bottom()..=rect.top(), y_t);
+            (index, egui::pos2(x, y))
+        })
+        .collect()
+}
+
+fn graph_point_style(
+    columns: OverlayColumnSelections,
+    column_index: usize,
+) -> (egui::Color32, f32) {
+    if column_index == columns.intensity {
+        (egui::Color32::from_rgb(123, 184, 226), 5.0)
+    } else if Some(column_index) == columns.threshold {
+        (egui::Color32::from_rgb(246, 199, 94), 5.0)
+    } else if Some(column_index) == columns.brightness {
+        (egui::Color32::from_rgb(170, 132, 255), 4.5)
+    } else {
+        (egui::Color32::from_rgb(210, 216, 224), 3.5)
+    }
+}
+
+fn graph_label_stride(point_count: usize) -> usize {
+    (point_count / 8).max(1)
+}
+
+fn graph_legend_chip(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+        ui.label(label);
+    });
+}
+
 fn overlay_column_options(dataset: &Dataset) -> Vec<OverlayColumnOption> {
     dataset
         .columns
@@ -9404,6 +10196,27 @@ fn file_name_display(path: &Path) -> String {
         .map_or_else(|| "none".to_string(), ToString::to_string)
 }
 
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars || max_chars < 5 {
+        return value.to_string();
+    }
+
+    let marker = "...";
+    let left_count = (max_chars - marker.len()) / 2;
+    let right_count = max_chars - marker.len() - left_count;
+    let left = value.chars().take(left_count).collect::<String>();
+    let right = value
+        .chars()
+        .rev()
+        .take(right_count)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{left}{marker}{right}")
+}
+
 fn scene_surface_display_label(index: usize, total: usize, surface: &SceneSurface) -> String {
     format!(
         "{}/{} {}{}",
@@ -9506,6 +10319,35 @@ fn free_pending_egui_textures(
             renderer.free_texture(id);
         }
     }
+}
+
+fn graph_initial_inner_size(view_size: PhysicalSize<u32>) -> PhysicalSize<u32> {
+    let max_width = graph_max_inner_width(view_size);
+    let max_height = graph_max_inner_height(view_size);
+    PhysicalSize::new(
+        bounded_initial_graph_dimension(
+            GRAPH_WINDOW_INNER_WIDTH,
+            GRAPH_MIN_INITIAL_INNER_WIDTH,
+            max_width,
+        ),
+        bounded_initial_graph_dimension(
+            GRAPH_WINDOW_INNER_HEIGHT,
+            GRAPH_MIN_INITIAL_INNER_HEIGHT,
+            max_height,
+        ),
+    )
+}
+
+fn bounded_initial_graph_dimension(preferred: u32, min: u32, max: u32) -> u32 {
+    preferred.min(max).max(min.min(max))
+}
+
+fn graph_max_inner_width(view_size: PhysicalSize<u32>) -> u32 {
+    ((view_size.width.max(1) as f32 * GRAPH_MAX_VIEW_WIDTH_FRACTION).round() as u32).max(1)
+}
+
+fn graph_max_inner_height(view_size: PhysicalSize<u32>) -> u32 {
+    ((view_size.height.max(1) as f32 * GRAPH_MAX_VIEW_HEIGHT_FRACTION).round() as u32).max(1)
 }
 
 fn desired_panel_size(

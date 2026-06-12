@@ -67,10 +67,29 @@ AFNI must be listening for NIML before Sumaru can connect: launch AFNI with
 `-niml` (and usually `-yesplugouts` for SUMA-style sessions), or press the
 `NIML+PO` button in the AFNI GUI after launch.
 
+For reproducible debugging, add `--niml-record path/to/session.nimlrec` to a
+viewer launch. Sumaru records each sent and received NIML event with direction,
+timestamp, and the serialized payload. The saved trace can be inspected or
+replayed without launching the viewer:
+
+```sh
+cargo run -- niml inspect path/to/session.nimlrec
+cargo run -- niml replay path/to/session.nimlrec
+```
+
+The same `niml inspect` and `niml replay` commands also accept raw NIML files.
+Small test messages can be sent directly to an AFNI/SUMA NIML socket:
+
+```sh
+cargo run -- --afni-port 53211 niml send raw path/to/message.niml
+cargo run -- --afni-port 53211 niml send crosshair --surface-id SURF_ID --node 42 --xyz 1,2,3
+cargo run -- --afni-port 53211 niml send command reset-camera
+```
+
 Example:
 
 ```sh
-cargo run -- --spec path/to/fsaverage_lh.spec --sv path/to/SurfVol.nii --talk-afni
+cargo run -- --spec path/to/fsaverage_lh.spec --sv path/to/SurfVol.nii --talk-afni --niml-record afni_session.nimlrec
 ```
 
 The same module also defines Sumaru-side NIML state messages for active surface,

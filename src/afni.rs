@@ -16,6 +16,7 @@ use crate::command::{
 use crate::io::{
     NimlData, NimlElement, NimlNumericMatrix, NimlValueType, parse_niml_bytes, serialize_niml_ascii,
 };
+use crate::niml_debug::{NimlDirection, NimlRecorder};
 use crate::surface::SurfaceMesh;
 
 pub const DEFAULT_AFNI_NIML_PORT: u16 = 53211;
@@ -189,6 +190,7 @@ pub struct AfniConnection {
     receiver: Receiver<AfniConnectionEvent>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
+    recorder: Option<NimlRecorder>,
     verbose: bool,
 }
 
@@ -203,6 +205,7 @@ impl AfniConnection {
     pub fn connect(
         config: &AfniPortConfig,
         verbose: bool,
+        recorder: Option<NimlRecorder>,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self> {
         let address = (config.host.as_str(), config.port)
@@ -235,8 +238,16 @@ impl AfniConnection {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = stop.clone();
+        let reader_recorder = recorder.clone();
         let reader = thread::spawn(move || {
-            read_afni_stream(reader_stream, sender, reader_stop, verbose, wake);
+            read_afni_stream(
+                reader_stream,
+                sender,
+                reader_stop,
+                verbose,
+                reader_recorder,
+                wake,
+            );
         });
 
         Ok(Self {
@@ -244,6 +255,7 @@ impl AfniConnection {
             receiver,
             stop,
             reader: Some(reader),
+            recorder,
             verbose,
         })
     }
@@ -257,6 +269,9 @@ impl AfniConnection {
         self.stream
             .flush()
             .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
+        if let Some(recorder) = self.recorder.as_ref() {
+            recorder.record_payload(NimlDirection::Tx, payload.as_bytes())?;
+        }
         Ok(())
     }
 
@@ -384,6 +399,7 @@ fn read_afni_stream(
     sender: mpsc::Sender<AfniConnectionEvent>,
     stop: Arc<AtomicBool>,
     verbose: bool,
+    recorder: Option<NimlRecorder>,
     wake: impl Fn() + Send + 'static,
 ) {
     let mut pending = Vec::new();
@@ -402,6 +418,15 @@ fn read_afni_stream(
                     Ok(elements) => {
                         if !elements.is_empty() {
                             log_niml_elements(verbose, "rx", &elements, pending.len());
+                            if let Some(recorder) = recorder.as_ref()
+                                && let Err(error) =
+                                    recorder.record_payload(NimlDirection::Rx, &pending)
+                            {
+                                let _ = sender.send(AfniConnectionEvent::Error(format!(
+                                    "failed to record AFNI NIML message: {error:#}"
+                                )));
+                                wake();
+                            }
                             let _ = sender.send(AfniConnectionEvent::Elements(elements));
                             wake();
                         }

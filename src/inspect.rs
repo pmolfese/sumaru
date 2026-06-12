@@ -5,11 +5,13 @@ use anyhow::{Context, Result, bail};
 use nifti::{NiftiObject, NiftiVolume, ReaderOptions};
 
 use crate::io::read_gifti_image;
+use crate::niml_debug::inspect_debug_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Gifti,
     Nifti,
+    Niml,
 }
 
 impl fmt::Display for FileKind {
@@ -17,6 +19,7 @@ impl fmt::Display for FileKind {
         match self {
             FileKind::Gifti => f.write_str("GIFTI"),
             FileKind::Nifti => f.write_str("NIFTI"),
+            FileKind::Niml => f.write_str("NIML"),
         }
     }
 }
@@ -45,7 +48,10 @@ pub fn inspect_path(path: impl AsRef<Path>) -> Result<InspectReport> {
     match detect_file_kind(path) {
         Some(FileKind::Gifti) => inspect_gifti(path),
         Some(FileKind::Nifti) => inspect_nifti(path),
-        None => bail!("unsupported file type: {}", path.display()),
+        Some(FileKind::Niml) => inspect_niml(path),
+        None => {
+            inspect_niml(path).with_context(|| format!("unsupported file type: {}", path.display()))
+        }
     }
 }
 
@@ -68,6 +74,15 @@ pub fn detect_file_kind(path: &Path) -> Option<FileKind> {
         || filename.ends_with(".img.gz")
     {
         return Some(FileKind::Nifti);
+    }
+
+    if filename.ends_with(".niml")
+        || filename.contains(".niml.")
+        || filename.ends_with(".nimlrec")
+        || filename.ends_with(".nimlrec.gz")
+        || filename.ends_with(".1d.dset")
+    {
+        return Some(FileKind::Niml);
     }
 
     None
@@ -123,9 +138,25 @@ fn inspect_nifti(path: &Path) -> Result<InspectReport> {
     })
 }
 
+fn inspect_niml(path: &Path) -> Result<InspectReport> {
+    let summary = inspect_debug_path(path)
+        .with_context(|| format!("failed to inspect NIML file {}", path.display()))?
+        .lines()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(InspectReport {
+        path: path.to_path_buf(),
+        kind: FileKind::Niml,
+        summary,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FileKind, detect_file_kind};
+    use super::{FileKind, detect_file_kind, inspect_path};
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -171,5 +202,41 @@ mod tests {
     #[test]
     fn rejects_unknown_files() {
         assert_eq!(detect_file_kind(Path::new("surface.obj")), None);
+    }
+
+    #[test]
+    fn detects_niml_files() {
+        assert_eq!(
+            detect_file_kind(Path::new("stats.niml.dset")),
+            Some(FileKind::Niml)
+        );
+        assert_eq!(
+            detect_file_kind(Path::new("drawn.niml.roi")),
+            Some(FileKind::Niml)
+        );
+        assert_eq!(
+            detect_file_kind(Path::new("session.nimlrec")),
+            Some(FileKind::Niml)
+        );
+        assert_eq!(
+            detect_file_kind(Path::new("session.nimlrec.gz")),
+            Some(FileKind::Niml)
+        );
+    }
+
+    #[test]
+    fn inspect_path_accepts_raw_niml() {
+        let path = std::env::temp_dir().join("sumaru_inspect_raw_niml_test.niml");
+        fs::write(
+            &path,
+            r#"<SUMARU_viewer_command command="reset_camera"></SUMARU_viewer_command>"#,
+        )
+        .unwrap();
+
+        let report = inspect_path(&path).unwrap();
+
+        assert_eq!(report.kind, FileKind::Niml);
+        assert!(report.summary.contains("SUMARU_viewer_command"));
+        let _ = fs::remove_file(path);
     }
 }
