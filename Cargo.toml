@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 egui = "0.34.3"
 egui-wgpu = "0.34.3"
 egui-winit = "0.34.3"
+flate2 = "1.1"
 gifti_rs = { package = "gifti-rs", git = "https://github.com/PennLINC/gifti-rs" }
 glam = "0.33"
 image = { version = "0.25", default-features = false, features = ["png"] }
