@@ -86,6 +86,7 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
 const VERTEX_STRIDE: wgpu::BufferAddress = 40;
 const MODE_LABEL_DURATION: Duration = Duration::from_secs(2);
+const MOMENTUM_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const STARTUP_REDRAW_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_REDRAW_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const SUMA_CONVEXITY_SMOOTHING_ITERATIONS: usize = 5;
@@ -646,6 +647,7 @@ struct ViewerState {
     /// location.
     afni_crosshair_node: Option<u32>,
     camera: Camera,
+    camera_tick_at: Instant,
     view_cursor_position: Option<(f64, f64)>,
     pair_dragging: bool,
     pair_drag_last_cursor: Option<(f64, f64)>,
@@ -1002,6 +1004,7 @@ impl ViewerState {
             sent_crosshair_node: None,
             afni_crosshair_node: None,
             camera,
+            camera_tick_at: Instant::now(),
             view_cursor_position: None,
             pair_dragging: false,
             pair_drag_last_cursor: None,
@@ -1250,6 +1253,10 @@ impl ViewerState {
                         self.show_mode_label(mode);
                         true
                     }
+                    PhysicalKey::Code(KeyCode::KeyM) => {
+                        self.toggle_camera_momentum();
+                        true
+                    }
                     PhysicalKey::Code(KeyCode::Space) => {
                         self.camera.reset();
                         self.controller.camera.note_reset();
@@ -1370,6 +1377,12 @@ impl ViewerState {
     }
 
     fn update(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.camera_tick_at);
+        self.camera_tick_at = now;
+        if self.camera.tick_momentum(elapsed) {
+            self.view_repaint_at = Some(now + MOMENTUM_FRAME_INTERVAL);
+        }
         let camera = self.camera.clone();
         self.update_render_uniforms_for_camera(&camera);
     }
@@ -1524,12 +1537,25 @@ impl ViewerState {
         if needs_texture_repaint {
             self.view_repaint_at = Some(Instant::now());
         }
+        self.schedule_momentum_repaint();
 
         command_buffers.push(encoder.finish());
         self.queue.submit(command_buffers);
         output.present();
 
         RenderStatus::Rendered
+    }
+
+    fn schedule_momentum_repaint(&mut self) {
+        if !self.camera.momentum_active() {
+            return;
+        }
+
+        let next_frame = Instant::now() + MOMENTUM_FRAME_INTERVAL;
+        self.view_repaint_at = Some(
+            self.view_repaint_at
+                .map_or(next_frame, |existing| existing.min(next_frame)),
+        );
     }
 
     fn encode_surface_render_pass(
@@ -2491,6 +2517,17 @@ impl ViewerState {
                         }
                         if ui.button("Cycle Camera").clicked() {
                             actions.push(ViewerCommand::ToggleCameraMode);
+                            ui.close();
+                        }
+                        if ui
+                            .button(if self.camera.momentum_enabled() {
+                                "Momentum Off"
+                            } else {
+                                "Momentum On"
+                            })
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::ToggleCameraMomentum);
                             ui.close();
                         }
                         if ui
@@ -3509,6 +3546,7 @@ impl ViewerState {
                     self.controller.camera.mode = mode.into();
                     self.show_mode_label(mode);
                 }
+                ViewerCommand::ToggleCameraMomentum => self.toggle_camera_momentum(),
                 ViewerCommand::ToggleBackground => self.controller.display.background.toggle(),
                 ViewerCommand::SetAnatomicalShadingVisible(visible) => {
                     self.controller.display.anatomical_shading_visible = visible;
@@ -6572,6 +6610,18 @@ impl ViewerState {
 
     fn show_mode_label(&mut self, mode: CameraMode) {
         self.show_transient_label(mode.label());
+    }
+
+    fn toggle_camera_momentum(&mut self) {
+        let enabled = self.camera.toggle_momentum();
+        self.show_transient_label(if enabled {
+            "momentum on"
+        } else {
+            "momentum off"
+        });
+        if enabled {
+            self.view_repaint_at = Some(Instant::now() + MOMENTUM_FRAME_INTERVAL);
+        }
     }
 
     fn show_transient_label(&mut self, text: impl Into<String>) {

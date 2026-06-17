@@ -1,7 +1,9 @@
 use glam::{Mat3, Mat4, Quat, Vec3};
+use std::time::Duration;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
 pub(super) const CAMERA_FOV_Y_RADIANS: f32 = std::f32::consts::FRAC_PI_4;
+const MOMENTUM_MIN_DELTA_PIXELS: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CameraMode {
@@ -35,6 +37,8 @@ pub(super) struct Camera {
     pub(super) distance: f32,
     rotating: bool,
     last_cursor: Option<(f64, f64)>,
+    momentum_enabled: bool,
+    momentum_delta: (f32, f32),
 }
 
 impl Default for Camera {
@@ -47,6 +51,8 @@ impl Default for Camera {
             distance: 3.0,
             rotating: false,
             last_cursor: None,
+            momentum_enabled: false,
+            momentum_delta: (0.0, 0.0),
         };
         camera.sync_orientation_from_angles();
         camera
@@ -64,6 +70,8 @@ impl Camera {
                 self.rotating = *state == ElementState::Pressed;
                 if !self.rotating {
                     self.last_cursor = None;
+                } else {
+                    self.momentum_delta = (0.0, 0.0);
                 }
                 true
             }
@@ -73,6 +81,11 @@ impl Camera {
                         let dx = position.x - last_x;
                         let dy = position.y - last_y;
                         self.drag(dx as f32, dy as f32);
+                        if self.momentum_enabled
+                            && (dx.abs() > f64::EPSILON || dy.abs() > f64::EPSILON)
+                        {
+                            self.momentum_delta = (dx as f32, dy as f32);
+                        }
                     }
                     self.last_cursor = Some((position.x, position.y));
                     return true;
@@ -86,6 +99,7 @@ impl Camera {
                     MouseScrollDelta::PixelDelta(position) => position.y as f32 / 120.0,
                 };
                 self.distance = (self.distance * 0.9_f32.powf(scroll)).clamp(0.75, 25.0);
+                self.stop_momentum();
                 true
             }
             _ => false,
@@ -97,6 +111,7 @@ impl Camera {
     }
 
     pub(super) fn toggle_mode(&mut self) -> CameraMode {
+        self.stop_momentum();
         self.mode = match self.mode {
             CameraMode::Orbit => {
                 self.sync_angles_from_orientation();
@@ -115,12 +130,53 @@ impl Camera {
     }
 
     pub(super) fn set_preset(&mut self, preset: PresetOrientation) {
+        self.stop_momentum();
         match preset {
             PresetOrientation::Left => self.set_view_direction(Vec3::NEG_X, Vec3::Z),
             PresetOrientation::Right => self.set_view_direction(Vec3::X, Vec3::Z),
             PresetOrientation::Top => self.set_view_direction(Vec3::Z, Vec3::Y),
             PresetOrientation::Bottom => self.set_view_direction(Vec3::NEG_Z, Vec3::Y),
         }
+    }
+
+    pub(super) fn momentum_enabled(&self) -> bool {
+        self.momentum_enabled
+    }
+
+    pub(super) fn momentum_active(&self) -> bool {
+        self.momentum_enabled
+            && !self.rotating
+            && self.momentum_delta_magnitude() >= MOMENTUM_MIN_DELTA_PIXELS
+    }
+
+    pub(super) fn toggle_momentum(&mut self) -> bool {
+        self.momentum_enabled = !self.momentum_enabled;
+        if !self.momentum_enabled {
+            self.stop_momentum();
+        }
+        self.momentum_enabled
+    }
+
+    pub(super) fn tick_momentum(&mut self, _elapsed: Duration) -> bool {
+        if !self.momentum_active() {
+            return false;
+        }
+
+        self.drag(self.momentum_delta.0, self.momentum_delta.1);
+        true
+    }
+
+    fn stop_momentum(&mut self) {
+        self.momentum_delta = (0.0, 0.0);
+    }
+
+    fn momentum_delta_magnitude(&self) -> f32 {
+        self.momentum_delta.0.hypot(self.momentum_delta.1)
+    }
+
+    #[cfg(test)]
+    fn set_momentum_delta_for_test(&mut self, dx: f32, dy: f32) {
+        self.momentum_delta = (dx, dy);
     }
 
     fn drag(&mut self, dx: f32, dy: f32) {
@@ -235,6 +291,7 @@ pub(super) fn stable_up_for_direction(eye_direction: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::{Camera, CameraMode, PresetOrientation};
+    use std::time::Duration;
 
     #[test]
     fn camera_mode_toggles_between_orbit_and_turntable() {
@@ -252,5 +309,24 @@ mod tests {
         let (eye_direction, _) = camera.view_axes();
 
         assert!(eye_direction.z > 0.99);
+    }
+
+    #[test]
+    fn momentum_ticks_continue_last_drag_direction_until_disabled() {
+        let mut camera = Camera::default();
+        let (before, _) = camera.view_axes();
+
+        assert!(camera.toggle_momentum());
+        camera.set_momentum_delta_for_test(12.0, 0.0);
+        assert!(camera.tick_momentum(Duration::from_millis(16)));
+
+        let (after, _) = camera.view_axes();
+        assert!(before.distance(after) > 0.001);
+
+        assert!(!camera.toggle_momentum());
+        let (disabled_before, _) = camera.view_axes();
+        assert!(!camera.tick_momentum(Duration::from_millis(16)));
+        let (disabled_after, _) = camera.view_axes();
+        assert!(disabled_before.distance(disabled_after) < 0.000_001);
     }
 }

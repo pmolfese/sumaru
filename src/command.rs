@@ -414,6 +414,7 @@ pub enum ViewerCommand {
     RefreshOverlayAppearance,
     ResetCamera,
     ToggleCameraMode,
+    ToggleCameraMomentum,
     ToggleBackground,
     SetAnatomicalShadingVisible(bool),
     SetOverlayVisible(bool),
