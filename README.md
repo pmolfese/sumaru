@@ -134,8 +134,13 @@ fields, so they can be tested without launching the GUI.
 - Press `r` to save the current view as a PNG, or Shift-`R` to save a 1x4
   montage. Single-surface scenes use left/right/top/bottom views; `both` spec
   scenes use closed top, closed bottom, open medial-in, and open outer-out
-  views. The VIEW section also has `Save` and `Montage` buttons.
+  views. The VIEW section also has `Save` and `Montage` buttons. When a
+  thresholded overlay is active, a second `_cmap`-suffixed file is saved
+  alongside the screenshot with the colorbar rendered on the right side.
 - Press `F5` to switch the background between black and white.
+- Press `g` to open or close the graph dock at the bottom of the view window.
+  When open, right-click picks update the graph live. Drag the handle at the
+  top of the dock to resize it; the 3D viewport adjusts to match.
 - Hold Option and press an arrow key for preset views:
   - Option-Left: left side view
   - Option-Right: right side view
@@ -175,8 +180,10 @@ the completed-work ledger.
   registration elements, parses `SUMA_irgba` overlays, maps incoming NIML
   messages to shared controller actions, and emits Sumaru state messages.
 - `src/command.rs` contains the shared controller and command state used to
-  route viewer menus, keyboard shortcuts, controller panels, and future AFNI
-  messages through the same non-`wgpu` model.
+  route viewer menus, keyboard shortcuts, controller panels, and AFNI messages
+  through the same non-`wgpu` model. It owns the canonical `OverlayThreshold`
+  type (used by both the render appearance and the controller command state) and
+  `ValueRange` (`f32` render range), keeping the render/domain boundary explicit.
 - `src/main.rs` is the command-line entry point. It parses `sumaru` arguments,
   launches the viewer with an initial surface or `.spec` scene, requires `-sv`
   surface-volume context for `.spec` launches, handles `--overlay`, passes
@@ -184,10 +191,16 @@ the completed-work ledger.
   `--preload`, and runs the `inspect` subcommand.
 - `src/color.rs` contains shared RGBA, continuous color-map, and label-table
   models for scalar maps and integer label datasets, including GIFTI and
-  FreeSurfer import helpers.
+  FreeSurfer import helpers. Continuous colormaps include 13 byte-exact AFNI
+  colorscales ported from `DC_spectrum_AJJ` / `DC_spectrum_ZSS` (the
+  same LUT engine SUMA uses): `Spectrum:red_to_blue`, both `+gap` variants,
+  `Spectrum:yellow_to_red`, `Spectrum:yellow_to_cyan` and its `+gap` variant,
+  `color_circle_AJJ`, `color_circle_ZSS`, `Reds_and_Blues`,
+  `Reds_and_Blues_w_Green`, `afni_p2spanned`, `bwr`, and `Fire`.
 - `src/dataset.rs` contains the canonical domain-attached dataset table model.
   It supports dense and sparse row-to-node data, typed columns, column labels
-  and roles, numeric ranges, units, and parent/provenance ids.
+  and roles, numeric ranges (`ColumnRange`, the `f64` domain range type),
+  units, and parent/provenance ids.
 - `src/inspect.rs` contains headless file inspection. It detects GIFTI/NIFTI
   paths, reads them through the current external crates, and prints concise
   metadata summaries.
@@ -212,7 +225,8 @@ the completed-work ledger.
   normals, records SUMA-inspired domain/metadata/lineage, and stores scalar
   overlay values/ranges without depending on viewer rendering details.
 - `src/viewer/mod.rs` coordinates the desktop viewer. It sets up the `winit`
-  event loop, owns the surface and controls windows, integrates `egui`, routes
+  event loop, owns the four windows (view, control, roi_control, graph) as
+  `WindowPane` values, integrates `egui` via `EguiPane`, routes
   keyboard/mouse/UI actions, loads surfaces and overlays, and calls into the
   viewer submodules for camera, picking, GPU setup, and render-prep work.
 - `src/viewer/camera.rs` contains the viewer camera model: orbit and turntable

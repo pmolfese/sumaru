@@ -254,6 +254,7 @@ pub fn replay_records(records: &[NimlDebugRecord]) -> Result<NimlReplayReport> {
                             AfniRouteAction::ViewerCommand(_) => report.viewer_commands += 1,
                             AfniRouteAction::LoadDataset(_) => report.load_dataset += 1,
                             AfniRouteAction::RgbaOverlay(_) => report.rgba_overlays += 1,
+                            AfniRouteAction::OverlayState(_) => report.viewer_commands += 1,
                             AfniRouteAction::SurfaceCrosshair(_) => report.surface_crosshairs += 1,
                             AfniRouteAction::RoiUpdate(_) => report.roi_updates += 1,
                         }

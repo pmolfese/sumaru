@@ -84,6 +84,7 @@ impl SelectionHighlight {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct OverlayAppearance {
     pub(super) range: ValueRange,
+    pub(super) symmetric_range: bool,
     pub(super) colormap: OverlayColorMap,
     pub(super) threshold: OverlayThreshold,
     pub(super) opacity: f32,
@@ -409,6 +410,7 @@ impl OverlayAppearance {
     pub(super) fn from_range(range: ValueRange) -> Self {
         Self {
             range: super::symmetric_value_range(range),
+            symmetric_range: true,
             colormap: OverlayColorMap::SpectrumRedToBlue,
             threshold: OverlayThreshold {
                 enabled: false,

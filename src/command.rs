@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use crate::surface::{SurfaceId, SurfaceSide, ValueRange};
+use crate::surface::{SurfaceId, SurfaceSide};
 
 const STATUS_LOG_LIMIT: usize = 256;
 const DEFAULT_PAIR_MAX_OPEN_DEGREES: f32 = 85.0;
@@ -233,28 +233,18 @@ impl PairVisibility {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverlayCommandState {
     pub visible: bool,
-    pub symmetric_range: bool,
-    pub intensity_range: Option<ValueRange>,
-    pub threshold: OverlayThreshold,
-    pub opacity: f32,
 }
 
 impl Default for OverlayCommandState {
     fn default() -> Self {
-        Self {
-            visible: true,
-            symmetric_range: true,
-            intensity_range: None,
-            threshold: OverlayThreshold::default(),
-            opacity: 1.0,
-        }
+        Self { visible: true }
     }
 }
 
-/// Overlay threshold state shared by the controller command layer, the render
-/// appearance, and the AFNI wire protocol. `enabled` carries the on/off state;
-/// in the partial-update `AfniOverlayState` this type is wrapped in `Option` to
-/// mean "present in the message" instead.
+/// Overlay threshold display state shared by the render appearance and the AFNI
+/// wire protocol. `enabled` carries the on/off state; in the partial-update
+/// `AfniOverlayState` this type is wrapped in `Option` to mean "present in the
+/// message" instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverlayThreshold {
     pub enabled: bool,
