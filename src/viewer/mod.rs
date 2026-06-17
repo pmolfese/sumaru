@@ -116,6 +116,11 @@ const GRAPH_MIN_PLOT_HEIGHT_POINTS: f32 = 96.0;
 const GRAPH_DEFAULT_PLOT_HEIGHT_POINTS: f32 = 138.0;
 const GRAPH_DOCK_DEFAULT_HEIGHT_POINTS: f32 = 360.0;
 const GRAPH_DOCK_MIN_HEIGHT_POINTS: f32 = 180.0;
+/// Smallest 3D scene height (egui points) left above the dock when it is dragged
+/// tall, so the brain never collapses entirely.
+const GRAPH_DOCK_MIN_SCENE_HEIGHT_POINTS: f32 = 160.0;
+/// Thickness (egui points) of the dock's resize grab strip.
+const GRAPH_DOCK_HANDLE_HEIGHT_POINTS: f32 = 6.0;
 const GRAPH_MAX_VIEW_WIDTH_FRACTION: f32 = 0.75;
 const GRAPH_MAX_VIEW_HEIGHT_FRACTION: f32 = 0.25;
 const INITIAL_WINDOW_RAISE_PIXELS: i32 = 100;
@@ -368,10 +373,10 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     state.update();
 
                     match state.render_view() {
-                        RenderStatus::Rendered => state.view_frame_rendered = true,
+                        RenderStatus::Rendered => state.view.frame_rendered = true,
                         RenderStatus::Skipped => {}
                         RenderStatus::Reconfigure => {
-                            state.resize_view(state.view_size);
+                            state.resize_view(state.view.size);
                             state.view_window().request_redraw();
                         }
                         RenderStatus::ValidationError => eprintln!("surface validation error"),
@@ -398,10 +403,10 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     state.control_window().request_redraw();
                 }
                 WindowEvent::RedrawRequested => match state.render_control() {
-                    RenderStatus::Rendered => state.control_frame_rendered = true,
+                    RenderStatus::Rendered => state.control.frame_rendered = true,
                     RenderStatus::Skipped => {}
                     RenderStatus::Reconfigure => {
-                        state.resize_control(state.control_size);
+                        state.resize_control(state.control.size);
                         state.control_window().request_redraw();
                     }
                     RenderStatus::ValidationError => eprintln!("control validation error"),
@@ -432,7 +437,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     RenderStatus::Rendered => {}
                     RenderStatus::Skipped => {}
                     RenderStatus::Reconfigure => {
-                        state.resize_roi_control(state.roi_control_size);
+                        state.resize_roi_control(state.roi_control.size);
                         state.roi_control_window().request_redraw();
                     }
                     RenderStatus::ValidationError => eprintln!("ROI control validation error"),
@@ -463,7 +468,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     RenderStatus::Rendered => {}
                     RenderStatus::Skipped => {}
                     RenderStatus::Reconfigure => {
-                        state.resize_graph(state.graph_size);
+                        state.resize_graph(state.graph.size);
                         state.graph_window().request_redraw();
                     }
                     RenderStatus::ValidationError => eprintln!("graph validation error"),
@@ -521,13 +526,13 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             return;
         }
 
-        let next_view = state.view_repaint_at;
-        let next_control = state.control_repaint_at;
+        let next_view = state.view.repaint_at;
+        let next_control = state.control.repaint_at;
         let next_roi_control = state
             .controller
             .panels
             .roi_controller_open
-            .then_some(state.roi_control_repaint_at)
+            .then_some(state.roi_control.repaint_at)
             .flatten();
         let view_due = next_view.is_some_and(|at| at <= now);
         let control_due = next_control.is_some_and(|at| at <= now);
@@ -557,38 +562,110 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
     }
 }
 
+/// Per-window egui plumbing. Each of the four windows (view, control, ROI
+/// control, graph) owns one of these instead of five parallel fields on
+/// `ViewerState`.
+struct EguiPane {
+    ctx: egui::Context,
+    state: egui_winit::State,
+    renderer: Renderer,
+    pending_textures: egui::TexturesDelta,
+    allocated_textures: HashSet<egui::TextureId>,
+}
+
+impl EguiPane {
+    fn new(ctx: egui::Context, state: egui_winit::State, renderer: Renderer) -> Self {
+        Self {
+            ctx,
+            state,
+            renderer,
+            pending_textures: egui::TexturesDelta::default(),
+            allocated_textures: HashSet::new(),
+        }
+    }
+
+    /// Uploads this pane's pending texture deltas to the GPU. Returns whether a
+    /// repaint is needed (a texture arrived before its allocation) along with
+    /// the set of deltas to retain for the next frame.
+    fn upload_pending(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> (bool, egui::TexturesDelta) {
+        let mut retained = egui::TexturesDelta::default();
+        let mut needs_repaint = false;
+        for (id, image_delta) in &self.pending_textures.set {
+            if image_delta.pos.is_some() && !self.allocated_textures.contains(id) {
+                retained.set.push((*id, image_delta.clone()));
+                needs_repaint = true;
+                continue;
+            }
+            self.renderer
+                .update_texture(device, queue, *id, image_delta);
+            self.allocated_textures.insert(*id);
+        }
+        (needs_repaint, retained)
+    }
+
+    /// Frees textures this pane marked for release on the previous frame.
+    fn free_pending(&mut self) {
+        for id in &self.pending_textures.free {
+            if self.allocated_textures.remove(id) {
+                self.renderer.free_texture(id);
+            }
+        }
+    }
+}
+
+/// One of the application's windows together with its wgpu surface and egui
+/// pane. Replaces four parallel field-groups on `ViewerState`. Not every window
+/// uses every field (e.g. `last_requested_size` and `frame_rendered` are only
+/// consulted by some), but keeping the shape uniform is what removes the
+/// repetition.
+struct WindowPane {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    size: PhysicalSize<u32>,
+    last_requested_size: Option<PhysicalSize<u32>>,
+    repaint_at: Option<Instant>,
+    frame_rendered: bool,
+    egui: EguiPane,
+}
+
+impl WindowPane {
+    fn new(
+        window: Arc<Window>,
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+        size: PhysicalSize<u32>,
+        egui: EguiPane,
+    ) -> Self {
+        Self {
+            window,
+            surface,
+            config,
+            size,
+            last_requested_size: None,
+            repaint_at: None,
+            frame_rendered: false,
+            egui,
+        }
+    }
+}
+
 struct ViewerState {
-    view_window: Arc<Window>,
-    control_window: Arc<Window>,
-    roi_control_window: Arc<Window>,
-    graph_window: Arc<Window>,
-    view_surface: wgpu::Surface<'static>,
-    control_surface: wgpu::Surface<'static>,
-    roi_control_surface: wgpu::Surface<'static>,
-    graph_surface: wgpu::Surface<'static>,
+    view: WindowPane,
+    control: WindowPane,
+    roi_control: WindowPane,
+    graph: WindowPane,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    view_config: wgpu::SurfaceConfiguration,
-    control_config: wgpu::SurfaceConfiguration,
-    roi_control_config: wgpu::SurfaceConfiguration,
-    graph_config: wgpu::SurfaceConfiguration,
-    view_size: PhysicalSize<u32>,
-    control_size: PhysicalSize<u32>,
-    roi_control_size: PhysicalSize<u32>,
-    graph_size: PhysicalSize<u32>,
-    last_requested_control_size: Option<PhysicalSize<u32>>,
-    last_requested_roi_control_size: Option<PhysicalSize<u32>>,
     graph_dock_pre_open_size: Option<PhysicalSize<u32>>,
-    /// When the view window should next repaint for menu animations, or `None`
-    /// if its egui overlay is idle.
-    view_repaint_at: Option<Instant>,
-    /// When the control window should next repaint for an egui animation, or
-    /// `None` if it is idle. Drives `ControlFlow::WaitUntil`.
-    control_repaint_at: Option<Instant>,
-    roi_control_repaint_at: Option<Instant>,
-    graph_repaint_at: Option<Instant>,
-    view_frame_rendered: bool,
-    control_frame_rendered: bool,
+    /// Height (egui points) of the graph dock panel. Owned here rather than left
+    /// to egui's panel-state persistence (which did not survive frames here), so
+    /// the self-managed resize handle sticks and drives the 3D viewport split.
+    graph_dock_height_points: f32,
     startup_redraw_until: Instant,
     render_pipeline: wgpu::RenderPipeline,
     surface_buffers: Option<SurfaceBuffers>,
@@ -654,26 +731,6 @@ struct ViewerState {
     pair_drag_changed: bool,
     modifiers: ModifiersState,
     mode_label: Option<ModeLabel>,
-    view_egui_ctx: egui::Context,
-    view_egui_state: egui_winit::State,
-    view_egui_renderer: Renderer,
-    view_pending_egui_textures: egui::TexturesDelta,
-    view_allocated_egui_textures: HashSet<egui::TextureId>,
-    egui_ctx: egui::Context,
-    egui_state: egui_winit::State,
-    egui_renderer: Renderer,
-    pending_egui_textures: egui::TexturesDelta,
-    allocated_egui_textures: HashSet<egui::TextureId>,
-    roi_egui_ctx: egui::Context,
-    roi_egui_state: egui_winit::State,
-    roi_egui_renderer: Renderer,
-    roi_pending_egui_textures: egui::TexturesDelta,
-    roi_allocated_egui_textures: HashSet<egui::TextureId>,
-    graph_egui_ctx: egui::Context,
-    graph_egui_state: egui_winit::State,
-    graph_egui_renderer: Renderer,
-    graph_pending_egui_textures: egui::TexturesDelta,
-    graph_allocated_egui_textures: HashSet<egui::TextureId>,
 }
 
 impl ViewerState {
@@ -932,33 +989,38 @@ impl ViewerState {
         let afni_recorder = niml_record_path.map(NimlRecorder::create).transpose()?;
 
         let mut state = Self {
-            view_window,
-            control_window,
-            roi_control_window,
-            graph_window,
-            view_surface,
-            control_surface,
-            roi_control_surface,
-            graph_surface,
+            view: WindowPane::new(
+                view_window,
+                view_surface,
+                view_config,
+                view_size,
+                EguiPane::new(view_egui_ctx, view_egui_state, view_egui_renderer),
+            ),
+            control: WindowPane::new(
+                control_window,
+                control_surface,
+                control_config,
+                control_size,
+                EguiPane::new(egui_ctx, egui_state, egui_renderer),
+            ),
+            roi_control: WindowPane::new(
+                roi_control_window,
+                roi_control_surface,
+                roi_control_config,
+                roi_control_size,
+                EguiPane::new(roi_egui_ctx, roi_egui_state, roi_egui_renderer),
+            ),
+            graph: WindowPane::new(
+                graph_window,
+                graph_surface,
+                graph_config,
+                graph_size,
+                EguiPane::new(graph_egui_ctx, graph_egui_state, graph_egui_renderer),
+            ),
             device,
             queue,
-            view_config,
-            control_config,
-            roi_control_config,
-            graph_config,
-            view_size,
-            control_size,
-            roi_control_size,
-            graph_size,
-            last_requested_control_size: None,
-            last_requested_roi_control_size: None,
             graph_dock_pre_open_size: None,
-            view_repaint_at: None,
-            control_repaint_at: None,
-            roi_control_repaint_at: None,
-            graph_repaint_at: None,
-            view_frame_rendered: false,
-            control_frame_rendered: false,
+            graph_dock_height_points: GRAPH_DOCK_DEFAULT_HEIGHT_POINTS,
             startup_redraw_until: Instant::now(),
             render_pipeline,
             surface_buffers: None,
@@ -1011,26 +1073,6 @@ impl ViewerState {
             pair_drag_changed: false,
             modifiers: ModifiersState::empty(),
             mode_label: None,
-            view_egui_ctx,
-            view_egui_state,
-            view_egui_renderer,
-            view_pending_egui_textures: egui::TexturesDelta::default(),
-            view_allocated_egui_textures: HashSet::new(),
-            egui_ctx,
-            egui_state,
-            egui_renderer,
-            pending_egui_textures: egui::TexturesDelta::default(),
-            allocated_egui_textures: HashSet::new(),
-            roi_egui_ctx,
-            roi_egui_state,
-            roi_egui_renderer,
-            roi_pending_egui_textures: egui::TexturesDelta::default(),
-            roi_allocated_egui_textures: HashSet::new(),
-            graph_egui_ctx,
-            graph_egui_state,
-            graph_egui_renderer,
-            graph_pending_egui_textures: egui::TexturesDelta::default(),
-            graph_allocated_egui_textures: HashSet::new(),
         };
 
         if let Some(path) = initial_surface_path {
@@ -1066,24 +1108,24 @@ impl ViewerState {
     }
 
     fn view_window(&self) -> &Window {
-        &self.view_window
+        &self.view.window
     }
 
     fn control_window(&self) -> &Window {
-        &self.control_window
+        &self.control.window
     }
 
     fn roi_control_window(&self) -> &Window {
-        &self.roi_control_window
+        &self.roi_control.window
     }
 
     fn graph_window(&self) -> &Window {
-        &self.graph_window
+        &self.graph.window
     }
 
     fn arm_startup_redraw_guard(&mut self) {
-        self.view_frame_rendered = false;
-        self.control_frame_rendered = false;
+        self.view.frame_rendered = false;
+        self.control.frame_rendered = false;
         self.startup_redraw_until = Instant::now()
             .checked_add(STARTUP_REDRAW_TIMEOUT)
             .unwrap_or_else(Instant::now);
@@ -1091,15 +1133,15 @@ impl ViewerState {
 
     fn needs_startup_redraw(&self, now: Instant) -> bool {
         now <= self.startup_redraw_until
-            && (!self.view_frame_rendered || !self.control_frame_rendered)
+            && (!self.view.frame_rendered || !self.control.frame_rendered)
     }
 
     fn request_missing_startup_redraws(&self) {
-        if !self.view_frame_rendered {
-            self.view_window.request_redraw();
+        if !self.view.frame_rendered {
+            self.view.window.request_redraw();
         }
-        if !self.control_frame_rendered {
-            self.control_window.request_redraw();
+        if !self.control.frame_rendered {
+            self.control.window.request_redraw();
         }
     }
 
@@ -1108,10 +1150,10 @@ impl ViewerState {
             return;
         }
 
-        self.view_size = size;
-        self.view_config.width = size.width;
-        self.view_config.height = size.height;
-        self.view_surface.configure(&self.device, &self.view_config);
+        self.view.size = size;
+        self.view.config.width = size.width;
+        self.view.config.height = size.height;
+        self.view.surface.configure(&self.device, &self.view.config);
         self.depth_buffer = DepthBuffer::new(&self.device, size.width, size.height);
     }
 
@@ -1120,12 +1162,13 @@ impl ViewerState {
             return;
         }
 
-        self.control_size = size;
-        self.last_requested_control_size = None;
-        self.control_config.width = size.width;
-        self.control_config.height = size.height;
-        self.control_surface
-            .configure(&self.device, &self.control_config);
+        self.control.size = size;
+        self.control.last_requested_size = None;
+        self.control.config.width = size.width;
+        self.control.config.height = size.height;
+        self.control
+            .surface
+            .configure(&self.device, &self.control.config);
     }
 
     fn resize_roi_control(&mut self, size: PhysicalSize<u32>) {
@@ -1133,12 +1176,13 @@ impl ViewerState {
             return;
         }
 
-        self.roi_control_size = size;
-        self.last_requested_roi_control_size = None;
-        self.roi_control_config.width = size.width;
-        self.roi_control_config.height = size.height;
-        self.roi_control_surface
-            .configure(&self.device, &self.roi_control_config);
+        self.roi_control.size = size;
+        self.roi_control.last_requested_size = None;
+        self.roi_control.config.width = size.width;
+        self.roi_control.config.height = size.height;
+        self.roi_control
+            .surface
+            .configure(&self.device, &self.roi_control.config);
     }
 
     fn resize_graph(&mut self, size: PhysicalSize<u32>) {
@@ -1146,11 +1190,12 @@ impl ViewerState {
             return;
         }
 
-        self.graph_size = size;
-        self.graph_config.width = size.width;
-        self.graph_config.height = size.height;
-        self.graph_surface
-            .configure(&self.device, &self.graph_config);
+        self.graph.size = size;
+        self.graph.config.width = size.width;
+        self.graph.config.height = size.height;
+        self.graph
+            .surface
+            .configure(&self.device, &self.graph.config);
     }
 
     fn view_input(&mut self, event: &WindowEvent) -> bool {
@@ -1162,10 +1207,12 @@ impl ViewerState {
         }
 
         let egui_response = self
-            .view_egui_state
-            .on_window_event(&self.view_window, event);
+            .view
+            .egui
+            .state
+            .on_window_event(&self.view.window, event);
         if egui_response.repaint {
-            self.view_window.request_redraw();
+            self.view.window.request_redraw();
         }
         if egui_response.consumed {
             return true;
@@ -1346,7 +1393,11 @@ impl ViewerState {
     }
 
     fn control_input(&mut self, event: &WindowEvent) -> InputResponse {
-        let egui_response = self.egui_state.on_window_event(&self.control_window, event);
+        let egui_response = self
+            .control
+            .egui
+            .state
+            .on_window_event(&self.control.window, event);
 
         InputResponse {
             consumed: egui_response.consumed,
@@ -1356,8 +1407,10 @@ impl ViewerState {
 
     fn roi_control_input(&mut self, event: &WindowEvent) -> InputResponse {
         let egui_response = self
-            .roi_egui_state
-            .on_window_event(&self.roi_control_window, event);
+            .roi_control
+            .egui
+            .state
+            .on_window_event(&self.roi_control.window, event);
 
         InputResponse {
             consumed: egui_response.consumed,
@@ -1367,8 +1420,10 @@ impl ViewerState {
 
     fn graph_input(&mut self, event: &WindowEvent) -> InputResponse {
         let egui_response = self
-            .graph_egui_state
-            .on_window_event(&self.graph_window, event);
+            .graph
+            .egui
+            .state
+            .on_window_event(&self.graph.window, event);
 
         InputResponse {
             consumed: egui_response.consumed,
@@ -1381,7 +1436,7 @@ impl ViewerState {
         let elapsed = now.saturating_duration_since(self.camera_tick_at);
         self.camera_tick_at = now;
         if self.camera.tick_momentum(elapsed) {
-            self.view_repaint_at = Some(now + MOMENTUM_FRAME_INTERVAL);
+            self.view.repaint_at = Some(now + MOMENTUM_FRAME_INTERVAL);
         }
         let camera = self.camera.clone();
         self.update_render_uniforms_for_camera(&camera);
@@ -1392,16 +1447,16 @@ impl ViewerState {
     }
 
     fn scene_viewport_size(&self) -> PhysicalSize<u32> {
-        if self.controller.panels.graph_window_open
-            && let Some(pre_open_size) = self.graph_dock_pre_open_size
-        {
-            return PhysicalSize::new(
-                self.view_size.width.max(1),
-                pre_open_size.height.min(self.view_size.height).max(1),
-            );
-        }
+        let height = if self.controller.panels.graph_window_open {
+            // Reserve the dock's current height for the plot, leaving the rest of
+            // the window for the 3D scene.
+            let dock = self.graph_dock_height_pixels();
+            self.view.size.height.saturating_sub(dock).max(1)
+        } else {
+            self.view.size.height.max(1)
+        };
 
-        PhysicalSize::new(self.view_size.width.max(1), self.view_size.height.max(1))
+        PhysicalSize::new(self.view.size.width.max(1), height)
     }
 
     fn scene_viewport_aspect(&self) -> f32 {
@@ -1427,46 +1482,52 @@ impl ViewerState {
 
     fn render_view(&mut self) -> RenderStatus {
         egui_winit::update_viewport_info(
-            self.view_egui_state
+            self.view
+                .egui
+                .state
                 .egui_input_mut()
                 .viewports
                 .entry(egui::ViewportId::ROOT)
                 .or_default(),
-            &self.view_egui_ctx,
-            &self.view_window,
+            &self.view.egui.ctx,
+            &self.view.window,
             false,
         );
-        let raw_input = self.view_egui_state.take_egui_input(&self.view_window);
-        let egui_ctx = self.view_egui_ctx.clone();
+        let raw_input = self.view.egui.state.take_egui_input(&self.view.window);
+        let egui_ctx = self.view.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         #[allow(deprecated)]
         let full_output = egui_ctx.run(raw_input, |ctx| {
             ui_actions = self.draw_view_overlay_ui(ctx);
         });
-        self.view_repaint_at = repaint_delay_to_instant(&full_output);
+        self.view.repaint_at = repaint_delay_to_instant(&full_output);
         let actions_present = !ui_actions.is_empty();
-        self.view_egui_state
-            .handle_platform_output(&self.view_window, full_output.platform_output);
+        self.view
+            .egui
+            .state
+            .handle_platform_output(&self.view.window, full_output.platform_output);
         self.apply_commands(ui_actions);
         if actions_present {
-            self.view_window.request_redraw();
-            self.control_window.request_redraw();
+            self.view.window.request_redraw();
+            self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
-                self.roi_control_window.request_redraw();
+                self.roi_control.window.request_redraw();
             }
             if self.controller.panels.graph_window_open {
-                self.view_window.request_redraw();
+                self.view.window.request_redraw();
             }
         }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.view_config.width, self.view_config.height],
+            size_in_pixels: [self.view.config.width, self.view.config.height],
             pixels_per_point: full_output.pixels_per_point,
         };
-        self.view_pending_egui_textures
+        self.view
+            .egui
+            .pending_textures
             .append(full_output.textures_delta);
 
-        let output = match self.view_surface.get_current_texture() {
+        let output = match self.view.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -1488,14 +1549,9 @@ impl ViewerState {
 
         self.encode_surface_render_pass(&mut encoder, &view, &self.depth_buffer.view);
 
-        let (needs_texture_repaint, retained_textures) = upload_pending_egui_textures(
-            &self.device,
-            &self.queue,
-            &mut self.view_egui_renderer,
-            &self.view_pending_egui_textures,
-            &mut self.view_allocated_egui_textures,
-        );
-        let mut command_buffers = self.view_egui_renderer.update_buffers(
+        let (needs_texture_repaint, retained_textures) =
+            self.view.egui.upload_pending(&self.device, &self.queue);
+        let mut command_buffers = self.view.egui.renderer.update_buffers(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -1521,21 +1577,17 @@ impl ViewerState {
                 multiview_mask: None,
             });
 
-            self.view_egui_renderer.render(
+            self.view.egui.renderer.render(
                 &mut egui_pass.forget_lifetime(),
                 &paint_jobs,
                 &screen_descriptor,
             );
         }
 
-        free_pending_egui_textures(
-            &mut self.view_egui_renderer,
-            &self.view_pending_egui_textures,
-            &mut self.view_allocated_egui_textures,
-        );
-        self.view_pending_egui_textures = retained_textures;
+        self.view.egui.free_pending();
+        self.view.egui.pending_textures = retained_textures;
         if needs_texture_repaint {
-            self.view_repaint_at = Some(Instant::now());
+            self.view.repaint_at = Some(Instant::now());
         }
         self.schedule_momentum_repaint();
 
@@ -1552,8 +1604,9 @@ impl ViewerState {
         }
 
         let next_frame = Instant::now() + MOMENTUM_FRAME_INTERVAL;
-        self.view_repaint_at = Some(
-            self.view_repaint_at
+        self.view.repaint_at = Some(
+            self.view
+                .repaint_at
                 .map_or(next_frame, |existing| existing.min(next_frame)),
         );
     }
@@ -1937,8 +1990,8 @@ impl ViewerState {
     }
 
     fn capture_surface_view(&mut self, camera: &Camera) -> Result<ScreenshotImage> {
-        let width = self.view_config.width.max(1);
-        let height = self.view_config.height.max(1);
+        let width = self.view.config.width.max(1);
+        let height = self.view.config.height.max(1);
         let extent = wgpu::Extent3d {
             width,
             height,
@@ -1950,7 +2003,7 @@ impl ViewerState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: self.view_config.format,
+            format: self.view.config.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -2010,7 +2063,7 @@ impl ViewerState {
             width,
             height,
             padded_bytes_per_row,
-            self.view_config.format,
+            self.view.config.format,
         )?;
         drop(mapped);
         readback_buffer.unmap();
@@ -2020,17 +2073,23 @@ impl ViewerState {
 
     fn render_control(&mut self) -> RenderStatus {
         egui_winit::update_viewport_info(
-            self.egui_state
+            self.control
+                .egui
+                .state
                 .egui_input_mut()
                 .viewports
                 .entry(egui::ViewportId::ROOT)
                 .or_default(),
-            &self.egui_ctx,
-            &self.control_window,
+            &self.control.egui.ctx,
+            &self.control.window,
             false,
         );
-        let raw_input = self.egui_state.take_egui_input(&self.control_window);
-        let egui_ctx = self.egui_ctx.clone();
+        let raw_input = self
+            .control
+            .egui
+            .state
+            .take_egui_input(&self.control.window);
+        let egui_ctx = self.control.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         let mut desired_control_size_points = egui::Vec2::ZERO;
         #[allow(deprecated)]
@@ -2041,7 +2100,7 @@ impl ViewerState {
         });
         // Schedule the next control-window repaint from egui's requested delay:
         // ZERO means "again next frame" (an active animation), MAX means idle.
-        self.control_repaint_at = repaint_delay_to_instant(&full_output);
+        self.control.repaint_at = repaint_delay_to_instant(&full_output);
         let repaint_delay = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -2050,31 +2109,35 @@ impl ViewerState {
         // A panel action (load, toggle, camera/background change) alters the
         // 3D scene, so the view window needs to repaint too.
         let actions_present = !ui_actions.is_empty();
-        self.egui_state
-            .handle_platform_output(&self.control_window, full_output.platform_output);
+        self.control
+            .egui
+            .state
+            .handle_platform_output(&self.control.window, full_output.platform_output);
         if repaint_delay != Duration::ZERO {
             self.fit_control_window(desired_control_size_points, full_output.pixels_per_point);
         }
         self.apply_commands(ui_actions);
         if actions_present {
-            self.view_window.request_redraw();
-            self.control_window.request_redraw();
+            self.view.window.request_redraw();
+            self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
-                self.roi_control_window.request_redraw();
+                self.roi_control.window.request_redraw();
             }
             if self.controller.panels.graph_window_open {
-                self.view_window.request_redraw();
+                self.view.window.request_redraw();
             }
         }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.control_config.width, self.control_config.height],
+            size_in_pixels: [self.control.config.width, self.control.config.height],
             pixels_per_point: full_output.pixels_per_point,
         };
-        self.pending_egui_textures
+        self.control
+            .egui
+            .pending_textures
             .append(full_output.textures_delta);
 
-        let output = match self.control_surface.get_current_texture() {
+        let output = match self.control.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -2094,14 +2157,9 @@ impl ViewerState {
                 label: Some("control render encoder"),
             });
 
-        let (needs_texture_repaint, retained_textures) = upload_pending_egui_textures(
-            &self.device,
-            &self.queue,
-            &mut self.egui_renderer,
-            &self.pending_egui_textures,
-            &mut self.allocated_egui_textures,
-        );
-        let mut command_buffers = self.egui_renderer.update_buffers(
+        let (needs_texture_repaint, retained_textures) =
+            self.control.egui.upload_pending(&self.device, &self.queue);
+        let mut command_buffers = self.control.egui.renderer.update_buffers(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -2132,23 +2190,19 @@ impl ViewerState {
                 multiview_mask: None,
             });
 
-            self.egui_renderer.render(
+            self.control.egui.renderer.render(
                 &mut egui_pass.forget_lifetime(),
                 &paint_jobs,
                 &screen_descriptor,
             );
         }
 
-        free_pending_egui_textures(
-            &mut self.egui_renderer,
-            &self.pending_egui_textures,
-            &mut self.allocated_egui_textures,
-        );
-        self.pending_egui_textures = retained_textures;
+        self.control.egui.free_pending();
+        self.control.egui.pending_textures = retained_textures;
         if needs_texture_repaint {
             // Deferred texture upload: repaint next frame to finish it. Under
             // ControlFlow::Wait this scheduled wake is what actually drives it.
-            self.control_repaint_at = Some(Instant::now());
+            self.control.repaint_at = Some(Instant::now());
         }
 
         command_buffers.push(encoder.finish());
@@ -2160,19 +2214,23 @@ impl ViewerState {
 
     fn render_roi_control(&mut self) -> RenderStatus {
         egui_winit::update_viewport_info(
-            self.roi_egui_state
+            self.roi_control
+                .egui
+                .state
                 .egui_input_mut()
                 .viewports
                 .entry(egui::ViewportId::ROOT)
                 .or_default(),
-            &self.roi_egui_ctx,
-            &self.roi_control_window,
+            &self.roi_control.egui.ctx,
+            &self.roi_control.window,
             false,
         );
         let raw_input = self
-            .roi_egui_state
-            .take_egui_input(&self.roi_control_window);
-        let egui_ctx = self.roi_egui_ctx.clone();
+            .roi_control
+            .egui
+            .state
+            .take_egui_input(&self.roi_control.window);
+        let egui_ctx = self.roi_control.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         let mut desired_roi_control_size_points = egui::Vec2::ZERO;
         #[allow(deprecated)]
@@ -2181,7 +2239,7 @@ impl ViewerState {
             ui_actions = output.actions;
             desired_roi_control_size_points = output.desired_control_size_points;
         });
-        self.roi_control_repaint_at = repaint_delay_to_instant(&full_output);
+        self.roi_control.repaint_at = repaint_delay_to_instant(&full_output);
         let repaint_delay = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -2189,8 +2247,10 @@ impl ViewerState {
             .unwrap_or(Duration::MAX);
 
         let actions_present = !ui_actions.is_empty();
-        self.roi_egui_state
-            .handle_platform_output(&self.roi_control_window, full_output.platform_output);
+        self.roi_control
+            .egui
+            .state
+            .handle_platform_output(&self.roi_control.window, full_output.platform_output);
         if repaint_delay != Duration::ZERO {
             self.fit_roi_control_window(
                 desired_roi_control_size_points,
@@ -2199,28 +2259,30 @@ impl ViewerState {
         }
         self.apply_commands(ui_actions);
         if actions_present {
-            self.view_window.request_redraw();
-            self.control_window.request_redraw();
+            self.view.window.request_redraw();
+            self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
-                self.roi_control_window.request_redraw();
+                self.roi_control.window.request_redraw();
             }
             if self.controller.panels.graph_window_open {
-                self.view_window.request_redraw();
+                self.view.window.request_redraw();
             }
         }
 
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels: [
-                self.roi_control_config.width,
-                self.roi_control_config.height,
+                self.roi_control.config.width,
+                self.roi_control.config.height,
             ],
             pixels_per_point: full_output.pixels_per_point,
         };
-        self.roi_pending_egui_textures
+        self.roi_control
+            .egui
+            .pending_textures
             .append(full_output.textures_delta);
 
-        let output = match self.roi_control_surface.get_current_texture() {
+        let output = match self.roi_control.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -2240,14 +2302,11 @@ impl ViewerState {
                 label: Some("ROI control render encoder"),
             });
 
-        let (needs_texture_repaint, retained_textures) = upload_pending_egui_textures(
-            &self.device,
-            &self.queue,
-            &mut self.roi_egui_renderer,
-            &self.roi_pending_egui_textures,
-            &mut self.roi_allocated_egui_textures,
-        );
-        let mut command_buffers = self.roi_egui_renderer.update_buffers(
+        let (needs_texture_repaint, retained_textures) = self
+            .roi_control
+            .egui
+            .upload_pending(&self.device, &self.queue);
+        let mut command_buffers = self.roi_control.egui.renderer.update_buffers(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -2278,21 +2337,17 @@ impl ViewerState {
                 multiview_mask: None,
             });
 
-            self.roi_egui_renderer.render(
+            self.roi_control.egui.renderer.render(
                 &mut egui_pass.forget_lifetime(),
                 &paint_jobs,
                 &screen_descriptor,
             );
         }
 
-        free_pending_egui_textures(
-            &mut self.roi_egui_renderer,
-            &self.roi_pending_egui_textures,
-            &mut self.roi_allocated_egui_textures,
-        );
-        self.roi_pending_egui_textures = retained_textures;
+        self.roi_control.egui.free_pending();
+        self.roi_control.egui.pending_textures = retained_textures;
         if needs_texture_repaint {
-            self.roi_control_repaint_at = Some(Instant::now());
+            self.roi_control.repaint_at = Some(Instant::now());
         }
 
         command_buffers.push(encoder.finish());
@@ -2304,34 +2359,40 @@ impl ViewerState {
 
     fn render_graph(&mut self) -> RenderStatus {
         egui_winit::update_viewport_info(
-            self.graph_egui_state
+            self.graph
+                .egui
+                .state
                 .egui_input_mut()
                 .viewports
                 .entry(egui::ViewportId::ROOT)
                 .or_default(),
-            &self.graph_egui_ctx,
-            &self.graph_window,
+            &self.graph.egui.ctx,
+            &self.graph.window,
             false,
         );
-        let raw_input = self.graph_egui_state.take_egui_input(&self.graph_window);
-        let egui_ctx = self.graph_egui_ctx.clone();
+        let raw_input = self.graph.egui.state.take_egui_input(&self.graph.window);
+        let egui_ctx = self.graph.egui.ctx.clone();
         #[allow(deprecated)]
         let full_output = egui_ctx.run(raw_input, |ctx| {
             self.draw_graph_ui(ctx);
         });
-        self.graph_repaint_at = repaint_delay_to_instant(&full_output);
-        self.graph_egui_state
-            .handle_platform_output(&self.graph_window, full_output.platform_output);
+        self.graph.repaint_at = repaint_delay_to_instant(&full_output);
+        self.graph
+            .egui
+            .state
+            .handle_platform_output(&self.graph.window, full_output.platform_output);
 
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.graph_config.width, self.graph_config.height],
+            size_in_pixels: [self.graph.config.width, self.graph.config.height],
             pixels_per_point: full_output.pixels_per_point,
         };
-        self.graph_pending_egui_textures
+        self.graph
+            .egui
+            .pending_textures
             .append(full_output.textures_delta);
 
-        let output = match self.graph_surface.get_current_texture() {
+        let output = match self.graph.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -2351,14 +2412,9 @@ impl ViewerState {
                 label: Some("graph render encoder"),
             });
 
-        let (needs_texture_repaint, retained_textures) = upload_pending_egui_textures(
-            &self.device,
-            &self.queue,
-            &mut self.graph_egui_renderer,
-            &self.graph_pending_egui_textures,
-            &mut self.graph_allocated_egui_textures,
-        );
-        let mut command_buffers = self.graph_egui_renderer.update_buffers(
+        let (needs_texture_repaint, retained_textures) =
+            self.graph.egui.upload_pending(&self.device, &self.queue);
+        let mut command_buffers = self.graph.egui.renderer.update_buffers(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -2389,21 +2445,17 @@ impl ViewerState {
                 multiview_mask: None,
             });
 
-            self.graph_egui_renderer.render(
+            self.graph.egui.renderer.render(
                 &mut egui_pass.forget_lifetime(),
                 &paint_jobs,
                 &screen_descriptor,
             );
         }
 
-        free_pending_egui_textures(
-            &mut self.graph_egui_renderer,
-            &self.graph_pending_egui_textures,
-            &mut self.graph_allocated_egui_textures,
-        );
-        self.graph_pending_egui_textures = retained_textures;
+        self.graph.egui.free_pending();
+        self.graph.egui.pending_textures = retained_textures;
         if needs_texture_repaint {
-            self.graph_repaint_at = Some(Instant::now());
+            self.graph.repaint_at = Some(Instant::now());
         }
 
         command_buffers.push(encoder.finish());
@@ -2415,7 +2467,7 @@ impl ViewerState {
 
     fn draw_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {
         let mut actions = Vec::new();
-        let panel_height = (self.control_size.height as f32 - 24.0).max(240.0);
+        let panel_height = (self.control.size.height as f32 - 24.0).max(240.0);
         let mut desired_control_size_points = egui::vec2(
             CONTROL_CONTENT_WIDTH_POINTS + 24.0,
             CONTROL_MIN_INNER_HEIGHT as f32,
@@ -2641,13 +2693,44 @@ impl ViewerState {
         actions
     }
 
-    fn draw_graph_dock_ui(&self, ctx: &egui::Context, actions: &mut Vec<ViewerCommand>) {
+    fn draw_graph_dock_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<ViewerCommand>) {
+        let current_height = self.graph_dock_height_points;
         #[allow(deprecated)]
-        egui::TopBottomPanel::bottom("graph_dock")
-            .resizable(true)
-            .default_height(GRAPH_DOCK_DEFAULT_HEIGHT_POINTS)
-            .min_height(GRAPH_DOCK_MIN_HEIGHT_POINTS)
+        let response = egui::TopBottomPanel::bottom("graph_dock")
+            .resizable(false)
+            .exact_height(current_height)
             .show(ctx, |ui| {
+                let mut next_height = current_height;
+
+                // Self-managed resize handle along the dock's top edge. egui's own
+                // panel-resize state did not persist here, so the dock height is
+                // owned by `graph_dock_height_points` and adjusted directly.
+                let full = ui.max_rect();
+                let handle_rect = egui::Rect::from_min_max(
+                    full.left_top(),
+                    egui::pos2(full.right(), full.top() + GRAPH_DOCK_HANDLE_HEIGHT_POINTS),
+                );
+                let handle = ui.interact(
+                    handle_rect,
+                    ui.id().with("graph_dock_resize"),
+                    egui::Sense::drag(),
+                );
+                if handle.hovered() || handle.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if handle.dragged() {
+                    // Dragging up (negative y) grows the dock.
+                    next_height -= handle.drag_delta().y;
+                }
+                let stroke = if handle.hovered() || handle.dragged() {
+                    ui.visuals().widgets.active.bg_stroke
+                } else {
+                    ui.visuals().widgets.noninteractive.bg_stroke
+                };
+                ui.painter()
+                    .hline(handle_rect.x_range(), handle_rect.center().y, stroke);
+                ui.add_space(GRAPH_DOCK_HANDLE_HEIGHT_POINTS);
+
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Graph").strong().color(accent_color()));
                     ui.separator();
@@ -2662,7 +2745,20 @@ impl ViewerState {
                 });
                 ui.separator();
                 self.draw_graph_contents(ui);
+
+                next_height
             });
+
+        let window_height_points = self.view.size.height as f32 / ctx.pixels_per_point().max(0.01);
+        let max_height = (window_height_points - GRAPH_DOCK_MIN_SCENE_HEIGHT_POINTS)
+            .max(GRAPH_DOCK_MIN_HEIGHT_POINTS);
+        let clamped = response
+            .inner
+            .clamp(GRAPH_DOCK_MIN_HEIGHT_POINTS, max_height);
+        if (clamped - current_height).abs() > f32::EPSILON {
+            self.graph_dock_height_points = clamped;
+            self.view.window.request_redraw();
+        }
     }
 
     fn draw_view_transient_label(&mut self, ctx: &egui::Context) {
@@ -2698,7 +2794,7 @@ impl ViewerState {
 
     fn draw_roi_control_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {
         let mut actions = Vec::new();
-        let panel_height = (self.roi_control_size.height as f32 - 24.0).max(160.0);
+        let panel_height = (self.roi_control.size.height as f32 - 24.0).max(160.0);
         let mut desired_control_size_points = egui::vec2(
             ROI_CONTROL_CONTENT_WIDTH_POINTS + 24.0,
             ROI_CONTROL_MIN_INNER_HEIGHT as f32,
@@ -3415,7 +3511,7 @@ impl ViewerState {
         pixels_per_point: f32,
     ) {
         let Some(desired_size) = desired_panel_size(
-            &self.control_window,
+            &self.control.window,
             desired_control_size_points,
             pixels_per_point,
             CONTROL_MIN_INNER_WIDTH,
@@ -3427,17 +3523,17 @@ impl ViewerState {
         ) else {
             return;
         };
-        if size_is_close(self.control_size, desired_size) {
+        if size_is_close(self.control.size, desired_size) {
             return;
         }
-        if self.last_requested_control_size == Some(desired_size) {
+        if self.control.last_requested_size == Some(desired_size) {
             return;
         }
-        self.last_requested_control_size = Some(desired_size);
-        if let Some(actual_size) = self.control_window.request_inner_size(desired_size) {
+        self.control.last_requested_size = Some(desired_size);
+        if let Some(actual_size) = self.control.window.request_inner_size(desired_size) {
             self.resize_control(actual_size);
         }
-        self.control_window.request_redraw();
+        self.control.window.request_redraw();
     }
 
     fn fit_roi_control_window(
@@ -3446,7 +3542,7 @@ impl ViewerState {
         pixels_per_point: f32,
     ) {
         let Some(desired_size) = desired_panel_size(
-            &self.roi_control_window,
+            &self.roi_control.window,
             desired_control_size_points,
             pixels_per_point,
             ROI_CONTROL_MIN_INNER_WIDTH,
@@ -3458,17 +3554,17 @@ impl ViewerState {
         ) else {
             return;
         };
-        if size_is_close(self.roi_control_size, desired_size) {
+        if size_is_close(self.roi_control.size, desired_size) {
             return;
         }
-        if self.last_requested_roi_control_size == Some(desired_size) {
+        if self.roi_control.last_requested_size == Some(desired_size) {
             return;
         }
-        self.last_requested_roi_control_size = Some(desired_size);
-        if let Some(actual_size) = self.roi_control_window.request_inner_size(desired_size) {
+        self.roi_control.last_requested_size = Some(desired_size);
+        if let Some(actual_size) = self.roi_control.window.request_inner_size(desired_size) {
             self.resize_roi_control(actual_size);
         }
-        self.roi_control_window.request_redraw();
+        self.roi_control.window.request_redraw();
     }
 
     fn apply_commands(&mut self, actions: Vec<ViewerCommand>) {
@@ -3822,7 +3918,8 @@ impl ViewerState {
         self.update_scene_stats();
         self.camera.reset();
         self.controller.camera.note_reset();
-        self.view_window
+        self.view
+            .window
             .set_title(&window_title(self.surface_path.as_ref()));
         self.log_status(format!(
             "Loaded surface with {node_count} nodes and {face_count} triangles."
@@ -4341,10 +4438,11 @@ impl ViewerState {
         self.controller.interaction.set_pick(Some(pick));
         self.afni_crosshair_node = Some(node_index);
         self.refresh_pick_overlay_value();
+        self.refresh_graph_snapshot_if_open();
         self.upload_surface_buffers();
-        self.control_window.request_redraw();
+        self.control.window.request_redraw();
         if self.controller.panels.roi_controller_open {
-            self.roi_control_window.request_redraw();
+            self.roi_control.window.request_redraw();
         }
         self.log_status(format!(
             "Applied AFNI/SUMA crosshair to node {}{}.",
@@ -4742,7 +4840,8 @@ impl ViewerState {
             self.upload_surface_buffers();
             self.update_scene_stats();
         }
-        self.view_window
+        self.view
+            .window
             .set_title(&window_title(self.surface_path.as_ref()));
         self.log_status(format!(
             "Active surface {}/{}: {}{}.",
@@ -5677,20 +5776,20 @@ impl ViewerState {
 
     fn set_surface_controller_visible(&mut self, visible: bool) {
         self.controller.panels.surface_controller_visible = visible;
-        self.control_window.set_visible(visible);
+        self.control.window.set_visible(visible);
         if visible {
-            self.control_window.request_redraw();
+            self.control.window.request_redraw();
         }
-        self.view_window.request_redraw();
+        self.view.window.request_redraw();
     }
 
     fn set_roi_controller_open(&mut self, open: bool) {
         self.controller.panels.roi_controller_open = open;
-        self.roi_control_window.set_visible(open);
+        self.roi_control.window.set_visible(open);
         if open {
-            self.roi_control_window.request_redraw();
+            self.roi_control.window.request_redraw();
         }
-        self.view_window.request_redraw();
+        self.view.window.request_redraw();
     }
 
     fn visible_overlay(&self) -> Option<&Overlay> {
@@ -5721,6 +5820,24 @@ impl ViewerState {
                 self.log_status("No surface under the cursor.");
             }
         }
+        self.refresh_graph_snapshot_if_open();
+    }
+
+    /// Rebuilds the docked graph from the current pick while the graph dock is
+    /// open, so selecting a new node updates the plot without re-pressing `g`.
+    fn refresh_graph_snapshot_if_open(&mut self) {
+        if !self.controller.panels.graph_window_open {
+            return;
+        }
+        let snapshot = self
+            .controller
+            .interaction
+            .pick
+            .and_then(|pick| self.graph_snapshot_for_pick(pick));
+        if snapshot.is_some() {
+            self.graph_snapshot = snapshot;
+        }
+        self.view.window.request_redraw();
     }
 
     fn pick_surface_at_cursor(&self) -> Option<SurfacePick> {
@@ -5814,9 +5931,9 @@ impl ViewerState {
 
         self.upload_surface_buffers();
         self.update_scene_stats();
-        self.control_window.request_redraw();
+        self.control.window.request_redraw();
         if self.controller.panels.roi_controller_open {
-            self.roi_control_window.request_redraw();
+            self.roi_control.window.request_redraw();
         }
 
         Ok(())
@@ -6098,11 +6215,11 @@ impl ViewerState {
             self.shrink_view_window_after_graph_dock();
         }
         self.controller.panels.graph_window_open = open;
-        self.graph_window.set_visible(false);
+        self.graph.window.set_visible(false);
         if open {
-            self.view_window.request_redraw();
+            self.view.window.request_redraw();
         }
-        self.view_window.request_redraw();
+        self.view.window.request_redraw();
     }
 
     fn grow_view_window_for_graph_dock(&mut self) {
@@ -6116,11 +6233,11 @@ impl ViewerState {
         }
 
         let desired_size = PhysicalSize::new(
-            self.view_size.width.max(1),
-            self.view_size.height.saturating_add(growth).max(1),
+            self.view.size.width.max(1),
+            self.view.size.height.saturating_add(growth).max(1),
         );
-        self.graph_dock_pre_open_size = Some(self.view_size);
-        if let Some(actual_size) = self.view_window.request_inner_size(desired_size) {
+        self.graph_dock_pre_open_size = Some(self.view.size);
+        if let Some(actual_size) = self.view.window.request_inner_size(desired_size) {
             self.resize_view(actual_size);
         }
     }
@@ -6130,14 +6247,14 @@ impl ViewerState {
             return;
         };
         let desired_height = previous_size.height.max(1);
-        let desired_size = PhysicalSize::new(self.view_size.width.max(1), desired_height);
-        if let Some(actual_size) = self.view_window.request_inner_size(desired_size) {
+        let desired_size = PhysicalSize::new(self.view.size.width.max(1), desired_height);
+        if let Some(actual_size) = self.view.window.request_inner_size(desired_size) {
             self.resize_view(actual_size);
         }
     }
 
     fn graph_dock_height_pixels(&self) -> u32 {
-        (GRAPH_DOCK_DEFAULT_HEIGHT_POINTS * self.view_egui_ctx.pixels_per_point())
+        (self.graph_dock_height_points * self.view.egui.ctx.pixels_per_point())
             .round()
             .max(1.0) as u32
     }
@@ -6609,7 +6726,7 @@ impl ViewerState {
             "momentum off"
         });
         if enabled {
-            self.view_repaint_at = Some(Instant::now() + MOMENTUM_FRAME_INTERVAL);
+            self.view.repaint_at = Some(Instant::now() + MOMENTUM_FRAME_INTERVAL);
         }
     }
 
@@ -10450,39 +10567,6 @@ fn repaint_delay_to_instant(full_output: &egui::FullOutput) -> Option<Instant> {
         None
     } else {
         Instant::now().checked_add(repaint_delay)
-    }
-}
-
-fn upload_pending_egui_textures(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    renderer: &mut Renderer,
-    pending: &egui::TexturesDelta,
-    allocated: &mut HashSet<egui::TextureId>,
-) -> (bool, egui::TexturesDelta) {
-    let mut retained = egui::TexturesDelta::default();
-    let mut needs_repaint = false;
-    for (id, image_delta) in &pending.set {
-        if image_delta.pos.is_some() && !allocated.contains(id) {
-            retained.set.push((*id, image_delta.clone()));
-            needs_repaint = true;
-            continue;
-        }
-        renderer.update_texture(device, queue, *id, image_delta);
-        allocated.insert(*id);
-    }
-    (needs_repaint, retained)
-}
-
-fn free_pending_egui_textures(
-    renderer: &mut Renderer,
-    pending: &egui::TexturesDelta,
-    allocated: &mut HashSet<egui::TextureId>,
-) {
-    for id in &pending.free {
-        if allocated.remove(id) {
-            renderer.free_texture(id);
-        }
     }
 }
 
