@@ -116,6 +116,11 @@ const GRAPH_MIN_PLOT_HEIGHT_POINTS: f32 = 96.0;
 const GRAPH_DEFAULT_PLOT_HEIGHT_POINTS: f32 = 138.0;
 const GRAPH_DOCK_DEFAULT_HEIGHT_POINTS: f32 = 360.0;
 const GRAPH_DOCK_MIN_HEIGHT_POINTS: f32 = 180.0;
+/// Smallest 3D scene height (egui points) left above the dock when it is dragged
+/// tall, so the brain never collapses entirely.
+const GRAPH_DOCK_MIN_SCENE_HEIGHT_POINTS: f32 = 160.0;
+/// Thickness (egui points) of the dock's resize grab strip.
+const GRAPH_DOCK_HANDLE_HEIGHT_POINTS: f32 = 6.0;
 const GRAPH_MAX_VIEW_WIDTH_FRACTION: f32 = 0.75;
 const GRAPH_MAX_VIEW_HEIGHT_FRACTION: f32 = 0.25;
 const INITIAL_WINDOW_RAISE_PIXELS: i32 = 100;
@@ -657,6 +662,10 @@ struct ViewerState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     graph_dock_pre_open_size: Option<PhysicalSize<u32>>,
+    /// Height (egui points) of the graph dock panel. Owned here rather than left
+    /// to egui's panel-state persistence (which did not survive frames here), so
+    /// the self-managed resize handle sticks and drives the 3D viewport split.
+    graph_dock_height_points: f32,
     startup_redraw_until: Instant,
     render_pipeline: wgpu::RenderPipeline,
     surface_buffers: Option<SurfaceBuffers>,
@@ -1011,6 +1020,7 @@ impl ViewerState {
             device,
             queue,
             graph_dock_pre_open_size: None,
+            graph_dock_height_points: GRAPH_DOCK_DEFAULT_HEIGHT_POINTS,
             startup_redraw_until: Instant::now(),
             render_pipeline,
             surface_buffers: None,
@@ -1437,16 +1447,16 @@ impl ViewerState {
     }
 
     fn scene_viewport_size(&self) -> PhysicalSize<u32> {
-        if self.controller.panels.graph_window_open
-            && let Some(pre_open_size) = self.graph_dock_pre_open_size
-        {
-            return PhysicalSize::new(
-                self.view.size.width.max(1),
-                pre_open_size.height.min(self.view.size.height).max(1),
-            );
-        }
+        let height = if self.controller.panels.graph_window_open {
+            // Reserve the dock's current height for the plot, leaving the rest of
+            // the window for the 3D scene.
+            let dock = self.graph_dock_height_pixels();
+            self.view.size.height.saturating_sub(dock).max(1)
+        } else {
+            self.view.size.height.max(1)
+        };
 
-        PhysicalSize::new(self.view.size.width.max(1), self.view.size.height.max(1))
+        PhysicalSize::new(self.view.size.width.max(1), height)
     }
 
     fn scene_viewport_aspect(&self) -> f32 {
@@ -2683,13 +2693,44 @@ impl ViewerState {
         actions
     }
 
-    fn draw_graph_dock_ui(&self, ctx: &egui::Context, actions: &mut Vec<ViewerCommand>) {
+    fn draw_graph_dock_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<ViewerCommand>) {
+        let current_height = self.graph_dock_height_points;
         #[allow(deprecated)]
-        egui::TopBottomPanel::bottom("graph_dock")
-            .resizable(true)
-            .default_height(GRAPH_DOCK_DEFAULT_HEIGHT_POINTS)
-            .min_height(GRAPH_DOCK_MIN_HEIGHT_POINTS)
+        let response = egui::TopBottomPanel::bottom("graph_dock")
+            .resizable(false)
+            .exact_height(current_height)
             .show(ctx, |ui| {
+                let mut next_height = current_height;
+
+                // Self-managed resize handle along the dock's top edge. egui's own
+                // panel-resize state did not persist here, so the dock height is
+                // owned by `graph_dock_height_points` and adjusted directly.
+                let full = ui.max_rect();
+                let handle_rect = egui::Rect::from_min_max(
+                    full.left_top(),
+                    egui::pos2(full.right(), full.top() + GRAPH_DOCK_HANDLE_HEIGHT_POINTS),
+                );
+                let handle = ui.interact(
+                    handle_rect,
+                    ui.id().with("graph_dock_resize"),
+                    egui::Sense::drag(),
+                );
+                if handle.hovered() || handle.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if handle.dragged() {
+                    // Dragging up (negative y) grows the dock.
+                    next_height -= handle.drag_delta().y;
+                }
+                let stroke = if handle.hovered() || handle.dragged() {
+                    ui.visuals().widgets.active.bg_stroke
+                } else {
+                    ui.visuals().widgets.noninteractive.bg_stroke
+                };
+                ui.painter()
+                    .hline(handle_rect.x_range(), handle_rect.center().y, stroke);
+                ui.add_space(GRAPH_DOCK_HANDLE_HEIGHT_POINTS);
+
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Graph").strong().color(accent_color()));
                     ui.separator();
@@ -2704,7 +2745,20 @@ impl ViewerState {
                 });
                 ui.separator();
                 self.draw_graph_contents(ui);
+
+                next_height
             });
+
+        let window_height_points = self.view.size.height as f32 / ctx.pixels_per_point().max(0.01);
+        let max_height = (window_height_points - GRAPH_DOCK_MIN_SCENE_HEIGHT_POINTS)
+            .max(GRAPH_DOCK_MIN_HEIGHT_POINTS);
+        let clamped = response
+            .inner
+            .clamp(GRAPH_DOCK_MIN_HEIGHT_POINTS, max_height);
+        if (clamped - current_height).abs() > f32::EPSILON {
+            self.graph_dock_height_points = clamped;
+            self.view.window.request_redraw();
+        }
     }
 
     fn draw_view_transient_label(&mut self, ctx: &egui::Context) {
@@ -4384,6 +4438,7 @@ impl ViewerState {
         self.controller.interaction.set_pick(Some(pick));
         self.afni_crosshair_node = Some(node_index);
         self.refresh_pick_overlay_value();
+        self.refresh_graph_snapshot_if_open();
         self.upload_surface_buffers();
         self.control.window.request_redraw();
         if self.controller.panels.roi_controller_open {
@@ -5765,6 +5820,24 @@ impl ViewerState {
                 self.log_status("No surface under the cursor.");
             }
         }
+        self.refresh_graph_snapshot_if_open();
+    }
+
+    /// Rebuilds the docked graph from the current pick while the graph dock is
+    /// open, so selecting a new node updates the plot without re-pressing `g`.
+    fn refresh_graph_snapshot_if_open(&mut self) {
+        if !self.controller.panels.graph_window_open {
+            return;
+        }
+        let snapshot = self
+            .controller
+            .interaction
+            .pick
+            .and_then(|pick| self.graph_snapshot_for_pick(pick));
+        if snapshot.is_some() {
+            self.graph_snapshot = snapshot;
+        }
+        self.view.window.request_redraw();
     }
 
     fn pick_surface_at_cursor(&self) -> Option<SurfacePick> {
@@ -6181,7 +6254,7 @@ impl ViewerState {
     }
 
     fn graph_dock_height_pixels(&self) -> u32 {
-        (GRAPH_DOCK_DEFAULT_HEIGHT_POINTS * self.view.egui.ctx.pixels_per_point())
+        (self.graph_dock_height_points * self.view.egui.ctx.pixels_per_point())
             .round()
             .max(1.0) as u32
     }
