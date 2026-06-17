@@ -12,6 +12,8 @@ Findings come from the current tree (notably the ~80-field `ViewerState` and the
 
 ## Tier 1 — High payoff, mostly mechanical
 
+Status: item 1 done (branch `refactorT1`); items 2–3 pending.
+
 ### 1. Collapse the four per-window field groups into a `WindowPane` — ✅ DONE (branch `refactorT1`)
 
 Outcome: the ~36 window/egui fields collapsed into four `WindowPane`s, dropping
@@ -40,17 +42,27 @@ control, roi_control, graph):
 That's ~40 fields expressing the same shape four times
 ([`viewer/mod.rs:560`](src/viewer/mod.rs) onward).
 
-- [ ] Introduce `struct EguiPane { ctx, state, renderer, pending_textures, allocated_textures }`
-      and fold the existing free helpers (`upload_pending_egui_textures`,
-      `free_pending_egui_textures`, `repaint_delay_to_instant`) into methods on it.
-- [ ] Introduce `struct WindowPane { window, surface, config, size, last_requested_size, repaint_at, frame_rendered, egui: EguiPane }`.
-- [ ] Replace the 4× field groups with `view`, `control`, `roi_control`, `graph`
-      of type `WindowPane`. ~40 fields → 4.
-- [ ] Resize/redraw/repaint logic that is currently copy-pasted three or four
-      times becomes one method on `WindowPane`.
+- [x] Introduced `struct EguiPane { ctx, state, renderer, pending_textures, allocated_textures }`
+      with `upload_pending` / `free_pending` methods (folded from the two free
+      helpers). `repaint_delay_to_instant` stayed a free function — it operates on
+      an egui `FullOutput`, not on pane state, so it didn't belong on `EguiPane`.
+- [x] Introduced `struct WindowPane { window, surface, config, size, last_requested_size, repaint_at, frame_rendered, egui: EguiPane }`.
+- [x] Replaced the 4× field groups with `view`, `control`, `roi_control`, `graph`
+      of type `WindowPane`. ~36 fields → 4 (`ViewerState`: ~80 → 59).
+- [ ] Resize/redraw/repaint logic is not yet deduplicated into `WindowPane`
+      methods — the field bundling landed, but the per-window resize/redraw bodies
+      are still written out separately. A good follow-up within this item.
 
 *Risk:* low-moderate (lots of call sites, but each change is a rename). No logic
 changes. Biggest single readability win.
+
+**Smoke-test follow-ups (separate commit):** running the four-window app to
+verify the rename surfaced two *pre-existing* graph-dock bugs (not caused by the
+refactor), both fixed: (1) the docked graph only refreshed on `g` — it now
+follows node picks live; (2) the dock snapped back when resized because egui's
+panel-resize state didn't persist — the height is now owned in
+`graph_dock_height_points` with a self-managed drag handle, and the 3D viewport
+reserves that height so the dock stays put.
 
 ### 2. Unify the overlay state held on `ViewerState`
 Eight parallel `overlay_*` fields describe one logical thing
@@ -195,10 +207,11 @@ verifiable commits after Tier 1/2 shrink the surface.
 
 ## Suggested sequencing
 
-1. Tier 2 first (items 4–6): small, self-contained type merges that *reduce the
-   blast radius* of everything after them. Land each behind `From` shims.
-2. Tier 1 next (items 1–3): the field-group collapses, now expressed in the
-   unified types.
+1. ✅ Tier 2 first (items 4–6): small, self-contained type merges that *reduce the
+   blast radius* of everything after them. Done (merged on `refactor2`).
+2. Tier 1 next (items 1–3): the field-group collapses. **Item 1 done** (`WindowPane`/
+   `EguiPane`); items 2 (`OverlayState`) and 3 (single source of truth) remain.
+   Optional alongside: bundle `ViewerState::new`'s 17 args to clear that warning.
 3. Tier 3 last (items 7–8): pure relocation once the type surface is smaller.
 
 Run `cargo test && cargo clippy --lib && cargo fmt --all -- --check` after each
