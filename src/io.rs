@@ -129,15 +129,14 @@ pub fn parse_niml_str(text: &str) -> Result<Vec<NimlElement>> {
 }
 
 pub fn parse_niml_bytes(bytes: &[u8]) -> Result<Vec<NimlElement>> {
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        if text
+    if let Ok(text) = std::str::from_utf8(bytes)
+        && text
             .lines()
             .any(|line| line.trim_start().starts_with("# <Node_ROI"))
-        {
-            let cleaned = strip_niml_comment_prefixes(text);
-            let mut parser = NimlByteParser::new(cleaned.as_bytes());
-            return parser.parse();
-        }
+    {
+        let cleaned = strip_niml_comment_prefixes(text);
+        let mut parser = NimlByteParser::new(cleaned.as_bytes());
+        return parser.parse();
     }
 
     let mut parser = NimlByteParser::new(bytes);
@@ -2160,9 +2159,10 @@ fn column_role_from_niml_metadata(
         ColumnRole::Threshold
     } else if type_text.contains("brightness") || label_text.contains("brightness") {
         ColumnRole::Brightness
-    } else if !stat_text.is_empty() && stat_text != "none" {
-        ColumnRole::Statistic
-    } else if type_text.contains("stat") || label_text.contains("stat") {
+    } else if (!stat_text.is_empty() && stat_text != "none")
+        || type_text.contains("stat")
+        || label_text.contains("stat")
+    {
         ColumnRole::Statistic
     } else {
         ColumnRole::Intensity

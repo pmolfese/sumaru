@@ -37,19 +37,13 @@ pub struct ColumnSelection {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RangeSelection {
     Auto,
-    Manual(OverlayRange),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OverlayRange {
-    pub min: f64,
-    pub max: f64,
+    Manual(ColumnRange),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Threshold {
     pub mode: ThresholdMode,
-    pub range: Option<OverlayRange>,
+    pub range: Option<ColumnRange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,8 +186,8 @@ impl Overlay {
             .transpose()
             .context("overlay brightness column is invalid")?;
         let intensity_range = self.resolved_intensity_range(intensity_column)?;
-        let brightness_range: Option<OverlayRange> =
-            brightness_column.and_then(|column| column.range.map(Into::into));
+        let brightness_range: Option<ColumnRange> =
+            brightness_column.and_then(|column| column.range);
         self.threshold.validate()?;
         let colormap = self
             .colormap
@@ -223,13 +217,13 @@ impl Overlay {
                 && !intensity_range.contains(value);
             let mut color = map_value(value, intensity_range, colormap);
 
-            if let (Some(column), Some(range)) = (brightness_column, brightness_range) {
-                if let Some(brightness) = numeric_value(column, row) {
-                    let factor = range.normalized(brightness).clamp(0.0, 1.0) as f32;
-                    color[0] *= factor;
-                    color[1] *= factor;
-                    color[2] *= factor;
-                }
+            if let (Some(column), Some(range)) = (brightness_column, brightness_range)
+                && let Some(brightness) = numeric_value(column, row)
+            {
+                let factor = range.normalized(brightness).clamp(0.0, 1.0) as f32;
+                color[0] *= factor;
+                color[1] *= factor;
+                color[2] *= factor;
             }
 
             if clipped_out {
@@ -300,11 +294,10 @@ impl Overlay {
         self
     }
 
-    fn resolved_intensity_range(&self, column: &DataColumn) -> Result<OverlayRange> {
+    fn resolved_intensity_range(&self, column: &DataColumn) -> Result<ColumnRange> {
         let mut range = match self.intensity_range {
             RangeSelection::Auto => column
                 .range
-                .map(Into::into)
                 .with_context(|| format!("column {} has no numeric range", column.label))?,
             RangeSelection::Manual(range) => range,
         };
@@ -312,7 +305,7 @@ impl Overlay {
 
         if self.symmetric_range {
             let extent = range.min.abs().max(range.max.abs());
-            range = OverlayRange {
+            range = ColumnRange {
                 min: -extent,
                 max: extent,
             };
@@ -376,28 +369,28 @@ impl Threshold {
     pub fn above(min: f64) -> Self {
         Self {
             mode: ThresholdMode::Above,
-            range: Some(OverlayRange { min, max: min }),
+            range: Some(ColumnRange { min, max: min }),
         }
     }
 
     pub fn below(max: f64) -> Self {
         Self {
             mode: ThresholdMode::Below,
-            range: Some(OverlayRange { min: max, max }),
+            range: Some(ColumnRange { min: max, max }),
         }
     }
 
     pub fn between(min: f64, max: f64) -> Self {
         Self {
             mode: ThresholdMode::Between,
-            range: Some(OverlayRange { min, max }),
+            range: Some(ColumnRange { min, max }),
         }
     }
 
     pub fn outside(min: f64, max: f64) -> Self {
         Self {
             mode: ThresholdMode::Outside,
-            range: Some(OverlayRange { min, max }),
+            range: Some(ColumnRange { min, max }),
         }
     }
 
@@ -426,38 +419,6 @@ impl Threshold {
             ThresholdMode::Below => value <= range.max,
             ThresholdMode::Between => range.contains(value),
             ThresholdMode::Outside => value <= range.min || value >= range.max,
-        }
-    }
-}
-
-impl OverlayRange {
-    fn contains(&self, value: f64) -> bool {
-        value >= self.min && value <= self.max
-    }
-
-    fn normalized(&self, value: f64) -> f64 {
-        if (self.max - self.min).abs() <= f64::EPSILON {
-            0.5
-        } else {
-            ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
-        }
-    }
-
-    fn validate(&self, label: &str) -> Result<()> {
-        ensure!(
-            self.min.is_finite() && self.max.is_finite(),
-            "{label} must contain finite values"
-        );
-        ensure!(self.min <= self.max, "{label} min is greater than max");
-        Ok(())
-    }
-}
-
-impl From<ColumnRange> for OverlayRange {
-    fn from(range: ColumnRange) -> Self {
-        Self {
-            min: range.min,
-            max: range.max,
         }
     }
 }
@@ -501,7 +462,7 @@ fn numeric_value(column: &DataColumn, row: usize) -> Option<f64> {
     }
 }
 
-fn map_value(value: f64, range: OverlayRange, colormap: &ContinuousColorMap) -> [f32; 4] {
+fn map_value(value: f64, range: ColumnRange, colormap: &ContinuousColorMap) -> [f32; 4] {
     let normalized = range.normalized(value) as f32;
     colormap.sample(normalized).to_array()
 }
@@ -519,11 +480,10 @@ impl ColumnDataKind for ColumnData {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipMode, MaskMode, Overlay, OverlayColumns, OverlayLayerRole, OverlayRange,
-        RangeSelection, Threshold,
+        ClipMode, MaskMode, Overlay, OverlayColumns, OverlayLayerRole, RangeSelection, Threshold,
     };
     use crate::color::ColorMap;
-    use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
+    use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::surface::SurfaceDomain;
 
     #[test]
@@ -664,7 +624,7 @@ mod tests {
         let dataset = scalar_dataset(&domain);
         let mut overlay = Overlay::from_dataset(&dataset, &domain, OverlayColumns::new(0))
             .unwrap()
-            .with_intensity_range(RangeSelection::Manual(OverlayRange {
+            .with_intensity_range(RangeSelection::Manual(ColumnRange {
                 min: -0.5,
                 max: 0.5,
             }))

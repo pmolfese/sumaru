@@ -350,7 +350,7 @@ pub struct OverlayDataset {
     pub threshold_values: Option<Vec<f32>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ValueRange {
     pub min: f32,
     pub max: f32,
@@ -2645,9 +2645,7 @@ fn infer_domain_kind(
         } else {
             SurfaceDomainKind::StandardTemplate
         }
-    } else if subject_label.is_some() {
-        SurfaceDomainKind::NativeSubject
-    } else if source_file.and_then(infer_subject_from_path).is_some() {
+    } else if subject_label.is_some() || source_file.and_then(infer_subject_from_path).is_some() {
         SurfaceDomainKind::NativeSubject
     } else {
         SurfaceDomainKind::Unknown
@@ -2658,10 +2656,11 @@ fn normalize_standard_space(space: &str) -> String {
     let trimmed = space.trim();
     let compact = compact_lower(trimmed);
 
-    if let Some(rest) = compact.strip_prefix("std") {
-        if !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) {
-            return format!("std.{rest}");
-        }
+    if let Some(rest) = compact.strip_prefix("std")
+        && !rest.is_empty()
+        && rest.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return format!("std.{rest}");
     }
 
     if compact.starts_with("fslr") {
@@ -2802,7 +2801,7 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 
 fn vertices_from_array(array: &DataArray) -> Result<Vec<[f32; 3]>> {
     ensure!(
-        array.data.len() % 3 == 0,
+        array.data.len().is_multiple_of(3),
         "POINTSET array length is not divisible by 3"
     );
 
@@ -2846,7 +2845,7 @@ fn numeric_values_from_array(array: &DataArray) -> Vec<f32> {
 
 fn triangles_from_array(array: &DataArray) -> Result<Vec<[u32; 3]>> {
     ensure!(
-        array.data.len() % 3 == 0,
+        array.data.len().is_multiple_of(3),
         "TRIANGLE array length is not divisible by 3"
     );
 

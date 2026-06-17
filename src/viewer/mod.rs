@@ -28,13 +28,13 @@ use crate::command::{
     BackgroundMode, CameraControlMode, ControllerState, HemisphereLayout, HemisphereLayoutState,
     PairVisibility, SurfacePick, ViewPreset, ViewerCommand,
 };
-use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
+use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
 use crate::io::{
     NimlElement, read_gifti_dataset, read_niml_dataset, read_niml_roi, write_niml_roi,
 };
 use crate::niml_debug::NimlRecorder;
 use crate::overlay::{
-    ColumnSelection, MaskMode, Overlay, OverlayColumns, OverlayRange, RangeSelection, Threshold,
+    ColumnSelection, MaskMode, Overlay, OverlayColumns, RangeSelection, Threshold,
 };
 use crate::roi::{
     Roi, RoiBrushAction, RoiDatum, RoiDrawStatus, RoiDrawingType, RoiElementKind, RoiSource,
@@ -3475,28 +3475,26 @@ impl ViewerState {
         for action in actions {
             match action {
                 ViewerCommand::PickSurface => {
-                    if let Some(path) = pick_surface_file(self.surface_path.as_ref()) {
-                        if let Err(error) = self.load_surface_path(path) {
-                            self.set_error(error);
-                        }
+                    if let Some(path) = pick_surface_file(self.surface_path.as_ref())
+                        && let Err(error) = self.load_surface_path(path)
+                    {
+                        self.set_error(error);
                     }
                 }
                 ViewerCommand::PickOverlay => {
                     if let Some(path) =
                         pick_overlay_file(self.overlay_path.as_ref().or(self.surface_path.as_ref()))
+                        && let Err(error) = self.load_overlay_path(path)
                     {
-                        if let Err(error) = self.load_overlay_path(path) {
-                            self.set_error(error);
-                        }
+                        self.set_error(error);
                     }
                 }
                 ViewerCommand::PickRoi => {
                     if let Some(path) =
                         pick_roi_file(self.roi_path.as_ref().or(self.surface_path.as_ref()))
+                        && let Err(error) = self.load_roi_path(path)
                     {
-                        if let Err(error) = self.load_roi_path(path) {
-                            self.set_error(error);
-                        }
+                        self.set_error(error);
                     }
                 }
                 ViewerCommand::PickSpec => {
@@ -3505,10 +3503,10 @@ impl ViewerState {
                         .as_ref()
                         .map(|scene| &scene.spec_path)
                         .or(self.surface_path.as_ref());
-                    if let Some(path) = pick_spec_file(current_path) {
-                        if let Err(error) = self.load_spec_path(path, None) {
-                            self.set_error(error);
-                        }
+                    if let Some(path) = pick_spec_file(current_path)
+                        && let Err(error) = self.load_spec_path(path, None)
+                    {
+                        self.set_error(error);
                     }
                 }
                 ViewerCommand::PickSurfaceVolume => {
@@ -3521,10 +3519,10 @@ impl ViewerState {
                                 .and_then(|scene| scene.surface_volume_path.as_ref())
                         })
                         .or(self.surface_path.as_ref());
-                    if let Some(path) = pick_surface_volume_file(current_path) {
-                        if let Err(error) = self.set_surface_volume_path(path) {
-                            self.set_error(error);
-                        }
+                    if let Some(path) = pick_surface_volume_file(current_path)
+                        && let Err(error) = self.set_surface_volume_path(path)
+                    {
+                        self.set_error(error);
                     }
                 }
                 ViewerCommand::RefreshOverlayColumns => {
@@ -3784,7 +3782,7 @@ impl ViewerState {
         self.overlay_appearance = OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE);
         self.controller.overlay.symmetric_range = true;
         self.controller.overlay.intensity_range = None;
-        self.controller.overlay.threshold = None;
+        self.controller.overlay.threshold = self.overlay_appearance.threshold;
         self.controller.overlay.opacity = self.overlay_appearance.opacity;
         self.overlay_path = None;
         self.overlay_pair_paths = None;
@@ -4836,25 +4834,25 @@ impl ViewerState {
     }
 
     fn roi_component_ranges(&self, mesh: &SurfaceMesh) -> Vec<RoiComponentRange> {
-        if let Some((left, right)) = self.active_paired_components() {
-            if let (Some(left_mesh), Some(right_mesh)) = (left.mesh.as_ref(), right.mesh.as_ref()) {
-                return vec![
-                    RoiComponentRange {
-                        side: SurfaceSide::Left,
-                        node_offset: 0,
-                        node_count: left_mesh.vertices.len(),
-                        triangle_offset: 0,
-                        triangle_count: left_mesh.triangles.len(),
-                    },
-                    RoiComponentRange {
-                        side: SurfaceSide::Right,
-                        node_offset: left_mesh.vertices.len() as u32,
-                        node_count: right_mesh.vertices.len(),
-                        triangle_offset: left_mesh.triangles.len(),
-                        triangle_count: right_mesh.triangles.len(),
-                    },
-                ];
-            }
+        if let Some((left, right)) = self.active_paired_components()
+            && let (Some(left_mesh), Some(right_mesh)) = (left.mesh.as_ref(), right.mesh.as_ref())
+        {
+            return vec![
+                RoiComponentRange {
+                    side: SurfaceSide::Left,
+                    node_offset: 0,
+                    node_count: left_mesh.vertices.len(),
+                    triangle_offset: 0,
+                    triangle_count: left_mesh.triangles.len(),
+                },
+                RoiComponentRange {
+                    side: SurfaceSide::Right,
+                    node_offset: left_mesh.vertices.len() as u32,
+                    node_count: right_mesh.vertices.len(),
+                    triangle_offset: left_mesh.triangles.len(),
+                    triangle_count: right_mesh.triangles.len(),
+                },
+            ];
         }
 
         vec![RoiComponentRange {
@@ -5656,17 +5654,8 @@ impl ViewerState {
     }
 
     fn sync_controller_overlay_display_state(&mut self) {
-        self.controller.overlay.intensity_range = Some([
-            self.overlay_appearance.range.min,
-            self.overlay_appearance.range.max,
-        ]);
-        self.controller.overlay.threshold = self.overlay_appearance.threshold.enabled.then_some(
-            crate::command::OverlayThresholdCommandState {
-                value: self.overlay_appearance.threshold.value,
-                absolute: self.overlay_appearance.threshold.absolute,
-                hide_failed: self.overlay_appearance.threshold.hide_failed,
-            },
-        );
+        self.controller.overlay.intensity_range = Some(self.overlay_appearance.range);
+        self.controller.overlay.threshold = self.overlay_appearance.threshold;
         self.controller.overlay.opacity = self.overlay_appearance.opacity;
     }
 
@@ -8646,8 +8635,6 @@ fn append_niml_roi_extension(path: PathBuf) -> PathBuf {
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(".niml.roi") {
         path
-    } else if lower.ends_with(".roi") {
-        path.with_extension("niml.roi")
     } else {
         path.with_extension("niml.roi")
     }
@@ -9643,8 +9630,8 @@ fn threshold_and_mask_from_appearance(appearance: OverlayAppearance) -> (Thresho
     (threshold, mask_mode)
 }
 
-fn overlay_range_from_value_range(range: ValueRange) -> OverlayRange {
-    OverlayRange {
+fn overlay_range_from_value_range(range: ValueRange) -> ColumnRange {
+    ColumnRange {
         min: range.min as f64,
         max: range.max as f64,
     }
@@ -9678,13 +9665,13 @@ fn overlay_dataset_from_canonical_dataset(
         ) {
             *slot = value;
         }
-        if let (Some(column), Some(slots)) = (threshold_column, threshold_values.as_mut()) {
-            if let (Some(value), Some(slot)) = (
+        if let (Some(column), Some(slots)) = (threshold_column, threshold_values.as_mut())
+            && let (Some(value), Some(slot)) = (
                 numeric_column_value_as_f32(column, row),
                 slots.get_mut(node),
-            ) {
-                *slot = value;
-            }
+            )
+        {
+            *slot = value;
         }
     }
 
@@ -10333,13 +10320,13 @@ fn vertical_threshold_bar(
         egui::StrokeKind::Outside,
     );
 
-    if response.clicked() || response.dragged() {
-        if let Some(position) = response.interact_pointer_pos() {
-            let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
-            appearance.threshold.value = threshold_value_from_bar_y(bar_rect, min, max, position.y);
-            appearance.threshold.enabled = true;
-            changed = true;
-        }
+    if (response.clicked() || response.dragged())
+        && let Some(position) = response.interact_pointer_pos()
+    {
+        let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
+        appearance.threshold.value = threshold_value_from_bar_y(bar_rect, min, max, position.y);
+        appearance.threshold.enabled = true;
+        changed = true;
     }
 
     let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
