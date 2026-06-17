@@ -91,6 +91,15 @@ pub(super) struct OverlayAppearance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OverlayColorMap {
+    SpectrumRedToBlue,
+    SpectrumRedToBlueGap,
+    SpectrumYellowToRed,
+    SpectrumYellowToCyan,
+    SpectrumYellowToCyanGap,
+    ColorCircleAjj,
+    ColorCircleZss,
+    RedsAndBlues,
+    RedsAndBluesWithGreen,
     AfniP2Spanned,
     BlueWhiteRed,
     Fire,
@@ -407,7 +416,7 @@ impl OverlayAppearance {
     pub(super) fn from_range(range: ValueRange) -> Self {
         Self {
             range: super::symmetric_value_range(range),
-            colormap: OverlayColorMap::AfniP2Spanned,
+            colormap: OverlayColorMap::SpectrumRedToBlue,
             threshold: OverlayThreshold {
                 enabled: false,
                 absolute: true,
@@ -421,7 +430,16 @@ impl OverlayAppearance {
 }
 
 impl OverlayColorMap {
-    pub(super) const ALL: [Self; 4] = [
+    pub(super) const ALL: [Self; 13] = [
+        Self::SpectrumRedToBlue,
+        Self::SpectrumRedToBlueGap,
+        Self::SpectrumYellowToRed,
+        Self::SpectrumYellowToCyan,
+        Self::SpectrumYellowToCyanGap,
+        Self::ColorCircleAjj,
+        Self::ColorCircleZss,
+        Self::RedsAndBlues,
+        Self::RedsAndBluesWithGreen,
         Self::AfniP2Spanned,
         Self::BlueWhiteRed,
         Self::Fire,
@@ -430,6 +448,15 @@ impl OverlayColorMap {
 
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::SpectrumRedToBlue => "Spectrum:red_to_blue",
+            Self::SpectrumRedToBlueGap => "Spectrum:red_to_blue+gap",
+            Self::SpectrumYellowToRed => "Spectrum:yellow_to_red",
+            Self::SpectrumYellowToCyan => "Spectrum:yellow_to_cyan",
+            Self::SpectrumYellowToCyanGap => "Spectrum:yellow_to_cyan+gap",
+            Self::ColorCircleAjj => "Color_circle_AJJ",
+            Self::ColorCircleZss => "Color_circle_ZSS",
+            Self::RedsAndBlues => "Reds_and_Blues",
+            Self::RedsAndBluesWithGreen => "Reds_and_Blues_w_Green",
             Self::AfniP2Spanned => "afni_p2spanned",
             Self::BlueWhiteRed => "blue-white-red",
             Self::Fire => "nih_fire",
@@ -439,6 +466,15 @@ impl OverlayColorMap {
 
     pub(super) fn to_color_map(self) -> ColorMap {
         match self {
+            Self::SpectrumRedToBlue => ColorMap::spectrum_red_to_blue(),
+            Self::SpectrumRedToBlueGap => ColorMap::spectrum_red_to_blue_gap(),
+            Self::SpectrumYellowToRed => ColorMap::spectrum_yellow_to_red(),
+            Self::SpectrumYellowToCyan => ColorMap::spectrum_yellow_to_cyan(),
+            Self::SpectrumYellowToCyanGap => ColorMap::spectrum_yellow_to_cyan_gap(),
+            Self::ColorCircleAjj => ColorMap::color_circle_ajj(),
+            Self::ColorCircleZss => ColorMap::color_circle_zss(),
+            Self::RedsAndBlues => ColorMap::reds_and_blues(),
+            Self::RedsAndBluesWithGreen => ColorMap::reds_and_blues_with_green(),
             Self::AfniP2Spanned => ColorMap::afni_p2_spanned(),
             Self::BlueWhiteRed => ColorMap::blue_white_red(),
             Self::Fire => ColorMap::fire(),

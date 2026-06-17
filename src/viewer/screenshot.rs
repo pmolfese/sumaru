@@ -41,6 +41,21 @@ pub(super) fn append_png_extension(path: PathBuf) -> PathBuf {
     path
 }
 
+/// Inserts `suffix` between a path's file stem and its extension, e.g.
+/// `sumaru_view.png` with suffix `_cmap` becomes `sumaru_view_cmap.png`.
+pub(super) fn append_filename_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("screenshot");
+    let mut file_name = format!("{stem}{suffix}");
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        file_name.push('.');
+        file_name.push_str(extension);
+    }
+    path.with_file_name(file_name)
+}
+
 pub(super) fn save_png(path: &Path, image: &ScreenshotImage) -> Result<()> {
     image::save_buffer_with_format(
         path,
@@ -287,9 +302,21 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ScreenshotImage, append_png_extension, crop_to_content, pad_image, padded_bytes_per_row,
-        stitch_horizontal, stitch_horizontal_with_gap, texture_bytes_to_rgba,
+        ScreenshotImage, append_filename_suffix, append_png_extension, crop_to_content, pad_image,
+        padded_bytes_per_row, stitch_horizontal, stitch_horizontal_with_gap, texture_bytes_to_rgba,
     };
+
+    #[test]
+    fn filename_suffix_is_inserted_before_extension() {
+        assert_eq!(
+            append_filename_suffix(&PathBuf::from("/tmp/sumaru_view.png"), "_cmap"),
+            PathBuf::from("/tmp/sumaru_view_cmap.png")
+        );
+        assert_eq!(
+            append_filename_suffix(&PathBuf::from("montage"), "_cmap"),
+            PathBuf::from("montage_cmap")
+        );
+    }
 
     #[test]
     fn png_extension_is_added_when_missing() {

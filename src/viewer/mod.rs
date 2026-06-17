@@ -1617,6 +1617,7 @@ impl ViewerState {
         let image = self.capture_surface_view(&camera)?;
         screenshot::save_png(&path, &image)?;
         self.log_status(format!("Saved screenshot {}.", path.display()));
+        self.save_colormap_companion(&image, &path)?;
 
         Ok(())
     }
@@ -1651,8 +1652,99 @@ impl ViewerState {
         let montage = result?;
         screenshot::save_png(&path, &montage)?;
         self.log_status(format!("Saved montage {}.", path.display()));
+        self.save_colormap_companion(&montage, &path)?;
 
         Ok(())
+    }
+
+    /// When a thresholded overlay is active, writes a second copy of `base`
+    /// with the active colormap drawn along the right edge. The companion file
+    /// reuses `path` with `_cmap` inserted before the extension. No-op when no
+    /// thresholded overlay is shown.
+    fn save_colormap_companion(&self, base: &ScreenshotImage, path: &Path) -> Result<()> {
+        if !self.has_thresholded_overlay() {
+            return Ok(());
+        }
+
+        let background = self.controller.display.background.rgba8();
+        let panel = self.colorbar_panel_image(base, background);
+        let with_colorbar = screenshot::stitch_horizontal(&[base.clone(), panel])?;
+        let cmap_path = screenshot::append_filename_suffix(path, "_cmap");
+        screenshot::save_png(&cmap_path, &with_colorbar)?;
+        self.log_status(format!(
+            "Saved screenshot with colormap {}.",
+            cmap_path.display()
+        ));
+
+        Ok(())
+    }
+
+    /// True when an overlay is loaded and its threshold is enabled.
+    fn has_thresholded_overlay(&self) -> bool {
+        self.overlay.is_some() && self.overlay_appearance.threshold.enabled
+    }
+
+    /// Builds a right-side panel the same height as `base` containing a vertical
+    /// colorbar for the active overlay colormap (max at top, min at bottom).
+    fn colorbar_panel_image(&self, base: &ScreenshotImage, background: [u8; 4]) -> ScreenshotImage {
+        let height = base.height.max(1);
+        let bar_width = (base.width / 25).clamp(20, 60);
+        let left_margin = bar_width / 2;
+        let right_margin = bar_width;
+        let panel_width = left_margin + bar_width + right_margin;
+
+        let vertical_margin = (height / 12).max(4).min(height / 2);
+        let bar_top = vertical_margin;
+        let bar_bottom = height.saturating_sub(vertical_margin).max(bar_top + 1);
+        let bar_height = bar_bottom - bar_top;
+        let border = contrasting_border(background);
+
+        let mut rgba = vec![0_u8; panel_width as usize * height as usize * 4];
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&background);
+        }
+
+        let mut set_pixel = |x: u32, y: u32, color: [u8; 4]| {
+            if x < panel_width && y < height {
+                let index = ((y * panel_width + x) * 4) as usize;
+                rgba[index..index + 4].copy_from_slice(&color);
+            }
+        };
+
+        for y in bar_top..bar_bottom {
+            let t = if bar_height > 1 {
+                1.0 - (y - bar_top) as f32 / (bar_height - 1) as f32
+            } else {
+                1.0
+            };
+            let color = sample_colormap(self.overlay_appearance.colormap, t);
+            let rgba8 = [
+                (color[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (color[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (color[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+                255,
+            ];
+            for x in left_margin..left_margin + bar_width {
+                set_pixel(x, y, rgba8);
+            }
+        }
+
+        // 1px border framing the bar.
+        let frame_left = left_margin.saturating_sub(1);
+        let frame_right = left_margin + bar_width;
+        let frame_top = bar_top.saturating_sub(1);
+        let frame_bottom = bar_bottom;
+        for x in frame_left..=frame_right {
+            set_pixel(x, frame_top, border);
+            set_pixel(x, frame_bottom, border);
+        }
+        for y in frame_top..=frame_bottom {
+            set_pixel(frame_left, y, border);
+            set_pixel(frame_right, y, border);
+        }
+
+        ScreenshotImage::new(panel_width, height, rgba)
+            .expect("colorbar panel dimensions match its buffer")
     }
 
     fn capture_standard_montage(&mut self) -> Result<ScreenshotImage> {
@@ -2986,6 +3078,12 @@ impl ViewerState {
                             ))
                             .color(muted_color()),
                         );
+                        if let Some(q_value) = self.selected_threshold_q_value() {
+                            ui.label(
+                                egui::RichText::new(threshold_q_value_display(q_value))
+                                    .color(muted_color()),
+                            );
+                        }
                     },
                 );
 
@@ -3163,6 +3261,16 @@ impl ViewerState {
     fn selected_threshold_p_value(&self) -> Option<f64> {
         self.selected_threshold_stat_spec()
             .and_then(|stat| stat.two_sided_p_value(self.overlay_appearance.threshold.value as f64))
+    }
+
+    fn selected_threshold_q_value(&self) -> Option<f64> {
+        let dataset = self.overlay_dataset.as_ref()?;
+        let index = self.overlay_columns.threshold?;
+        let column = dataset.columns.get(index)?;
+        column
+            .fdr_curve
+            .as_ref()?
+            .q_value(self.overlay_appearance.threshold.value as f64)
     }
 
     fn draw_scene_section(&self, ui: &mut egui::Ui) {
@@ -8101,6 +8209,18 @@ impl BackgroundMode {
     }
 }
 
+/// Picks black or white (whichever contrasts more) for framing a colorbar
+/// against the given background.
+fn contrasting_border(background: [u8; 4]) -> [u8; 4] {
+    let luminance =
+        0.299 * background[0] as f32 + 0.587 * background[1] as f32 + 0.114 * background[2] as f32;
+    if luminance > 127.0 {
+        [0, 0, 0, 255]
+    } else {
+        [255, 255, 255, 255]
+    }
+}
+
 fn window_title(surface_path: Option<&PathBuf>) -> String {
     surface_path.map_or_else(
         || "sumaru".to_string(),
@@ -8811,6 +8931,8 @@ fn paired_data_column(left: DataColumn, right: DataColumn) -> Result<DataColumn>
     let right_role = right.role;
     let right_units = right.units;
     let right_stat = right.stat;
+    let right_fdr_curve = right.fdr_curve;
+    let left_fdr_curve = left.fdr_curve.clone();
     ensure!(
         std::mem::discriminant(&left.values) == std::mem::discriminant(&right.values),
         "paired overlay column {} and {} have different data types",
@@ -8827,6 +8949,11 @@ fn paired_data_column(left: DataColumn, right: DataColumn) -> Result<DataColumn>
     } else {
         None
     };
+    let fdr_curve = if left_fdr_curve == right_fdr_curve {
+        left_fdr_curve
+    } else {
+        None
+    };
     let role = if left.role == right_role {
         left.role.clone()
     } else {
@@ -8839,7 +8966,8 @@ fn paired_data_column(left: DataColumn, right: DataColumn) -> Result<DataColumn>
         units,
         paired_column_data(left.values, right.values)?,
     )?
-    .with_stat(stat))
+    .with_stat(stat)
+    .with_fdr_curve(fdr_curve))
 }
 
 fn paired_column_data(left: ColumnData, right: ColumnData) -> Result<ColumnData> {
@@ -10417,6 +10545,14 @@ fn threshold_p_value_display(pvalue: Option<f64>) -> String {
         Some(value) if value < 0.001 => format!("p <= {value:.2e}"),
         Some(value) => format!("p <= {value:.4}"),
         None => "p --".to_string(),
+    }
+}
+
+fn threshold_q_value_display(qvalue: f64) -> String {
+    if qvalue < 0.001 {
+        format!("q <= {qvalue:.2e}")
+    } else {
+        format!("q <= {qvalue:.4}")
     }
 }
 

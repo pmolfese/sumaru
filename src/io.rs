@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail, ensure};
 use gifti_rs::{ArrayData, DataArray, GiftiImage, Meta};
 
 use crate::color::Rgba;
-use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds};
+use crate::dataset::{
+    AfniFdrCurve, ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds,
+};
 use crate::roi::{Roi, RoiBrushAction, RoiDatum, RoiDrawingType, RoiElementKind, RoiSource};
 use crate::surface::{SurfaceDomain, SurfaceSide};
 
@@ -86,6 +88,7 @@ pub struct NimlDatasetPayload {
     pub column_labels: Vec<String>,
     pub column_types: Vec<String>,
     pub column_stats: Vec<String>,
+    pub fdr_curves: BTreeMap<usize, AfniFdrCurve>,
     pub history: Option<String>,
 }
 
@@ -496,6 +499,7 @@ impl NimlDatasetPayload {
             column_labels: Vec::new(),
             column_types: Vec::new(),
             column_stats: Vec::new(),
+            fdr_curves: BTreeMap::new(),
             history: None,
         };
 
@@ -528,6 +532,15 @@ impl NimlDatasetPayload {
                     let Some(atr_name) = child.attrs.get("atr_name") else {
                         continue;
                     };
+                    if let Some(column) = fdr_curve_column_index(atr_name) {
+                        let NimlData::Numeric(matrix) = &child.data else {
+                            bail!("{atr_name} payload is not numeric");
+                        };
+                        payload
+                            .fdr_curves
+                            .insert(column, fdr_curve_from_matrix(matrix)?);
+                        continue;
+                    }
                     let text = match &child.data {
                         NimlData::Text(text) => text.as_str(),
                         _ => "",
@@ -627,6 +640,21 @@ impl NimlDatasetPayload {
         if let Some(history) = &self.history {
             push_atr(&mut children, "HISTORY_NOTE", history);
         }
+        for (column, curve) in &self.fdr_curves {
+            let mut attrs = BTreeMap::new();
+            attrs.insert("atr_name".to_string(), format!("FDRCURVE_{column:06}"));
+            attrs.insert("ni_type".to_string(), "float".to_string());
+            attrs.insert(
+                "ni_dimen".to_string(),
+                (curve.samples.len() + 2).to_string(),
+            );
+            let values = curve.to_afni_values();
+            children.push(NimlElement::numeric(
+                "AFNI_atr",
+                attrs,
+                NimlNumericMatrix::new(vec![NimlValueType::Float32], values.len(), values)?,
+            ));
+        }
 
         Ok(NimlElement::group("AFNI_dataset", root_attrs, children))
     }
@@ -723,14 +751,35 @@ impl NimlDatasetPayload {
             value_type => bail!("cannot convert non-numeric NIML type {value_type:?} to Dataset"),
         };
 
-        DataColumn::new(label, role, None, values).map(|column| {
-            column.with_stat(
-                stat.map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string),
-            )
+        let fdr_curve = self.fdr_curves.get(&column).cloned();
+        DataColumn::new(label, role, None, values).map(|data_column| {
+            data_column
+                .with_stat(
+                    stat.map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                )
+                .with_fdr_curve(fdr_curve)
         })
     }
+}
+
+fn fdr_curve_column_index(atr_name: &str) -> Option<usize> {
+    atr_name
+        .strip_prefix("FDRCURVE_")
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn fdr_curve_from_matrix(matrix: &NimlNumericMatrix) -> Result<AfniFdrCurve> {
+    ensure!(
+        matrix.column_count() == 1,
+        "FDR curve matrix has {} columns; expected 1",
+        matrix.column_count()
+    );
+    let values = (0..matrix.rows)
+        .map(|row| matrix.get(row, 0).context("FDR curve value is missing"))
+        .collect::<Result<Vec<_>>>()?;
+    AfniFdrCurve::from_afni_values(&values)
 }
 
 fn read_gifti_compat(path: &Path) -> Result<GiftiImage> {
@@ -2205,6 +2254,7 @@ mod tests {
     use crate::dataset::{ColumnData, ColumnRole, DatasetKind};
     use crate::roi::{Roi, RoiBrushAction, RoiDatum, RoiDrawingType, RoiElementKind, RoiSource};
     use crate::surface::{SurfaceDomain, SurfaceSide};
+    use std::collections::BTreeMap;
 
     #[test]
     fn niml_type_expansion_matches_reference_repeat_syntax() {
@@ -2371,6 +2421,9 @@ mod tests {
 <AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_LABS" >effect;Tstat;</AFNI_atr>
 <AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_TYPE" >Generic_Float;Generic_Float;</AFNI_atr>
 <AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_STATSYM" >none;Ttest(10);</AFNI_atr>
+<AFNI_atr ni_type="float" ni_dimen="5" atr_name="FDRCURVE_000001" >
+0 1 2 1 0.5
+</AFNI_atr>
 </AFNI_dataset>
 "#,
         )
@@ -2388,6 +2441,21 @@ mod tests {
         assert_eq!(dataset.columns[0].role, ColumnRole::Intensity);
         assert_eq!(dataset.columns[1].role, ColumnRole::Statistic);
         assert_eq!(dataset.columns[1].stat.as_deref(), Some("Ttest(10)"));
+        assert!(payload.fdr_curves.contains_key(&1));
+        assert!(dataset.columns[0].fdr_curve.is_none());
+        assert_eq!(
+            dataset.columns[1].fdr_curve.as_ref().unwrap().z_value(1.0),
+            Some(1.0)
+        );
+        assert!(
+            dataset.columns[1]
+                .fdr_curve
+                .as_ref()
+                .unwrap()
+                .q_value(1.0)
+                .unwrap()
+                < 0.32
+        );
         match &dataset.columns[0].values {
             ColumnData::Float32(values) => assert_eq!(values, &vec![1.5, 3.5]),
             values => panic!("unexpected column data: {values:?}"),
@@ -2414,6 +2482,7 @@ mod tests {
             column_labels: vec!["roi".to_string()],
             column_types: vec!["ROI_Label".to_string()],
             column_stats: vec!["none".to_string()],
+            fdr_curves: BTreeMap::new(),
             history: None,
         };
 
@@ -2553,6 +2622,7 @@ mod tests {
             column_labels: Vec::new(),
             column_types: Vec::new(),
             column_stats: Vec::new(),
+            fdr_curves: BTreeMap::new(),
             history: None,
         };
 

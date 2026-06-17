@@ -58,6 +58,42 @@ pub struct FreeSurferLabelEntry {
 }
 
 impl ColorMap {
+    pub fn spectrum_red_to_blue() -> Self {
+        Self::Continuous(ContinuousColorMap::spectrum_red_to_blue())
+    }
+
+    pub fn spectrum_yellow_to_red() -> Self {
+        Self::Continuous(ContinuousColorMap::spectrum_yellow_to_red())
+    }
+
+    pub fn color_circle_ajj() -> Self {
+        Self::Continuous(ContinuousColorMap::color_circle_ajj())
+    }
+
+    pub fn spectrum_red_to_blue_gap() -> Self {
+        Self::Continuous(ContinuousColorMap::spectrum_red_to_blue_gap())
+    }
+
+    pub fn spectrum_yellow_to_cyan() -> Self {
+        Self::Continuous(ContinuousColorMap::spectrum_yellow_to_cyan())
+    }
+
+    pub fn spectrum_yellow_to_cyan_gap() -> Self {
+        Self::Continuous(ContinuousColorMap::spectrum_yellow_to_cyan_gap())
+    }
+
+    pub fn color_circle_zss() -> Self {
+        Self::Continuous(ContinuousColorMap::color_circle_zss())
+    }
+
+    pub fn reds_and_blues() -> Self {
+        Self::Continuous(ContinuousColorMap::reds_and_blues())
+    }
+
+    pub fn reds_and_blues_with_green() -> Self {
+        Self::Continuous(ContinuousColorMap::reds_and_blues_with_green())
+    }
+
     pub fn afni_p2_spanned() -> Self {
         Self::Continuous(ContinuousColorMap::afni_p2_spanned())
     }
@@ -138,6 +174,141 @@ impl ContinuousColorMap {
                     color: Rgba::new_unchecked(0.86, 0.08, 0.08, 1.0),
                 },
             ],
+        }
+    }
+
+    /// AFNI's `Spectrum:red_to_blue` colorscale (`bigmap[0]` in display.c),
+    /// reproduced exactly from `DC_spectrum_AJJ`. Oriented so position 0 is
+    /// blue (low) and position 1 is red (high), matching AFNI's value mapping.
+    pub fn spectrum_red_to_blue() -> Self {
+        // AFNI sweeps hue = ii*(248/255) - 4 for ii in 0..=255 (red -> blue).
+        // Position p corresponds to ii = (1 - p) * 255, so hue = (1-p)*248 - 4.
+        Self::ajj_colorscale("Spectrum:red_to_blue", 0.8, |p| (1.0 - p) * 248.0 - 4.0)
+    }
+
+    /// AFNI's `Spectrum:yellow_to_red` colorscale (`bigmap[4]`), reproduced
+    /// from `DC_spectrum_AJJ` with gamma 0.7. Position 0 is red (low),
+    /// position 1 is yellow (high).
+    pub fn spectrum_yellow_to_red() -> Self {
+        // AFNI sweeps hue = 60 - ii*(60/255) for ii in 0..=255 (yellow -> red).
+        // With ii = (1 - p) * 255 this simplifies to hue = 60 * p.
+        Self::ajj_colorscale("Spectrum:yellow_to_red", 0.7, |p| p * 60.0)
+    }
+
+    /// AFNI's `Color_circle_AJJ` colorscale (`bigmap[5]`), a full hue wheel
+    /// from `DC_spectrum_AJJ` with gamma 0.8. Useful for cyclic data such as
+    /// phase/angle maps.
+    pub fn color_circle_ajj() -> Self {
+        // AFNI sweeps the full circle hue = ii*(360/255) for ii in 0..=255.
+        Self::ajj_colorscale("Color_circle_AJJ", 0.8, |p| p * 360.0)
+    }
+
+    /// AFNI's `Spectrum:red_to_blue+gap` colorscale (`bigmap[1]`). Red->yellow
+    /// in the lower half, a black gap across the center, cyan->blue in the
+    /// upper half. The gap reads cleanly for thresholded two-tailed stats.
+    pub fn spectrum_red_to_blue_gap() -> Self {
+        Self::ajj_indexed("Spectrum:red_to_blue+gap", |index| {
+            if index < BIGMAP_MBOT {
+                spectrum_ajj(index as f64 * (AJJ_YEL / (BIGMAP_MBOT - 1) as f64), 0.8)
+            } else if index > BIGMAP_MTOP {
+                spectrum_ajj(
+                    AJJ_CYN + (index - BIGMAP_MTOP - 1) as f64 * (60.0 / BIGMAP_HALF_SPAN),
+                    0.8,
+                )
+            } else {
+                Rgba::OPAQUE_BLACK
+            }
+        })
+    }
+
+    /// AFNI's `Spectrum:yellow_to_cyan` colorscale (`bigmap[2]`). Yellow->red
+    /// lower, a magenta/purple bridge across the center, blue->cyan upper.
+    pub fn spectrum_yellow_to_cyan() -> Self {
+        Self::ajj_indexed("Spectrum:yellow_to_cyan", |index| {
+            spectrum_ajj(yellow_to_cyan_hue(index), 0.8)
+        })
+    }
+
+    /// AFNI's `Spectrum:yellow_to_cyan+gap` colorscale (`bigmap[3]`). Same as
+    /// `yellow_to_cyan` but with a black gap replacing the center bridge.
+    pub fn spectrum_yellow_to_cyan_gap() -> Self {
+        Self::ajj_indexed("Spectrum:yellow_to_cyan+gap", |index| {
+            if (BIGMAP_MBOT..=BIGMAP_MTOP).contains(&index) {
+                Rgba::OPAQUE_BLACK
+            } else {
+                spectrum_ajj(yellow_to_cyan_hue(index), 0.8)
+            }
+        })
+    }
+
+    /// AFNI's `Color_circle_ZSS` colorscale (`bigmap[6]`), a full hue wheel
+    /// built from `DC_spectrum_ZSS`.
+    pub fn color_circle_zss() -> Self {
+        Self::ajj_indexed("Color_circle_ZSS", |index| {
+            spectrum_zss(360.0 - index as f64 * (360.0 / (BIGMAP_N - 1) as f64), 1.0)
+        })
+    }
+
+    /// AFNI's `Reds_and_Blues` colorscale (`bigmap[7]`). Yellow->red across the
+    /// lower half, blue->cyan across the upper half, with no green.
+    pub fn reds_and_blues() -> Self {
+        Self::ajj_indexed("Reds_and_Blues", reds_and_blues_color)
+    }
+
+    /// AFNI's `Reds_and_Blues_w_Green` colorscale (`bigmap[8]`). Identical to
+    /// `Reds_and_Blues` with a green band at the center. AFNI paints only two
+    /// entries (127, 128) green, which is an invisible sliver once the 256-entry
+    /// LUT is interpolated, so we widen the seam to `BIGMAP_GREEN_SEAM_HALF`
+    /// entries on each side of center while keeping AFNI's exact green hue.
+    pub fn reds_and_blues_with_green() -> Self {
+        let green_band =
+            (BIGMAP_HALF - BIGMAP_GREEN_SEAM_HALF)..(BIGMAP_HALF + BIGMAP_GREEN_SEAM_HALF);
+        Self::ajj_indexed("Reds_and_Blues_w_Green", move |index| {
+            if green_band.contains(&index) {
+                spectrum_ajj(
+                    BIGMAP_HALF as f64 * ((AJJ_BLU + 8.0) / (BIGMAP_N - 1) as f64) - 4.0,
+                    0.8,
+                )
+            } else {
+                reds_and_blues_color(index)
+            }
+        })
+    }
+
+    /// Builds a 256-entry colorscale by evaluating `DC_spectrum_AJJ` at the hue
+    /// produced by `hue_at` for each stop position. Mirrors the per-channel
+    /// gamma and byte quantization of AFNI's `NJ_bigmaps_init`.
+    fn ajj_colorscale(name: &str, gamma: f64, hue_at: impl Fn(f64) -> f64) -> Self {
+        const COUNT: usize = 256;
+        let stops = (0..COUNT)
+            .map(|index| {
+                let position = index as f32 / (COUNT - 1) as f32;
+                ColorStop {
+                    position,
+                    color: spectrum_ajj(hue_at(position as f64), gamma),
+                }
+            })
+            .collect();
+        Self {
+            name: name.to_string(),
+            stops,
+        }
+    }
+
+    /// Builds a colorscale from an AFNI per-index color function. AFNI draws
+    /// array index 0 at the top (maximum value), so index `ii` maps to position
+    /// `(N-1-ii)/(N-1)`; the returned stops are sorted ascending by position.
+    fn ajj_indexed(name: &str, color_at: impl Fn(usize) -> Rgba) -> Self {
+        let mut stops: Vec<ColorStop> = (0..BIGMAP_N)
+            .map(|index| ColorStop {
+                position: (BIGMAP_N - 1 - index) as f32 / (BIGMAP_N - 1) as f32,
+                color: color_at(index),
+            })
+            .collect();
+        stops.reverse();
+        Self {
+            name: name.to_string(),
+            stops,
         }
     }
 
@@ -246,6 +417,145 @@ impl ContinuousColorMap {
 
         self.stops[self.stops.len() - 1].color
     }
+}
+
+// Geometry of AFNI's 256-entry "bigmap" colorscales (display.c). NBIG_GAP is
+// NPANE_BIG/32 = 8, so the center gap spans MBOT..=MTOP.
+const BIGMAP_N: usize = 256;
+const BIGMAP_HALF: usize = BIGMAP_N / 2; // NPANE_BIG/2 = 128
+const BIGMAP_MBOT: usize = 120; // NPANE_BIG/2 - NBIG_GAP
+const BIGMAP_MTOP: usize = 136; // NPANE_BIG/2 + NBIG_GAP
+const BIGMAP_HALF_SPAN: f64 = (BIGMAP_N - BIGMAP_MTOP - 2) as f64; // 118
+// Half-width (in LUT entries) of the green center band for Reds_and_Blues_w_Green.
+// AFNI uses an effective half-width of 1 (entries 127, 128); we widen it so the
+// band survives interpolation and stays visible in colorbars and on the surface.
+const BIGMAP_GREEN_SEAM_HALF: usize = 4;
+
+// AFNI hue fiducials (display.h).
+const AJJ_YEL: f64 = 60.0;
+const AJJ_CYN: f64 = 180.0;
+const AJJ_BLU: f64 = 240.0;
+
+/// Hue sweep shared by `yellow_to_cyan` and its gapped variant (`bigmap[2]`).
+fn yellow_to_cyan_hue(index: usize) -> f64 {
+    if index < BIGMAP_MBOT {
+        AJJ_YEL - index as f64 * (AJJ_YEL / (BIGMAP_MBOT - 1) as f64)
+    } else if index > BIGMAP_MTOP {
+        AJJ_BLU - (index - BIGMAP_MTOP - 1) as f64 * (60.0 / BIGMAP_HALF_SPAN)
+    } else {
+        let denom = (BIGMAP_MTOP - BIGMAP_MBOT + 2) as f64; // 18
+        360.0 - (index - BIGMAP_MBOT + 1) as f64 * (120.0 / denom)
+    }
+}
+
+/// Per-index color for AFNI's `Reds_and_Blues` (`bigmap[7]`).
+fn reds_and_blues_color(index: usize) -> Rgba {
+    if index < BIGMAP_HALF {
+        spectrum_ajj(
+            AJJ_YEL - index as f64 * (AJJ_YEL / (BIGMAP_HALF - 1) as f64),
+            0.8,
+        )
+    } else {
+        let span = (BIGMAP_N - BIGMAP_HALF - 2) as f64; // 126
+        let offset = index as f64 - (BIGMAP_MTOP as f64 + 1.0); // can be negative, as in C
+        spectrum_ajj(AJJ_BLU - offset * (60.0 / span), 0.8)
+    }
+}
+
+/// Faithful port of AFNI's `DC_spectrum_ZSS` (display.c). Maps a hue angle in
+/// degrees to RGB through four quadrants, with the same byte quantization as
+/// `spectrum_ajj`.
+fn spectrum_zss(hue: f64, gamma: f64) -> Rgba {
+    let gamma = if gamma <= 0.0 { 1.0 } else { gamma };
+
+    let mut an = hue;
+    while an < 0.0 {
+        an += 360.0;
+    }
+    while an > 360.0 {
+        an -= 360.0;
+    }
+    an /= 90.0;
+
+    let channel = |value: f64| -> i32 {
+        let powered = if value <= 0.0 { 0.0 } else { value.powf(gamma) };
+        (255.0 * powered + 0.5) as i32
+    };
+
+    let (red, green, blue);
+    if an <= 1.0 {
+        red = channel(1.0 - an);
+        green = channel(0.5 * an);
+        blue = channel(an);
+    } else if an <= 2.0 {
+        red = 0;
+        green = channel(0.5 * an);
+        blue = channel(2.0 - an);
+    } else if an <= 3.0 {
+        red = channel(an - 2.0);
+        green = 255;
+        blue = 0;
+    } else {
+        red = 255;
+        green = channel(4.0 - an);
+        blue = 0;
+    }
+
+    let to_unit = |value: i32| value.clamp(0, 255) as f32 / 255.0;
+    Rgba::new_unchecked(to_unit(red), to_unit(green), to_unit(blue), 1.0)
+}
+
+/// Faithful port of AFNI's `DC_spectrum_AJJ` (display.c). Maps a hue angle in
+/// degrees to an RGB color using the "RWC" constants and a per-channel gamma,
+/// quantizing to bytes exactly as AFNI does before normalizing back to 0..1.
+fn spectrum_ajj(hue: f64, gamma: f64) -> Rgba {
+    let gamma = if gamma <= 0.0 { 1.0 } else { gamma };
+
+    // RWC's choices: ak == ab == 5, so s == sb == 250 and c == cb.
+    let ak = 5.0_f64;
+    let s = 255.0 - ak;
+    let c = s / 60.0;
+    let ab = 5.0_f64;
+    let sb = 255.0 - ab;
+    let cb = sb / 60.0;
+
+    let mut an = hue;
+    while an < 0.0 {
+        an += 360.0;
+    }
+    while an > 360.0 {
+        an -= 360.0;
+    }
+
+    // mypow: x <= 0 -> 0, else x^gamma. Output is 255*pow(num/255) + 0.5 cast
+    // to int, matching AFNI's truncating byte quantization.
+    let channel = |numerator: f64| -> i32 {
+        let normalized = numerator / 255.0;
+        let powered = if normalized <= 0.0 {
+            0.0
+        } else {
+            normalized.powf(gamma)
+        };
+        (255.0 * powered + 0.5) as i32
+    };
+
+    let (red, green, blue);
+    if an < 120.0 {
+        red = channel(ak + s.min((120.0 - an) * c));
+        green = channel(ak + s.min(an * c));
+        blue = 0;
+    } else if an < 240.0 {
+        red = 0;
+        green = channel(ak + s.min((240.0 - an) * c));
+        blue = channel(ab + sb.min((an - 120.0) * cb));
+    } else {
+        red = channel(ak + s.min((an - 240.0) * c));
+        green = 0;
+        blue = channel(ab + s.min((360.0 - an) * cb));
+    }
+
+    let to_unit = |value: i32| value.clamp(0, 255) as f32 / 255.0;
+    Rgba::new_unchecked(to_unit(red), to_unit(green), to_unit(blue), 1.0)
 }
 
 impl ColorStop {
@@ -472,6 +782,18 @@ mod tests {
         let continuous = colormap.as_continuous().unwrap();
 
         assert_eq!(continuous.sample(0.0), Rgba::OPAQUE_BLACK);
+        // Exact DC_spectrum_AJJ endpoints are slightly tinted by the +/-4 deg
+        // hue padding: blue is (35, 0, 255), red is (255, 0, 35) in bytes.
+        let red_to_blue = ColorMap::spectrum_red_to_blue();
+        let red_to_blue = red_to_blue.as_continuous().unwrap();
+        assert_eq!(
+            red_to_blue.sample(0.0),
+            Rgba::new(35.0 / 255.0, 0.0, 1.0, 1.0).unwrap()
+        );
+        assert_eq!(
+            red_to_blue.sample(1.0),
+            Rgba::new(1.0, 0.0, 35.0 / 255.0, 1.0).unwrap()
+        );
         assert_eq!(
             ColorMap::afni_p2_spanned()
                 .as_continuous()
@@ -490,6 +812,88 @@ mod tests {
             ColorMap::fire().as_continuous().unwrap().sample(1.0),
             Rgba::new(1.0, 1.0, 0.88, 1.0).unwrap()
         );
+    }
+
+    fn assert_bytes_close(actual: Rgba, expected: [u8; 3]) {
+        let to_byte = |channel: f32| (channel * 255.0).round() as i32;
+        assert_eq!(
+            [
+                to_byte(actual.red),
+                to_byte(actual.green),
+                to_byte(actual.blue),
+            ],
+            [expected[0] as i32, expected[1] as i32, expected[2] as i32],
+        );
+    }
+
+    #[test]
+    fn ajj_colorscales_match_afni_byte_values() {
+        // Reference bytes computed directly from AFNI's DC_spectrum_AJJ.
+        let red_to_blue = ColorMap::spectrum_red_to_blue();
+        let red_to_blue = red_to_blue.as_continuous().unwrap();
+        assert_eq!(red_to_blue.stops.len(), 256);
+        // Position 1.0 is AFNI index 0 (red); the yellow plateau sits at index 64.
+        assert_bytes_close(red_to_blue.sample(1.0), [255, 0, 35]);
+        assert_bytes_close(red_to_blue.sample(191.0 / 255.0), [255, 249, 0]);
+        assert_bytes_close(red_to_blue.sample(0.0), [35, 0, 255]);
+
+        // Gamma 0.7 lifts the dark end, so "red" carries a little green.
+        let yellow_to_red = ColorMap::spectrum_yellow_to_red();
+        let yellow_to_red = yellow_to_red.as_continuous().unwrap();
+        assert_bytes_close(yellow_to_red.sample(1.0), [255, 255, 0]);
+        assert_bytes_close(yellow_to_red.sample(0.0), [255, 16, 0]);
+
+        // Full hue wheel: green near the middle, near-red at both ends.
+        let circle = ColorMap::color_circle_ajj();
+        let circle = circle.as_continuous().unwrap();
+        assert_bytes_close(circle.sample(0.0), [255, 11, 0]);
+        assert_bytes_close(circle.sample(85.0 / 255.0), [0, 255, 11]);
+        assert_bytes_close(circle.sample(1.0), [255, 0, 11]);
+    }
+
+    #[test]
+    fn gap_and_two_sided_colorscales_match_afni_byte_values() {
+        // For ajj_indexed maps, AFNI index ii maps to position (255-ii)/255.
+        let pos = |index: usize| (255 - index) as f32 / 255.0;
+
+        let red_to_blue_gap = ColorMap::spectrum_red_to_blue_gap();
+        let red_to_blue_gap = red_to_blue_gap.as_continuous().unwrap();
+        assert_bytes_close(red_to_blue_gap.sample(pos(0)), [255, 11, 0]);
+        assert_bytes_close(red_to_blue_gap.sample(pos(128)), [0, 0, 0]);
+        assert_bytes_close(red_to_blue_gap.sample(pos(255)), [11, 0, 255]);
+
+        let yellow_to_cyan = ColorMap::spectrum_yellow_to_cyan();
+        let yellow_to_cyan = yellow_to_cyan.as_continuous().unwrap();
+        assert_bytes_close(yellow_to_cyan.sample(pos(0)), [255, 255, 0]);
+        assert_bytes_close(yellow_to_cyan.sample(pos(128)), [255, 0, 255]);
+        assert_bytes_close(yellow_to_cyan.sample(pos(255)), [0, 255, 255]);
+
+        let yellow_to_cyan_gap = ColorMap::spectrum_yellow_to_cyan_gap();
+        let yellow_to_cyan_gap = yellow_to_cyan_gap.as_continuous().unwrap();
+        assert_bytes_close(yellow_to_cyan_gap.sample(pos(128)), [0, 0, 0]);
+
+        let circle_zss = ColorMap::color_circle_zss();
+        let circle_zss = circle_zss.as_continuous().unwrap();
+        assert_bytes_close(circle_zss.sample(pos(0)), [255, 0, 0]);
+        assert_bytes_close(circle_zss.sample(pos(64)), [254, 255, 0]);
+        assert_bytes_close(circle_zss.sample(pos(128)), [0, 254, 2]);
+
+        let reds_and_blues = ColorMap::reds_and_blues();
+        let reds_and_blues = reds_and_blues.as_continuous().unwrap();
+        assert_bytes_close(reds_and_blues.sample(pos(0)), [255, 255, 0]);
+        assert_bytes_close(reds_and_blues.sample(pos(128)), [37, 0, 255]);
+
+        // The "w_Green" variant inserts a widened green band centered on the
+        // seam (indices 124..132); just outside the band returns to red/blue.
+        let with_green = ColorMap::reds_and_blues_with_green();
+        let with_green = with_green.as_continuous().unwrap();
+        assert_bytes_close(with_green.sample(pos(124)), [0, 255, 14]);
+        assert_bytes_close(with_green.sample(pos(128)), [0, 255, 14]);
+        assert_bytes_close(with_green.sample(pos(131)), [0, 255, 14]);
+        let below = with_green.sample(pos(123));
+        let above = with_green.sample(pos(132));
+        assert!(below.red > below.green, "index 123 should stay reddish");
+        assert!(above.blue > above.green, "index 132 should stay bluish");
     }
 
     #[test]

@@ -125,7 +125,10 @@ fn correlation_two_tailed_p_value(r: f64, n_or_df: f64) -> Option<f64> {
     t_two_tailed_p_value(t, df)
 }
 
-fn normal_two_tailed_p_value(z: f64) -> Option<f64> {
+pub fn normal_two_tailed_p_value(z: f64) -> Option<f64> {
+    if !z.is_finite() {
+        return None;
+    }
     Some(erfc(z.abs() / std::f64::consts::SQRT_2).clamp(0.0, 1.0))
 }
 

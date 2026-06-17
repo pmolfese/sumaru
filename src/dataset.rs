@@ -1,5 +1,6 @@
 use anyhow::{Result, ensure};
 
+use crate::stats::normal_two_tailed_p_value;
 use crate::surface::{SurfaceDomain, SurfaceDomainId};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,8 +38,16 @@ pub struct DataColumn {
     pub role: ColumnRole,
     pub units: Option<String>,
     pub stat: Option<String>,
+    pub fdr_curve: Option<AfniFdrCurve>,
     pub values: ColumnData,
     pub range: Option<ColumnRange>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AfniFdrCurve {
+    pub x0: f64,
+    pub dx: f64,
+    pub samples: Vec<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +184,7 @@ impl DataColumn {
             role,
             units,
             stat: None,
+            fdr_curve: None,
             values,
             range,
         })
@@ -189,12 +199,98 @@ impl DataColumn {
         self
     }
 
+    pub fn with_fdr_curve(mut self, curve: Option<AfniFdrCurve>) -> Self {
+        self.fdr_curve = curve;
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+}
+
+impl AfniFdrCurve {
+    pub fn new(x0: f64, dx: f64, samples: Vec<f64>) -> Result<Self> {
+        ensure!(x0.is_finite(), "FDR curve x0 must be finite");
+        ensure!(
+            dx.is_finite() && dx.abs() > f64::EPSILON,
+            "FDR curve dx must be non-zero"
+        );
+        ensure!(!samples.is_empty(), "FDR curve has no samples");
+        ensure!(
+            samples.iter().all(|value| value.is_finite()),
+            "FDR curve contains non-finite samples"
+        );
+
+        Ok(Self { x0, dx, samples })
+    }
+
+    pub fn from_afni_values(values: &[f64]) -> Result<Self> {
+        ensure!(
+            values.len() >= 3,
+            "AFNI FDR curve needs x0, dx, and at least one sample"
+        );
+        Self::new(values[0], values[1], values[2..].to_vec())
+    }
+
+    pub fn to_afni_values(&self) -> Vec<f64> {
+        let mut values = Vec::with_capacity(self.samples.len() + 2);
+        values.push(self.x0);
+        values.push(self.dx);
+        values.extend_from_slice(&self.samples);
+        values
+    }
+
+    pub fn z_value(&self, threshold: f64) -> Option<f64> {
+        if !threshold.is_finite() {
+            return None;
+        }
+        let last = self.samples.len().checked_sub(1)?;
+        if last == 0 {
+            return self.samples.first().copied();
+        }
+
+        let x = threshold.abs();
+        let position = (x - self.x0) / self.dx;
+        if position <= 0.0 {
+            return self.samples.first().copied();
+        }
+        if position >= last as f64 {
+            return self.samples.last().copied();
+        }
+
+        let ix = position.floor() as usize;
+        let t = position - ix as f64;
+        let left = self.samples[ix];
+        let right = self.samples[ix + 1];
+        let lo = left.min(right);
+        let hi = left.max(right);
+
+        let y0 = self.samples[ix.saturating_sub(1)];
+        let y1 = left;
+        let y2 = right;
+        let y3 = self.samples[(ix + 2).min(last)];
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let cubic = 0.5
+            * ((2.0 * y1)
+                + (-y0 + y2) * t
+                + (2.0 * y0 - 5.0 * y1 + 4.0 * y2 - y3) * t2
+                + (-y0 + 3.0 * y1 - 3.0 * y2 + y3) * t3);
+
+        Some(cubic.clamp(lo, hi))
+    }
+
+    pub fn q_value(&self, threshold: f64) -> Option<f64> {
+        let z = self.z_value(threshold)?;
+        (z > 0.0)
+            .then(|| normal_two_tailed_p_value(z))
+            .flatten()
+            .or(Some(1.0))
     }
 }
 
