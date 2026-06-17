@@ -12,7 +12,7 @@ Findings come from the current tree (notably the ~80-field `ViewerState` and the
 
 ## Tier 1 — High payoff, mostly mechanical
 
-Status: item 1 done (branch `refactorT1`); items 2–3 pending.
+Status: items 1-3 done across `refactorT1`, `refactor2`, and `refactorOverlay`.
 
 ### 1. Collapse the four per-window field groups into a `WindowPane` — ✅ DONE (branch `refactorT1`)
 
@@ -64,38 +64,53 @@ panel-resize state didn't persist — the height is now owned in
 `graph_dock_height_points` with a self-managed drag handle, and the 3D viewport
 reserves that height so the dock stays put.
 
-### 2. Unify the overlay state held on `ViewerState`
+### 2. Unify the overlay state held on `ViewerState` — wrapper done
 Eight parallel `overlay_*` fields describe one logical thing
 ([`viewer/mod.rs:609`](src/viewer/mod.rs)):
 `overlay`, `overlay_values`, `overlay_dataset`, `overlay_columns`,
 `overlay_appearance`, `overlay_path`, `overlay_pair_paths`,
 `overlay_display_name`.
 
-- [ ] Group them into a `struct OverlayState { … }` (kept as a single field, or
+- [x] Group them into a `struct OverlayState { … }` (kept as a single field, or
       `Option<OverlayState>` for the load/unload lifecycle). `reset_scene_state`
       becomes one assignment instead of eight.
 - [ ] Audit which of these must be `Option` independently vs. which always travel
       together (e.g. `overlay`/`overlay_dataset`/`overlay_values` likely live and
       die as a unit).
 
+Outcome so far: `ViewerState` now owns one `ViewerOverlayState` with the previous
+overlay model, lookup values, canonical dataset, column selections, render
+appearance, source paths, and display label. This was kept mechanical: direct
+file overlays, paired overlays, AFNI `SUMA_irgba` overlays, picking, graphing,
+and controller display still use the same data and behavior. The deeper
+load/unload optionality audit remains part of the next cleanup pass.
+
 *Risk:* moderate (touches load/unload and many readers). High clarity payoff.
 
-### 3. Pick one source of truth for the overlay scalars that are currently mirrored
-The same overlay attributes live in **three** structs and are hand-synced:
+### 3. Pick one source of truth for the overlay scalars — ✅ done
+The same overlay attributes previously lived in **three** structs and were
+hand-synced:
 
 - `overlay::Overlay` (domain: `intensity_range`, `threshold`, `opacity`, `symmetric_range`, …)
-- `viewer/mesh.rs::OverlayAppearance` (`range`, `colormap`, `threshold`, `opacity`, `dim`)
-- `command.rs::OverlayCommandState` (`visible`, `symmetric_range`, `intensity_range`, `threshold`, `opacity`)
+- `viewer/mesh.rs::OverlayAppearance` (`range`, `symmetric_range`, `colormap`, `threshold`, `opacity`, `dim`)
+- `command.rs::OverlayCommandState` (previously `visible`, `symmetric_range`, `intensity_range`, `threshold`, `opacity`)
 
 The cost shows up as manual mirroring, e.g.
 [`viewer/mod.rs:3786`](src/viewer/mod.rs) copies `intensity_range`, `threshold`,
 and `opacity` from `overlay_appearance` into `controller.overlay` by hand.
 
-- [ ] Decide ownership: `OverlayAppearance` (render-facing) is the natural home
+- [x] Decide ownership: `OverlayAppearance` (render-facing) is the natural home
       for `range`/`colormap`/`threshold`/`opacity`/`dim`; `OverlayCommandState`
       should keep only what the controller uniquely needs (e.g. `visible`) and
       borrow the rest, instead of storing a second copy.
-- [ ] Remove the hand-sync lines once the duplication is gone.
+- [x] Remove the hand-sync lines once the duplication is gone.
+
+Outcome: `ViewerOverlayState.appearance` now owns the display scalars, including
+the symmetric-range toggle. `OverlayCommandState` keeps only `visible`.
+Incoming AFNI overlay display updates are routed to the viewer as
+`AfniRouteAction::OverlayState`, and outgoing AFNI overlay state is serialized
+from an explicit `AfniOverlayState` snapshot rather than from controller-owned
+mirror fields.
 
 *Risk:* moderate — requires care to keep the command/controller boundary intact,
 but eliminates a class of "the two copies drifted" bugs.
@@ -139,13 +154,12 @@ The last two are identical except `OverlayThreshold` has an `enabled` flag where
 the command form uses `Option<…>`.
 
 - [x] Merged `OverlayThresholdCommandState` into a single `command::OverlayThreshold`
-      `{ enabled, absolute, value, hide_failed }`, used as a plain field by both the
-      render appearance and the controller command state. The `enabled` flag is the
-      one on/off convention; `AfniOverlayState` still wraps it in `Option`, but there
-      the `Option` means "field present in this partial wire update," which is a
-      *different* concept — so that is correct, not a second convention. The
-      hand-rolled field-by-field projection in `sync_controller_overlay_display_state`
-      collapsed into a single struct copy.
+      `{ enabled, absolute, value, hide_failed }`, used by the render appearance and
+      AFNI wire protocol. The `enabled` flag is the one on/off convention;
+      `AfniOverlayState` still wraps it in `Option`, but there the `Option` means
+      "field present in this partial wire update," which is a *different* concept —
+      so that is correct, not a second convention. The later OverlayState cleanup
+      removed the controller mirror field entirely.
 - [x] Left the richer domain `Threshold`/`ThresholdMode` (Above/Below/Between/Outside)
       alone — merging it into the scalar render form would lose the mode enum, i.e.
       cut functionality. Documented here as an intentional split, not a duplicate.

@@ -17,7 +17,7 @@ use crate::io::{
     NimlData, NimlElement, NimlNumericMatrix, NimlValueType, parse_niml_bytes, serialize_niml_ascii,
 };
 use crate::niml_debug::{NimlDirection, NimlRecorder};
-use crate::surface::SurfaceMesh;
+use crate::surface::{SurfaceMesh, ValueRange};
 
 pub const DEFAULT_AFNI_NIML_PORT: u16 = 53211;
 pub const DEFAULT_PORT_OFFSET: u16 = 1024;
@@ -137,6 +137,7 @@ pub struct AfniSurfaceCrosshair {
 pub struct AfniOverlayState {
     pub visible: Option<bool>,
     pub symmetric_range: Option<bool>,
+    pub intensity_range: Option<ValueRange>,
     pub threshold: Option<OverlayThreshold>,
     pub opacity: Option<f32>,
     pub overlay_path: Option<PathBuf>,
@@ -162,6 +163,7 @@ pub enum AfniRouteAction {
     ViewerCommand(ViewerCommand),
     LoadDataset(PathBuf),
     RgbaOverlay(AfniRgbaOverlay),
+    OverlayState(AfniOverlayState),
     SurfaceCrosshair(AfniSurfaceCrosshair),
     RoiUpdate(AfniRoiUpdate),
 }
@@ -531,13 +533,16 @@ pub fn surface_registration_elements(
     ])
 }
 
-pub fn outgoing_state_elements(controller: &ControllerState) -> Result<Vec<NimlElement>> {
+pub fn outgoing_state_elements(
+    controller: &ControllerState,
+    overlay_state: &AfniOverlayState,
+) -> Result<Vec<NimlElement>> {
     let mut elements = Vec::new();
     elements.push(surface_state_element(controller));
     if let Some(crosshair) = controller.interaction.crosshair {
         elements.push(crosshair_element(crosshair)?);
     }
-    elements.push(overlay_state_element(controller));
+    elements.push(overlay_state_element(overlay_state));
     if controller.surface.current_roi_path.is_some() {
         elements.push(roi_state_element(controller));
     }
@@ -614,20 +619,8 @@ pub fn route_incoming_message(
     match message {
         AfniIncomingMessage::RgbaOverlay(overlay) => {
             controller.overlay.visible = true;
-            if let Some(threshold) = overlay
-                .threshold
-                .as_deref()
-                .and_then(|value| value.parse::<f32>().ok())
-            {
-                controller.overlay.threshold = OverlayThreshold {
-                    enabled: true,
-                    absolute: true,
-                    value: threshold,
-                    hide_failed: true,
-                };
-                outcome.applied_state = true;
-            }
             outcome.actions.push(AfniRouteAction::RgbaOverlay(overlay));
+            outcome.applied_state = true;
         }
         AfniIncomingMessage::SurfaceSelection(selection) => {
             if let Some(index) = selection.scene_index {
@@ -674,16 +667,14 @@ pub fn route_incoming_message(
                 ));
                 outcome.applied_state = true;
             }
-            if let Some(symmetric) = state.symmetric_range {
-                controller.overlay.symmetric_range = symmetric;
-                outcome.applied_state = true;
-            }
-            if let Some(threshold) = state.threshold {
-                controller.overlay.threshold = threshold;
-                outcome.applied_state = true;
-            }
-            if let Some(opacity) = state.opacity {
-                controller.overlay.opacity = opacity.clamp(0.0, 1.0);
+            if state.symmetric_range.is_some()
+                || state.intensity_range.is_some()
+                || state.threshold.is_some()
+                || state.opacity.is_some()
+            {
+                outcome
+                    .actions
+                    .push(AfniRouteAction::OverlayState(state.clone()));
                 outcome.applied_state = true;
             }
             if let Some(path) = state.overlay_path {
@@ -1153,26 +1144,25 @@ fn crosshair_element(crosshair: CrosshairState) -> Result<NimlElement> {
     ))
 }
 
-fn overlay_state_element(controller: &ControllerState) -> NimlElement {
+fn overlay_state_element(state: &AfniOverlayState) -> NimlElement {
     let mut attrs = BTreeMap::new();
-    attrs.insert(
-        "visible".to_string(),
-        bool_attr(controller.overlay.visible).to_string(),
-    );
-    attrs.insert(
-        "symmetric_range".to_string(),
-        bool_attr(controller.overlay.symmetric_range).to_string(),
-    );
-    attrs.insert(
-        "opacity".to_string(),
-        controller.overlay.opacity.to_string(),
-    );
-    if let Some(range) = controller.overlay.intensity_range {
+    if let Some(visible) = state.visible {
+        attrs.insert("visible".to_string(), bool_attr(visible).to_string());
+    }
+    if let Some(symmetric_range) = state.symmetric_range {
+        attrs.insert(
+            "symmetric_range".to_string(),
+            bool_attr(symmetric_range).to_string(),
+        );
+    }
+    if let Some(opacity) = state.opacity {
+        attrs.insert("opacity".to_string(), opacity.to_string());
+    }
+    if let Some(range) = state.intensity_range {
         attrs.insert("range_min".to_string(), range.min.to_string());
         attrs.insert("range_max".to_string(), range.max.to_string());
     }
-    let threshold = controller.overlay.threshold;
-    if threshold.enabled {
+    if let Some(threshold) = state.threshold.filter(|threshold| threshold.enabled) {
         attrs.insert("threshold_enabled".to_string(), "yes".to_string());
         attrs.insert("threshold_value".to_string(), threshold.value.to_string());
         attrs.insert(
@@ -1186,11 +1176,7 @@ fn overlay_state_element(controller: &ControllerState) -> NimlElement {
     } else {
         attrs.insert("threshold_enabled".to_string(), "no".to_string());
     }
-    push_opt_path_attr(
-        &mut attrs,
-        "overlay_path",
-        controller.surface.current_overlay_path.as_ref(),
-    );
+    push_opt_path_attr(&mut attrs, "overlay_path", state.overlay_path.as_ref());
     NimlElement::text("SUMARU_overlay_state", attrs, "")
 }
 
@@ -1306,10 +1292,18 @@ fn overlay_state_from_element(element: &NimlElement) -> AfniOverlayState {
     AfniOverlayState {
         visible: parse_attr(element, "visible"),
         symmetric_range: parse_attr(element, "symmetric_range"),
+        intensity_range: overlay_range_from_element(element),
         threshold,
         opacity: parse_attr(element, "opacity"),
         overlay_path: path_attr(element, "overlay_path"),
     }
+}
+
+fn overlay_range_from_element(element: &NimlElement) -> Option<ValueRange> {
+    Some(ValueRange {
+        min: parse_attr(element, "range_min")?,
+        max: parse_attr(element, "range_max")?,
+    })
 }
 
 fn controller_command_from_element(element: &NimlElement) -> Option<AfniControllerCommand> {
@@ -1574,12 +1568,10 @@ mod tests {
 
         assert!(outcome.applied_state);
         assert!(controller.overlay.visible);
-        assert!(controller.overlay.threshold.enabled);
-        assert_eq!(controller.overlay.threshold.value, 2.5);
         assert!(matches!(
             outcome.actions.as_slice(),
-            [AfniRouteAction::RgbaOverlay(AfniRgbaOverlay { surface_idcode, .. })]
-                if surface_idcode == "surf-1"
+            [AfniRouteAction::RgbaOverlay(AfniRgbaOverlay { surface_idcode, threshold, .. })]
+                if surface_idcode == "surf-1" && threshold.as_deref() == Some("2.5")
         ));
     }
 
@@ -1707,14 +1699,24 @@ mod tests {
             threshold_value: None,
         }));
         controller.surface.current_overlay_path = Some(PathBuf::from("stats.niml.dset"));
-        controller.overlay.threshold = OverlayThreshold {
-            enabled: true,
-            absolute: true,
-            value: 3.1,
-            hide_failed: true,
+        let overlay_state = AfniOverlayState {
+            visible: Some(controller.overlay.visible),
+            symmetric_range: Some(true),
+            intensity_range: Some(ValueRange {
+                min: -5.0,
+                max: 5.0,
+            }),
+            threshold: Some(OverlayThreshold {
+                enabled: true,
+                absolute: true,
+                value: 3.1,
+                hide_failed: true,
+            }),
+            opacity: Some(1.0),
+            overlay_path: controller.surface.current_overlay_path.clone(),
         };
 
-        let elements = outgoing_state_elements(&controller).unwrap();
+        let elements = outgoing_state_elements(&controller, &overlay_state).unwrap();
 
         assert!(
             elements
