@@ -100,6 +100,18 @@ more UI or protocol behavior into viewer-only fields.
   command state exists.
 - [x] Add a lightweight status/log event stream so `--verbose`, controllers,
   and future AFNI communication can report the same events consistently.
+- [ ] Add **new-sumaru** and **duplicate-sumaru** launch buttons to the
+  controller panel, drawn as custom-painted icon buttons (painter API, no extra
+  crate):
+  - **new-sumaru** (`+` icon): spawns a blank sumaru process — no surface, no
+    overlay, no session context carried over.
+  - **duplicate-sumaru** (two-overlapping-rectangles / copy icon): spawns a new
+    sumaru instance pre-loaded with the same surface (and spec state, if active)
+    but no overlay, so the user gets a clean starting point for a second
+    analysis view.
+  - Wire both to the linked-session layer (see *Linked Sumaru Sessions*) once
+    that infrastructure exists; for now, a plain subprocess launch is
+    sufficient.
 
 ## Everyday Viewer Use
 
