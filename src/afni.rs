@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Result, bail, ensure};
 
 use crate::command::{
-    BackgroundMode, ControllerState, CrosshairState, OverlayThresholdCommandState, ViewerCommand,
+    BackgroundMode, ControllerState, CrosshairState, OverlayThreshold, ViewerCommand,
 };
 use crate::io::{
     NimlData, NimlElement, NimlNumericMatrix, NimlValueType, parse_niml_bytes, serialize_niml_ascii,
@@ -137,7 +137,7 @@ pub struct AfniSurfaceCrosshair {
 pub struct AfniOverlayState {
     pub visible: Option<bool>,
     pub symmetric_range: Option<bool>,
-    pub threshold: Option<OverlayThresholdCommandState>,
+    pub threshold: Option<OverlayThreshold>,
     pub opacity: Option<f32>,
     pub overlay_path: Option<PathBuf>,
 }
@@ -619,11 +619,12 @@ pub fn route_incoming_message(
                 .as_deref()
                 .and_then(|value| value.parse::<f32>().ok())
             {
-                controller.overlay.threshold = Some(OverlayThresholdCommandState {
-                    value: threshold,
+                controller.overlay.threshold = OverlayThreshold {
+                    enabled: true,
                     absolute: true,
+                    value: threshold,
                     hide_failed: true,
-                });
+                };
                 outcome.applied_state = true;
             }
             outcome.actions.push(AfniRouteAction::RgbaOverlay(overlay));
@@ -678,7 +679,7 @@ pub fn route_incoming_message(
                 outcome.applied_state = true;
             }
             if let Some(threshold) = state.threshold {
-                controller.overlay.threshold = Some(threshold);
+                controller.overlay.threshold = threshold;
                 outcome.applied_state = true;
             }
             if let Some(opacity) = state.opacity {
@@ -1167,10 +1168,11 @@ fn overlay_state_element(controller: &ControllerState) -> NimlElement {
         controller.overlay.opacity.to_string(),
     );
     if let Some(range) = controller.overlay.intensity_range {
-        attrs.insert("range_min".to_string(), range[0].to_string());
-        attrs.insert("range_max".to_string(), range[1].to_string());
+        attrs.insert("range_min".to_string(), range.min.to_string());
+        attrs.insert("range_max".to_string(), range.max.to_string());
     }
-    if let Some(threshold) = controller.overlay.threshold {
+    let threshold = controller.overlay.threshold;
+    if threshold.enabled {
         attrs.insert("threshold_enabled".to_string(), "yes".to_string());
         attrs.insert("threshold_value".to_string(), threshold.value.to_string());
         attrs.insert(
@@ -1294,9 +1296,10 @@ fn numeric_xyz_from_element(element: &NimlElement) -> Result<[f32; 3]> {
 fn overlay_state_from_element(element: &NimlElement) -> AfniOverlayState {
     let threshold = parse_attr::<bool>(element, "threshold_enabled")
         .unwrap_or(false)
-        .then_some(OverlayThresholdCommandState {
-            value: parse_attr(element, "threshold_value").unwrap_or(0.0),
+        .then_some(OverlayThreshold {
+            enabled: true,
             absolute: parse_attr(element, "threshold_absolute").unwrap_or(true),
+            value: parse_attr(element, "threshold_value").unwrap_or(0.0),
             hide_failed: parse_attr(element, "threshold_hide_failed").unwrap_or(true),
         });
 
@@ -1571,7 +1574,8 @@ mod tests {
 
         assert!(outcome.applied_state);
         assert!(controller.overlay.visible);
-        assert_eq!(controller.overlay.threshold.unwrap().value, 2.5);
+        assert!(controller.overlay.threshold.enabled);
+        assert_eq!(controller.overlay.threshold.value, 2.5);
         assert!(matches!(
             outcome.actions.as_slice(),
             [AfniRouteAction::RgbaOverlay(AfniRgbaOverlay { surface_idcode, .. })]
@@ -1703,11 +1707,12 @@ mod tests {
             threshold_value: None,
         }));
         controller.surface.current_overlay_path = Some(PathBuf::from("stats.niml.dset"));
-        controller.overlay.threshold = Some(OverlayThresholdCommandState {
-            value: 3.1,
+        controller.overlay.threshold = OverlayThreshold {
+            enabled: true,
             absolute: true,
+            value: 3.1,
             hide_failed: true,
-        });
+        };
 
         let elements = outgoing_state_elements(&controller).unwrap();
 

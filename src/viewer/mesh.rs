@@ -1,6 +1,7 @@
 use glam::Vec3;
 
 use crate::color::ColorMap;
+use crate::command::OverlayThreshold;
 use crate::overlay::Overlay;
 use crate::surface::{SurfaceMesh, ValueRange};
 
@@ -104,14 +105,6 @@ pub(super) enum OverlayColorMap {
     BlueWhiteRed,
     Fire,
     Grayscale,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct OverlayThreshold {
-    pub(super) enabled: bool,
-    pub(super) absolute: bool,
-    pub(super) value: f32,
-    pub(super) hide_failed: bool,
 }
 
 impl PreparedSurface {
@@ -574,10 +567,8 @@ mod tests {
         DEFAULT_SURFACE_COLOR, PreparedGeometry, PreparedSurface, RoiAppearance, SelectionHighlight,
     };
     use crate::color::ColorMap;
-    use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
-    use crate::overlay::{
-        MaskMode, Overlay, OverlayColumns, OverlayRange, RangeSelection, Threshold,
-    };
+    use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
+    use crate::overlay::{MaskMode, Overlay, OverlayColumns, RangeSelection, Threshold};
     use crate::surface::SurfaceMesh;
     use glam::Vec3;
 
@@ -800,7 +791,7 @@ mod tests {
         let mut overlay = Overlay::from_dataset(dataset, &mesh.domain, columns)
             .unwrap()
             .with_colormap(ColorMap::afni_p2_spanned())
-            .with_intensity_range(RangeSelection::Manual(OverlayRange {
+            .with_intensity_range(RangeSelection::Manual(ColumnRange {
                 min: -1.0,
                 max: 1.0,
             }))

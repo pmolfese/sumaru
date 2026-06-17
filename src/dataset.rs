@@ -73,10 +73,35 @@ pub enum ColumnData {
     Text(Vec<String>),
 }
 
+/// A closed `[min, max]` interval over data values. Shared by data columns and
+/// the overlay intensity/threshold ranges (formerly a separate `OverlayRange`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColumnRange {
     pub min: f64,
     pub max: f64,
+}
+
+impl ColumnRange {
+    pub(crate) fn contains(&self, value: f64) -> bool {
+        value >= self.min && value <= self.max
+    }
+
+    pub(crate) fn normalized(&self, value: f64) -> f64 {
+        if (self.max - self.min).abs() <= f64::EPSILON {
+            0.5
+        } else {
+            ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+        }
+    }
+
+    pub(crate) fn validate(&self, label: &str) -> Result<()> {
+        ensure!(
+            self.min.is_finite() && self.max.is_finite(),
+            "{label} must contain finite values"
+        );
+        ensure!(self.min <= self.max, "{label} min is greater than max");
+        Ok(())
+    }
 }
 
 impl Dataset {

@@ -2,13 +2,13 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use crate::surface::{SurfaceId, SurfaceSide};
+use crate::surface::{SurfaceId, SurfaceSide, ValueRange};
 
 const STATUS_LOG_LIMIT: usize = 256;
 const DEFAULT_PAIR_MAX_OPEN_DEGREES: f32 = 85.0;
 const DEFAULT_PAIR_ACORN_EXTRA_GAP: f32 = 50.0;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ControllerState {
     pub camera: CameraCommandState,
     pub display: DisplayCommandState,
@@ -18,21 +18,6 @@ pub struct ControllerState {
     pub interaction: InteractionState,
     pub panels: PanelState,
     status_log: StatusLog,
-}
-
-impl Default for ControllerState {
-    fn default() -> Self {
-        Self {
-            camera: CameraCommandState::default(),
-            display: DisplayCommandState::default(),
-            overlay: OverlayCommandState::default(),
-            roi: RoiCommandState::default(),
-            surface: SurfaceCommandState::default(),
-            interaction: InteractionState::default(),
-            panels: PanelState::default(),
-            status_log: StatusLog::default(),
-        }
-    }
 }
 
 impl ControllerState {
@@ -249,8 +234,8 @@ impl PairVisibility {
 pub struct OverlayCommandState {
     pub visible: bool,
     pub symmetric_range: bool,
-    pub intensity_range: Option<[f32; 2]>,
-    pub threshold: Option<OverlayThresholdCommandState>,
+    pub intensity_range: Option<ValueRange>,
+    pub threshold: OverlayThreshold,
     pub opacity: f32,
 }
 
@@ -260,17 +245,33 @@ impl Default for OverlayCommandState {
             visible: true,
             symmetric_range: true,
             intensity_range: None,
-            threshold: None,
+            threshold: OverlayThreshold::default(),
             opacity: 1.0,
         }
     }
 }
 
+/// Overlay threshold state shared by the controller command layer, the render
+/// appearance, and the AFNI wire protocol. `enabled` carries the on/off state;
+/// in the partial-update `AfniOverlayState` this type is wrapped in `Option` to
+/// mean "present in the message" instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OverlayThresholdCommandState {
-    pub value: f32,
+pub struct OverlayThreshold {
+    pub enabled: bool,
     pub absolute: bool,
+    pub value: f32,
     pub hide_failed: bool,
+}
+
+impl Default for OverlayThreshold {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            absolute: true,
+            value: 0.0,
+            hide_failed: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
