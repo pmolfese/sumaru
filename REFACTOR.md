@@ -38,22 +38,32 @@ then **C**, then **D**.
 
 ## Remaining work
 
-### A. Split `viewer/mod.rs` along its existing seams — biggest win
+### A. Split `viewer/mod.rs` along its existing seams — method split ✅ DONE (branch `refactorWindowPaneB`)
 
-`impl ViewerState` alone is ~6,000 lines. Method-name clustering already reveals
-natural modules: `roi_*` (27), `draw_*` (18), `afni_*` (18), `pair*`/`paired_*`
-(28), `graph_*` (12), `overlay_*`/`load_*` (20), `pick_*` (10), `capture_*`/`save_*`.
+`impl ViewerState` was ~6,000 lines in a 12.2k-line file.
 
-- [ ] Move cohesive method groups into `impl ViewerState` blocks in topical
-      submodules (`viewer/afni.rs`, `viewer/roi.rs`, `viewer/overlay_load.rs`,
-      `viewer/pairing.rs`, `viewer/graph.rs`). `screenshot.rs`, `mesh.rs`,
-      `camera.rs`, `pick.rs`, `gpu.rs` already show the pattern works.
-- [ ] Relocate the ~45 small local structs (`LoadedOverlay`, `SceneStats`,
-      `GraphSnapshot`, `MontageShot`, …) to the module that owns them.
+- [x] Moved six cohesive method clusters into `impl ViewerState` blocks in topical
+      submodules, each with a module doc-comment and a brief `///` on every moved
+      method. Methods are exposed `pub(super)` so the parent (and sibling
+      submodules) keep calling them unchanged:
+      - `viewer/afni.rs` — AFNI/SUMA NIML talk (18 methods, ~636 lines)
+      - `viewer/capture.rs` — screenshot/montage capture + camera framing (~411)
+      - `viewer/overlay_load.rs` — overlay load + column/appearance refresh (~383)
+      - `viewer/roi.rs` — drawn-ROI editing, fill, save, `load_roi_path` (~465)
+      - `viewer/pairing.rs` — paired-hemisphere drag/transform/layout (~230)
+      - `viewer/graph.rs` — graph window/dock + snapshot (~145)
+      Net: `mod.rs` 12,167 → 10,021 lines (~2,150 moved). All ~216 tests pass,
+      fmt clean, clippy unchanged.
+- [ ] **Still open:** relocate the ~45 small local structs (`LoadedOverlay`,
+      `SceneStats`, `GraphSnapshot`, `MontageShot`, …) to the module that owns
+      them. Deferred — structs are referenced across modules and would need
+      `pub(super)`/`pub(crate)` visibility bumps; lower value than the method
+      split and best done as its own pass. The `draw_*` UI cluster and
+      `pick_*` methods also remain in `mod.rs` (the draw methods are heavily
+      interleaved; a `viewer/ui.rs` split is a reasonable future step).
 
-*Risk:* low per move (pure relocation, no logic change), but high churn — do it
-in small, individually-verifiable commits, one method cluster at a time. Easiest
-after Item B removes the per-window resize boilerplate.
+*Risk:* low per move (pure relocation, no logic change). Done one cluster at a
+time, compiling + testing after each.
 
 *Why first among the structural items:* every later edit to the viewer pays the
 "scroll through 11.8k lines" tax. This is the change that compounds.
@@ -142,8 +152,8 @@ remaining items — good "small commit" filler between the larger ones.
 
 1. ✅ **B** — finish `WindowPane` (dedupe resize/redraw + bundle constructor
    args). Done on `refactorWindowPaneB`.
-2. **A** — split `viewer/mod.rs` into topical submodules. The big structural
-   payoff; easier now that B is done.
+2. ✅ **A** — split `viewer/mod.rs` into topical submodules (method clusters).
+   Done on `refactorWindowPaneB`; struct relocation still open.
 3. **C** — deepen `OverlayState` (start with the minimal grouping / rename pass).
 4. **D** — tidy the ROI type cluster as small-commit filler.
 
