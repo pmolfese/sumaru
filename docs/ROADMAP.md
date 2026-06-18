@@ -124,18 +124,17 @@ more UI or protocol behavior into viewer-only fields.
   command state exists.
 - [x] Add a lightweight status/log event stream so `--verbose`, controllers,
   and future AFNI communication can report the same events consistently.
-- [ ] Add **new-sumaru** and **duplicate-sumaru** launch buttons to the
-  controller panel, drawn as custom-painted icon buttons (painter API, no extra
-  crate):
+- [x] Add **new-sumaru** and **duplicate-sumaru** launch buttons to the view
+  menu bar, drawn as custom-painted icon buttons (painter API, no extra crate):
   - **new-sumaru** (`+` icon): spawns a blank sumaru process — no surface, no
     overlay, no session context carried over.
   - **duplicate-sumaru** (two-overlapping-rectangles / copy icon): spawns a new
-    sumaru instance pre-loaded with the same surface (and spec state, if active)
+    sumaru instance pre-loaded with the same surface or spec (and surface volume)
     but no overlay, so the user gets a clean starting point for a second
     analysis view.
-  - Wire both to the linked-session layer (see *Linked Sumaru Sessions*) once
-    that infrastructure exists; for now, a plain subprocess launch is
-    sufficient.
+  - Both are plain detached subprocess launches (`current_exe()` with `--spec`/
+    `--surface`/`--sv` args). Still open: wire them to the linked-session layer
+    (see *Linked Sumaru Sessions*) so a duplicate can auto-link to its parent.
 
 ## Everyday Viewer Use
 
@@ -225,31 +224,44 @@ upload time, scalar/color upload time, threshold rebuild time, and frame time.
 Volume work stays behind AFNI/file-format interop because AFNI coordinate
 semantics need to be represented correctly before serious rendering begins.
 
-- [ ] Define `Volume` and `VolumeSpace` types from NIFTI/AFNI concepts:
-  dimensions, voxel sizes, origin, orientation codes, qform/sform or AFNI
-  matrix attributes, and transforms between voxel index/IJK, scanner/world, and
-  AFNI-style coordinate spaces.
-- [ ] Convert NIFTI headers and affine metadata into the shared `VolumeSpace`
-  model.
+A first **orthogonal slice-plane** pass has landed: `--volume` loads a NIfTI into
+a `Volume` (`src/volume.rs`) and renders axial/coronal/sagittal planes in the 3D
+scene with right-click select + left-drag scrubbing and add/remove of parallel
+slices (`src/viewer/volume_view.rs`). What remains is AFNI volume metadata, true
+ray-marched rendering, window/level UI, and surface co-registration.
+
+- [x] Define `Volume` and `VolumeSpace` types from NIFTI/AFNI concepts.
+  `VolumeSpace` (voxel↔world transforms, `VoxelIndex`) lives in `surface.rs`;
+  `Volume` (dense scalar grid + range + space) in `src/volume.rs`. Still to do:
+  AFNI matrix attributes and explicit orientation-code handling.
+- [x] Convert NIFTI headers and affine metadata into the shared `VolumeSpace`
+  model (sform/qform affine → `SurfaceTransform`).
 - [ ] Add fixture-backed snapshot/golden tests for representative `.nii.gz`,
-  `.hdr/.img`, AFNI volume metadata, and malformed volume inputs.
+  `.hdr/.img`, AFNI volume metadata, and malformed volume inputs. *(One load
+  test against `sub-3_SurfVol.nii` exists; broaden it.)*
 - [ ] Add AFNI `.HEAD/.BRIK` metadata support once the shared `VolumeSpace`
   model is ready.
-- [ ] Add `-v/--volume` as a volume-only viewer mode for NIFTI `.nii` and
-  `.nii.gz` inputs.
-- [ ] Start with volume metadata in the viewer and orthogonal slice rendering
+- [x] Add `-v/--volume` as a volume viewer mode for NIFTI `.nii`/`.nii.gz`
+  inputs (`--volume`/`--vol`).
+- [x] Start with volume metadata in the viewer and orthogonal slice rendering
   to validate NIFTI loading, intensity normalization, voxel spacing, and
   orientation handling.
-- [ ] Add slice navigation, window/level controls, and crosshair-linked slice
-  positions.
-- [ ] Upload volume data to GPU textures with a clear scalar datatype
-  conversion and normalization strategy.
+- [~] Add slice navigation, window/level controls, and crosshair-linked slice
+  positions. *(Done: right-click-select + left-drag slice navigation, plus
+  add/remove of parallel slices. Still open: a window/level UI control — currently
+  defaults to the full intensity range — and crosshair-linked positions.)*
+- [x] Upload volume data to GPU textures with a clear scalar datatype
+  conversion and normalization strategy (f32 → R32Float 3D texture, nearest
+  sampling; window/level mapped in the shader).
 - [ ] Add true 3D volume rendering with a `wgpu` ray-marching shader, transfer
   functions, opacity/window controls, and 3D texture upload.
 - [ ] Decide how 4D NIFTI data maps into the viewer: first volume by default,
   selectable timepoints/bricks later.
-- [ ] Integrate surface, overlay, ROI, and volume scenes once shared spatial
-  transforms and crosshair state are reliable.
+- [~] Integrate surface, overlay, ROI, and volume scenes once shared spatial
+  transforms and crosshair state are reliable. *(Slices already render in the
+  surface camera/depth scene; full surface↔volume co-registration — sharing
+  bounds and crosshair — is still open. Right-click is currently routed to slice
+  selection when a volume is loaded.)*
 
 ## Linked Sumaru Sessions And Session Restore
 
