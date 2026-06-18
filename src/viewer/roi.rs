@@ -4,6 +4,550 @@
 
 use super::*;
 
+/// A loaded set of ROIs rendered together as one overlay layer: the source
+/// name, the ROIs themselves, their drawing appearance, and the per-node label
+/// strings plus a tally of how many nodes mapped onto the surface versus were
+/// skipped (e.g. out-of-range node indices).
+#[derive(Debug, Clone)]
+pub(super) struct RoiLayer {
+    pub(super) display_name: String,
+    pub(super) rois: Vec<Roi>,
+    pub(super) appearance: RoiAppearance,
+    pub(super) node_labels: HashMap<u32, Vec<String>>,
+    pub(super) mapped_nodes: usize,
+    pub(super) skipped_nodes: usize,
+}
+
+/// The editable ROI bench: one slot per ROI plus a trailing blank slot, which
+/// slot is active, and the next integer label to hand out when a new slot is
+/// created.
+#[derive(Debug, Clone)]
+pub(super) struct RoiWorkspace {
+    pub(super) slots: Vec<RoiSlot>,
+    pub(super) active_index: usize,
+    pub(super) next_integer_label: i32,
+}
+
+/// One ROI in the workspace. While `editing`, the live `draft` is the source of
+/// truth; once finalized it is frozen into `finalized_roi`. `visible` toggles
+/// whether the slot is drawn.
+#[derive(Debug, Clone)]
+pub(super) struct RoiSlot {
+    pub(super) draft: RoiDraft,
+    pub(super) finalized_roi: Option<Roi>,
+    pub(super) editing: bool,
+    pub(super) visible: bool,
+}
+
+/// The undoable editing state of an ROI draft: the target surface, the drawn
+/// anchor nodes and stroke segments, and the fill state. Factored out of
+/// `RoiDraft` so it is also the unit stored on the undo/redo stacks — capturing
+/// or restoring a draft is a single clone of this struct rather than a
+/// hand-maintained field-by-field copy. (Was the separate `RoiDraftSnapshot`.)
+#[derive(Debug, Clone, Default)]
+pub(super) struct RoiDraftState {
+    /// Surface/domain/side this draft is bound to, once a first point is placed.
+    pub(super) target: Option<RoiDraftTarget>,
+    /// Ordered anchor (click) nodes of the path.
+    pub(super) anchor_nodes: Vec<u32>,
+    /// Stroke segments connecting consecutive anchors (last may close the loop).
+    pub(super) segments: Vec<Vec<u32>>,
+    /// Filled-interior nodes, once a closed path is filled.
+    pub(super) fill_nodes: Option<Vec<u32>>,
+    /// Seed node a fill was started from.
+    pub(super) fill_seed_node: Option<u32>,
+    /// A fill is requested and awaiting the next click.
+    pub(super) fill_pending: bool,
+    /// Free-draw mode is active (each click extends the path).
+    pub(super) draw_enabled: bool,
+}
+
+/// An in-progress drawn ROI: its label/color identity, the editable `state`,
+/// and the undo/redo history of prior states.
+#[derive(Debug, Clone)]
+pub(super) struct RoiDraft {
+    pub(super) label: String,
+    pub(super) integer_label: i32,
+    /// The current editable state (target, path, fill).
+    pub(super) state: RoiDraftState,
+    /// Past states for undo, most recent last.
+    pub(super) history: Vec<RoiDraftState>,
+    /// States popped by undo, available to redo.
+    pub(super) redo_history: Vec<RoiDraftState>,
+}
+
+/// The surface a draft is bound to, identified well enough to re-locate it
+/// across reloads: the surface id, its domain id, and which hemisphere side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RoiDraftTarget {
+    pub(super) surface_id: SurfaceId,
+    pub(super) domain_id: SurfaceDomainId,
+    pub(super) side: SurfaceSide,
+}
+
+/// The result of resolving a click into ROI space: the picked surface mesh, the
+/// draft target it belongs to, and the node index in that surface's local
+/// numbering.
+#[derive(Debug, Clone)]
+pub(super) struct RoiPickTarget {
+    pub(super) mesh: SurfaceMesh,
+    pub(super) target: RoiDraftTarget,
+    pub(super) local_node: u32,
+}
+
+impl RoiLayer {
+    pub(super) fn labels_for_node(&self, node: u32) -> &[String] {
+        self.node_labels
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+impl Default for RoiWorkspace {
+    fn default() -> Self {
+        let mut workspace = Self {
+            slots: Vec::new(),
+            active_index: 0,
+            next_integer_label: 1,
+        };
+        workspace.push_blank_slot();
+        workspace
+    }
+}
+
+impl RoiWorkspace {
+    pub(super) fn from_rois(rois: Vec<Roi>) -> Self {
+        let next_integer_label = rois
+            .iter()
+            .map(|roi| roi.integer_label)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
+        let mut workspace = Self {
+            slots: rois.into_iter().map(RoiSlot::from_roi).collect(),
+            active_index: 0,
+            next_integer_label,
+        };
+        let active_index = workspace.push_blank_slot();
+        workspace.active_index = active_index;
+        workspace
+    }
+
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(super) fn has_saveable_rois(&self) -> bool {
+        self.slots.iter().any(RoiSlot::has_roi)
+    }
+
+    pub(super) fn active_draft(&self) -> Option<&RoiDraft> {
+        self.slots
+            .get(self.active_index)
+            .filter(|slot| slot.editing)
+            .map(|slot| &slot.draft)
+    }
+
+    pub(super) fn active_draft_mut(&mut self) -> Option<&mut RoiDraft> {
+        self.slots
+            .get_mut(self.active_index)
+            .filter(|slot| slot.editing)
+            .map(|slot| &mut slot.draft)
+    }
+
+    pub(super) fn set_active(&mut self, index: usize) -> bool {
+        if index >= self.slots.len() {
+            return false;
+        }
+        self.active_index = index;
+        true
+    }
+
+    pub(super) fn saveable_rois(&self) -> Result<Vec<Roi>> {
+        self.slots
+            .iter()
+            .filter_map(RoiSlot::current_roi)
+            .collect::<Result<Vec<_>>>()
+    }
+
+    pub(super) fn saveable_roi_at(&self, index: usize) -> Result<Option<Roi>> {
+        self.slots
+            .get(index)
+            .and_then(RoiSlot::current_roi)
+            .transpose()
+    }
+
+    pub(super) fn visible_rois(&self) -> Result<Vec<Roi>> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.visible)
+            .filter_map(RoiSlot::current_roi)
+            .collect::<Result<Vec<_>>>()
+    }
+
+    pub(super) fn finalize_slot(&mut self, index: usize) -> Result<bool> {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return Ok(false);
+        };
+        let Some(roi) = slot.draft.to_roi()? else {
+            return Ok(false);
+        };
+        slot.finalized_roi = Some(roi);
+        slot.editing = false;
+        slot.draft.state.draw_enabled = false;
+        slot.draft.state.fill_pending = false;
+        slot.visible = true;
+        let next_index = self.push_blank_slot();
+        self.active_index = next_index;
+
+        Ok(true)
+    }
+
+    pub(super) fn edit_slot(&mut self, index: usize) -> Result<bool> {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return Ok(false);
+        };
+        if slot.editing {
+            self.active_index = index;
+            return Ok(true);
+        }
+        let Some(roi) = slot.finalized_roi.as_ref() else {
+            return Ok(false);
+        };
+        let Some(draft) = RoiDraft::from_roi(roi) else {
+            return Ok(false);
+        };
+        slot.draft = draft;
+        slot.finalized_roi = None;
+        slot.editing = true;
+        self.active_index = index;
+
+        Ok(true)
+    }
+
+    pub(super) fn delete_slot(&mut self, index: usize) -> bool {
+        if index >= self.slots.len() {
+            return false;
+        }
+
+        self.slots.remove(index);
+        if self.slots.is_empty() {
+            self.active_index = self.push_blank_slot();
+            return true;
+        }
+
+        if self.active_index > index {
+            self.active_index -= 1;
+        } else if self.active_index >= self.slots.len() {
+            self.active_index = self.slots.len() - 1;
+        }
+
+        if !self.slots.iter().any(|slot| slot.editing) {
+            self.active_index = self.push_blank_slot();
+        }
+
+        true
+    }
+
+    pub(super) fn push_blank_slot(&mut self) -> usize {
+        let value = self.next_integer_label;
+        self.next_integer_label = self.next_integer_label.saturating_add(1);
+        self.slots
+            .push(RoiSlot::blank(format!("roi_{value}"), value));
+        self.slots.len() - 1
+    }
+}
+
+impl RoiSlot {
+    pub(super) fn blank(label: String, integer_label: i32) -> Self {
+        Self {
+            draft: RoiDraft::new(label, integer_label),
+            finalized_roi: None,
+            editing: true,
+            visible: true,
+        }
+    }
+
+    pub(super) fn from_roi(roi: Roi) -> Self {
+        let draft = RoiDraft::from_roi(&roi)
+            .unwrap_or_else(|| RoiDraft::new(roi.label.clone(), roi.integer_label));
+        Self {
+            draft,
+            finalized_roi: Some(roi),
+            editing: false,
+            visible: true,
+        }
+    }
+
+    pub(super) fn has_roi(&self) -> bool {
+        self.finalized_roi.is_some() || !self.draft.is_empty()
+    }
+
+    pub(super) fn current_roi(&self) -> Option<Result<Roi>> {
+        if self.editing {
+            return self.draft.to_roi().transpose();
+        }
+        self.finalized_roi.clone().map(Ok)
+    }
+
+    pub(super) fn label(&self) -> &str {
+        if self.editing {
+            &self.draft.label
+        } else {
+            self.finalized_roi
+                .as_ref()
+                .map(|roi| roi.label.as_str())
+                .unwrap_or(self.draft.label.as_str())
+        }
+    }
+
+    pub(super) fn integer_label(&self) -> i32 {
+        if self.editing {
+            self.draft.integer_label
+        } else {
+            self.finalized_roi
+                .as_ref()
+                .map(|roi| roi.integer_label)
+                .unwrap_or(self.draft.integer_label)
+        }
+    }
+}
+
+impl Default for RoiDraft {
+    fn default() -> Self {
+        Self::new("roi_1", 1)
+    }
+}
+
+impl RoiDraft {
+    pub(super) fn new(label: impl Into<String>, integer_label: i32) -> Self {
+        Self {
+            label: label.into(),
+            integer_label,
+            state: RoiDraftState::default(),
+            history: Vec::new(),
+            redo_history: Vec::new(),
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.state.anchor_nodes.is_empty()
+            && self.state.segments.is_empty()
+            && self.state.fill_nodes.is_none()
+    }
+
+    pub(super) fn is_joined(&self) -> bool {
+        self.state.segments.last().is_some_and(|segment| {
+            segment.len() >= 2
+                && self.state.anchor_nodes.len() >= 3
+                && segment.last().copied() == self.state.anchor_nodes.first().copied()
+        })
+    }
+
+    pub(super) fn can_join(&self) -> bool {
+        self.state.anchor_nodes.len() >= 3 && !self.is_joined()
+    }
+
+    pub(super) fn can_fill(&self) -> bool {
+        self.is_joined()
+    }
+
+    pub(super) fn can_undo(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    pub(super) fn can_redo(&self) -> bool {
+        !self.redo_history.is_empty()
+    }
+
+    pub(super) fn reopen_joined_path_for_append(&mut self) {
+        if self.is_joined() {
+            self.state.segments.pop();
+        }
+        self.state.fill_nodes = None;
+        self.state.fill_seed_node = None;
+        self.state.fill_pending = false;
+    }
+
+    pub(super) fn from_roi(roi: &Roi) -> Option<Self> {
+        let mut draft = Self::new(roi.label.clone(), roi.integer_label);
+        draft.state.target = match (&roi.parent_surface_id, &roi.parent_domain_id) {
+            (Some(surface_id), Some(domain_id)) => Some(RoiDraftTarget {
+                surface_id: surface_id.clone(),
+                domain_id: domain_id.clone(),
+                side: roi.parent_side.clone(),
+            }),
+            _ => None,
+        };
+
+        for datum in &roi.data {
+            if datum.action == RoiBrushAction::FillArea {
+                if !datum.node_path.is_empty() {
+                    draft.state.fill_nodes = Some(datum.node_path.clone());
+                }
+                continue;
+            }
+
+            match datum.kind {
+                RoiElementKind::NodeSegment | RoiElementKind::EdgeGroup => {
+                    if datum.node_path.is_empty() {
+                        continue;
+                    }
+                    if draft.state.anchor_nodes.is_empty()
+                        && let Some(first) = datum.node_path.first().copied()
+                    {
+                        draft.state.anchor_nodes.push(first);
+                    }
+                    if datum.action != RoiBrushAction::JoinEnds
+                        && let Some(last) = datum.node_path.last().copied()
+                        && draft.state.anchor_nodes.last().copied() != Some(last)
+                    {
+                        draft.state.anchor_nodes.push(last);
+                    }
+                    draft.state.segments.push(datum.node_path.clone());
+                }
+                RoiElementKind::NodeGroup if !datum.node_path.is_empty() => {
+                    if draft.state.segments.is_empty() && draft.state.anchor_nodes.is_empty() {
+                        draft.state.anchor_nodes = datum.node_path.clone();
+                    } else {
+                        draft.state.fill_nodes = Some(datum.node_path.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        (!draft.is_empty()).then_some(draft)
+    }
+
+    /// Capture the current editable state for the undo/redo stacks.
+    pub(super) fn snapshot(&self) -> RoiDraftState {
+        self.state.clone()
+    }
+
+    /// Replace the editable state with a previously captured snapshot.
+    pub(super) fn restore(&mut self, snapshot: RoiDraftState) {
+        self.state = snapshot;
+    }
+
+    pub(super) fn push_history(&mut self) {
+        self.history.push(self.snapshot());
+        self.redo_history.clear();
+    }
+
+    pub(super) fn undo(&mut self) -> bool {
+        let Some(snapshot) = self.history.pop() else {
+            return false;
+        };
+        self.redo_history.push(self.snapshot());
+        self.restore(snapshot);
+        true
+    }
+
+    pub(super) fn redo(&mut self) -> bool {
+        let Some(snapshot) = self.redo_history.pop() else {
+            return false;
+        };
+        self.history.push(self.snapshot());
+        self.restore(snapshot);
+        true
+    }
+
+    pub(super) fn boundary_nodes(&self) -> Vec<u32> {
+        let mut nodes = Vec::new();
+        for segment in &self.state.segments {
+            if segment.is_empty() {
+                continue;
+            }
+            let start = usize::from(nodes.last().copied() == segment.first().copied());
+            nodes.extend(segment.iter().skip(start).copied());
+        }
+        nodes
+    }
+
+    pub(super) fn to_roi(&self) -> Result<Option<Roi>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(target) = self.state.target.clone() else {
+            return Ok(None);
+        };
+        let mut data = Vec::new();
+        if self.state.segments.is_empty() && !self.state.anchor_nodes.is_empty() {
+            data.push(RoiDatum::node_group(self.state.anchor_nodes.clone())?);
+        }
+        for (index, segment) in self.state.segments.iter().enumerate() {
+            let action = if index == self.state.segments.len().saturating_sub(1) && self.is_joined()
+            {
+                RoiBrushAction::JoinEnds
+            } else {
+                RoiBrushAction::AppendStroke
+            };
+            data.push(RoiDatum::node_segment(segment.clone(), action)?);
+        }
+        if let Some(nodes) = &self.state.fill_nodes {
+            data.push(RoiDatum::new(
+                RoiElementKind::NodeGroup,
+                RoiBrushAction::FillArea,
+                nodes.clone(),
+                Vec::new(),
+            )?);
+        }
+
+        let drawing_type = if self.state.fill_nodes.is_some() {
+            RoiDrawingType::FilledArea
+        } else if self.is_joined() {
+            RoiDrawingType::ClosedPath
+        } else {
+            RoiDrawingType::OpenPath
+        };
+        let roi = Roi::new(self.label.clone(), self.integer_label)?
+            .with_parent_surface(target.surface_id, target.domain_id, target.side)
+            .with_source(RoiSource::Drawn, None)?
+            .with_style(
+                roi_fill_color_for_label(self.integer_label),
+                roi_edge_color_for_label(self.integer_label),
+                2,
+            )?
+            .with_color_by_label(true)
+            .with_draw_status(if self.is_joined() {
+                RoiDrawStatus::Finished
+            } else {
+                RoiDrawStatus::InCreation
+            })
+            .with_drawing_type(drawing_type)
+            .with_data(data)?;
+
+        Ok(Some(roi))
+    }
+}
+
+/// The product of turning a set of ROIs into a drawable appearance: the colors
+/// to apply, the per-node label strings, and how many nodes were successfully
+/// mapped versus skipped during the build.
+#[derive(Debug, Clone)]
+pub(super) struct RoiAppearanceBuild {
+    pub(super) appearance: RoiAppearance,
+    pub(super) node_labels: HashMap<u32, Vec<String>>,
+    pub(super) mapped_nodes: usize,
+    pub(super) skipped_nodes: usize,
+}
+
+/// Where one hemisphere's data lives inside a composite paired surface: which
+/// side it is, and its node and triangle offsets/counts within the combined
+/// buffers. Used to scatter ROI results back to the right slice of a pair.
+#[derive(Debug, Clone)]
+pub(super) struct RoiComponentRange {
+    pub(super) side: SurfaceSide,
+    pub(super) node_offset: u32,
+    pub(super) node_count: usize,
+    pub(super) triangle_offset: usize,
+    pub(super) triangle_count: usize,
+}
+
 impl ViewerState {
     /// Route a right-click during ROI drawing to add-point or seed-fill.
     pub(super) fn handle_roi_draw_click_at_cursor(&mut self) -> Result<()> {
