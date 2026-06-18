@@ -114,7 +114,8 @@ fields, so they can be tested without launching the GUI.
   the monitor size.
 - Add `--verbose` to print viewer status messages to the terminal.
 - Spec scenes load only the active display state by default. Add `--preload`
-  to load the remaining spec surfaces in the background after launch.
+  to load all spec surfaces into memory before the viewer opens, so switching
+  between surfaces is instant (at the cost of a longer startup).
 - Left-drag to orbit.
 - Right-click the surface to inspect the nearest node, triangle, and loaded
   overlay value.

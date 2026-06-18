@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -495,18 +495,6 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         };
 
         match event {
-            ViewerEvent::SpecPreloadReady => {
-                if state.drain_preload_results() {
-                    state.control_window().request_redraw();
-                    if state.controller.panels.roi_controller_open {
-                        state.roi_control_window().request_redraw();
-                    }
-                    if state.controller.panels.graph_window_open {
-                        state.view_window().request_redraw();
-                    }
-                    state.view_window().request_redraw();
-                }
-            }
             ViewerEvent::AfniMessagesReady => {
                 if state.drain_afni_events() {
                     state.control_window().request_redraw();
@@ -517,6 +505,12 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                         state.view_window().request_redraw();
                     }
                     state.view_window().request_redraw();
+                }
+            }
+            ViewerEvent::SceneStatsReady => {
+                if state.drain_scene_stats() {
+                    // Only the controls panel shows scene stats.
+                    state.control_window().request_redraw();
                 }
             }
         }
@@ -920,12 +914,21 @@ struct ViewerState {
     surface_volume_idcode: Option<String>,
     scene_stats: Option<SceneStats>,
     /// Cached geometry-derived stats (winding/area/counts) keyed by surface id,
-    /// so recolors do not recompute the expensive `winding_report`.
-    scene_geometry_stats: Option<(SurfaceId, SceneGeometryStats)>,
+    /// so recolors do not recompute the expensive `winding_report`. Keyed as a
+    /// map (not a single slot) so switching back and forth between spec surfaces
+    /// reuses each surface's stats instead of recomputing on every toggle.
+    scene_geometry_stats: HashMap<SurfaceId, SceneGeometryStats>,
+    /// Background channel for geometry stats computed off the hot path. The
+    /// expensive `winding_report` runs on a worker thread so a first surface
+    /// switch displays immediately; the result fills the SCENE panel a moment
+    /// later. See [`Self::update_scene_stats`].
+    scene_stats_sender: mpsc::Sender<(SurfaceId, SceneGeometryStats)>,
+    scene_stats_receiver: mpsc::Receiver<(SurfaceId, SceneGeometryStats)>,
+    /// Surface ids whose geometry stats are currently being computed on a worker
+    /// thread, so repeat switches do not spawn duplicate work.
+    pending_scene_stats: HashSet<SurfaceId>,
     verbose: bool,
     preload_enabled: bool,
-    preload_sender: Sender<PreloadResult>,
-    preload_receiver: Receiver<PreloadResult>,
     event_proxy: EventLoopProxy<ViewerEvent>,
     afni_options: AfniViewerOptions,
     afni_connection: Option<AfniConnection>,
@@ -1211,8 +1214,8 @@ impl ViewerState {
             initial_surface_volume_path.map(canonical_or_original_path);
         let initial_surface_volume_idcode =
             query_afni_dataset_idcode_optional(initial_surface_volume_path.as_deref())?;
-        let (preload_sender, preload_receiver) = mpsc::channel();
         let afni_recorder = niml_record_path.map(NimlRecorder::create).transpose()?;
+        let (scene_stats_sender, scene_stats_receiver) = mpsc::channel();
 
         let mut state = Self {
             view: WindowPane::new(
@@ -1270,11 +1273,12 @@ impl ViewerState {
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             scene_stats: None,
-            scene_geometry_stats: None,
+            scene_geometry_stats: HashMap::new(),
+            scene_stats_sender,
+            scene_stats_receiver,
+            pending_scene_stats: HashSet::new(),
             verbose,
             preload_enabled,
-            preload_sender,
-            preload_receiver,
             event_proxy,
             afni_options,
             afni_connection: None,
@@ -3582,7 +3586,7 @@ impl ViewerState {
         self.reset_scene_state();
         self.ensure_scene_surface_loaded(0)?;
         self.activate_scene_surface(0)?;
-        self.start_scene_preload(generation);
+        self.preload_scene_surfaces_blocking(generation);
         self.camera.reset();
         self.controller.camera.note_reset();
         self.log_status(format!(
@@ -3766,7 +3770,12 @@ impl ViewerState {
         Ok(())
     }
 
-    fn start_scene_preload(&self, generation: u64) {
+    /// Load every not-yet-loaded spec surface component mesh into memory,
+    /// blocking until all are resident. Called during spec load so that with
+    /// `--preload` the viewer does not become interactive until switching
+    /// between surfaces is instant. Each mesh is applied (and its display cache
+    /// warmed) as soon as it loads.
+    fn preload_scene_surfaces_blocking(&mut self, generation: u64) {
         if !self.preload_enabled {
             self.log_status("Spec preloading disabled.");
             return;
@@ -3775,6 +3784,8 @@ impl ViewerState {
         let Some(scene) = self.surface_scene.as_ref() else {
             return;
         };
+        // Collect the work first so the immutable scene borrow is released
+        // before we load + apply each mesh (which needs `&mut self`).
         let mut tasks = Vec::new();
         for (surface_index, surface) in scene.surfaces.iter().enumerate() {
             for (component_index, component) in surface.components.iter().enumerate() {
@@ -3796,38 +3807,24 @@ impl ViewerState {
         }
 
         self.log_status(format!(
-            "Preloading {} spec surface components in the background.",
+            "Preloading {} spec surface components before display.",
             tasks.len()
         ));
-        let sender = self.preload_sender.clone();
-        let event_proxy = self.event_proxy.clone();
-        thread::spawn(move || {
-            for task in tasks {
-                let result = load_spec_component_mesh(
-                    &task.spec,
-                    &task.surface,
-                    task.surface_volume_idcode.as_deref(),
-                )
-                .map_err(|error| format!("{error:#}"));
-                let _ = sender.send(PreloadResult {
-                    generation: task.generation,
-                    surface_index: task.surface_index,
-                    component_index: task.component_index,
-                    path: task.surface.path.clone(),
-                    result,
-                });
-                let _ = event_proxy.send_event(ViewerEvent::SpecPreloadReady);
-            }
-        });
-    }
-
-    fn drain_preload_results(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok(result) = self.preload_receiver.try_recv() {
-            changed |= self.apply_preload_result(result);
+        for task in tasks {
+            let result = load_spec_component_mesh(
+                &task.spec,
+                &task.surface,
+                task.surface_volume_idcode.as_deref(),
+            )
+            .map_err(|error| format!("{error:#}"));
+            self.apply_preload_result(PreloadResult {
+                generation: task.generation,
+                surface_index: task.surface_index,
+                component_index: task.component_index,
+                path: task.surface.path.clone(),
+                result,
+            });
         }
-
-        changed
     }
 
     fn apply_preload_result(&mut self, result: PreloadResult) -> bool {
@@ -3890,6 +3887,8 @@ impl ViewerState {
     }
 
     fn activate_scene_surface(&mut self, index: usize) -> Result<()> {
+        // Surface-switch latency, surfaced under `--verbose`.
+        let switch_start = self.verbose.then(Instant::now);
         self.ensure_scene_surface_loaded(index)?;
         let layout = self.controller.display.pair_state;
         let (surface_count, name, state, path, snapshot) = {
@@ -3930,6 +3929,12 @@ impl ViewerState {
         } else {
             self.upload_surface_buffers();
             self.update_scene_stats();
+        }
+        if let Some(start) = switch_start {
+            self.log_status(format!(
+                "Surface switch took {:.1} ms.",
+                start.elapsed().as_secs_f64() * 1000.0
+            ));
         }
         self.view
             .window
@@ -4655,27 +4660,32 @@ impl ViewerState {
     fn update_scene_stats(&mut self) {
         let Some(mesh) = self.mesh.as_ref() else {
             self.scene_stats = None;
-            self.scene_geometry_stats = None;
             return;
         };
 
         // The expensive part (winding_report + total_area) only depends on
-        // geometry, so cache it per surface id. Recolors keep the same id and
-        // reuse it, recomputing only the cheap overlay range.
+        // geometry, so cache it per surface id. On a cache hit (recolors, and
+        // every surface revisit) this is instant. On a miss — only the first
+        // visit to a surface — the heavy compute runs on a worker thread so the
+        // switch displays immediately; `drain_scene_stats` fills the panel when
+        // the result arrives.
         let id = mesh.metadata.id.clone();
-        let cache_hit = matches!(
-            &self.scene_geometry_stats,
-            Some((cached_id, _)) if *cached_id == id
-        );
-        let geometry = if cache_hit {
-            self.scene_geometry_stats
-                .as_ref()
-                .expect("cache hit checked above")
-                .1
-        } else {
-            let geometry = SceneGeometryStats::from_mesh(mesh);
-            self.scene_geometry_stats = Some((id, geometry));
-            geometry
+        let Some(geometry) = self.scene_geometry_stats.get(&id).copied() else {
+            // Show the cheap part now (nodes/triangles come from the geometry,
+            // so the SCENE panel stays blank until stats land); kick off the
+            // background compute unless one is already in flight for this id.
+            self.scene_stats = None;
+            if self.pending_scene_stats.insert(id.clone()) {
+                let mesh = mesh.clone();
+                let sender = self.scene_stats_sender.clone();
+                let proxy = self.event_proxy.clone();
+                thread::spawn(move || {
+                    let geometry = SceneGeometryStats::from_mesh(&mesh);
+                    let _ = sender.send((id, geometry));
+                    let _ = proxy.send_event(ViewerEvent::SceneStatsReady);
+                });
+            }
+            return;
         };
 
         self.scene_stats = Some(SceneStats {
@@ -4687,6 +4697,24 @@ impl ViewerState {
                 .as_ref()
                 .map(|overlay| overlay.range),
         });
+    }
+
+    /// Apply geometry stats computed on a worker thread: cache each result and,
+    /// if the active surface now has stats, refresh the SCENE panel. Returns
+    /// whether anything changed (so the caller can request a redraw).
+    fn drain_scene_stats(&mut self) -> bool {
+        let mut received = false;
+        while let Ok((id, geometry)) = self.scene_stats_receiver.try_recv() {
+            self.pending_scene_stats.remove(&id);
+            self.scene_geometry_stats.insert(id, geometry);
+            received = true;
+        }
+        if received {
+            // Rebuild scene_stats for whatever surface is active now (its stats
+            // may have just arrived, or it may have changed while we waited).
+            self.update_scene_stats();
+        }
+        received
     }
 
     fn show_mode_label(&mut self, mode: CameraMode) {
@@ -6209,8 +6237,8 @@ struct ControlUiOutput {
 
 #[derive(Debug, Clone, Copy)]
 enum ViewerEvent {
-    SpecPreloadReady,
     AfniMessagesReady,
+    SceneStatsReady,
 }
 
 struct PreloadTask {

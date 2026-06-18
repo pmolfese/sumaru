@@ -54,13 +54,10 @@ then **C**, then **D**.
       - `viewer/graph.rs` — graph window/dock + snapshot (~145)
       Net: `mod.rs` 12,167 → 10,021 lines (~2,150 moved). All ~216 tests pass,
       fmt clean, clippy unchanged.
-- [ ] **Still open:** relocate the ~45 small local structs (`LoadedOverlay`,
-      `SceneStats`, `GraphSnapshot`, `MontageShot`, …) to the module that owns
-      them. Deferred — structs are referenced across modules and would need
-      `pub(super)`/`pub(crate)` visibility bumps; lower value than the method
-      split and best done as its own pass. The `draw_*` UI cluster and
-      `pick_*` methods also remain in `mod.rs` (the draw methods are heavily
-      interleaved; a `viewer/ui.rs` split is a reasonable future step).
+- [ ] **Still open:** relocate the ~50 local structs to their owning module, and
+      split the `draw_*` UI cluster into `viewer/ui.rs`. These are deferred
+      navigability follow-ons — see [A-follow-up](#a-follow-up--struct-relocation--uirs-split-deferred)
+      below for the full outline, rationale, and reduction estimate.
 
 *Risk:* low per move (pure relocation, no logic change). Done one cluster at a
 time, compiling + testing after each.
@@ -151,6 +148,94 @@ sat alongside the domain `roi::Roi`.
 
 *Risk:* was low; done as a mechanical rewrite with the ROI test suite as the
 safety net. All ~216 tests pass, clippy unchanged, fmt clean.
+
+---
+
+## A-follow-up — struct relocation + `ui.rs` split (deferred)
+
+After the method split, `mod.rs` is ~10,089 lines and the single `impl
+ViewerState` still runs ~956→4740 (~3,800 lines). The six submodules use
+`use super::*`, so they currently *borrow* ~50 type definitions that still
+physically live in `mod.rs`. Two follow-ons finish the job. Both are **pure
+navigability** — no behavior change, no hazard removed — which is why they sit
+below the correctness-bearing items.
+
+### A1 — Relocate the ~50 local structs to their owning module
+
+Every type lives in `mod.rs` regardless of who uses it. Natural owners:
+
+| Target module | Types |
+|---|---|
+| `roi.rs` | `RoiLayer`, `RoiWorkspace`, `RoiSlot`, `RoiDraft`, `RoiDraftState`, `RoiDraftTarget`, `RoiPickTarget`, `RoiAppearanceBuild`, `RoiComponentRange` (9) |
+| *(new)* `scene.rs` | `SurfaceScene`, `SceneSurface`, `SceneSurfaceComponent`, `SurfaceBuffers`, `SurfaceRenderSet`, `SurfaceRenderInstance`, `PreparedGeometryCache`, `AnatomicalShadingCache`, `DisplayMeshCache`, `DisplayMeshSnapshot`, `SurfaceLabelLookup`, `SceneStats`, `SceneGeometryStats`, `TransformedBounds` (14) |
+| `overlay_load.rs` | `LoadedOverlay`, `LoadedOverlaySelection`, `PairedOverlayPaths`, `OverlayColumnSelections`, `OverlayColumnOption` (5) |
+| `capture.rs` | `MontageShot`, `MontageLayout`, `MontageCamera` (3) |
+| `graph.rs` | `GraphSnapshot`, `GraphPoint` (2) |
+| `pairing.rs` | `ComponentTransform`, `StatePair` (2) |
+| `afni.rs` | `AfniSurfaceTarget`, `AfniViewerOptions` (2) |
+
+Stays in `mod.rs` (the genuine core): `ViewerState`, `ViewerApp`,
+`WindowPane`/`EguiPane`, `ViewerWindows`/`InitialScene`, `ViewerEvent`,
+`RenderStatus`, `LaunchOptions`.
+
+*Mechanic:* each move is "cut the `struct` + its `impl` blocks, paste into the
+target module." The only friction is **visibility** — a type used by `mod.rs`
+*and* a sibling now needs `pub(super)` on the type and any fields the other
+module touches. Unlike the method moves, this is per-field, not a blind perl
+pass.
+
+### A2 — Split the `draw_*` UI cluster into `viewer/ui.rs`
+
+13 `draw_*` methods span ~2018→~3070 (~1,050 lines) — the largest cohesive block
+left in the impl (`draw_ui`, `draw_view_overlay_ui`, `draw_overlay_workbench`,
+`draw_overlay_range_controls`, `draw_surface_dataset_section`,
+`draw_scene_section`, `draw_pick_section`, `draw_roi_control_contents`,
+`draw_graph_dock_ui`, …) plus their UI-only helpers (`ControlUiOutput`,
+`InputResponse`, `ModeLabel`, `desired_panel_size`).
+
+They are "interleaved" in two senses that explain the deferral:
+1. **Intra-cluster coupling** — `draw_ui` calls `draw_scene_section` /
+   `draw_pick_section` / `draw_overlay_workbench`; they share egui idioms and
+   thread a `&mut Vec<ViewerCommand>` of actions. Moving one means moving the set.
+2. **Cross-cutting reads** — they touch overlay, ROI, scene, and camera state
+   broadly, so the move surfaces the most visibility bumps. Doing A1 first
+   (especially the overlay/ROI/scene structs) clears that path.
+
+### Why — clarity
+
+- **Co-location.** Today ROI drawing methods live in `roi.rs` but `RoiDraft`
+  lives in `mod.rs`. After A1, the type, its `impl`, and the `ViewerState`
+  methods that use it share a file — "everything about `RoiDraft`" is one answer.
+- **`mod.rs` becomes a table of contents, not an encyclopedia** — its job
+  collapses to construct the app, own the windows, run the event loop, and
+  orchestrate render/update.
+- **Visibility documents the seams.** Marking a field `pub(super)` makes
+  cross-module coupling explicit and greppable; today it is invisible because
+  everything shares one privacy scope.
+- **`ui.rs` isolates the egui layer** so the render/event core is no longer
+  interrupted by ~1,050 lines of widget layout (and vice-versa).
+
+### Why — reduction (estimate)
+
+- A2 (`ui.rs`): ~1,050 lines out of `mod.rs`.
+- A1 (structs + their impls): ~2,000–2,500 lines (scene/ROI/overlay carry most
+  of the `impl` weight).
+- Net: `mod.rs` plausibly lands ~6,000–6,500 lines; `impl ViewerState` itself
+  shrinks from ~3,800 to ~2,000 lines of genuine lifecycle/orchestration. No
+  logic is deleted — this is redistribution, but the largest file roughly halves.
+
+### Sequencing
+
+1. **`scene.rs` first** (new module) — the 14 scene/render types are the densest
+   cluster with the clearest boundary; biggest single clarity win.
+2. **Relocate the topical structs** into the existing `roi.rs` / `overlay_load.rs`
+   / `capture.rs` / `graph.rs` / `pairing.rs` — small, one commit each.
+3. **`ui.rs` last** — the big draw split, once overlay/ROI/scene types are
+   already `pub(super)` and co-located.
+
+Default to `pub(super)` (not `pub(crate)`) so coupling stays scoped to the
+`viewer` module tree. Each step compiles + tests independently, as the method
+split did.
 
 ---
 
