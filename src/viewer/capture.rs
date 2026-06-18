@@ -95,7 +95,7 @@ impl ViewerState {
 
     /// True when an overlay is loaded and its threshold is enabled.
     pub(super) fn has_thresholded_overlay(&self) -> bool {
-        self.overlay.is_loaded() && self.overlay.appearance.threshold.enabled
+        self.overlay.is_loaded() && self.overlay.render.appearance.threshold.enabled
     }
 
     /// Builds a right-side panel the same height as `base` containing a vertical
@@ -135,7 +135,7 @@ impl ViewerState {
             } else {
                 1.0
             };
-            let color = sample_colormap(self.overlay.appearance.colormap, t);
+            let color = sample_colormap(self.overlay.render.appearance.colormap, t);
             let rgba8 = [
                 (color[0] * 255.0).round().clamp(0.0, 255.0) as u8,
                 (color[1] * 255.0).round().clamp(0.0, 255.0) as u8,

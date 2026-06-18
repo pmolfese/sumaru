@@ -94,30 +94,41 @@ on this branch — `desired_panel_size`/`pick.rs` arg counts, two `io.rs` lints,
 and a `label_dataset` expect from the lookup-table commit — none introduced
 here.)
 
-### C. Deepen `OverlayState` — separate the four lifetimes
+### C. Deepen `OverlayState` — separate the four lifetimes (rename + grouping ✅ DONE, branch `refactorWindowPaneB`)
 
-`ViewerState` now owns one `ViewerOverlayState`, but it still mixes loaded source
-identity, the canonical dataset, derived per-node scalar values, and the
-render-ready color cache in one flat struct. Options, lowest-risk first:
+`ViewerState`'s `ViewerOverlayState` was a flat eight-field struct mixing source
+identity, canonical dataset, derived scalars, and the render cache.
 
-- [ ] **Minimal grouping (recommended start):** split the wrapper into nested
-      `OverlaySourceInfo`, `DatasetOverlayState`, and `OverlayRenderCache`
-      structs, preserving current behavior. Lowest-risk readability pass.
-- [ ] **Rename-only pass** (can land first or instead): `model` → `render_model`,
-      `values` → `node_values`, `dataset` → `canonical_dataset`. Tiny, clarifies
-      intent before any reshape.
-- [ ] **Strong enum** (higher payoff, more reach): make loaded content explicit
-      as either canonical-dataset overlay data *or* AFNI-baked RGBA cache. Gives
-      real invariants but touches more call sites.
+- [x] **Rename pass:** `model` → `render_model`, `values` → `node_values`,
+      `dataset` → `canonical_dataset`. Clarifies intent at every read site
+      (~101 accesses across the viewer submodules).
+- [x] **Minimal grouping:** `ViewerOverlayState` is now three nested structs by
+      lifetime, each documented field-by-field:
+      - `OverlaySourceInfo { path, pair_paths, display_name }` — provenance.
+      - `DatasetOverlayState { canonical_dataset, columns, node_values }` —
+        canonical data + the scalars derived from it (they recompute together).
+      - `OverlayRenderCache { render_model, appearance }` — what the GPU upload
+        consumes.
+      Access paths are now `self.overlay.source.*` / `.data.*` / `.render.*`.
+      All three groups `#[derive(Default)]` (render cache keeps a manual
+      `Default` for the seeded appearance range). All ~216 tests pass, clippy
+      unchanged, fmt clean.
+
+Still open (deferred, higher reach):
+
+- [ ] **Strong enum:** make loaded content explicit as either canonical-dataset
+      overlay data *or* AFNI-baked RGBA cache. Encodes the real invariant but
+      touches the most call sites.
 - [ ] **Move display state:** promote `OverlayAppearance` out of `viewer/mesh.rs`
       into a reusable overlay/display module so viewer UI, AFNI interop, and
       future GPU shader recoloring share one display-state type. (Pairs well with
       the GPU/shader work in `ROADMAP.md`.)
 - [ ] Audit which sub-parts must be `Option` independently vs. which always live
-      and die together (`overlay`/`dataset`/`values` likely a unit).
+      and die together (`render_model`/`canonical_dataset`/`node_values` likely a
+      unit — candidates for the strong-enum step).
 
-*Risk:* moderate — touches the load/unload path and many readers. High clarity
-payoff because this is the most frequently-touched data in the app.
+*Risk:* moderate — touched the load/unload path and many readers; done as a
+mechanical anchored rewrite with the test suite as the safety net.
 
 ### D. Tidy the ROI render-side type cluster
 
@@ -154,7 +165,8 @@ remaining items — good "small commit" filler between the larger ones.
    args). Done on `refactorWindowPaneB`.
 2. ✅ **A** — split `viewer/mod.rs` into topical submodules (method clusters).
    Done on `refactorWindowPaneB`; struct relocation still open.
-3. **C** — deepen `OverlayState` (start with the minimal grouping / rename pass).
+3. ✅ **C** — deepen `OverlayState`: rename + minimal grouping done on
+   `refactorWindowPaneB`. Strong-enum / move-`OverlayAppearance` steps deferred.
 4. **D** — tidy the ROI type cluster as small-commit filler.
 
 Run `cargo test && cargo clippy --lib && cargo fmt --all -- --check` after each

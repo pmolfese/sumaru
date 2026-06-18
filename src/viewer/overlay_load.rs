@@ -24,16 +24,16 @@ impl ViewerState {
         self.overlay.clear();
         self.afni_rgba_colors = None;
         self.afni_rgba_signatures.clear();
-        self.overlay.values = Some(overlay_values);
-        self.overlay.dataset = Some(loaded_overlay.dataset);
-        self.overlay.columns = loaded_overlay.columns;
+        self.overlay.data.node_values = Some(overlay_values);
+        self.overlay.data.canonical_dataset = Some(loaded_overlay.dataset);
+        self.overlay.data.columns = loaded_overlay.columns;
         self.controller.overlay.visible = true;
-        self.overlay.appearance = OverlayAppearance::from_range(range);
-        self.overlay.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
-        self.overlay.path = Some(path.clone());
-        self.overlay.pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
+        self.overlay.render.appearance = OverlayAppearance::from_range(range);
+        self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        self.overlay.source.path = Some(path.clone());
+        self.overlay.source.pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
         self.controller.surface.current_overlay_path = Some(path.clone());
-        self.overlay.display_name = Some(loaded_selection.display_name);
+        self.overlay.source.display_name = Some(loaded_selection.display_name);
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
@@ -70,16 +70,16 @@ impl ViewerState {
         self.overlay.clear();
         self.afni_rgba_colors = None;
         self.afni_rgba_signatures.clear();
-        self.overlay.values = Some(overlay_values);
-        self.overlay.dataset = Some(loaded_overlay.dataset);
-        self.overlay.columns = loaded_overlay.columns;
+        self.overlay.data.node_values = Some(overlay_values);
+        self.overlay.data.canonical_dataset = Some(loaded_overlay.dataset);
+        self.overlay.data.columns = loaded_overlay.columns;
         self.controller.overlay.visible = true;
-        self.overlay.appearance = OverlayAppearance::from_range(range);
-        self.overlay.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
-        self.overlay.path = Some(pair.left_path.clone());
-        self.overlay.pair_paths = Some(pair.clone());
+        self.overlay.render.appearance = OverlayAppearance::from_range(range);
+        self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        self.overlay.source.path = Some(pair.left_path.clone());
+        self.overlay.source.pair_paths = Some(pair.clone());
         self.controller.surface.current_overlay_path = Some(pair.left_path.clone());
-        self.overlay.display_name = Some(loaded_selection.display_name);
+        self.overlay.source.display_name = Some(loaded_selection.display_name);
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
@@ -101,10 +101,11 @@ impl ViewerState {
         if let Some(subs) = subs {
             let dataset = self
                 .overlay
-                .dataset
+                .data
+                .canonical_dataset
                 .as_ref()
                 .context("no overlay dataset is loaded")?;
-            self.overlay.columns = resolve_overlay_subs(dataset, subs)?;
+            self.overlay.data.columns = resolve_overlay_subs(dataset, subs)?;
             self.refresh_overlay_columns()?;
         }
 
@@ -118,10 +119,10 @@ impl ViewerState {
 
     /// Set the initial threshold from a p-value if the column carries a stat.
     pub(super) fn apply_initial_overlay_p_value(&mut self, p_value: f64) -> Result<()> {
-        let Some(dataset) = self.overlay.dataset.as_ref() else {
+        let Some(dataset) = self.overlay.data.canonical_dataset.as_ref() else {
             return Ok(());
         };
-        let Some(threshold_index) = self.overlay.columns.threshold else {
+        let Some(threshold_index) = self.overlay.data.columns.threshold else {
             self.warn_and_disable_initial_threshold(format!(
                 "--p-val {p_value} requested, but no T sub-brick is selected"
             ));
@@ -153,13 +154,13 @@ impl ViewerState {
             return Ok(());
         };
 
-        self.overlay.appearance.threshold.enabled = true;
-        self.overlay.appearance.threshold.absolute = true;
-        self.overlay.appearance.threshold.value = threshold_value as f32;
+        self.overlay.render.appearance.threshold.enabled = true;
+        self.overlay.render.appearance.threshold.absolute = true;
+        self.overlay.render.appearance.threshold.value = threshold_value as f32;
         self.sanitize_overlay_appearance();
         self.log_status(format!(
             "Initial threshold p <= {p_value:.4} -> T {:.4}.",
-            self.overlay.appearance.threshold.value
+            self.overlay.render.appearance.threshold.value
         ));
 
         Ok(())
@@ -168,7 +169,7 @@ impl ViewerState {
     /// Log a warning and leave thresholding off when an initial option fails.
     pub(super) fn warn_and_disable_initial_threshold(&mut self, message: String) {
         eprintln!("sumaru warning: {message}; threshold disabled.");
-        self.overlay.appearance.threshold.enabled = false;
+        self.overlay.render.appearance.threshold.enabled = false;
     }
 
     /// Build the overlay model from the current column selections.
@@ -286,7 +287,8 @@ impl ViewerState {
     pub(super) fn refresh_overlay_columns(&mut self) -> Result<()> {
         let dataset = self
             .overlay
-            .dataset
+            .data
+            .canonical_dataset
             .as_ref()
             .context("no canonical overlay dataset is loaded")?;
         let domain = &self
@@ -297,12 +299,12 @@ impl ViewerState {
         let overlay = overlay_dataset_from_canonical_dataset(
             dataset,
             domain.node_count,
-            self.overlay.columns,
+            self.overlay.data.columns,
         )?;
         let range = overlay.range;
-        let column_summary = overlay_column_summary(dataset, self.overlay.columns);
-        self.overlay.values = Some(overlay);
-        self.overlay.appearance.range = if self.overlay.appearance.symmetric_range {
+        let column_summary = overlay_column_summary(dataset, self.overlay.data.columns);
+        self.overlay.data.node_values = Some(overlay);
+        self.overlay.render.appearance.range = if self.overlay.render.appearance.symmetric_range {
             symmetric_value_range(range)
         } else {
             range
@@ -319,7 +321,7 @@ impl ViewerState {
 
     /// Recompute overlay appearance defaults from the selected columns.
     pub(super) fn refresh_overlay_appearance(&mut self) -> Result<()> {
-        if self.overlay.dataset.is_none() {
+        if self.overlay.data.canonical_dataset.is_none() {
             return Ok(());
         }
 
@@ -336,7 +338,8 @@ impl ViewerState {
     pub(super) fn rebuild_overlay_model(&mut self) -> Result<()> {
         let dataset = self
             .overlay
-            .dataset
+            .data
+            .canonical_dataset
             .as_ref()
             .context("no canonical overlay dataset is loaded")?;
         let domain = &self
@@ -345,24 +348,25 @@ impl ViewerState {
             .context("load a surface before rebuilding overlay colors")?
             .domain;
         let columns = canonical_overlay_columns(
-            self.overlay.columns,
-            self.overlay.appearance.threshold.enabled,
+            self.overlay.data.columns,
+            self.overlay.render.appearance.threshold.enabled,
         );
-        let (threshold, mask_mode) = threshold_and_mask_from_appearance(self.overlay.appearance);
+        let (threshold, mask_mode) =
+            threshold_and_mask_from_appearance(self.overlay.render.appearance);
         // Build with an empty cache, apply the real display settings, then
         // compute the color cache exactly once (from_dataset would compute it a
         // first time with default settings and throw that away).
         let mut overlay = Overlay::without_color_cache(dataset, domain, columns)?
-            .with_colormap(self.overlay.appearance.colormap.to_color_map())
+            .with_colormap(self.overlay.render.appearance.colormap.to_color_map())
             .with_intensity_range(RangeSelection::Manual(overlay_range_from_value_range(
-                self.overlay.appearance.range,
+                self.overlay.render.appearance.range,
             )))
-            .with_symmetric_range(self.overlay.appearance.symmetric_range)
+            .with_symmetric_range(self.overlay.render.appearance.symmetric_range)
             .with_threshold(threshold, mask_mode)
-            .with_opacity(self.overlay.appearance.opacity);
+            .with_opacity(self.overlay.render.appearance.opacity);
 
         overlay.rebuild_color_cache(dataset, domain)?;
-        self.overlay.model = Some(overlay);
+        self.overlay.render.render_model = Some(overlay);
 
         Ok(())
     }

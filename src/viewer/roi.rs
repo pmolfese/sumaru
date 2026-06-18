@@ -260,7 +260,7 @@ impl ViewerState {
         let mesh = self.mesh.as_ref()?;
         let node_index = self.display_node_for_roi_anchor(target, local_node)?;
 
-        surface_pick_for_mesh_node(mesh, self.overlay.values.as_ref(), node_index)
+        surface_pick_for_mesh_node(mesh, self.overlay.data.node_values.as_ref(), node_index)
     }
 
     /// Map a target-local node to its combined-mesh display node.

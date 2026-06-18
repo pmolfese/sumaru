@@ -782,45 +782,77 @@ impl WindowPane {
     }
 }
 
-struct ViewerOverlayState {
-    model: Option<Overlay>,
-    values: Option<OverlayDataset>,
-    dataset: Option<Dataset>,
-    columns: OverlayColumnSelections,
-    appearance: OverlayAppearance,
+/// Where the loaded overlay came from. Drives the UI display label and lets the
+/// loader resolve the opposite hemisphere of a paired overlay.
+#[derive(Default)]
+struct OverlaySourceInfo {
+    /// Source file of a single-file overlay.
     path: Option<PathBuf>,
+    /// Explicit left/right file pair, when loaded as a paired overlay.
     pair_paths: Option<ExplicitOverlayPair>,
+    /// Friendly label that overrides the file name in the UI when set.
     display_name: Option<String>,
 }
 
-impl Default for ViewerOverlayState {
+/// The canonical overlay data and the per-node scalars derived from it. These
+/// travel together: the node values are recomputed whenever the dataset or the
+/// selected columns change.
+#[derive(Default)]
+struct DatasetOverlayState {
+    /// Parsed multi-column dataset backing the overlay.
+    canonical_dataset: Option<Dataset>,
+    /// Which dataset columns feed intensity / threshold / brightness.
+    columns: OverlayColumnSelections,
+    /// Per-node scalar values resolved from the selected columns.
+    node_values: Option<OverlayDataset>,
+}
+
+/// The render-ready overlay model and its display settings. This is what the GPU
+/// color upload consumes; rebuilt from [`DatasetOverlayState`] + `appearance`.
+struct OverlayRenderCache {
+    /// Colorized overlay model built from the dataset and appearance.
+    render_model: Option<Overlay>,
+    /// Display settings: colormap, range, threshold, opacity, dim.
+    appearance: OverlayAppearance,
+}
+
+impl Default for OverlayRenderCache {
     fn default() -> Self {
         Self {
-            model: None,
-            values: None,
-            dataset: None,
-            columns: OverlayColumnSelections::default(),
+            render_model: None,
             appearance: OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE),
-            path: None,
-            pair_paths: None,
-            display_name: None,
         }
     }
 }
 
+/// Viewer-side overlay state, grouped by lifetime: `source` (provenance),
+/// `data` (canonical dataset + derived scalars), and `render` (the colorized
+/// model the GPU consumes). Replaces the earlier flat eight-field struct.
+#[derive(Default)]
+struct ViewerOverlayState {
+    source: OverlaySourceInfo,
+    data: DatasetOverlayState,
+    render: OverlayRenderCache,
+}
+
 impl ViewerOverlayState {
+    /// Reset to the unloaded state (used by `reset_scene_state`).
     fn clear(&mut self) {
         *self = Self::default();
     }
 
+    /// True once a colorized overlay model exists.
     fn is_loaded(&self) -> bool {
-        self.model.is_some()
+        self.render.render_model.is_some()
     }
 
+    /// UI label for the overlay: explicit display name, else the file name,
+    /// else `"none"`.
     fn display_text(&self) -> String {
-        self.display_name
+        self.source
+            .display_name
             .clone()
-            .or_else(|| self.path.as_deref().map(file_name_display))
+            .or_else(|| self.source.path.as_deref().map(file_name_display))
             .unwrap_or_else(|| "none".to_string())
     }
 }
@@ -2389,7 +2421,7 @@ impl ViewerState {
             return;
         }
 
-        draw_graph_snapshot(ui, snapshot, self.overlay.columns);
+        draw_graph_snapshot(ui, snapshot, self.overlay.data.columns);
     }
 
     fn draw_roi_control_contents(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ViewerCommand>) {
@@ -2693,7 +2725,8 @@ impl ViewerState {
         let overlay_loaded = self.overlay.is_loaded();
         let column_options = self
             .overlay
-            .dataset
+            .data
+            .canonical_dataset
             .as_ref()
             .map(overlay_column_options)
             .unwrap_or_default();
@@ -2718,11 +2751,11 @@ impl ViewerState {
                         let threshold_range = self.selected_threshold_range();
                         changed |= vertical_threshold_bar(
                             ui,
-                            &mut self.overlay.appearance,
+                            &mut self.overlay.render.appearance,
                             threshold_range,
                         );
                         ui.monospace(threshold_value_display(
-                            self.overlay.appearance.threshold.value,
+                            self.overlay.render.appearance.threshold.value,
                         ));
                         ui.label(
                             egui::RichText::new(threshold_p_value_display(
@@ -2753,20 +2786,20 @@ impl ViewerState {
                                 columns_changed |= draw_intensity_column_selector(
                                     ui,
                                     &column_options,
-                                    &mut self.overlay.columns.intensity,
+                                    &mut self.overlay.data.columns.intensity,
                                 );
                                 columns_changed |= draw_threshold_column_selector(
                                     ui,
                                     &column_options,
-                                    &mut self.overlay.columns.threshold,
-                                    self.overlay.appearance.threshold.value,
+                                    &mut self.overlay.data.columns.threshold,
+                                    self.overlay.render.appearance.threshold.value,
                                 );
                                 columns_changed |= draw_optional_column_selector(
                                     ui,
                                     "B",
                                     "brightness_column",
                                     &column_options,
-                                    &mut self.overlay.columns.brightness,
+                                    &mut self.overlay.data.columns.brightness,
                                 );
                             }
                         });
@@ -2775,13 +2808,13 @@ impl ViewerState {
                     ui.horizontal(|ui| {
                         ui.label("Map");
                         egui::ComboBox::from_id_salt("overlay_colormap")
-                            .selected_text(self.overlay.appearance.colormap.label())
+                            .selected_text(self.overlay.render.appearance.colormap.label())
                             .width(170.0)
                             .show_ui(ui, |ui| {
                                 for colormap in OverlayColorMap::ALL {
                                     changed |= ui
                                         .selectable_value(
-                                            &mut self.overlay.appearance.colormap,
+                                            &mut self.overlay.render.appearance.colormap,
                                             colormap,
                                             colormap.label(),
                                         )
@@ -2794,21 +2827,27 @@ impl ViewerState {
                     ui.add_space(6.0);
                     changed |= ui
                         .add(
-                            egui::Slider::new(&mut self.overlay.appearance.dim, 0.0..=1.5)
+                            egui::Slider::new(&mut self.overlay.render.appearance.dim, 0.0..=1.5)
                                 .text("Dim"),
                         )
                         .changed();
                     changed |= ui
                         .add(
-                            egui::Slider::new(&mut self.overlay.appearance.opacity, 0.0..=1.0)
-                                .text("Opacity"),
+                            egui::Slider::new(
+                                &mut self.overlay.render.appearance.opacity,
+                                0.0..=1.0,
+                            )
+                            .text("Opacity"),
                         )
                         .changed();
 
                     ui.add_space(10.0);
                     ui.horizontal_wrapped(|ui| {
                         changed |= ui
-                            .checkbox(&mut self.overlay.appearance.threshold.absolute, "Abs")
+                            .checkbox(
+                                &mut self.overlay.render.appearance.threshold.absolute,
+                                "Abs",
+                            )
                             .changed();
                     });
                     if let Some(stat) = self.selected_threshold_stat_label() {
@@ -2832,17 +2871,21 @@ impl ViewerState {
 
         ui.horizontal(|ui| {
             changed |= ui
-                .checkbox(&mut self.overlay.appearance.symmetric_range, "Symmetric")
+                .checkbox(
+                    &mut self.overlay.render.appearance.symmetric_range,
+                    "Symmetric",
+                )
                 .changed();
 
-            if self.overlay.appearance.symmetric_range {
+            if self.overlay.render.appearance.symmetric_range {
                 let mut extent = self
                     .overlay
+                    .render
                     .appearance
                     .range
                     .min
                     .abs()
-                    .max(self.overlay.appearance.range.max.abs())
+                    .max(self.overlay.render.appearance.range.max.abs())
                     .max(0.0001);
                 let speed = (extent / 100.0).max(0.001);
                 if ui
@@ -2854,24 +2897,24 @@ impl ViewerState {
                     .changed()
                 {
                     let extent = extent.abs().max(0.0001);
-                    self.overlay.appearance.range = ValueRange {
+                    self.overlay.render.appearance.range = ValueRange {
                         min: -extent,
                         max: extent,
                     };
                     changed = true;
                 }
             } else {
-                let speed = range_drag_speed(self.overlay.appearance.range);
+                let speed = range_drag_speed(self.overlay.render.appearance.range);
                 changed |= ui
                     .add(
-                        egui::DragValue::new(&mut self.overlay.appearance.range.min)
+                        egui::DragValue::new(&mut self.overlay.render.appearance.range.min)
                             .speed(speed)
                             .prefix("min "),
                     )
                     .changed();
                 changed |= ui
                     .add(
-                        egui::DragValue::new(&mut self.overlay.appearance.range.max)
+                        egui::DragValue::new(&mut self.overlay.render.appearance.range.max)
                             .speed(speed)
                             .prefix("max "),
                     )
@@ -2883,8 +2926,8 @@ impl ViewerState {
     }
 
     fn selected_threshold_stat_label(&self) -> Option<String> {
-        let dataset = self.overlay.dataset.as_ref()?;
-        let index = self.overlay.columns.threshold?;
+        let dataset = self.overlay.data.canonical_dataset.as_ref()?;
+        let index = self.overlay.data.columns.threshold?;
         dataset.columns.get(index)?.stat.clone()
     }
 
@@ -2896,10 +2939,12 @@ impl ViewerState {
 
     fn selected_threshold_range(&self) -> ValueRange {
         self.overlay
-            .dataset
+            .data
+            .canonical_dataset
             .as_ref()
             .and_then(|dataset| {
                 self.overlay
+                    .data
                     .columns
                     .threshold
                     .and_then(|index| dataset.columns.get(index))
@@ -2909,23 +2954,30 @@ impl ViewerState {
                 min: range.min as f32,
                 max: range.max as f32,
             })
-            .or_else(|| self.overlay.values.as_ref().map(|overlay| overlay.range))
+            .or_else(|| {
+                self.overlay
+                    .data
+                    .node_values
+                    .as_ref()
+                    .map(|overlay| overlay.range)
+            })
             .unwrap_or(DEFAULT_OVERLAY_RANGE)
     }
 
     fn selected_threshold_p_value(&self) -> Option<f64> {
-        self.selected_threshold_stat_spec()
-            .and_then(|stat| stat.two_sided_p_value(self.overlay.appearance.threshold.value as f64))
+        self.selected_threshold_stat_spec().and_then(|stat| {
+            stat.two_sided_p_value(self.overlay.render.appearance.threshold.value as f64)
+        })
     }
 
     fn selected_threshold_q_value(&self) -> Option<f64> {
-        let dataset = self.overlay.dataset.as_ref()?;
-        let index = self.overlay.columns.threshold?;
+        let dataset = self.overlay.data.canonical_dataset.as_ref()?;
+        let index = self.overlay.data.columns.threshold?;
         let column = dataset.columns.get(index)?;
         column
             .fdr_curve
             .as_ref()?
-            .q_value(self.overlay.appearance.threshold.value as f64)
+            .q_value(self.overlay.render.appearance.threshold.value as f64)
     }
 
     fn draw_scene_section(&self, ui: &mut egui::Ui) {
@@ -2997,12 +3049,12 @@ impl ViewerState {
     }
 
     fn sanitize_overlay_appearance(&mut self) {
-        let range = &mut self.overlay.appearance.range;
+        let range = &mut self.overlay.render.appearance.range;
         if !range.min.is_finite() || !range.max.is_finite() {
             *range = DEFAULT_OVERLAY_RANGE;
         }
 
-        if self.overlay.appearance.symmetric_range {
+        if self.overlay.render.appearance.symmetric_range {
             let extent = range.min.abs().max(range.max.abs()).max(0.0001);
             *range = ValueRange {
                 min: -extent,
@@ -3016,15 +3068,17 @@ impl ViewerState {
             range.max = range.min + 1.0;
         }
 
-        self.overlay.appearance.dim = self.overlay.appearance.dim.clamp(0.0, 1.5);
-        self.overlay.appearance.opacity = self.overlay.appearance.opacity.clamp(0.0, 1.0);
+        self.overlay.render.appearance.dim = self.overlay.render.appearance.dim.clamp(0.0, 1.5);
+        self.overlay.render.appearance.opacity =
+            self.overlay.render.appearance.opacity.clamp(0.0, 1.0);
 
         let (threshold_min, threshold_max) = threshold_bounds(
             self.selected_threshold_range(),
-            self.overlay.appearance.threshold.absolute,
+            self.overlay.render.appearance.threshold.absolute,
         );
-        self.overlay.appearance.threshold.value = self
+        self.overlay.render.appearance.threshold.value = self
             .overlay
+            .render
             .appearance
             .threshold
             .value
@@ -3104,9 +3158,13 @@ impl ViewerState {
                     }
                 }
                 ViewerCommand::PickOverlay => {
-                    if let Some(path) =
-                        pick_overlay_file(self.overlay.path.as_ref().or(self.surface_path.as_ref()))
-                        && let Err(error) = self.load_overlay_path(path)
+                    if let Some(path) = pick_overlay_file(
+                        self.overlay
+                            .source
+                            .path
+                            .as_ref()
+                            .or(self.surface_path.as_ref()),
+                    ) && let Err(error) = self.load_overlay_path(path)
                     {
                         self.set_error(error);
                     }
@@ -3867,7 +3925,7 @@ impl ViewerState {
         {
             self.refresh_active_pair_render_geometry()?;
         }
-        if self.overlay.dataset.is_some() {
+        if self.overlay.data.canonical_dataset.is_some() {
             self.refresh_overlay_columns()?;
         } else {
             self.upload_surface_buffers();
@@ -3977,13 +4035,13 @@ impl ViewerState {
     }
 
     fn pick_overlay_display_text(&self) -> String {
-        let Some(path) = self.overlay.path.as_deref() else {
+        let Some(path) = self.overlay.source.path.as_deref() else {
             return "none".to_string();
         };
 
         if let Some(pick) = self.controller.interaction.pick
             && let Some(component) = self.picked_paired_component(pick)
-            && let Some(pair) = self.overlay.pair_paths.as_ref()
+            && let Some(pair) = self.overlay.source.pair_paths.as_ref()
         {
             return match component.side {
                 SurfaceSide::Left => file_name_display(&pair.left_path),
@@ -4099,7 +4157,8 @@ impl ViewerState {
 
     fn visible_overlay(&self) -> Option<&Overlay> {
         self.overlay
-            .model
+            .render
+            .render_model
             .as_ref()
             .filter(|_| self.controller.overlay.visible)
     }
@@ -4163,7 +4222,7 @@ impl ViewerState {
         let mesh = self.mesh.as_ref()?;
         pick_surface(
             mesh,
-            self.overlay.values.as_ref(),
+            self.overlay.data.node_values.as_ref(),
             &self.camera,
             scene_size,
             cursor,
@@ -4196,7 +4255,7 @@ impl ViewerState {
                 && let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == component.side)
                 && let Some((pick, distance)) = pick_surface_with_model(
                     mesh,
-                    self.overlay.values.as_ref(),
+                    self.overlay.data.node_values.as_ref(),
                     &self.camera,
                     self.scene_viewport_size(),
                     cursor,
@@ -4220,13 +4279,15 @@ impl ViewerState {
         if let Some(pick) = &mut self.controller.interaction.pick {
             pick.overlay_value = self
                 .overlay
-                .values
+                .data
+                .node_values
                 .as_ref()
                 .and_then(|overlay| overlay.values.get(pick.node_index as usize))
                 .copied();
             pick.threshold_value = self
                 .overlay
-                .values
+                .data
+                .node_values
                 .as_ref()
                 .and_then(|overlay| overlay.threshold_values.as_ref())
                 .and_then(|values| values.get(pick.node_index as usize))
@@ -4310,7 +4371,7 @@ impl ViewerState {
                 &geometry,
                 surface_color_slice,
                 visible_overlay,
-                self.overlay.appearance.dim,
+                self.overlay.render.appearance.dim,
                 roi,
                 selection,
             )
@@ -4441,7 +4502,7 @@ impl ViewerState {
             .visible_roi_layer()
             .map(|layer| layer.appearance.node_colors.clone());
         let selection = self.controller.interaction.pick;
-        let dim = self.overlay.appearance.dim;
+        let dim = self.overlay.render.appearance.dim;
         let layout = self.controller.display.pair_state;
         let visibility = self.controller.display.pair_visibility;
         let matrices = self.active_pair_matrices_for_layout(layout, visibility);
@@ -4619,7 +4680,12 @@ impl ViewerState {
 
         self.scene_stats = Some(SceneStats {
             geometry,
-            overlay_range: self.overlay.values.as_ref().map(|overlay| overlay.range),
+            overlay_range: self
+                .overlay
+                .data
+                .node_values
+                .as_ref()
+                .map(|overlay| overlay.range),
         });
     }
 
