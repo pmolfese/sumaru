@@ -9,7 +9,9 @@ neuroimaging file types SUMA workflows depend on.
 - GIFTI surface/shape/dataset I/O through `gifti-rs` from `PennLINC/gifti-rs`
 - NIFTI volume I/O through `nifti` from `Enet4/nifti-rs`
 - SUMA `.spec` parsing for single-hemisphere multi-surface scenes
-- A first surface viewer through `winit`, `wgpu`, and `egui`
+- A surface viewer through `winit`, `wgpu`, and `egui`, with overlays, drawn
+  ROIs, and paired-hemisphere layouts
+- A `--volume` mode that renders orthogonal NIfTI slice planes in the 3D scene
 - Headless file inspection:
 
 ```sh
@@ -22,6 +24,7 @@ cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.gii.dset
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset --verbose
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --preload
+cargo run -- --volume /path/to/subj_SurfVol.nii
 cargo run -- inspect /path/to/file.nii.gz
 ```
 
@@ -147,6 +150,28 @@ fields, so they can be tested without launching the GUI.
   - Option-Right: right side view
   - Option-Up: top-down view
   - Option-Down: bottom-up view
+- The view menu bar has two right-aligned icon buttons: `+` launches a new blank
+  `sumaru` window, and the copy icon duplicates the current surface/spec (no
+  overlay) into a fresh window for a second analysis view.
+
+## Volume Slices
+
+Launch with `--volume path/to/volume.nii` (or `.nii.gz`) to render a NIfTI
+volume as orthogonal slice planes inside the 3D scene. All three planes show by
+default, color-coded by orientation: **axial red, coronal green, sagittal
+blue**, each with a colored grab tab.
+
+- **Right-click** a plane to select it (its border brightens).
+- **Left-drag** the selected plane to scrub it along its axis; left-drag with no
+  plane selected still orbits the camera.
+- **Right-click empty space** to deselect.
+- The **Volume** menu adds a second parallel slice of any orientation
+  ("Add Axial/Coronal/Sagittal slice") or removes the selected one, so you can
+  view two depths of the same orientation at once.
+
+Slices share the surface camera and depth buffer; the slice shader reconstructs
+each fragment's voxel coordinate from the file's voxel↔world affine, so planes
+stay correct under any orientation.
 
 ## Design Direction
 
@@ -189,7 +214,8 @@ the completed-work ledger.
   launches the viewer with an initial surface or `.spec` scene, requires `-sv`
   surface-volume context for `.spec` launches, handles `--overlay`, passes
   through `--verbose` terminal logging, controls spec preloading with
-  `--preload`, and runs the `inspect` subcommand.
+  `--preload`, opens a NIfTI volume in slice-plane mode with `--volume`, and runs
+  the `inspect` subcommand.
 - `src/color.rs` contains shared RGBA, continuous color-map, and label-table
   models for scalar maps and integer label datasets, including GIFTI and
   FreeSurfer import helpers. Continuous colormaps include 13 byte-exact AFNI
@@ -205,12 +231,16 @@ the completed-work ledger.
 - `src/inspect.rs` contains headless file inspection. It detects GIFTI/NIFTI
   paths, reads them through the current external crates, and prints concise
   metadata summaries.
-- `src/io.rs` contains the first native AFNI/SUMA I/O layer. It parses and
-  writes NIML elements, handles ASCII and fixed-width binary numeric payloads,
-  preserves mixed numeric/string rows, extracts `.niml.dset`/`.niml.roi`
-  payloads, converts NIML and AFNI `.gii.dset` datasets into canonical
-  `Dataset` values, and encodes compatibility checks against the AFNI C,
-  MATLAB, and SUMAvista Python readers.
+- `src/io/` is the native AFNI/SUMA I/O layer, split into a thin `mod.rs`
+  re-export facade over topical submodules: `io/niml.rs` (the NIML element model,
+  ASCII/binary parser and serializer, label tables, and low-level text/number
+  helpers), `io/gifti.rs` (GIFTI dataset loading and NIFTI-intent → column-role
+  mapping), and `io/roi.rs` (`.niml.roi` read/write and the side/drawing-type
+  code mappers). Callers keep using `crate::io::*`; the facade is the migration
+  seam toward the external `afni_rust` crate (see `docs/ROADMAP.md`).
+- `src/volume.rs` loads a NIfTI volume into a dense scalar grid plus the
+  voxel↔world transform (`VolumeSpace`) and intensity range, ready for the
+  `--volume` slice-plane renderer.
 - `src/overlay.rs` contains display state layered on datasets. It selects
   intensity/threshold/brightness columns, stores color-map and range controls,
   and builds per-node RGBA color caches for rendering.
@@ -225,27 +255,48 @@ the completed-work ledger.
   adapter. It loads vertices/triangles, validates indices, computes bounds and
   normals, records SUMA-inspired domain/metadata/lineage, and stores scalar
   overlay values/ranges without depending on viewer rendering details.
-- `src/viewer/mod.rs` coordinates the desktop viewer. It sets up the `winit`
-  event loop, owns the four windows (view, control, roi_control, graph) as
-  `WindowPane` values, integrates `egui` via `EguiPane`, routes
-  keyboard/mouse/UI actions, loads surfaces and overlays, and calls into the
-  viewer submodules for camera, picking, GPU setup, and render-prep work.
+- `src/viewer/mod.rs` is the viewer core. It sets up the `winit` event loop,
+  owns the four windows (view, control, roi_control, graph) as `WindowPane`
+  values, integrates `egui` via `EguiPane`, owns `ViewerState`, dispatches
+  `ViewerCommand`s, loads surfaces/overlays/volumes, and drives render/update.
+  The feature-specific behavior lives in the topical submodules below (each an
+  `impl ViewerState` block reached through `use super::*`), so `mod.rs` reads as
+  a table of contents rather than an encyclopedia.
+- `src/viewer/input.rs` routes window input: the view window's mouse/keyboard
+  handling (camera, pair-drag, ROI picking, volume slice scrubbing, keyboard
+  shortcuts) plus the egui passthrough for the control, ROI, and graph windows.
+- `src/viewer/ui.rs` holds all `egui` panel drawing: the view menu bar, the
+  surface/overlay workbench, ROI/pick sections, and the graph window/dock.
 - `src/viewer/camera.rs` contains the viewer camera model: orbit and turntable
   modes, preset orientations, scroll zoom, mouse drag handling, and camera
   uniform packing for the shader.
+- `src/viewer/scene.rs` owns the multi-surface scene and GPU render set:
+  `SurfaceScene`/`SceneSurface` and the resident vertex/index buffers.
+- `src/viewer/overlay_load.rs` loads single and paired overlays and refreshes
+  the overlay columns, appearance, and render model.
+- `src/viewer/roi.rs` holds the drawn-ROI editing, fill, save, and load logic
+  plus the ROI workspace/slot/draft types.
+- `src/viewer/pairing.rs` handles paired-hemisphere drag, transform, and layout.
+- `src/viewer/afni.rs` holds the viewer-side AFNI/SUMA NIML talk bridge.
+- `src/viewer/capture.rs` and `src/viewer/screenshot.rs` handle screenshot and
+  montage capture: camera framing, `wgpu` readback → RGBA, PNG writing, and
+  preset-view montage stitching.
+- `src/viewer/graph.rs` manages the picked-node graph window and dock.
+- `src/viewer/transform.rs` holds the paired-hemisphere layout math (matrices,
+  auto-spread/clearance heuristics, open-book gesture bookkeeping).
+- `src/viewer/volume_view.rs` is the `--volume` GPU state: the 3D intensity
+  texture, the orthogonal slice-plane pipeline, slice add/remove/select/drag,
+  and the `ViewerState` handlers that drive it.
 - `src/viewer/gpu.rs` contains small `wgpu` setup helpers such as surface
-  format/present-mode selection and the depth-buffer texture used by the
-  surface render pass.
+  format/present-mode selection and the depth-buffer texture.
 - `src/viewer/mesh.rs` prepares durable surface/overlay data for the viewer. It
   normalizes positions, flattens triangle indices, assigns default or overlay
   colors, and packs vertex/index bytes for GPU upload.
-- `src/viewer/pick.rs` contains right-click surface inspection. It builds a
-  camera ray from the cursor, intersects it with normalized triangles, and
+- `src/viewer/pick.rs` contains right-click surface inspection and the shared
+  camera-ray builder. It intersects the cursor ray with normalized triangles and
   reports the hit triangle, nearest node, and overlay value.
-- `src/viewer/screenshot.rs` contains screenshot image helpers. It converts
-  `wgpu` readback bytes into RGBA pixels, writes PNG files, and stitches the
-  preset-view montage.
-- `src/viewer/shader.wgsl` contains the GPU shader code used by `wgpu`,
-  primarily the lit surface rendering path.
+- `src/viewer/shader.wgsl` contains the lit surface rendering shader;
+  `src/viewer/volume_slice.wgsl` contains the volume slice-plane shader (window/
+  level grayscale with per-fragment voxel reconstruction).
 - `target/` is generated by Cargo when you build or run the project. It is not
   source code and can be regenerated at any time.

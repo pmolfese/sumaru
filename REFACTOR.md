@@ -13,26 +13,32 @@ interpretability / maintainability wins come first**.
 
 ## Where the leverage is now
 
-The type-layer cleanup is largely finished, so the dominant remaining problem is
-**file/structure size**, not duplicate types. Ranked by payoff:
+The type-layer cleanup is finished (Tiers 1–2), and the `viewer/mod.rs` method
+split, `ui.rs`/`input.rs` extraction, and most struct relocation have landed.
+`mod.rs` is down to **~7,800 lines** (from ~12.2k). The remaining leverage,
+ranked by payoff:
 
-1. **Split `viewer/mod.rs`** — the single largest readability win left. ~11.8k
-   lines / ~6k-line `impl ViewerState`. Nothing else moves the "can a new reader
-   find anything" needle as much. (Item A)
-2. **Finish `WindowPane`** — the field collapse landed, but the four copies of
-   resize/redraw/repaint logic are still inline. Folding them into methods is
-   low-risk, deletes real duplication, and is the natural completion of work
-   already in the tree. (Item B)
-3. **Deepen `OverlayState`** — the wrapper groups the fields, but still mixes
-   four lifetimes (source identity, dataset, derived scalars, render cache).
-   Splitting them clarifies the most-touched data in the app. (Item C)
-4. **Tidy the ROI render-side type cluster** — nine `Roi*` view structs; some
-   are a snapshot and its target holding the same data. Smaller, more localized
-   win. (Item D)
+1. **Split `src/surface.rs`** — *new top item.* At ~4,180 lines it is now the
+   single largest god-file in the tree (the viewer is already split). It bundles
+   ~40 types and 31 impls across unrelated concerns: mesh core, topology, masks,
+   spatial transforms, volume space, and surface↔surface mapping. The `io/`
+   split is the proven template. (Item E)
+2. **Finish struct relocation (A1 loose ends)** — the scene/ROI/overlay clusters
+   moved, but a handful of single-owner types still sit in `mod.rs`
+   (graph/afni/capture/pairing types, plus `InputResponse`→`input.rs` and the
+   UI-only `ControlUiOutput`/`LaunchButtonIcon`/`paint_launch_button`/`stat_row`
+   →`ui.rs`). Small, mechanical, and completes the "everything about X in one
+   file" story. (Item A1)
+3. **Group `ViewerState`'s 56 fields** — still a wide struct. Cluster the loose
+   fields (volume + slice-drag, ROI editing state, scene/buffers/caches) into
+   nested sub-structs the way overlay state already was. (Item F)
+4. **Deepen `OverlayState` / tidy remaining ROI types** — the deferred reaches
+   from Items C and D (strong enum for overlay content, move `OverlayAppearance`
+   out of `mesh.rs`). Lower urgency. (Items C/D leftovers)
 
-Do them roughly in this order: **B is a quick completion**, **A is the big
-structural payoff** (and is much easier *after* B shrinks the per-window noise),
-then **C**, then **D**.
+Do them roughly in this order: **E is the big structural payoff** now that the
+viewer is tamed, **A1 is a quick co-location completion**, then **F**, then the
+C/D leftovers.
 
 ---
 
@@ -160,46 +166,116 @@ physically live in `mod.rs`. Two follow-ons finish the job. Both are **pure
 navigability** — no behavior change, no hazard removed — which is why they sit
 below the correctness-bearing items.
 
-### A1 — Relocate the ~50 local structs to their owning module
+### A1 — Relocate the local structs to their owning module — 🟡 PARTIAL
 
-Every type lives in `mod.rs` regardless of who uses it. Natural owners:
+The big clusters have moved: the ROI types live in `roi.rs`, the overlay-load
+types in `overlay_load.rs`, the geometry/transform types in `transform.rs`, and
+the 14-type scene/render cluster now lives in `scene.rs`. **Remaining loose
+ends** (single-owner types still in `mod.rs`):
 
-| Target module | Types |
+| Target module | Types still in `mod.rs` |
 |---|---|
-| `roi.rs` | `RoiLayer`, `RoiWorkspace`, `RoiSlot`, `RoiDraft`, `RoiDraftState`, `RoiDraftTarget`, `RoiPickTarget`, `RoiAppearanceBuild`, `RoiComponentRange` (9) |
-| *(new)* `scene.rs` | `SurfaceScene`, `SceneSurface`, `SceneSurfaceComponent`, `SurfaceBuffers`, `SurfaceRenderSet`, `SurfaceRenderInstance`, `PreparedGeometryCache`, `AnatomicalShadingCache`, `DisplayMeshCache`, `DisplayMeshSnapshot`, `SurfaceLabelLookup`, `SceneStats`, `SceneGeometryStats`, `TransformedBounds` (14) |
-| `overlay_load.rs` | `LoadedOverlay`, `LoadedOverlaySelection`, `PairedOverlayPaths`, `OverlayColumnSelections`, `OverlayColumnOption` (5) |
-| `capture.rs` | `MontageShot`, `MontageLayout`, `MontageCamera` (3) |
-| `graph.rs` | `GraphSnapshot`, `GraphPoint` (2) |
-| `pairing.rs` | `ComponentTransform`, `StatePair` (2) |
-| `afni.rs` | `AfniSurfaceTarget`, `AfniViewerOptions` (2) |
+| `graph.rs` | `GraphSnapshot`, `GraphPoint` |
+| `afni.rs` | `AfniSurfaceTarget`, `AfniViewerOptions` |
+| `capture.rs` | `MontageShot`, `MontageLayout`, `MontageCamera` |
+| `pairing.rs` | `ComponentTransform` |
+| `input.rs` | `InputResponse` |
+| `ui.rs` | `ControlUiOutput`, `LaunchButtonIcon` + `paint_launch_button`, `stat_row`, the `pick_*_file` dialogs |
 
 Stays in `mod.rs` (the genuine core): `ViewerState`, `ViewerApp`,
 `WindowPane`/`EguiPane`, `ViewerWindows`/`InitialScene`, `ViewerEvent`,
-`RenderStatus`, `LaunchOptions`.
+`RenderStatus`, `LaunchOptions`, `PreloadTask`/`PreloadResult`.
 
 *Mechanic:* each move is "cut the `struct` + its `impl` blocks, paste into the
 target module." The only friction is **visibility** — a type used by `mod.rs`
 *and* a sibling now needs `pub(super)` on the type and any fields the other
-module touches. Unlike the method moves, this is per-field, not a blind perl
-pass.
+module touches. Unlike the method moves, this is per-field, not a blind pass.
+Now that `input.rs`/`ui.rs` exist, their helpers are the lowest-friction moves.
 
-### A2 — Split the `draw_*` UI cluster into `viewer/ui.rs`
+---
 
-13 `draw_*` methods span ~2018→~3070 (~1,050 lines) — the largest cohesive block
-left in the impl (`draw_ui`, `draw_view_overlay_ui`, `draw_overlay_workbench`,
-`draw_overlay_range_controls`, `draw_surface_dataset_section`,
-`draw_scene_section`, `draw_pick_section`, `draw_roi_control_contents`,
-`draw_graph_dock_ui`, …) plus their UI-only helpers (`ControlUiOutput`,
-`InputResponse`, `ModeLabel`, `desired_panel_size`).
+## E. Split `src/surface.rs` into a `surface/` directory module
 
-They are "interleaved" in two senses that explain the deferral:
-1. **Intra-cluster coupling** — `draw_ui` calls `draw_scene_section` /
-   `draw_pick_section` / `draw_overlay_workbench`; they share egui idioms and
-   thread a `&mut Vec<ViewerCommand>` of actions. Moving one means moving the set.
-2. **Cross-cutting reads** — they touch overlay, ROI, scene, and camera state
-   broadly, so the move surfaces the most visibility bumps. Doing A1 first
-   (especially the overlay/ROI/scene structs) clears that path.
+`surface.rs` is ~4,180 lines — the largest god-file left now that the viewer is
+split. It holds ~40 types and 31 `impl` blocks across concerns that rarely
+change together. The `io/` split (a thin `mod.rs` re-export over topical
+submodules) is the exact template; internals stay internal.
+
+Natural seams:
+
+| Submodule | Types |
+|---|---|
+| `surface/mesh.rs` | `SurfaceMesh` (+ its ~820-line impl), `SurfaceMetadata`, `SurfaceLineage`, `SphereMetadata`, `Bounds`, `SurfaceGeometryMetrics` |
+| `surface/identity.rs` | `SurfaceId`, `SurfaceDomainId`, `SurfaceDomain`, `SurfaceDomainIdentity`, `SurfaceDomainKind`, `SurfaceKinship`, `SurfaceSide`, `SurfaceKind`, `AnatomicalCorrectness` |
+| `surface/topology.rs` | `SurfaceTopology`, `EdgeRecord`, `EdgeFaces`, `WindingReport`, `MeshValidationReport`, `MeshValidationIssue`, `NormalDirection` |
+| `surface/mask.rs` | `NodeMask`, `FaceMask`, `BitMask`, `FaceMaskMode`, `SurfacePatch`, `SurfacePath` |
+| `surface/transform.rs` | `SurfaceTransform`, `VolumeSpace`, `VoxelIndex`, `VolumeSamplePoint`, `ClipPlane`, `LineSegment` |
+| `surface/mapping.rs` | `SurfaceToSurfaceMap`, `SurfaceMappingKind`, `NodeWeights`, `SmoothingWeights` |
+| `surface/mod.rs` | thin re-export facade; keep `OverlayDataset`, `ValueRange` here (or hoist later) |
+
+*Risk:* low — pure relocation behind a `pub use` facade, exactly like `io/`.
+Do it one submodule at a time, compiling + testing after each. `VolumeSpace`
+and `SurfaceTransform` are the natural first cut (self-contained, well-tested,
+and the volume feature already leans on them).
+
+*Why now:* it is the single biggest remaining "can a new reader find anything"
+file, and it is *not* viewer-coupled, so it is the cleanest large win left.
+
+## F. Group `ViewerState`'s remaining loose fields
+
+`ViewerState` is still ~56 fields. The overlay/window groupings already proved
+the pattern (`self.overlay.source.*`, the four `WindowPane`s). Remaining loose
+clusters worth nesting:
+
+- **Volume:** `volume_view`, `volume_slice_drag` → a small `VolumeUiState`.
+- **ROI editing:** `roi_path`, `roi_layer`, `roi_workspace` → one group.
+- **Scene/render:** `surface_scene`, `surface_buffers`, `surface_render_set`,
+  `prepared_geometry_cache`, `anatomical_shading_cache`, `mesh` are a related
+  set touched together on load/switch.
+
+*Risk:* moderate (many readers); do it as anchored rewrites with the test suite
+as the net, the way `OverlayState` grouping was done.
+
+### A2 — Split the `draw_*` UI cluster into `viewer/ui.rs` — ✅ DONE (branch `refactorRS`)
+
+- [x] Moved all 13 `draw_*` methods into an `impl ViewerState` block in
+      `viewer/ui.rs` (~1,108 lines): `draw_ui`, `draw_view_overlay_ui`,
+      `draw_overlay_workbench`, `draw_overlay_range_controls`,
+      `draw_surface_dataset_section`, `draw_scene_section`, `draw_pick_section`,
+      `draw_roi_control_contents`, `draw_graph_dock_ui`, `draw_graph_ui`,
+      `draw_graph_contents`, `draw_roi_control_ui`, `draw_view_transient_label`.
+      Entry points (`draw_ui`/`draw_roi_control_ui`/`draw_graph_ui`) and
+      `selected_threshold_range` are `pub(super)`; the rest are private to
+      `ui.rs`. UI-only helpers (`ControlUiOutput`, `LaunchButtonIcon`,
+      `paint_launch_button`, `stat_row`, the `pick_*_file` dialogs) were left in
+      `mod.rs` and are reached via `use super::*` — co-locating them is an A1
+      loose end.
+- The cross-cutting-reads concern resolved cleanly: only one method
+  (`selected_threshold_range`) had a still-in-`mod.rs` caller and needed a
+  visibility bump — the compiler surfaced it immediately, which is the seam
+  working as intended.
+
+### A3 — Split window input handling into `viewer/input.rs` — ✅ DONE (branch `refactorRS`)
+
+Not in the original plan, but the volume work made it obvious: every interaction
+feature edits the `WindowEvent` match.
+
+- [x] Moved `view_input` (mouse/keyboard/camera/pair-drag/ROI-pick/volume-drag
+      routing) plus the `control_input`/`roi_control_input`/`graph_input` egui
+      passthroughs into `viewer/input.rs` (~272 lines), all `pub(super)`.
+      Net `mod.rs` −263 lines.
+
+### A4 — Volume feature glue → `viewer/volume_view.rs` — ✅ DONE (branch `refactorRS`)
+
+- [x] The six `ViewerState` volume handlers (`load_volume_path`,
+      `add_volume_slice`, `remove_selected_volume_slice`,
+      `select_volume_plane_at_cursor`, `try_begin_volume_slice_drag`,
+      `update_volume_slice_drag`) moved into an `impl ViewerState` block next to
+      `VolumeView`, so the whole `--volume` feature (data, GPU, handlers) lives
+      in `volume.rs` + `volume_view.rs`.
+
+*Session net (`refactorRS`):* `mod.rs` 9,278 → ~7,809 lines. All tests pass,
+fmt clean, no new warnings. Pure relocation throughout.
 
 ### Why — clarity
 
@@ -257,11 +333,23 @@ split did.
 1. ✅ **B** — finish `WindowPane` (dedupe resize/redraw + bundle constructor
    args). Done on `refactorWindowPaneB`.
 2. ✅ **A** — split `viewer/mod.rs` into topical submodules (method clusters).
-   Done on `refactorWindowPaneB`; struct relocation still open.
+   Done on `refactorWindowPaneB`; struct relocation mostly done since.
 3. ✅ **C** — deepen `OverlayState`: rename + minimal grouping done on
    `refactorWindowPaneB`. Strong-enum / move-`OverlayAppearance` steps deferred.
 4. ✅ **D** — tidy the ROI type cluster (merged `RoiDraftSnapshot` into
    `RoiDraftState`). Done on `refactorWindowPaneB`.
+5. ✅ **A2/A3/A4** — `ui.rs` + `input.rs` split, volume glue co-located. Done on
+   `refactorRS`.
+
+Remaining, in suggested order:
+
+6. **E** — split `src/surface.rs` into a `surface/` directory module (biggest
+   structural win left, low risk, not viewer-coupled).
+7. **A1** — relocate the remaining single-owner viewer structs (start with the
+   `input.rs`/`ui.rs` helpers — lowest friction).
+8. **F** — group `ViewerState`'s remaining loose fields.
+9. **C/D leftovers** — overlay strong-enum, move `OverlayAppearance` out of
+   `mesh.rs`.
 
 Run `cargo test && cargo clippy --lib && cargo fmt --all -- --check` after each
 step; the suite (~210 tests) is the safety net for "no functionality cut."
