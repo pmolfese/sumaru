@@ -143,8 +143,7 @@ impl ViewerState {
             .or(self.afni_crosshair_node)
             .or_else(|| node_nearest_bounds_center(mesh))
             .unwrap_or(0);
-        let Some(pick) =
-            surface_pick_for_mesh_node(mesh, self.overlay.data.node_values.as_ref(), node)
+        let Some(pick) = surface_pick_for_mesh_node(mesh, self.overlay.data.node_values(), node)
         else {
             return;
         };
@@ -354,9 +353,7 @@ impl ViewerState {
         let overlay_model = Overlay::from_color_cache(&mesh.domain, colors.clone(), dataset_id)?;
         self.afni_rgba_colors = Some(colors);
         self.overlay.render.render_model = Some(overlay_model);
-        self.overlay.data.node_values = None;
-        self.overlay.data.canonical_dataset = None;
-        self.overlay.data.columns = OverlayColumnSelections::default();
+        self.overlay.data = DatasetOverlayState::None;
         self.overlay.source.path = None;
         self.overlay.source.pair_paths = None;
         self.controller.surface.current_overlay_path = None;
@@ -431,11 +428,10 @@ impl ViewerState {
             .mesh
             .as_ref()
             .context("load a surface before applying AFNI/SUMA crosshair")?;
-        let pick =
-            surface_pick_for_mesh_node(mesh, self.overlay.data.node_values.as_ref(), node_index)
-                .with_context(|| {
-                    format!("AFNI/SUMA crosshair references unavailable node {node_index}")
-                })?;
+        let pick = surface_pick_for_mesh_node(mesh, self.overlay.data.node_values(), node_index)
+            .with_context(|| {
+                format!("AFNI/SUMA crosshair references unavailable node {node_index}")
+            })?;
 
         self.controller.interaction.set_pick(Some(pick));
         self.afni_crosshair_node = Some(node_index);
