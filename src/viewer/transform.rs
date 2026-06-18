@@ -189,7 +189,11 @@ impl TransformedBounds {
     }
 }
 
-pub(super) fn transform_point(mesh: &SurfaceMesh, transform: ComponentTransform, point: Vec3) -> Vec3 {
+pub(super) fn transform_point(
+    mesh: &SurfaceMesh,
+    transform: ComponentTransform,
+    point: Vec3,
+) -> Vec3 {
     let pivot = transform
         .rotation_pivot
         .unwrap_or_else(|| Vec3::from_array(mesh.bounds.center));
@@ -279,4 +283,3 @@ pub(super) fn pair_open_percent_label(open_angle_degrees: f32) -> String {
         format!("{percent:+.0}%")
     }
 }
-

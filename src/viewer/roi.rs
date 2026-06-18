@@ -548,7 +548,6 @@ pub(super) struct RoiComponentRange {
     pub(super) triangle_count: usize,
 }
 
-
 impl ViewerState {
     /// Route a right-click during ROI drawing to add-point or seed-fill.
     pub(super) fn handle_roi_draw_click_at_cursor(&mut self) -> Result<()> {
