@@ -79,7 +79,7 @@ impl ViewerState {
     /// Build the per-column value series plotted for a given node pick.
     pub(super) fn graph_snapshot_for_pick(&self, pick: SurfacePick) -> Option<GraphSnapshot> {
         let mut points = Vec::new();
-        if let Some(dataset) = self.overlay.dataset.as_ref()
+        if let Some(dataset) = self.overlay.data.canonical_dataset.as_ref()
             && let Some(row) = dataset_row_for_node(dataset, pick.node_index)
         {
             for (column_index, column) in dataset.columns.iter().enumerate() {
@@ -97,14 +97,14 @@ impl ViewerState {
         if points.is_empty() {
             if let Some(value) = pick.overlay_value {
                 points.push(GraphPoint {
-                    column_index: self.overlay.columns.intensity,
+                    column_index: self.overlay.data.columns.intensity,
                     label: "I".to_string(),
                     value,
                 });
             }
             if let Some(value) = pick.threshold_value {
                 points.push(GraphPoint {
-                    column_index: self.overlay.columns.threshold.unwrap_or(1),
+                    column_index: self.overlay.data.columns.threshold.unwrap_or(1),
                     label: "T".to_string(),
                     value,
                 });

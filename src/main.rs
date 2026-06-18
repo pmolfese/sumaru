@@ -67,7 +67,8 @@ struct Cli {
     #[arg(long = "verbose")]
     verbose: bool,
 
-    /// Preload spec surfaces in the background after the first display state.
+    /// Preload all spec surfaces into memory before the viewer opens, so
+    /// switching between surfaces is instant (slower startup).
     #[arg(long = "preload")]
     preload: bool,
 

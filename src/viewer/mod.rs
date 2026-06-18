@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -495,18 +495,6 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         };
 
         match event {
-            ViewerEvent::SpecPreloadReady => {
-                if state.drain_preload_results() {
-                    state.control_window().request_redraw();
-                    if state.controller.panels.roi_controller_open {
-                        state.roi_control_window().request_redraw();
-                    }
-                    if state.controller.panels.graph_window_open {
-                        state.view_window().request_redraw();
-                    }
-                    state.view_window().request_redraw();
-                }
-            }
             ViewerEvent::AfniMessagesReady => {
                 if state.drain_afni_events() {
                     state.control_window().request_redraw();
@@ -517,6 +505,12 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                         state.view_window().request_redraw();
                     }
                     state.view_window().request_redraw();
+                }
+            }
+            ViewerEvent::SceneStatsReady => {
+                if state.drain_scene_stats() {
+                    // Only the controls panel shows scene stats.
+                    state.control_window().request_redraw();
                 }
             }
         }
@@ -782,45 +776,77 @@ impl WindowPane {
     }
 }
 
-struct ViewerOverlayState {
-    model: Option<Overlay>,
-    values: Option<OverlayDataset>,
-    dataset: Option<Dataset>,
-    columns: OverlayColumnSelections,
-    appearance: OverlayAppearance,
+/// Where the loaded overlay came from. Drives the UI display label and lets the
+/// loader resolve the opposite hemisphere of a paired overlay.
+#[derive(Default)]
+struct OverlaySourceInfo {
+    /// Source file of a single-file overlay.
     path: Option<PathBuf>,
+    /// Explicit left/right file pair, when loaded as a paired overlay.
     pair_paths: Option<ExplicitOverlayPair>,
+    /// Friendly label that overrides the file name in the UI when set.
     display_name: Option<String>,
 }
 
-impl Default for ViewerOverlayState {
+/// The canonical overlay data and the per-node scalars derived from it. These
+/// travel together: the node values are recomputed whenever the dataset or the
+/// selected columns change.
+#[derive(Default)]
+struct DatasetOverlayState {
+    /// Parsed multi-column dataset backing the overlay.
+    canonical_dataset: Option<Dataset>,
+    /// Which dataset columns feed intensity / threshold / brightness.
+    columns: OverlayColumnSelections,
+    /// Per-node scalar values resolved from the selected columns.
+    node_values: Option<OverlayDataset>,
+}
+
+/// The render-ready overlay model and its display settings. This is what the GPU
+/// color upload consumes; rebuilt from [`DatasetOverlayState`] + `appearance`.
+struct OverlayRenderCache {
+    /// Colorized overlay model built from the dataset and appearance.
+    render_model: Option<Overlay>,
+    /// Display settings: colormap, range, threshold, opacity, dim.
+    appearance: OverlayAppearance,
+}
+
+impl Default for OverlayRenderCache {
     fn default() -> Self {
         Self {
-            model: None,
-            values: None,
-            dataset: None,
-            columns: OverlayColumnSelections::default(),
+            render_model: None,
             appearance: OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE),
-            path: None,
-            pair_paths: None,
-            display_name: None,
         }
     }
 }
 
+/// Viewer-side overlay state, grouped by lifetime: `source` (provenance),
+/// `data` (canonical dataset + derived scalars), and `render` (the colorized
+/// model the GPU consumes). Replaces the earlier flat eight-field struct.
+#[derive(Default)]
+struct ViewerOverlayState {
+    source: OverlaySourceInfo,
+    data: DatasetOverlayState,
+    render: OverlayRenderCache,
+}
+
 impl ViewerOverlayState {
+    /// Reset to the unloaded state (used by `reset_scene_state`).
     fn clear(&mut self) {
         *self = Self::default();
     }
 
+    /// True once a colorized overlay model exists.
     fn is_loaded(&self) -> bool {
-        self.model.is_some()
+        self.render.render_model.is_some()
     }
 
+    /// UI label for the overlay: explicit display name, else the file name,
+    /// else `"none"`.
     fn display_text(&self) -> String {
-        self.display_name
+        self.source
+            .display_name
             .clone()
-            .or_else(|| self.path.as_deref().map(file_name_display))
+            .or_else(|| self.source.path.as_deref().map(file_name_display))
             .unwrap_or_else(|| "none".to_string())
     }
 }
@@ -888,12 +914,21 @@ struct ViewerState {
     surface_volume_idcode: Option<String>,
     scene_stats: Option<SceneStats>,
     /// Cached geometry-derived stats (winding/area/counts) keyed by surface id,
-    /// so recolors do not recompute the expensive `winding_report`.
-    scene_geometry_stats: Option<(SurfaceId, SceneGeometryStats)>,
+    /// so recolors do not recompute the expensive `winding_report`. Keyed as a
+    /// map (not a single slot) so switching back and forth between spec surfaces
+    /// reuses each surface's stats instead of recomputing on every toggle.
+    scene_geometry_stats: HashMap<SurfaceId, SceneGeometryStats>,
+    /// Background channel for geometry stats computed off the hot path. The
+    /// expensive `winding_report` runs on a worker thread so a first surface
+    /// switch displays immediately; the result fills the SCENE panel a moment
+    /// later. See [`Self::update_scene_stats`].
+    scene_stats_sender: mpsc::Sender<(SurfaceId, SceneGeometryStats)>,
+    scene_stats_receiver: mpsc::Receiver<(SurfaceId, SceneGeometryStats)>,
+    /// Surface ids whose geometry stats are currently being computed on a worker
+    /// thread, so repeat switches do not spawn duplicate work.
+    pending_scene_stats: HashSet<SurfaceId>,
     verbose: bool,
     preload_enabled: bool,
-    preload_sender: Sender<PreloadResult>,
-    preload_receiver: Receiver<PreloadResult>,
     event_proxy: EventLoopProxy<ViewerEvent>,
     afni_options: AfniViewerOptions,
     afni_connection: Option<AfniConnection>,
@@ -1179,8 +1214,8 @@ impl ViewerState {
             initial_surface_volume_path.map(canonical_or_original_path);
         let initial_surface_volume_idcode =
             query_afni_dataset_idcode_optional(initial_surface_volume_path.as_deref())?;
-        let (preload_sender, preload_receiver) = mpsc::channel();
         let afni_recorder = niml_record_path.map(NimlRecorder::create).transpose()?;
+        let (scene_stats_sender, scene_stats_receiver) = mpsc::channel();
 
         let mut state = Self {
             view: WindowPane::new(
@@ -1238,11 +1273,12 @@ impl ViewerState {
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             scene_stats: None,
-            scene_geometry_stats: None,
+            scene_geometry_stats: HashMap::new(),
+            scene_stats_sender,
+            scene_stats_receiver,
+            pending_scene_stats: HashSet::new(),
             verbose,
             preload_enabled,
-            preload_sender,
-            preload_receiver,
             event_proxy,
             afni_options,
             afni_connection: None,
@@ -1410,7 +1446,7 @@ impl ViewerState {
                 let roi_draw_active = self
                     .roi_workspace
                     .active_draft()
-                    .is_some_and(|draft| draft.draw_enabled || draft.fill_pending);
+                    .is_some_and(|draft| draft.state.draw_enabled || draft.state.fill_pending);
                 if roi_draw_active {
                     if let Err(error) = self.handle_roi_draw_click_at_cursor() {
                         self.set_error(error);
@@ -2389,7 +2425,7 @@ impl ViewerState {
             return;
         }
 
-        draw_graph_snapshot(ui, snapshot, self.overlay.columns);
+        draw_graph_snapshot(ui, snapshot, self.overlay.data.columns);
     }
 
     fn draw_roi_control_contents(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ViewerCommand>) {
@@ -2511,7 +2547,7 @@ impl ViewerState {
                                         .add_enabled(
                                             self.mesh.is_some(),
                                             egui::Button::new("Draw")
-                                                .selected(is_active && slot.draft.draw_enabled),
+                                                .selected(is_active && slot.draft.state.draw_enabled),
                                         )
                                         .on_hover_text(
                                             "Right-click the surface to add ROI anchor points",
@@ -2520,7 +2556,7 @@ impl ViewerState {
                                     if draw_clicked {
                                         actions.push(ViewerCommand::ToggleRoiDraw(
                                             index,
-                                            !slot.draft.draw_enabled,
+                                            !slot.draft.state.draw_enabled,
                                         ));
                                     }
                                     if ui
@@ -2693,7 +2729,8 @@ impl ViewerState {
         let overlay_loaded = self.overlay.is_loaded();
         let column_options = self
             .overlay
-            .dataset
+            .data
+            .canonical_dataset
             .as_ref()
             .map(overlay_column_options)
             .unwrap_or_default();
@@ -2718,11 +2755,11 @@ impl ViewerState {
                         let threshold_range = self.selected_threshold_range();
                         changed |= vertical_threshold_bar(
                             ui,
-                            &mut self.overlay.appearance,
+                            &mut self.overlay.render.appearance,
                             threshold_range,
                         );
                         ui.monospace(threshold_value_display(
-                            self.overlay.appearance.threshold.value,
+                            self.overlay.render.appearance.threshold.value,
                         ));
                         ui.label(
                             egui::RichText::new(threshold_p_value_display(
@@ -2753,20 +2790,20 @@ impl ViewerState {
                                 columns_changed |= draw_intensity_column_selector(
                                     ui,
                                     &column_options,
-                                    &mut self.overlay.columns.intensity,
+                                    &mut self.overlay.data.columns.intensity,
                                 );
                                 columns_changed |= draw_threshold_column_selector(
                                     ui,
                                     &column_options,
-                                    &mut self.overlay.columns.threshold,
-                                    self.overlay.appearance.threshold.value,
+                                    &mut self.overlay.data.columns.threshold,
+                                    self.overlay.render.appearance.threshold.value,
                                 );
                                 columns_changed |= draw_optional_column_selector(
                                     ui,
                                     "B",
                                     "brightness_column",
                                     &column_options,
-                                    &mut self.overlay.columns.brightness,
+                                    &mut self.overlay.data.columns.brightness,
                                 );
                             }
                         });
@@ -2775,13 +2812,13 @@ impl ViewerState {
                     ui.horizontal(|ui| {
                         ui.label("Map");
                         egui::ComboBox::from_id_salt("overlay_colormap")
-                            .selected_text(self.overlay.appearance.colormap.label())
+                            .selected_text(self.overlay.render.appearance.colormap.label())
                             .width(170.0)
                             .show_ui(ui, |ui| {
                                 for colormap in OverlayColorMap::ALL {
                                     changed |= ui
                                         .selectable_value(
-                                            &mut self.overlay.appearance.colormap,
+                                            &mut self.overlay.render.appearance.colormap,
                                             colormap,
                                             colormap.label(),
                                         )
@@ -2794,21 +2831,27 @@ impl ViewerState {
                     ui.add_space(6.0);
                     changed |= ui
                         .add(
-                            egui::Slider::new(&mut self.overlay.appearance.dim, 0.0..=1.5)
+                            egui::Slider::new(&mut self.overlay.render.appearance.dim, 0.0..=1.5)
                                 .text("Dim"),
                         )
                         .changed();
                     changed |= ui
                         .add(
-                            egui::Slider::new(&mut self.overlay.appearance.opacity, 0.0..=1.0)
-                                .text("Opacity"),
+                            egui::Slider::new(
+                                &mut self.overlay.render.appearance.opacity,
+                                0.0..=1.0,
+                            )
+                            .text("Opacity"),
                         )
                         .changed();
 
                     ui.add_space(10.0);
                     ui.horizontal_wrapped(|ui| {
                         changed |= ui
-                            .checkbox(&mut self.overlay.appearance.threshold.absolute, "Abs")
+                            .checkbox(
+                                &mut self.overlay.render.appearance.threshold.absolute,
+                                "Abs",
+                            )
                             .changed();
                     });
                     if let Some(stat) = self.selected_threshold_stat_label() {
@@ -2832,17 +2875,21 @@ impl ViewerState {
 
         ui.horizontal(|ui| {
             changed |= ui
-                .checkbox(&mut self.overlay.appearance.symmetric_range, "Symmetric")
+                .checkbox(
+                    &mut self.overlay.render.appearance.symmetric_range,
+                    "Symmetric",
+                )
                 .changed();
 
-            if self.overlay.appearance.symmetric_range {
+            if self.overlay.render.appearance.symmetric_range {
                 let mut extent = self
                     .overlay
+                    .render
                     .appearance
                     .range
                     .min
                     .abs()
-                    .max(self.overlay.appearance.range.max.abs())
+                    .max(self.overlay.render.appearance.range.max.abs())
                     .max(0.0001);
                 let speed = (extent / 100.0).max(0.001);
                 if ui
@@ -2854,24 +2901,24 @@ impl ViewerState {
                     .changed()
                 {
                     let extent = extent.abs().max(0.0001);
-                    self.overlay.appearance.range = ValueRange {
+                    self.overlay.render.appearance.range = ValueRange {
                         min: -extent,
                         max: extent,
                     };
                     changed = true;
                 }
             } else {
-                let speed = range_drag_speed(self.overlay.appearance.range);
+                let speed = range_drag_speed(self.overlay.render.appearance.range);
                 changed |= ui
                     .add(
-                        egui::DragValue::new(&mut self.overlay.appearance.range.min)
+                        egui::DragValue::new(&mut self.overlay.render.appearance.range.min)
                             .speed(speed)
                             .prefix("min "),
                     )
                     .changed();
                 changed |= ui
                     .add(
-                        egui::DragValue::new(&mut self.overlay.appearance.range.max)
+                        egui::DragValue::new(&mut self.overlay.render.appearance.range.max)
                             .speed(speed)
                             .prefix("max "),
                     )
@@ -2883,8 +2930,8 @@ impl ViewerState {
     }
 
     fn selected_threshold_stat_label(&self) -> Option<String> {
-        let dataset = self.overlay.dataset.as_ref()?;
-        let index = self.overlay.columns.threshold?;
+        let dataset = self.overlay.data.canonical_dataset.as_ref()?;
+        let index = self.overlay.data.columns.threshold?;
         dataset.columns.get(index)?.stat.clone()
     }
 
@@ -2896,10 +2943,12 @@ impl ViewerState {
 
     fn selected_threshold_range(&self) -> ValueRange {
         self.overlay
-            .dataset
+            .data
+            .canonical_dataset
             .as_ref()
             .and_then(|dataset| {
                 self.overlay
+                    .data
                     .columns
                     .threshold
                     .and_then(|index| dataset.columns.get(index))
@@ -2909,23 +2958,30 @@ impl ViewerState {
                 min: range.min as f32,
                 max: range.max as f32,
             })
-            .or_else(|| self.overlay.values.as_ref().map(|overlay| overlay.range))
+            .or_else(|| {
+                self.overlay
+                    .data
+                    .node_values
+                    .as_ref()
+                    .map(|overlay| overlay.range)
+            })
             .unwrap_or(DEFAULT_OVERLAY_RANGE)
     }
 
     fn selected_threshold_p_value(&self) -> Option<f64> {
-        self.selected_threshold_stat_spec()
-            .and_then(|stat| stat.two_sided_p_value(self.overlay.appearance.threshold.value as f64))
+        self.selected_threshold_stat_spec().and_then(|stat| {
+            stat.two_sided_p_value(self.overlay.render.appearance.threshold.value as f64)
+        })
     }
 
     fn selected_threshold_q_value(&self) -> Option<f64> {
-        let dataset = self.overlay.dataset.as_ref()?;
-        let index = self.overlay.columns.threshold?;
+        let dataset = self.overlay.data.canonical_dataset.as_ref()?;
+        let index = self.overlay.data.columns.threshold?;
         let column = dataset.columns.get(index)?;
         column
             .fdr_curve
             .as_ref()?
-            .q_value(self.overlay.appearance.threshold.value as f64)
+            .q_value(self.overlay.render.appearance.threshold.value as f64)
     }
 
     fn draw_scene_section(&self, ui: &mut egui::Ui) {
@@ -2997,12 +3053,12 @@ impl ViewerState {
     }
 
     fn sanitize_overlay_appearance(&mut self) {
-        let range = &mut self.overlay.appearance.range;
+        let range = &mut self.overlay.render.appearance.range;
         if !range.min.is_finite() || !range.max.is_finite() {
             *range = DEFAULT_OVERLAY_RANGE;
         }
 
-        if self.overlay.appearance.symmetric_range {
+        if self.overlay.render.appearance.symmetric_range {
             let extent = range.min.abs().max(range.max.abs()).max(0.0001);
             *range = ValueRange {
                 min: -extent,
@@ -3016,15 +3072,17 @@ impl ViewerState {
             range.max = range.min + 1.0;
         }
 
-        self.overlay.appearance.dim = self.overlay.appearance.dim.clamp(0.0, 1.5);
-        self.overlay.appearance.opacity = self.overlay.appearance.opacity.clamp(0.0, 1.0);
+        self.overlay.render.appearance.dim = self.overlay.render.appearance.dim.clamp(0.0, 1.5);
+        self.overlay.render.appearance.opacity =
+            self.overlay.render.appearance.opacity.clamp(0.0, 1.0);
 
         let (threshold_min, threshold_max) = threshold_bounds(
             self.selected_threshold_range(),
-            self.overlay.appearance.threshold.absolute,
+            self.overlay.render.appearance.threshold.absolute,
         );
-        self.overlay.appearance.threshold.value = self
+        self.overlay.render.appearance.threshold.value = self
             .overlay
+            .render
             .appearance
             .threshold
             .value
@@ -3104,9 +3162,13 @@ impl ViewerState {
                     }
                 }
                 ViewerCommand::PickOverlay => {
-                    if let Some(path) =
-                        pick_overlay_file(self.overlay.path.as_ref().or(self.surface_path.as_ref()))
-                        && let Err(error) = self.load_overlay_path(path)
+                    if let Some(path) = pick_overlay_file(
+                        self.overlay
+                            .source
+                            .path
+                            .as_ref()
+                            .or(self.surface_path.as_ref()),
+                    ) && let Err(error) = self.load_overlay_path(path)
                     {
                         self.set_error(error);
                     }
@@ -3232,8 +3294,8 @@ impl ViewerState {
                     if self.mesh.is_some() && self.roi_workspace.set_active(index) {
                         self.controller.roi.active_slot = index;
                         if let Some(draft) = self.roi_workspace.active_draft_mut() {
-                            draft.draw_enabled = active;
-                            draft.fill_pending = false;
+                            draft.state.draw_enabled = active;
+                            draft.state.fill_pending = false;
                         }
                         if active {
                             self.log_status("ROI draw on. Right-click the surface to add points.");
@@ -3255,8 +3317,8 @@ impl ViewerState {
                     if let Some(draft) = self.roi_workspace.active_draft_mut()
                         && draft.can_fill()
                     {
-                        draft.fill_pending = true;
-                        draft.draw_enabled = true;
+                        draft.state.fill_pending = true;
+                        draft.state.draw_enabled = true;
                         self.log_status(
                             "ROI fill armed. Right-click inside or outside the closed path.",
                         );
@@ -3524,7 +3586,7 @@ impl ViewerState {
         self.reset_scene_state();
         self.ensure_scene_surface_loaded(0)?;
         self.activate_scene_surface(0)?;
-        self.start_scene_preload(generation);
+        self.preload_scene_surfaces_blocking(generation);
         self.camera.reset();
         self.controller.camera.note_reset();
         self.log_status(format!(
@@ -3708,7 +3770,12 @@ impl ViewerState {
         Ok(())
     }
 
-    fn start_scene_preload(&self, generation: u64) {
+    /// Load every not-yet-loaded spec surface component mesh into memory,
+    /// blocking until all are resident. Called during spec load so that with
+    /// `--preload` the viewer does not become interactive until switching
+    /// between surfaces is instant. Each mesh is applied (and its display cache
+    /// warmed) as soon as it loads.
+    fn preload_scene_surfaces_blocking(&mut self, generation: u64) {
         if !self.preload_enabled {
             self.log_status("Spec preloading disabled.");
             return;
@@ -3717,6 +3784,8 @@ impl ViewerState {
         let Some(scene) = self.surface_scene.as_ref() else {
             return;
         };
+        // Collect the work first so the immutable scene borrow is released
+        // before we load + apply each mesh (which needs `&mut self`).
         let mut tasks = Vec::new();
         for (surface_index, surface) in scene.surfaces.iter().enumerate() {
             for (component_index, component) in surface.components.iter().enumerate() {
@@ -3738,38 +3807,24 @@ impl ViewerState {
         }
 
         self.log_status(format!(
-            "Preloading {} spec surface components in the background.",
+            "Preloading {} spec surface components before display.",
             tasks.len()
         ));
-        let sender = self.preload_sender.clone();
-        let event_proxy = self.event_proxy.clone();
-        thread::spawn(move || {
-            for task in tasks {
-                let result = load_spec_component_mesh(
-                    &task.spec,
-                    &task.surface,
-                    task.surface_volume_idcode.as_deref(),
-                )
-                .map_err(|error| format!("{error:#}"));
-                let _ = sender.send(PreloadResult {
-                    generation: task.generation,
-                    surface_index: task.surface_index,
-                    component_index: task.component_index,
-                    path: task.surface.path.clone(),
-                    result,
-                });
-                let _ = event_proxy.send_event(ViewerEvent::SpecPreloadReady);
-            }
-        });
-    }
-
-    fn drain_preload_results(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok(result) = self.preload_receiver.try_recv() {
-            changed |= self.apply_preload_result(result);
+        for task in tasks {
+            let result = load_spec_component_mesh(
+                &task.spec,
+                &task.surface,
+                task.surface_volume_idcode.as_deref(),
+            )
+            .map_err(|error| format!("{error:#}"));
+            self.apply_preload_result(PreloadResult {
+                generation: task.generation,
+                surface_index: task.surface_index,
+                component_index: task.component_index,
+                path: task.surface.path.clone(),
+                result,
+            });
         }
-
-        changed
     }
 
     fn apply_preload_result(&mut self, result: PreloadResult) -> bool {
@@ -3832,6 +3887,8 @@ impl ViewerState {
     }
 
     fn activate_scene_surface(&mut self, index: usize) -> Result<()> {
+        // Surface-switch latency, surfaced under `--verbose`.
+        let switch_start = self.verbose.then(Instant::now);
         self.ensure_scene_surface_loaded(index)?;
         let layout = self.controller.display.pair_state;
         let (surface_count, name, state, path, snapshot) = {
@@ -3867,11 +3924,17 @@ impl ViewerState {
         {
             self.refresh_active_pair_render_geometry()?;
         }
-        if self.overlay.dataset.is_some() {
+        if self.overlay.data.canonical_dataset.is_some() {
             self.refresh_overlay_columns()?;
         } else {
             self.upload_surface_buffers();
             self.update_scene_stats();
+        }
+        if let Some(start) = switch_start {
+            self.log_status(format!(
+                "Surface switch took {:.1} ms.",
+                start.elapsed().as_secs_f64() * 1000.0
+            ));
         }
         self.view
             .window
@@ -3977,13 +4040,13 @@ impl ViewerState {
     }
 
     fn pick_overlay_display_text(&self) -> String {
-        let Some(path) = self.overlay.path.as_deref() else {
+        let Some(path) = self.overlay.source.path.as_deref() else {
             return "none".to_string();
         };
 
         if let Some(pick) = self.controller.interaction.pick
             && let Some(component) = self.picked_paired_component(pick)
-            && let Some(pair) = self.overlay.pair_paths.as_ref()
+            && let Some(pair) = self.overlay.source.pair_paths.as_ref()
         {
             return match component.side {
                 SurfaceSide::Left => file_name_display(&pair.left_path),
@@ -4099,7 +4162,8 @@ impl ViewerState {
 
     fn visible_overlay(&self) -> Option<&Overlay> {
         self.overlay
-            .model
+            .render
+            .render_model
             .as_ref()
             .filter(|_| self.controller.overlay.visible)
     }
@@ -4163,7 +4227,7 @@ impl ViewerState {
         let mesh = self.mesh.as_ref()?;
         pick_surface(
             mesh,
-            self.overlay.values.as_ref(),
+            self.overlay.data.node_values.as_ref(),
             &self.camera,
             scene_size,
             cursor,
@@ -4196,7 +4260,7 @@ impl ViewerState {
                 && let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == component.side)
                 && let Some((pick, distance)) = pick_surface_with_model(
                     mesh,
-                    self.overlay.values.as_ref(),
+                    self.overlay.data.node_values.as_ref(),
                     &self.camera,
                     self.scene_viewport_size(),
                     cursor,
@@ -4220,13 +4284,15 @@ impl ViewerState {
         if let Some(pick) = &mut self.controller.interaction.pick {
             pick.overlay_value = self
                 .overlay
-                .values
+                .data
+                .node_values
                 .as_ref()
                 .and_then(|overlay| overlay.values.get(pick.node_index as usize))
                 .copied();
             pick.threshold_value = self
                 .overlay
-                .values
+                .data
+                .node_values
                 .as_ref()
                 .and_then(|overlay| overlay.threshold_values.as_ref())
                 .and_then(|values| values.get(pick.node_index as usize))
@@ -4310,7 +4376,7 @@ impl ViewerState {
                 &geometry,
                 surface_color_slice,
                 visible_overlay,
-                self.overlay.appearance.dim,
+                self.overlay.render.appearance.dim,
                 roi,
                 selection,
             )
@@ -4441,7 +4507,7 @@ impl ViewerState {
             .visible_roi_layer()
             .map(|layer| layer.appearance.node_colors.clone());
         let selection = self.controller.interaction.pick;
-        let dim = self.overlay.appearance.dim;
+        let dim = self.overlay.render.appearance.dim;
         let layout = self.controller.display.pair_state;
         let visibility = self.controller.display.pair_visibility;
         let matrices = self.active_pair_matrices_for_layout(layout, visibility);
@@ -4594,33 +4660,61 @@ impl ViewerState {
     fn update_scene_stats(&mut self) {
         let Some(mesh) = self.mesh.as_ref() else {
             self.scene_stats = None;
-            self.scene_geometry_stats = None;
             return;
         };
 
         // The expensive part (winding_report + total_area) only depends on
-        // geometry, so cache it per surface id. Recolors keep the same id and
-        // reuse it, recomputing only the cheap overlay range.
+        // geometry, so cache it per surface id. On a cache hit (recolors, and
+        // every surface revisit) this is instant. On a miss — only the first
+        // visit to a surface — the heavy compute runs on a worker thread so the
+        // switch displays immediately; `drain_scene_stats` fills the panel when
+        // the result arrives.
         let id = mesh.metadata.id.clone();
-        let cache_hit = matches!(
-            &self.scene_geometry_stats,
-            Some((cached_id, _)) if *cached_id == id
-        );
-        let geometry = if cache_hit {
-            self.scene_geometry_stats
-                .as_ref()
-                .expect("cache hit checked above")
-                .1
-        } else {
-            let geometry = SceneGeometryStats::from_mesh(mesh);
-            self.scene_geometry_stats = Some((id, geometry));
-            geometry
+        let Some(geometry) = self.scene_geometry_stats.get(&id).copied() else {
+            // Show the cheap part now (nodes/triangles come from the geometry,
+            // so the SCENE panel stays blank until stats land); kick off the
+            // background compute unless one is already in flight for this id.
+            self.scene_stats = None;
+            if self.pending_scene_stats.insert(id.clone()) {
+                let mesh = mesh.clone();
+                let sender = self.scene_stats_sender.clone();
+                let proxy = self.event_proxy.clone();
+                thread::spawn(move || {
+                    let geometry = SceneGeometryStats::from_mesh(&mesh);
+                    let _ = sender.send((id, geometry));
+                    let _ = proxy.send_event(ViewerEvent::SceneStatsReady);
+                });
+            }
+            return;
         };
 
         self.scene_stats = Some(SceneStats {
             geometry,
-            overlay_range: self.overlay.values.as_ref().map(|overlay| overlay.range),
+            overlay_range: self
+                .overlay
+                .data
+                .node_values
+                .as_ref()
+                .map(|overlay| overlay.range),
         });
+    }
+
+    /// Apply geometry stats computed on a worker thread: cache each result and,
+    /// if the active surface now has stats, refresh the SCENE panel. Returns
+    /// whether anything changed (so the caller can request a redraw).
+    fn drain_scene_stats(&mut self) -> bool {
+        let mut received = false;
+        while let Ok((id, geometry)) = self.scene_stats_receiver.try_recv() {
+            self.pending_scene_stats.remove(&id);
+            self.scene_geometry_stats.insert(id, geometry);
+            received = true;
+        }
+        if received {
+            // Rebuild scene_stats for whatever surface is active now (its stats
+            // may have just arrived, or it may have changed while we waited).
+            self.update_scene_stats();
+        }
+        received
     }
 
     fn show_mode_label(&mut self, mode: CameraMode) {
@@ -5578,19 +5672,41 @@ struct RoiSlot {
     visible: bool,
 }
 
+/// The undoable editing state of an ROI draft: the target surface, the drawn
+/// anchor nodes and stroke segments, and the fill state. Factored out of
+/// `RoiDraft` so it is also the unit stored on the undo/redo stacks — capturing
+/// or restoring a draft is a single clone of this struct rather than a
+/// hand-maintained field-by-field copy. (Was the separate `RoiDraftSnapshot`.)
+#[derive(Debug, Clone, Default)]
+struct RoiDraftState {
+    /// Surface/domain/side this draft is bound to, once a first point is placed.
+    target: Option<RoiDraftTarget>,
+    /// Ordered anchor (click) nodes of the path.
+    anchor_nodes: Vec<u32>,
+    /// Stroke segments connecting consecutive anchors (last may close the loop).
+    segments: Vec<Vec<u32>>,
+    /// Filled-interior nodes, once a closed path is filled.
+    fill_nodes: Option<Vec<u32>>,
+    /// Seed node a fill was started from.
+    fill_seed_node: Option<u32>,
+    /// A fill is requested and awaiting the next click.
+    fill_pending: bool,
+    /// Free-draw mode is active (each click extends the path).
+    draw_enabled: bool,
+}
+
+/// An in-progress drawn ROI: its label/color identity, the editable `state`,
+/// and the undo/redo history of prior states.
 #[derive(Debug, Clone)]
 struct RoiDraft {
     label: String,
     integer_label: i32,
-    target: Option<RoiDraftTarget>,
-    anchor_nodes: Vec<u32>,
-    segments: Vec<Vec<u32>>,
-    fill_nodes: Option<Vec<u32>>,
-    fill_seed_node: Option<u32>,
-    fill_pending: bool,
-    draw_enabled: bool,
-    history: Vec<RoiDraftSnapshot>,
-    redo_history: Vec<RoiDraftSnapshot>,
+    /// The current editable state (target, path, fill).
+    state: RoiDraftState,
+    /// Past states for undo, most recent last.
+    history: Vec<RoiDraftState>,
+    /// States popped by undo, available to redo.
+    redo_history: Vec<RoiDraftState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5598,17 +5714,6 @@ struct RoiDraftTarget {
     surface_id: SurfaceId,
     domain_id: SurfaceDomainId,
     side: SurfaceSide,
-}
-
-#[derive(Debug, Clone)]
-struct RoiDraftSnapshot {
-    target: Option<RoiDraftTarget>,
-    anchor_nodes: Vec<u32>,
-    segments: Vec<Vec<u32>>,
-    fill_nodes: Option<Vec<u32>>,
-    fill_seed_node: Option<u32>,
-    fill_pending: bool,
-    draw_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5719,8 +5824,8 @@ impl RoiWorkspace {
         };
         slot.finalized_roi = Some(roi);
         slot.editing = false;
-        slot.draft.draw_enabled = false;
-        slot.draft.fill_pending = false;
+        slot.draft.state.draw_enabled = false;
+        slot.draft.state.fill_pending = false;
         slot.visible = true;
         let next_index = self.push_blank_slot();
         self.active_index = next_index;
@@ -5849,32 +5954,28 @@ impl RoiDraft {
         Self {
             label: label.into(),
             integer_label,
-            target: None,
-            anchor_nodes: Vec::new(),
-            segments: Vec::new(),
-            fill_nodes: None,
-            fill_seed_node: None,
-            fill_pending: false,
-            draw_enabled: false,
+            state: RoiDraftState::default(),
             history: Vec::new(),
             redo_history: Vec::new(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.anchor_nodes.is_empty() && self.segments.is_empty() && self.fill_nodes.is_none()
+        self.state.anchor_nodes.is_empty()
+            && self.state.segments.is_empty()
+            && self.state.fill_nodes.is_none()
     }
 
     fn is_joined(&self) -> bool {
-        self.segments.last().is_some_and(|segment| {
+        self.state.segments.last().is_some_and(|segment| {
             segment.len() >= 2
-                && self.anchor_nodes.len() >= 3
-                && segment.last().copied() == self.anchor_nodes.first().copied()
+                && self.state.anchor_nodes.len() >= 3
+                && segment.last().copied() == self.state.anchor_nodes.first().copied()
         })
     }
 
     fn can_join(&self) -> bool {
-        self.anchor_nodes.len() >= 3 && !self.is_joined()
+        self.state.anchor_nodes.len() >= 3 && !self.is_joined()
     }
 
     fn can_fill(&self) -> bool {
@@ -5891,16 +5992,16 @@ impl RoiDraft {
 
     fn reopen_joined_path_for_append(&mut self) {
         if self.is_joined() {
-            self.segments.pop();
+            self.state.segments.pop();
         }
-        self.fill_nodes = None;
-        self.fill_seed_node = None;
-        self.fill_pending = false;
+        self.state.fill_nodes = None;
+        self.state.fill_seed_node = None;
+        self.state.fill_pending = false;
     }
 
     fn from_roi(roi: &Roi) -> Option<Self> {
         let mut draft = Self::new(roi.label.clone(), roi.integer_label);
-        draft.target = match (&roi.parent_surface_id, &roi.parent_domain_id) {
+        draft.state.target = match (&roi.parent_surface_id, &roi.parent_domain_id) {
             (Some(surface_id), Some(domain_id)) => Some(RoiDraftTarget {
                 surface_id: surface_id.clone(),
                 domain_id: domain_id.clone(),
@@ -5912,7 +6013,7 @@ impl RoiDraft {
         for datum in &roi.data {
             if datum.action == RoiBrushAction::FillArea {
                 if !datum.node_path.is_empty() {
-                    draft.fill_nodes = Some(datum.node_path.clone());
+                    draft.state.fill_nodes = Some(datum.node_path.clone());
                 }
                 continue;
             }
@@ -5922,24 +6023,24 @@ impl RoiDraft {
                     if datum.node_path.is_empty() {
                         continue;
                     }
-                    if draft.anchor_nodes.is_empty()
+                    if draft.state.anchor_nodes.is_empty()
                         && let Some(first) = datum.node_path.first().copied()
                     {
-                        draft.anchor_nodes.push(first);
+                        draft.state.anchor_nodes.push(first);
                     }
                     if datum.action != RoiBrushAction::JoinEnds
                         && let Some(last) = datum.node_path.last().copied()
-                        && draft.anchor_nodes.last().copied() != Some(last)
+                        && draft.state.anchor_nodes.last().copied() != Some(last)
                     {
-                        draft.anchor_nodes.push(last);
+                        draft.state.anchor_nodes.push(last);
                     }
-                    draft.segments.push(datum.node_path.clone());
+                    draft.state.segments.push(datum.node_path.clone());
                 }
                 RoiElementKind::NodeGroup if !datum.node_path.is_empty() => {
-                    if draft.segments.is_empty() && draft.anchor_nodes.is_empty() {
-                        draft.anchor_nodes = datum.node_path.clone();
+                    if draft.state.segments.is_empty() && draft.state.anchor_nodes.is_empty() {
+                        draft.state.anchor_nodes = datum.node_path.clone();
                     } else {
-                        draft.fill_nodes = Some(datum.node_path.clone());
+                        draft.state.fill_nodes = Some(datum.node_path.clone());
                     }
                 }
                 _ => {}
@@ -5949,26 +6050,14 @@ impl RoiDraft {
         (!draft.is_empty()).then_some(draft)
     }
 
-    fn snapshot(&self) -> RoiDraftSnapshot {
-        RoiDraftSnapshot {
-            target: self.target.clone(),
-            anchor_nodes: self.anchor_nodes.clone(),
-            segments: self.segments.clone(),
-            fill_nodes: self.fill_nodes.clone(),
-            fill_seed_node: self.fill_seed_node,
-            fill_pending: self.fill_pending,
-            draw_enabled: self.draw_enabled,
-        }
+    /// Capture the current editable state for the undo/redo stacks.
+    fn snapshot(&self) -> RoiDraftState {
+        self.state.clone()
     }
 
-    fn restore(&mut self, snapshot: RoiDraftSnapshot) {
-        self.target = snapshot.target;
-        self.anchor_nodes = snapshot.anchor_nodes;
-        self.segments = snapshot.segments;
-        self.fill_nodes = snapshot.fill_nodes;
-        self.fill_seed_node = snapshot.fill_seed_node;
-        self.fill_pending = snapshot.fill_pending;
-        self.draw_enabled = snapshot.draw_enabled;
+    /// Replace the editable state with a previously captured snapshot.
+    fn restore(&mut self, snapshot: RoiDraftState) {
+        self.state = snapshot;
     }
 
     fn push_history(&mut self) {
@@ -5996,7 +6085,7 @@ impl RoiDraft {
 
     fn boundary_nodes(&self) -> Vec<u32> {
         let mut nodes = Vec::new();
-        for segment in &self.segments {
+        for segment in &self.state.segments {
             if segment.is_empty() {
                 continue;
             }
@@ -6011,22 +6100,23 @@ impl RoiDraft {
             return Ok(None);
         }
 
-        let Some(target) = self.target.clone() else {
+        let Some(target) = self.state.target.clone() else {
             return Ok(None);
         };
         let mut data = Vec::new();
-        if self.segments.is_empty() && !self.anchor_nodes.is_empty() {
-            data.push(RoiDatum::node_group(self.anchor_nodes.clone())?);
+        if self.state.segments.is_empty() && !self.state.anchor_nodes.is_empty() {
+            data.push(RoiDatum::node_group(self.state.anchor_nodes.clone())?);
         }
-        for (index, segment) in self.segments.iter().enumerate() {
-            let action = if index == self.segments.len().saturating_sub(1) && self.is_joined() {
+        for (index, segment) in self.state.segments.iter().enumerate() {
+            let action = if index == self.state.segments.len().saturating_sub(1) && self.is_joined()
+            {
                 RoiBrushAction::JoinEnds
             } else {
                 RoiBrushAction::AppendStroke
             };
             data.push(RoiDatum::node_segment(segment.clone(), action)?);
         }
-        if let Some(nodes) = &self.fill_nodes {
+        if let Some(nodes) = &self.state.fill_nodes {
             data.push(RoiDatum::new(
                 RoiElementKind::NodeGroup,
                 RoiBrushAction::FillArea,
@@ -6035,7 +6125,7 @@ impl RoiDraft {
             )?);
         }
 
-        let drawing_type = if self.fill_nodes.is_some() {
+        let drawing_type = if self.state.fill_nodes.is_some() {
             RoiDrawingType::FilledArea
         } else if self.is_joined() {
             RoiDrawingType::ClosedPath
@@ -6147,8 +6237,8 @@ struct ControlUiOutput {
 
 #[derive(Debug, Clone, Copy)]
 enum ViewerEvent {
-    SpecPreloadReady,
     AfniMessagesReady,
+    SceneStatsReady,
 }
 
 struct PreloadTask {
@@ -7720,22 +7810,22 @@ fn roi_slot_state_text(slot: &RoiSlot) -> String {
 
 fn roi_draft_status_text(draft: &RoiDraft) -> String {
     if draft.is_empty() {
-        if draft.draw_enabled {
+        if draft.state.draw_enabled {
             return "draw armed".to_string();
         }
         return "none".to_string();
     }
 
     let mut parts = vec![
-        format!("{} anchors", draft.anchor_nodes.len()),
-        format!("{} segments", draft.segments.len()),
+        format!("{} anchors", draft.state.anchor_nodes.len()),
+        format!("{} segments", draft.state.segments.len()),
     ];
     if draft.is_joined() {
         parts.push("joined".to_string());
     }
-    if let Some(nodes) = &draft.fill_nodes {
+    if let Some(nodes) = &draft.state.fill_nodes {
         parts.push(format!("{} filled nodes", nodes.len()));
-    } else if draft.fill_pending {
+    } else if draft.state.fill_pending {
         parts.push("fill armed".to_string());
     }
 
@@ -9080,15 +9170,15 @@ mod tests {
         let mut workspace = RoiWorkspace::default();
         {
             let draft = workspace.active_draft_mut().unwrap();
-            draft.target = Some(target);
-            draft.anchor_nodes = vec![0, 1, 2];
+            draft.state.target = Some(target);
+            draft.state.anchor_nodes = vec![0, 1, 2];
         }
 
         let rois = workspace.saveable_rois().unwrap();
 
         assert_eq!(rois.len(), 1);
         assert!(workspace.slots[0].editing);
-        assert_eq!(workspace.slots[0].draft.anchor_nodes, vec![0, 1, 2]);
+        assert_eq!(workspace.slots[0].draft.state.anchor_nodes, vec![0, 1, 2]);
 
         assert!(workspace.finalize_slot(0).unwrap());
         assert_eq!(workspace.slots.len(), 2);
@@ -9130,7 +9220,7 @@ mod tests {
         assert!(workspace.edit_slot(0).unwrap());
         assert_eq!(workspace.active_index, 0);
         assert!(workspace.slots[0].editing);
-        assert_eq!(workspace.slots[0].draft.anchor_nodes, vec![0, 2]);
+        assert_eq!(workspace.slots[0].draft.state.anchor_nodes, vec![0, 2]);
         assert_eq!(workspace.saveable_rois().unwrap().len(), 1);
     }
 
@@ -9147,35 +9237,41 @@ mod tests {
             side: SurfaceSide::Left,
         };
         let mut draft = super::RoiDraft::new("roi_1", 1);
-        draft.anchor_nodes = vec![0, 1, 2];
-        draft.segments = vec![vec![0, 1], vec![1, 2], vec![2, 0]];
-        draft.fill_nodes = Some(vec![0, 1, 2, 3]);
-        draft.fill_seed_node = Some(3);
-        draft.fill_pending = true;
+        draft.state.anchor_nodes = vec![0, 1, 2];
+        draft.state.segments = vec![vec![0, 1], vec![1, 2], vec![2, 0]];
+        draft.state.fill_nodes = Some(vec![0, 1, 2, 3]);
+        draft.state.fill_seed_node = Some(3);
+        draft.state.fill_pending = true;
 
         assert!(draft.is_joined());
-        if draft.target.is_none() {
-            draft.target = Some(target.clone());
+        if draft.state.target.is_none() {
+            draft.state.target = Some(target.clone());
         }
         draft.push_history();
         draft.reopen_joined_path_for_append();
-        draft.segments.push(vec![2, 1]);
-        draft.anchor_nodes.push(1);
+        draft.state.segments.push(vec![2, 1]);
+        draft.state.anchor_nodes.push(1);
 
         assert!(!draft.is_joined());
-        assert_eq!(draft.segments, vec![vec![0, 1], vec![1, 2], vec![2, 1]]);
-        assert_eq!(draft.anchor_nodes, vec![0, 1, 2, 1]);
-        assert_eq!(draft.fill_nodes, None);
-        assert_eq!(draft.fill_seed_node, None);
-        assert!(!draft.fill_pending);
+        assert_eq!(
+            draft.state.segments,
+            vec![vec![0, 1], vec![1, 2], vec![2, 1]]
+        );
+        assert_eq!(draft.state.anchor_nodes, vec![0, 1, 2, 1]);
+        assert_eq!(draft.state.fill_nodes, None);
+        assert_eq!(draft.state.fill_seed_node, None);
+        assert!(!draft.state.fill_pending);
 
         assert!(draft.undo());
         assert!(draft.is_joined());
-        assert_eq!(draft.target, Some(target));
-        assert_eq!(draft.segments, vec![vec![0, 1], vec![1, 2], vec![2, 0]]);
-        assert_eq!(draft.anchor_nodes, vec![0, 1, 2]);
-        assert_eq!(draft.fill_nodes, Some(vec![0, 1, 2, 3]));
-        assert_eq!(draft.fill_seed_node, Some(3));
+        assert_eq!(draft.state.target, Some(target));
+        assert_eq!(
+            draft.state.segments,
+            vec![vec![0, 1], vec![1, 2], vec![2, 0]]
+        );
+        assert_eq!(draft.state.anchor_nodes, vec![0, 1, 2]);
+        assert_eq!(draft.state.fill_nodes, Some(vec![0, 1, 2, 3]));
+        assert_eq!(draft.state.fill_seed_node, Some(3));
     }
 
     #[test]
@@ -9191,8 +9287,8 @@ mod tests {
             side: SurfaceSide::Left,
         };
         let mut draft = super::RoiDraft::new("roi_2", 2);
-        draft.target = Some(target);
-        draft.anchor_nodes = vec![0, 1, 2];
+        draft.state.target = Some(target);
+        draft.state.anchor_nodes = vec![0, 1, 2];
 
         let roi = draft.to_roi().unwrap().unwrap();
 

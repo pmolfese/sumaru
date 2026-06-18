@@ -143,7 +143,8 @@ impl ViewerState {
             .or(self.afni_crosshair_node)
             .or_else(|| node_nearest_bounds_center(mesh))
             .unwrap_or(0);
-        let Some(pick) = surface_pick_for_mesh_node(mesh, self.overlay.values.as_ref(), node)
+        let Some(pick) =
+            surface_pick_for_mesh_node(mesh, self.overlay.data.node_values.as_ref(), node)
         else {
             return;
         };
@@ -279,19 +280,19 @@ impl ViewerState {
         let mut changed = false;
 
         if let Some(symmetric_range) = state.symmetric_range {
-            self.overlay.appearance.symmetric_range = symmetric_range;
+            self.overlay.render.appearance.symmetric_range = symmetric_range;
             changed = true;
         }
         if let Some(range) = state.intensity_range {
-            self.overlay.appearance.range = range;
+            self.overlay.render.appearance.range = range;
             changed = true;
         }
         if let Some(threshold) = state.threshold {
-            self.overlay.appearance.threshold = threshold;
+            self.overlay.render.appearance.threshold = threshold;
             changed = true;
         }
         if let Some(opacity) = state.opacity {
-            self.overlay.appearance.opacity = opacity.clamp(0.0, 1.0);
+            self.overlay.render.appearance.opacity = opacity.clamp(0.0, 1.0);
             changed = true;
         }
 
@@ -352,20 +353,20 @@ impl ViewerState {
             .or_else(|| Some("AFNI SUMA_irgba".to_string()));
         let overlay_model = Overlay::from_color_cache(&mesh.domain, colors.clone(), dataset_id)?;
         self.afni_rgba_colors = Some(colors);
-        self.overlay.model = Some(overlay_model);
-        self.overlay.values = None;
-        self.overlay.dataset = None;
-        self.overlay.columns = OverlayColumnSelections::default();
-        self.overlay.path = None;
-        self.overlay.pair_paths = None;
+        self.overlay.render.render_model = Some(overlay_model);
+        self.overlay.data.node_values = None;
+        self.overlay.data.canonical_dataset = None;
+        self.overlay.data.columns = OverlayColumnSelections::default();
+        self.overlay.source.path = None;
+        self.overlay.source.pair_paths = None;
         self.controller.surface.current_overlay_path = None;
-        self.overlay.display_name = Some("AFNI SUMA_irgba".to_string());
+        self.overlay.source.display_name = Some("AFNI SUMA_irgba".to_string());
         if let Some(threshold) = overlay
             .threshold
             .as_deref()
             .and_then(|value| value.parse::<f32>().ok())
         {
-            self.overlay.appearance.threshold = OverlayThreshold {
+            self.overlay.render.appearance.threshold = OverlayThreshold {
                 enabled: true,
                 absolute: true,
                 value: threshold,
@@ -430,10 +431,11 @@ impl ViewerState {
             .mesh
             .as_ref()
             .context("load a surface before applying AFNI/SUMA crosshair")?;
-        let pick = surface_pick_for_mesh_node(mesh, self.overlay.values.as_ref(), node_index)
-            .with_context(|| {
-                format!("AFNI/SUMA crosshair references unavailable node {node_index}")
-            })?;
+        let pick =
+            surface_pick_for_mesh_node(mesh, self.overlay.data.node_values.as_ref(), node_index)
+                .with_context(|| {
+                    format!("AFNI/SUMA crosshair references unavailable node {node_index}")
+                })?;
 
         self.controller.interaction.set_pick(Some(pick));
         self.afni_crosshair_node = Some(node_index);

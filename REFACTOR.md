@@ -54,13 +54,10 @@ then **C**, then **D**.
       - `viewer/graph.rs` — graph window/dock + snapshot (~145)
       Net: `mod.rs` 12,167 → 10,021 lines (~2,150 moved). All ~216 tests pass,
       fmt clean, clippy unchanged.
-- [ ] **Still open:** relocate the ~45 small local structs (`LoadedOverlay`,
-      `SceneStats`, `GraphSnapshot`, `MontageShot`, …) to the module that owns
-      them. Deferred — structs are referenced across modules and would need
-      `pub(super)`/`pub(crate)` visibility bumps; lower value than the method
-      split and best done as its own pass. The `draw_*` UI cluster and
-      `pick_*` methods also remain in `mod.rs` (the draw methods are heavily
-      interleaved; a `viewer/ui.rs` split is a reasonable future step).
+- [ ] **Still open:** relocate the ~50 local structs to their owning module, and
+      split the `draw_*` UI cluster into `viewer/ui.rs`. These are deferred
+      navigability follow-ons — see [A-follow-up](#a-follow-up--struct-relocation--uirs-split-deferred)
+      below for the full outline, rationale, and reduction estimate.
 
 *Risk:* low per move (pure relocation, no logic change). Done one cluster at a
 time, compiling + testing after each.
@@ -94,44 +91,151 @@ on this branch — `desired_panel_size`/`pick.rs` arg counts, two `io.rs` lints,
 and a `label_dataset` expect from the lookup-table commit — none introduced
 here.)
 
-### C. Deepen `OverlayState` — separate the four lifetimes
+### C. Deepen `OverlayState` — separate the four lifetimes (rename + grouping ✅ DONE, branch `refactorWindowPaneB`)
 
-`ViewerState` now owns one `ViewerOverlayState`, but it still mixes loaded source
-identity, the canonical dataset, derived per-node scalar values, and the
-render-ready color cache in one flat struct. Options, lowest-risk first:
+`ViewerState`'s `ViewerOverlayState` was a flat eight-field struct mixing source
+identity, canonical dataset, derived scalars, and the render cache.
 
-- [ ] **Minimal grouping (recommended start):** split the wrapper into nested
-      `OverlaySourceInfo`, `DatasetOverlayState`, and `OverlayRenderCache`
-      structs, preserving current behavior. Lowest-risk readability pass.
-- [ ] **Rename-only pass** (can land first or instead): `model` → `render_model`,
-      `values` → `node_values`, `dataset` → `canonical_dataset`. Tiny, clarifies
-      intent before any reshape.
-- [ ] **Strong enum** (higher payoff, more reach): make loaded content explicit
-      as either canonical-dataset overlay data *or* AFNI-baked RGBA cache. Gives
-      real invariants but touches more call sites.
+- [x] **Rename pass:** `model` → `render_model`, `values` → `node_values`,
+      `dataset` → `canonical_dataset`. Clarifies intent at every read site
+      (~101 accesses across the viewer submodules).
+- [x] **Minimal grouping:** `ViewerOverlayState` is now three nested structs by
+      lifetime, each documented field-by-field:
+      - `OverlaySourceInfo { path, pair_paths, display_name }` — provenance.
+      - `DatasetOverlayState { canonical_dataset, columns, node_values }` —
+        canonical data + the scalars derived from it (they recompute together).
+      - `OverlayRenderCache { render_model, appearance }` — what the GPU upload
+        consumes.
+      Access paths are now `self.overlay.source.*` / `.data.*` / `.render.*`.
+      All three groups `#[derive(Default)]` (render cache keeps a manual
+      `Default` for the seeded appearance range). All ~216 tests pass, clippy
+      unchanged, fmt clean.
+
+Still open (deferred, higher reach):
+
+- [ ] **Strong enum:** make loaded content explicit as either canonical-dataset
+      overlay data *or* AFNI-baked RGBA cache. Encodes the real invariant but
+      touches the most call sites.
 - [ ] **Move display state:** promote `OverlayAppearance` out of `viewer/mesh.rs`
       into a reusable overlay/display module so viewer UI, AFNI interop, and
       future GPU shader recoloring share one display-state type. (Pairs well with
       the GPU/shader work in `ROADMAP.md`.)
 - [ ] Audit which sub-parts must be `Option` independently vs. which always live
-      and die together (`overlay`/`dataset`/`values` likely a unit).
+      and die together (`render_model`/`canonical_dataset`/`node_values` likely a
+      unit — candidates for the strong-enum step).
 
-*Risk:* moderate — touches the load/unload path and many readers. High clarity
-payoff because this is the most frequently-touched data in the app.
+*Risk:* moderate — touched the load/unload path and many readers; done as a
+mechanical anchored rewrite with the test suite as the safety net.
 
-### D. Tidy the ROI render-side type cluster
+### D. Tidy the ROI render-side type cluster — ✅ DONE (branch `refactorWindowPaneB`)
 
 `RoiLayer`, `RoiWorkspace`, `RoiSlot`, `RoiDraft`, `RoiDraftTarget`,
 `RoiDraftSnapshot`, `RoiPickTarget`, `RoiAppearanceBuild`, `RoiComponentRange`
-([`viewer/mod.rs:7499`](src/viewer/mod.rs)+) sit alongside the domain `roi::Roi`.
+sat alongside the domain `roi::Roi`.
 
-- [ ] Audit `RoiDraft` / `RoiDraftTarget` / `RoiDraftSnapshot` for merging — a
-      snapshot and its target are often the same data captured at two moments.
-- [ ] Confirm each remaining type earns its keep; collapse any that are a struct
-      wrapping a single field used in one place.
+- [x] **Merged `RoiDraftSnapshot` into a nested `RoiDraftState`.** It was an exact
+      copy of `RoiDraft`'s seven editable fields; `snapshot()`/`restore()`
+      hand-copied each. Now `RoiDraft` holds `state: RoiDraftState` plus
+      `history`/`redo_history: Vec<RoiDraftState>`; `snapshot()` is
+      `self.state.clone()` and `restore()` is `self.state = snapshot`. Removes the
+      "add a field in three places or undo silently drops it" hazard — the real
+      maintainability win. ~106 field accesses moved under `.state` (anchored
+      rewrite; the 24 ROI undo/redo/fill tests are the safety net).
+- [x] **Confirmed the rest earn their keep:** `RoiAppearanceBuild` (4-field
+      builder return), `RoiComponentRange` (multi-field, 11 uses), and
+      `RoiPickTarget` (mesh + target + local node) are all genuine multi-field
+      bundles, not single-field wrappers — kept as-is.
 
-*Risk:* low, but re-read the draw/undo paths first. Most localized of the
-remaining items — good "small commit" filler between the larger ones.
+*Risk:* was low; done as a mechanical rewrite with the ROI test suite as the
+safety net. All ~216 tests pass, clippy unchanged, fmt clean.
+
+---
+
+## A-follow-up — struct relocation + `ui.rs` split (deferred)
+
+After the method split, `mod.rs` is ~10,089 lines and the single `impl
+ViewerState` still runs ~956→4740 (~3,800 lines). The six submodules use
+`use super::*`, so they currently *borrow* ~50 type definitions that still
+physically live in `mod.rs`. Two follow-ons finish the job. Both are **pure
+navigability** — no behavior change, no hazard removed — which is why they sit
+below the correctness-bearing items.
+
+### A1 — Relocate the ~50 local structs to their owning module
+
+Every type lives in `mod.rs` regardless of who uses it. Natural owners:
+
+| Target module | Types |
+|---|---|
+| `roi.rs` | `RoiLayer`, `RoiWorkspace`, `RoiSlot`, `RoiDraft`, `RoiDraftState`, `RoiDraftTarget`, `RoiPickTarget`, `RoiAppearanceBuild`, `RoiComponentRange` (9) |
+| *(new)* `scene.rs` | `SurfaceScene`, `SceneSurface`, `SceneSurfaceComponent`, `SurfaceBuffers`, `SurfaceRenderSet`, `SurfaceRenderInstance`, `PreparedGeometryCache`, `AnatomicalShadingCache`, `DisplayMeshCache`, `DisplayMeshSnapshot`, `SurfaceLabelLookup`, `SceneStats`, `SceneGeometryStats`, `TransformedBounds` (14) |
+| `overlay_load.rs` | `LoadedOverlay`, `LoadedOverlaySelection`, `PairedOverlayPaths`, `OverlayColumnSelections`, `OverlayColumnOption` (5) |
+| `capture.rs` | `MontageShot`, `MontageLayout`, `MontageCamera` (3) |
+| `graph.rs` | `GraphSnapshot`, `GraphPoint` (2) |
+| `pairing.rs` | `ComponentTransform`, `StatePair` (2) |
+| `afni.rs` | `AfniSurfaceTarget`, `AfniViewerOptions` (2) |
+
+Stays in `mod.rs` (the genuine core): `ViewerState`, `ViewerApp`,
+`WindowPane`/`EguiPane`, `ViewerWindows`/`InitialScene`, `ViewerEvent`,
+`RenderStatus`, `LaunchOptions`.
+
+*Mechanic:* each move is "cut the `struct` + its `impl` blocks, paste into the
+target module." The only friction is **visibility** — a type used by `mod.rs`
+*and* a sibling now needs `pub(super)` on the type and any fields the other
+module touches. Unlike the method moves, this is per-field, not a blind perl
+pass.
+
+### A2 — Split the `draw_*` UI cluster into `viewer/ui.rs`
+
+13 `draw_*` methods span ~2018→~3070 (~1,050 lines) — the largest cohesive block
+left in the impl (`draw_ui`, `draw_view_overlay_ui`, `draw_overlay_workbench`,
+`draw_overlay_range_controls`, `draw_surface_dataset_section`,
+`draw_scene_section`, `draw_pick_section`, `draw_roi_control_contents`,
+`draw_graph_dock_ui`, …) plus their UI-only helpers (`ControlUiOutput`,
+`InputResponse`, `ModeLabel`, `desired_panel_size`).
+
+They are "interleaved" in two senses that explain the deferral:
+1. **Intra-cluster coupling** — `draw_ui` calls `draw_scene_section` /
+   `draw_pick_section` / `draw_overlay_workbench`; they share egui idioms and
+   thread a `&mut Vec<ViewerCommand>` of actions. Moving one means moving the set.
+2. **Cross-cutting reads** — they touch overlay, ROI, scene, and camera state
+   broadly, so the move surfaces the most visibility bumps. Doing A1 first
+   (especially the overlay/ROI/scene structs) clears that path.
+
+### Why — clarity
+
+- **Co-location.** Today ROI drawing methods live in `roi.rs` but `RoiDraft`
+  lives in `mod.rs`. After A1, the type, its `impl`, and the `ViewerState`
+  methods that use it share a file — "everything about `RoiDraft`" is one answer.
+- **`mod.rs` becomes a table of contents, not an encyclopedia** — its job
+  collapses to construct the app, own the windows, run the event loop, and
+  orchestrate render/update.
+- **Visibility documents the seams.** Marking a field `pub(super)` makes
+  cross-module coupling explicit and greppable; today it is invisible because
+  everything shares one privacy scope.
+- **`ui.rs` isolates the egui layer** so the render/event core is no longer
+  interrupted by ~1,050 lines of widget layout (and vice-versa).
+
+### Why — reduction (estimate)
+
+- A2 (`ui.rs`): ~1,050 lines out of `mod.rs`.
+- A1 (structs + their impls): ~2,000–2,500 lines (scene/ROI/overlay carry most
+  of the `impl` weight).
+- Net: `mod.rs` plausibly lands ~6,000–6,500 lines; `impl ViewerState` itself
+  shrinks from ~3,800 to ~2,000 lines of genuine lifecycle/orchestration. No
+  logic is deleted — this is redistribution, but the largest file roughly halves.
+
+### Sequencing
+
+1. **`scene.rs` first** (new module) — the 14 scene/render types are the densest
+   cluster with the clearest boundary; biggest single clarity win.
+2. **Relocate the topical structs** into the existing `roi.rs` / `overlay_load.rs`
+   / `capture.rs` / `graph.rs` / `pairing.rs` — small, one commit each.
+3. **`ui.rs` last** — the big draw split, once overlay/ROI/scene types are
+   already `pub(super)` and co-located.
+
+Default to `pub(super)` (not `pub(crate)`) so coupling stays scoped to the
+`viewer` module tree. Each step compiles + tests independently, as the method
+split did.
 
 ---
 
@@ -154,8 +258,10 @@ remaining items — good "small commit" filler between the larger ones.
    args). Done on `refactorWindowPaneB`.
 2. ✅ **A** — split `viewer/mod.rs` into topical submodules (method clusters).
    Done on `refactorWindowPaneB`; struct relocation still open.
-3. **C** — deepen `OverlayState` (start with the minimal grouping / rename pass).
-4. **D** — tidy the ROI type cluster as small-commit filler.
+3. ✅ **C** — deepen `OverlayState`: rename + minimal grouping done on
+   `refactorWindowPaneB`. Strong-enum / move-`OverlayAppearance` steps deferred.
+4. ✅ **D** — tidy the ROI type cluster (merged `RoiDraftSnapshot` into
+   `RoiDraftState`). Done on `refactorWindowPaneB`.
 
 Run `cargo test && cargo clippy --lib && cargo fmt --all -- --check` after each
 step; the suite (~210 tests) is the safety net for "no functionality cut."
