@@ -1,0 +1,386 @@
+//! Overlay loading and column/appearance refresh: loading single and paired
+//! overlay files, applying initial CLI overlay options, resolving column
+//! selections, and rebuilding the overlay render model. Extracted from
+//! `viewer/mod.rs`; all methods stay on `ViewerState`.
+
+use super::*;
+
+impl ViewerState {
+    /// Load a single overlay file onto the current surface.
+    pub(super) fn load_overlay_path(&mut self, path: PathBuf) -> Result<()> {
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a surface before loading an overlay")?;
+        let loaded_selection = self
+            .load_overlay_selection(&path, mesh)
+            .with_context(|| format!("failed to load overlay {}", path.display()))?;
+        let loaded_overlay = loaded_selection.overlay;
+        let column_summary =
+            overlay_column_summary(&loaded_overlay.dataset, loaded_overlay.columns);
+        let overlay_values = loaded_overlay.overlay_values;
+        let range = overlay_values.range;
+
+        self.overlay.clear();
+        self.afni_rgba_colors = None;
+        self.afni_rgba_signatures.clear();
+        self.overlay.values = Some(overlay_values);
+        self.overlay.dataset = Some(loaded_overlay.dataset);
+        self.overlay.columns = loaded_overlay.columns;
+        self.controller.overlay.visible = true;
+        self.overlay.appearance = OverlayAppearance::from_range(range);
+        self.overlay.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        self.overlay.path = Some(path.clone());
+        self.overlay.pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
+        self.controller.surface.current_overlay_path = Some(path.clone());
+        self.overlay.display_name = Some(loaded_selection.display_name);
+        self.rebuild_overlay_model()?;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(format!(
+            "Loaded overlay range {:.4} to {:.4}. {column_summary}",
+            range.min, range.max
+        ));
+
+        Ok(())
+    }
+
+    /// Load an explicit left/right overlay pair onto a paired scene.
+    pub(super) fn load_overlay_pair_paths(&mut self, pair: ExplicitOverlayPair) -> Result<()> {
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a both-hemisphere spec before loading explicit paired overlays")?;
+        let loaded_selection = self
+            .load_explicit_paired_overlay_selection(&pair, mesh)
+            .with_context(|| {
+                format!(
+                    "failed to load paired overlays {} and {}",
+                    pair.left_path.display(),
+                    pair.right_path.display()
+                )
+            })?;
+        let loaded_overlay = loaded_selection.overlay;
+        let column_summary =
+            overlay_column_summary(&loaded_overlay.dataset, loaded_overlay.columns);
+        let overlay_values = loaded_overlay.overlay_values;
+        let range = overlay_values.range;
+
+        self.overlay.clear();
+        self.afni_rgba_colors = None;
+        self.afni_rgba_signatures.clear();
+        self.overlay.values = Some(overlay_values);
+        self.overlay.dataset = Some(loaded_overlay.dataset);
+        self.overlay.columns = loaded_overlay.columns;
+        self.controller.overlay.visible = true;
+        self.overlay.appearance = OverlayAppearance::from_range(range);
+        self.overlay.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        self.overlay.path = Some(pair.left_path.clone());
+        self.overlay.pair_paths = Some(pair.clone());
+        self.controller.surface.current_overlay_path = Some(pair.left_path.clone());
+        self.overlay.display_name = Some(loaded_selection.display_name);
+        self.rebuild_overlay_model()?;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(format!(
+            "Loaded paired overlays range {:.4} to {:.4}. {column_summary}",
+            range.min, range.max
+        ));
+
+        Ok(())
+    }
+
+    /// Apply CLI-provided sub-brick selectors and p-value to the loaded overlay.
+    pub(super) fn apply_initial_overlay_options(
+        &mut self,
+        subs: Option<&[String]>,
+        p_value: Option<f64>,
+    ) -> Result<()> {
+        if let Some(subs) = subs {
+            let dataset = self
+                .overlay
+                .dataset
+                .as_ref()
+                .context("no overlay dataset is loaded")?;
+            self.overlay.columns = resolve_overlay_subs(dataset, subs)?;
+            self.refresh_overlay_columns()?;
+        }
+
+        if let Some(p_value) = p_value {
+            self.apply_initial_overlay_p_value(p_value)?;
+            self.refresh_overlay_appearance()?;
+        }
+
+        Ok(())
+    }
+
+    /// Set the initial threshold from a p-value if the column carries a stat.
+    pub(super) fn apply_initial_overlay_p_value(&mut self, p_value: f64) -> Result<()> {
+        let Some(dataset) = self.overlay.dataset.as_ref() else {
+            return Ok(());
+        };
+        let Some(threshold_index) = self.overlay.columns.threshold else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} requested, but no T sub-brick is selected"
+            ));
+            return Ok(());
+        };
+        let Some(column) = dataset.columns.get(threshold_index) else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} requested, but T sub-brick #{threshold_index} does not exist"
+            ));
+            return Ok(());
+        };
+        let Some(stat_label) = column.stat.as_deref() else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} requested, but T sub-brick #{} '{}' has no stat metadata",
+                threshold_index, column.label
+            ));
+            return Ok(());
+        };
+        let Some(stat) = AfniStatSpec::parse(stat_label) else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} requested, but stat metadata '{stat_label}' is not supported"
+            ));
+            return Ok(());
+        };
+        let Some(threshold_value) = stat.statistic_for_p_value(p_value) else {
+            self.warn_and_disable_initial_threshold(format!(
+                "--p-val {p_value} could not be converted with stat metadata '{stat_label}'"
+            ));
+            return Ok(());
+        };
+
+        self.overlay.appearance.threshold.enabled = true;
+        self.overlay.appearance.threshold.absolute = true;
+        self.overlay.appearance.threshold.value = threshold_value as f32;
+        self.sanitize_overlay_appearance();
+        self.log_status(format!(
+            "Initial threshold p <= {p_value:.4} -> T {:.4}.",
+            self.overlay.appearance.threshold.value
+        ));
+
+        Ok(())
+    }
+
+    /// Log a warning and leave thresholding off when an initial option fails.
+    pub(super) fn warn_and_disable_initial_threshold(&mut self, message: String) {
+        eprintln!("sumaru warning: {message}; threshold disabled.");
+        self.overlay.appearance.threshold.enabled = false;
+    }
+
+    /// Build the overlay model from the current column selections.
+    pub(super) fn load_overlay_selection(
+        &self,
+        path: &Path,
+        mesh: &SurfaceMesh,
+    ) -> Result<LoadedOverlaySelection> {
+        if let Some((left, right)) = self.active_paired_components()
+            && let Some(paths) = paired_overlay_paths(path)
+        {
+            let left_mesh = left
+                .mesh
+                .as_ref()
+                .context("left hemisphere surface is still loading")?;
+            let right_mesh = right
+                .mesh
+                .as_ref()
+                .context("right hemisphere surface is still loading")?;
+            ensure!(
+                paths.left_path.exists(),
+                "left hemisphere overlay {} does not exist",
+                paths.left_path.display()
+            );
+            ensure!(
+                paths.right_path.exists(),
+                "right hemisphere overlay {} does not exist",
+                paths.right_path.display()
+            );
+
+            let left_dataset = load_dataset_from_path(&paths.left_path, left_mesh)
+                .with_context(|| format!("failed to load {}", paths.left_path.display()))?;
+            let right_dataset = load_dataset_from_path(&paths.right_path, right_mesh)
+                .with_context(|| format!("failed to load {}", paths.right_path.display()))?;
+            let dataset = paired_overlay_dataset(
+                left_dataset,
+                right_dataset,
+                &mesh.domain,
+                left_mesh.vertices.len() as u32,
+            )?;
+            let overlay = loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "paired NIML")?;
+
+            return Ok(LoadedOverlaySelection {
+                overlay,
+                display_name: paths.display_name,
+            });
+        }
+
+        Ok(LoadedOverlaySelection {
+            overlay: load_overlay_from_path(path, mesh)?,
+            display_name: file_name_display(path),
+        })
+    }
+
+    /// Build the overlay model for an explicit paired-hemisphere selection.
+    pub(super) fn load_explicit_paired_overlay_selection(
+        &self,
+        pair: &ExplicitOverlayPair,
+        mesh: &SurfaceMesh,
+    ) -> Result<LoadedOverlaySelection> {
+        let (left, right) = self
+            .active_paired_components()
+            .context("--overlay-lh/--overlay-rh require an active both-hemisphere spec")?;
+        let left_mesh = left
+            .mesh
+            .as_ref()
+            .context("left hemisphere surface is still loading")?;
+        let right_mesh = right
+            .mesh
+            .as_ref()
+            .context("right hemisphere surface is still loading")?;
+        ensure!(
+            pair.left_path.exists(),
+            "left hemisphere overlay {} does not exist",
+            pair.left_path.display()
+        );
+        ensure!(
+            pair.right_path.exists(),
+            "right hemisphere overlay {} does not exist",
+            pair.right_path.display()
+        );
+
+        let left_dataset = load_dataset_from_path(&pair.left_path, left_mesh)
+            .with_context(|| format!("failed to load {}", pair.left_path.display()))?;
+        let right_dataset = load_dataset_from_path(&pair.right_path, right_mesh)
+            .with_context(|| format!("failed to load {}", pair.right_path.display()))?;
+        let dataset = paired_overlay_dataset(
+            left_dataset,
+            right_dataset,
+            &mesh.domain,
+            left_mesh.vertices.len() as u32,
+        )?;
+        let overlay = loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "paired NIML")?;
+
+        Ok(LoadedOverlaySelection {
+            overlay,
+            display_name: explicit_overlay_pair_display_name(pair),
+        })
+    }
+
+    /// Infer the opposite-hemisphere overlay file for a loaded path.
+    pub(super) fn explicit_overlay_pair_for_loaded_path(
+        &self,
+        path: &Path,
+    ) -> Option<ExplicitOverlayPair> {
+        self.active_paired_components()?;
+        let paths = paired_overlay_paths(path)?;
+        Some(ExplicitOverlayPair {
+            left_path: paths.left_path,
+            right_path: paths.right_path,
+        })
+    }
+
+    /// Re-resolve intensity/threshold/brightness columns after a change.
+    pub(super) fn refresh_overlay_columns(&mut self) -> Result<()> {
+        let dataset = self
+            .overlay
+            .dataset
+            .as_ref()
+            .context("no canonical overlay dataset is loaded")?;
+        let domain = &self
+            .mesh
+            .as_ref()
+            .context("load a surface before selecting overlay columns")?
+            .domain;
+        let overlay = overlay_dataset_from_canonical_dataset(
+            dataset,
+            domain.node_count,
+            self.overlay.columns,
+        )?;
+        let range = overlay.range;
+        let column_summary = overlay_column_summary(dataset, self.overlay.columns);
+        self.overlay.values = Some(overlay);
+        self.overlay.appearance.range = if self.overlay.appearance.symmetric_range {
+            symmetric_value_range(range)
+        } else {
+            range
+        };
+        self.sanitize_overlay_appearance();
+        self.rebuild_overlay_model()?;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(format!("Overlay columns: {column_summary}"));
+
+        Ok(())
+    }
+
+    /// Recompute overlay appearance defaults from the selected columns.
+    pub(super) fn refresh_overlay_appearance(&mut self) -> Result<()> {
+        if self.overlay.dataset.is_none() {
+            return Ok(());
+        }
+
+        self.sanitize_overlay_appearance();
+        self.rebuild_overlay_model()?;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+
+        Ok(())
+    }
+
+    /// Rebuild the per-node overlay color model and re-upload colors.
+    pub(super) fn rebuild_overlay_model(&mut self) -> Result<()> {
+        let dataset = self
+            .overlay
+            .dataset
+            .as_ref()
+            .context("no canonical overlay dataset is loaded")?;
+        let domain = &self
+            .mesh
+            .as_ref()
+            .context("load a surface before rebuilding overlay colors")?
+            .domain;
+        let columns = canonical_overlay_columns(
+            self.overlay.columns,
+            self.overlay.appearance.threshold.enabled,
+        );
+        let (threshold, mask_mode) = threshold_and_mask_from_appearance(self.overlay.appearance);
+        // Build with an empty cache, apply the real display settings, then
+        // compute the color cache exactly once (from_dataset would compute it a
+        // first time with default settings and throw that away).
+        let mut overlay = Overlay::without_color_cache(dataset, domain, columns)?
+            .with_colormap(self.overlay.appearance.colormap.to_color_map())
+            .with_intensity_range(RangeSelection::Manual(overlay_range_from_value_range(
+                self.overlay.appearance.range,
+            )))
+            .with_symmetric_range(self.overlay.appearance.symmetric_range)
+            .with_threshold(threshold, mask_mode)
+            .with_opacity(self.overlay.appearance.opacity);
+
+        overlay.rebuild_color_cache(dataset, domain)?;
+        self.overlay.model = Some(overlay);
+
+        Ok(())
+    }
+
+    /// Toggle the active overlay on or off (key `O`).
+    pub(super) fn toggle_overlay_visibility(&mut self) {
+        if !self.overlay.is_loaded() {
+            self.log_status("No overlay is loaded.");
+            return;
+        }
+
+        self.controller.overlay.visible = !self.controller.overlay.visible;
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(if self.controller.overlay.visible {
+            "Overlay visible."
+        } else {
+            "Overlay hidden."
+        });
+    }
+}
