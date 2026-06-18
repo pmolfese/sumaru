@@ -303,18 +303,22 @@ impl ViewerApp {
             graph_window.set_outer_position(PhysicalPosition::new(position.x + 80, raised_y + 80));
         }
         self.state = Some(pollster::block_on(ViewerState::new(
-            view_window,
-            control_window,
-            roi_control_window,
-            graph_window,
-            self.initial_surface_path.take(),
-            self.initial_spec_path.take(),
-            self.initial_surface_volume_path.take(),
-            self.initial_overlay_path.take(),
-            self.initial_overlay_pair_paths.take(),
-            self.initial_roi_path.take(),
-            self.initial_overlay_subs.take(),
-            self.initial_overlay_p_value.take(),
+            ViewerWindows {
+                view: view_window,
+                control: control_window,
+                roi_control: roi_control_window,
+                graph: graph_window,
+            },
+            InitialScene {
+                surface_path: self.initial_surface_path.take(),
+                spec_path: self.initial_spec_path.take(),
+                surface_volume_path: self.initial_surface_volume_path.take(),
+                overlay_path: self.initial_overlay_path.take(),
+                overlay_pair_paths: self.initial_overlay_pair_paths.take(),
+                roi_path: self.initial_roi_path.take(),
+                overlay_subs: self.initial_overlay_subs.take(),
+                overlay_p_value: self.initial_overlay_p_value.take(),
+            },
             self.verbose,
             self.preload,
             self.afni.clone(),
@@ -653,6 +657,123 @@ impl WindowPane {
             egui,
         }
     }
+
+    /// Reconfigures the surface for a new physical size. No-op (returns `false`)
+    /// for a zero-area size. Clears any pending `last_requested_size`, since a
+    /// resize we asked for has now been satisfied (only the auto-fit control
+    /// windows ever set it; for the others it stays `None`).
+    fn resize(&mut self, device: &wgpu::Device, size: PhysicalSize<u32>) -> bool {
+        if size.width == 0 || size.height == 0 {
+            return false;
+        }
+        self.size = size;
+        self.last_requested_size = None;
+        self.config.width = size.width;
+        self.config.height = size.height;
+        self.surface.configure(device, &self.config);
+        true
+    }
+
+    /// Syncs egui viewport info for this pane and takes the accumulated raw
+    /// input, ready to feed `Context::run`.
+    fn take_egui_input(&mut self) -> egui::RawInput {
+        egui_winit::update_viewport_info(
+            self.egui
+                .state
+                .egui_input_mut()
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default(),
+            &self.egui.ctx,
+            &self.window,
+            false,
+        );
+        self.egui.state.take_egui_input(&self.window)
+    }
+
+    /// Encodes and presents a tessellated egui frame for this pane: uploads
+    /// pending textures, runs the egui render pass against the swapchain
+    /// texture, frees released textures, and presents. `label` names the
+    /// encoder/render-pass for debugging. Shared tail of every egui window's
+    /// render path.
+    fn present_egui_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        paint_jobs: &[egui::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+        label: &str,
+    ) -> RenderStatus {
+        let output = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(output)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return RenderStatus::Skipped;
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                return RenderStatus::Reconfigure;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => return RenderStatus::ValidationError,
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+
+        let (needs_texture_repaint, retained_textures) = self.egui.upload_pending(device, queue);
+        let mut command_buffers = self.egui.renderer.update_buffers(
+            device,
+            queue,
+            &mut encoder,
+            paint_jobs,
+            screen_descriptor,
+        );
+
+        {
+            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.06,
+                            g: 0.07,
+                            b: 0.08,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            self.egui.renderer.render(
+                &mut egui_pass.forget_lifetime(),
+                paint_jobs,
+                screen_descriptor,
+            );
+        }
+
+        self.egui.free_pending();
+        self.egui.pending_textures = retained_textures;
+        if needs_texture_repaint {
+            // Deferred texture upload: repaint next frame to finish it. Under
+            // ControlFlow::Wait this scheduled wake is what actually drives it.
+            self.repaint_at = Some(Instant::now());
+        }
+
+        command_buffers.push(encoder.finish());
+        queue.submit(command_buffers);
+        output.present();
+
+        RenderStatus::Rendered
+    }
 }
 
 struct ViewerOverlayState {
@@ -696,6 +817,30 @@ impl ViewerOverlayState {
             .or_else(|| self.path.as_deref().map(file_name_display))
             .unwrap_or_else(|| "none".to_string())
     }
+}
+
+/// The four application windows handed to [`ViewerState::new`]. Bundled so the
+/// constructor takes one argument for the window set instead of four.
+struct ViewerWindows {
+    view: Arc<Window>,
+    control: Arc<Window>,
+    roi_control: Arc<Window>,
+    graph: Arc<Window>,
+}
+
+/// Everything the viewer should load at startup, resolved from CLI/launch
+/// options. Bundled so the constructor takes one argument for the initial scene
+/// instead of eight.
+#[derive(Default)]
+struct InitialScene {
+    surface_path: Option<PathBuf>,
+    spec_path: Option<PathBuf>,
+    surface_volume_path: Option<PathBuf>,
+    overlay_path: Option<PathBuf>,
+    overlay_pair_paths: Option<ExplicitOverlayPair>,
+    roi_path: Option<PathBuf>,
+    overlay_subs: Option<Vec<String>>,
+    overlay_p_value: Option<f64>,
 }
 
 struct ViewerState {
@@ -772,24 +917,30 @@ struct ViewerState {
 
 impl ViewerState {
     async fn new(
-        view_window: Arc<Window>,
-        control_window: Arc<Window>,
-        roi_control_window: Arc<Window>,
-        graph_window: Arc<Window>,
-        initial_surface_path: Option<PathBuf>,
-        initial_spec_path: Option<PathBuf>,
-        initial_surface_volume_path: Option<PathBuf>,
-        initial_overlay_path: Option<PathBuf>,
-        initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
-        initial_roi_path: Option<PathBuf>,
-        initial_overlay_subs: Option<Vec<String>>,
-        initial_overlay_p_value: Option<f64>,
+        windows: ViewerWindows,
+        scene: InitialScene,
         verbose: bool,
         preload_enabled: bool,
         afni_options: AfniViewerOptions,
         niml_record_path: Option<PathBuf>,
         event_proxy: EventLoopProxy<ViewerEvent>,
     ) -> Result<Self> {
+        let ViewerWindows {
+            view: view_window,
+            control: control_window,
+            roi_control: roi_control_window,
+            graph: graph_window,
+        } = windows;
+        let InitialScene {
+            surface_path: initial_surface_path,
+            spec_path: initial_spec_path,
+            surface_volume_path: initial_surface_volume_path,
+            overlay_path: initial_overlay_path,
+            overlay_pair_paths: initial_overlay_pair_paths,
+            roi_path: initial_roi_path,
+            overlay_subs: initial_overlay_subs,
+            overlay_p_value: initial_overlay_p_value,
+        } = scene;
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
         let roi_control_size = roi_control_window.inner_size();
@@ -1176,56 +1327,21 @@ impl ViewerState {
     }
 
     fn resize_view(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
+        if self.view.resize(&self.device, size) {
+            self.depth_buffer = DepthBuffer::new(&self.device, size.width, size.height);
         }
-
-        self.view.size = size;
-        self.view.config.width = size.width;
-        self.view.config.height = size.height;
-        self.view.surface.configure(&self.device, &self.view.config);
-        self.depth_buffer = DepthBuffer::new(&self.device, size.width, size.height);
     }
 
     fn resize_control(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-
-        self.control.size = size;
-        self.control.last_requested_size = None;
-        self.control.config.width = size.width;
-        self.control.config.height = size.height;
-        self.control
-            .surface
-            .configure(&self.device, &self.control.config);
+        self.control.resize(&self.device, size);
     }
 
     fn resize_roi_control(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-
-        self.roi_control.size = size;
-        self.roi_control.last_requested_size = None;
-        self.roi_control.config.width = size.width;
-        self.roi_control.config.height = size.height;
-        self.roi_control
-            .surface
-            .configure(&self.device, &self.roi_control.config);
+        self.roi_control.resize(&self.device, size);
     }
 
     fn resize_graph(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-
-        self.graph.size = size;
-        self.graph.config.width = size.width;
-        self.graph.config.height = size.height;
-        self.graph
-            .surface
-            .configure(&self.device, &self.graph.config);
+        self.graph.resize(&self.device, size);
     }
 
     fn view_input(&mut self, event: &WindowEvent) -> bool {
@@ -2102,23 +2218,7 @@ impl ViewerState {
     }
 
     fn render_control(&mut self) -> RenderStatus {
-        egui_winit::update_viewport_info(
-            self.control
-                .egui
-                .state
-                .egui_input_mut()
-                .viewports
-                .entry(egui::ViewportId::ROOT)
-                .or_default(),
-            &self.control.egui.ctx,
-            &self.control.window,
-            false,
-        );
-        let raw_input = self
-            .control
-            .egui
-            .state
-            .take_egui_input(&self.control.window);
+        let raw_input = self.control.take_egui_input();
         let egui_ctx = self.control.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         let mut desired_control_size_points = egui::Vec2::ZERO;
@@ -2167,99 +2267,17 @@ impl ViewerState {
             .pending_textures
             .append(full_output.textures_delta);
 
-        let output = match self.control.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(output)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return RenderStatus::Skipped;
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                return RenderStatus::Reconfigure;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => return RenderStatus::ValidationError,
-        };
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("control render encoder"),
-            });
-
-        let (needs_texture_repaint, retained_textures) =
-            self.control.egui.upload_pending(&self.device, &self.queue);
-        let mut command_buffers = self.control.egui.renderer.update_buffers(
+        self.control.present_egui_frame(
             &self.device,
             &self.queue,
-            &mut encoder,
             &paint_jobs,
             &screen_descriptor,
-        );
-
-        {
-            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("egui render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.06,
-                            g: 0.07,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            self.control.egui.renderer.render(
-                &mut egui_pass.forget_lifetime(),
-                &paint_jobs,
-                &screen_descriptor,
-            );
-        }
-
-        self.control.egui.free_pending();
-        self.control.egui.pending_textures = retained_textures;
-        if needs_texture_repaint {
-            // Deferred texture upload: repaint next frame to finish it. Under
-            // ControlFlow::Wait this scheduled wake is what actually drives it.
-            self.control.repaint_at = Some(Instant::now());
-        }
-
-        command_buffers.push(encoder.finish());
-        self.queue.submit(command_buffers);
-        output.present();
-
-        RenderStatus::Rendered
+            "control render encoder",
+        )
     }
 
     fn render_roi_control(&mut self) -> RenderStatus {
-        egui_winit::update_viewport_info(
-            self.roi_control
-                .egui
-                .state
-                .egui_input_mut()
-                .viewports
-                .entry(egui::ViewportId::ROOT)
-                .or_default(),
-            &self.roi_control.egui.ctx,
-            &self.roi_control.window,
-            false,
-        );
-        let raw_input = self
-            .roi_control
-            .egui
-            .state
-            .take_egui_input(&self.roi_control.window);
+        let raw_input = self.roi_control.take_egui_input();
         let egui_ctx = self.roi_control.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         let mut desired_roi_control_size_points = egui::Vec2::ZERO;
@@ -2312,95 +2330,17 @@ impl ViewerState {
             .pending_textures
             .append(full_output.textures_delta);
 
-        let output = match self.roi_control.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(output)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return RenderStatus::Skipped;
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                return RenderStatus::Reconfigure;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => return RenderStatus::ValidationError,
-        };
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("ROI control render encoder"),
-            });
-
-        let (needs_texture_repaint, retained_textures) = self
-            .roi_control
-            .egui
-            .upload_pending(&self.device, &self.queue);
-        let mut command_buffers = self.roi_control.egui.renderer.update_buffers(
+        self.roi_control.present_egui_frame(
             &self.device,
             &self.queue,
-            &mut encoder,
             &paint_jobs,
             &screen_descriptor,
-        );
-
-        {
-            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ROI control egui render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.06,
-                            g: 0.07,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            self.roi_control.egui.renderer.render(
-                &mut egui_pass.forget_lifetime(),
-                &paint_jobs,
-                &screen_descriptor,
-            );
-        }
-
-        self.roi_control.egui.free_pending();
-        self.roi_control.egui.pending_textures = retained_textures;
-        if needs_texture_repaint {
-            self.roi_control.repaint_at = Some(Instant::now());
-        }
-
-        command_buffers.push(encoder.finish());
-        self.queue.submit(command_buffers);
-        output.present();
-
-        RenderStatus::Rendered
+            "ROI control render encoder",
+        )
     }
 
     fn render_graph(&mut self) -> RenderStatus {
-        egui_winit::update_viewport_info(
-            self.graph
-                .egui
-                .state
-                .egui_input_mut()
-                .viewports
-                .entry(egui::ViewportId::ROOT)
-                .or_default(),
-            &self.graph.egui.ctx,
-            &self.graph.window,
-            false,
-        );
-        let raw_input = self.graph.egui.state.take_egui_input(&self.graph.window);
+        let raw_input = self.graph.take_egui_input();
         let egui_ctx = self.graph.egui.ctx.clone();
         #[allow(deprecated)]
         let full_output = egui_ctx.run(raw_input, |ctx| {
@@ -2422,77 +2362,13 @@ impl ViewerState {
             .pending_textures
             .append(full_output.textures_delta);
 
-        let output = match self.graph.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(output)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return RenderStatus::Skipped;
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                return RenderStatus::Reconfigure;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => return RenderStatus::ValidationError,
-        };
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("graph render encoder"),
-            });
-
-        let (needs_texture_repaint, retained_textures) =
-            self.graph.egui.upload_pending(&self.device, &self.queue);
-        let mut command_buffers = self.graph.egui.renderer.update_buffers(
+        self.graph.present_egui_frame(
             &self.device,
             &self.queue,
-            &mut encoder,
             &paint_jobs,
             &screen_descriptor,
-        );
-
-        {
-            let egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("graph egui render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.06,
-                            g: 0.07,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            self.graph.egui.renderer.render(
-                &mut egui_pass.forget_lifetime(),
-                &paint_jobs,
-                &screen_descriptor,
-            );
-        }
-
-        self.graph.egui.free_pending();
-        self.graph.egui.pending_textures = retained_textures;
-        if needs_texture_repaint {
-            self.graph.repaint_at = Some(Instant::now());
-        }
-
-        command_buffers.push(encoder.finish());
-        self.queue.submit(command_buffers);
-        output.present();
-
-        RenderStatus::Rendered
+            "graph render encoder",
+        )
     }
 
     fn draw_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {

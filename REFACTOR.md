@@ -58,26 +58,31 @@ after Item B removes the per-window resize boilerplate.
 *Why first among the structural items:* every later edit to the viewer pays the
 "scroll through 11.8k lines" tax. This is the change that compounds.
 
-### B. Finish `WindowPane` — dedupe per-window logic + constructor args
+### B. Finish `WindowPane` — dedupe per-window logic + constructor args — ✅ DONE (branch `refactorWindowPaneB`)
 
-The field collapse is done (four `WindowPane`s, `ViewerState` 80 → 59 fields).
-Two pieces of the original item remain:
+The field collapse was already done (four `WindowPane`s, `ViewerState` 80 → 59
+fields). Both remaining pieces are now complete:
 
-- [ ] **Deduplicate resize/redraw/repaint** into `WindowPane` methods. The four
-      windows (view, control, roi_control, graph) still have their resize and
-      redraw bodies written out separately; with the fields now bundled, these
-      collapse into shared methods on `WindowPane`. Removes the last of the 4×
-      duplication this item set out to kill.
-- [ ] **Bundle `ViewerState::new`'s 17 arguments** (a standing clippy
-      `too_many_arguments` warning). Group the four windows + the `initial_*`
-      options into structs. Clears the warning and makes the constructor
-      readable.
+- [x] **Deduplicated resize/redraw/repaint** into `WindowPane` methods:
+      - `WindowPane::resize(device, size) -> bool` — the four `resize_*` methods
+        are now one-line delegates (view additionally rebuilds the depth buffer
+        on `true`).
+      - `WindowPane::take_egui_input()` — the shared viewport-sync + raw-input
+        head of every egui render path.
+      - `WindowPane::present_egui_frame(device, queue, jobs, descriptor, label)`
+        — the identical GPU tail (acquire texture → upload textures → render
+        pass → free → present, returning `RenderStatus`) that `render_control`,
+        `render_roi_control`, and `render_graph` each duplicated (~55 lines ×3).
+      Net `mod.rs` −114 lines.
+- [x] **Bundled `ViewerState::new`'s 17 arguments** into `ViewerWindows` (the
+      four windows) and `InitialScene` (the eight `initial_*` load options),
+      taking the constructor to 7 params. The clippy `too_many_arguments`
+      warning on `new` is cleared.
 
-*Risk:* low. The hard part (field bundling) is already merged; this is
-mechanical follow-through with an obvious test signal.
-
-*Why second:* small, finishes work already in flight, and shrinks `mod.rs`
-before the big split (Item A) so there's less to relocate.
+All ~210 tests pass, fmt clean. (Remaining lib clippy warnings are pre-existing
+on this branch — `desired_panel_size`/`pick.rs` arg counts, two `io.rs` lints,
+and a `label_dataset` expect from the lookup-table commit — none introduced
+here.)
 
 ### C. Deepen `OverlayState` — separate the four lifetimes
 
@@ -135,10 +140,10 @@ remaining items — good "small commit" filler between the larger ones.
 
 ## Suggested sequencing
 
-1. **B** — finish `WindowPane` (dedupe resize/redraw + bundle constructor args).
-   Quick, completes in-flight work, shrinks `mod.rs`.
+1. ✅ **B** — finish `WindowPane` (dedupe resize/redraw + bundle constructor
+   args). Done on `refactorWindowPaneB`.
 2. **A** — split `viewer/mod.rs` into topical submodules. The big structural
-   payoff; easier once B is done.
+   payoff; easier now that B is done.
 3. **C** — deepen `OverlayState` (start with the minimal grouping / rename pass).
 4. **D** — tidy the ROI type cluster as small-commit filler.
 
