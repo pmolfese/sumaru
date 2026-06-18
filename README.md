@@ -1,8 +1,57 @@
-# sumaru
+<h1 align="center">sumaru</h1>
 
-`sumaru` is a ground-up Rust rebuild of AFNI's SUMA surface tooling.
-The first milestone is a small, testable command-line core that can read the
-neuroimaging file types SUMA workflows depend on.
+<p align="center"><strong>SUMA, in Rust.</strong></p>
+
+<p align="center">
+A ground-up Rust rebuild of AFNI's SUMA surface tooling — a fast, native
+surface and volume viewer for neuroimaging, built on <code>winit</code>,
+<code>wgpu</code>, and <code>egui</code>, with a clean, testable library core
+underneath.
+</p>
+
+<p align="center">
+  <img src="docs/images/hero-surface-overlay.png" alt="sumaru viewing an inflated cortical surface with a thresholded statistical overlay" width="820">
+</p>
+
+`sumaru` reads the file formats SUMA workflows depend on — GIFTI surfaces,
+`.niml.dset`/`.gii.dset` overlays, `.spec` scenes, `.niml.roi` regions, and NIfTI
+volumes — renders them on the GPU, and talks to a running AFNI/SUMA session over
+NIML. No SUMA install, no X11, no MATLAB: one Rust binary.
+
+### Why sumaru
+
+- **Native and fast.** GPU rendering through `wgpu`; surfaces, overlays, ROIs,
+  and volume slices share one render pass.
+- **AFNI-compatible.** Speaks the same NIML talk protocol as SUMA/PySuma —
+  connect to a live AFNI session and exchange crosshairs, picks, and overlays.
+- **Surfaces *and* volumes.** Inflated/pial/sphere surfaces, paired-hemisphere
+  layouts, drawn ROIs, and orthogonal NIfTI slice planes in the same 3D scene.
+- **A real library, not just a GUI.** Most behavior lives in the library crate,
+  so batch tools, tests, and future renderers share one data model.
+
+### A look at the interface
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/volume-slices.png" alt="Orthogonal volume slice planes" width="100%"></td>
+    <td width="50%"><img src="docs/images/paired-hemispheres.png" alt="Paired-hemisphere open layout" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Volume mode — draggable axial / coronal / sagittal slice planes</em></td>
+    <td align="center"><em>Paired-hemisphere "acorn" layout from a both-hemisphere spec</em></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/roi-drawing.png" alt="ROI drawing on a surface" width="100%"></td>
+    <td width="50%"><img src="docs/images/controller-panel.png" alt="Surface and overlay controller panel" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Drawn ROIs with the ROI controller</em></td>
+    <td align="center"><em>Surface / overlay controller</em></td>
+  </tr>
+</table>
+
+> Screenshots live in [`docs/images/`](docs/images/) — see its README for the
+> exact filenames to drop in.
 
 ## Current Scope
 
