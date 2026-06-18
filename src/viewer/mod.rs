@@ -790,17 +790,82 @@ struct OverlaySourceInfo {
     display_name: Option<String>,
 }
 
-/// The canonical overlay data and the per-node scalars derived from it. These
-/// travel together: the node values are recomputed whenever the dataset or the
-/// selected columns change.
+/// The canonical overlay data and the per-node scalars derived from it. Either
+/// no dataset backs the overlay (unloaded, or AFNI-baked colors that carry no
+/// queryable table) or a dataset is fully `Loaded` with its selected columns
+/// and the per-node scalars derived from them. Folding the three values into one
+/// `Loaded` variant makes the "they travel together" invariant — node values
+/// are recomputed whenever the dataset or selected columns change — impossible
+/// to violate, replacing three hand-synced `Option`s.
+//
+// The `Loaded` variant is much larger than `None`, but this lives in a single
+// owned `ViewerOverlayState.data` field whose footprint matches the prior
+// `Option<Dataset>` + `Option<OverlayDataset>` struct — boxing would only add
+// indirection on the hottest overlay data for no real size win.
 #[derive(Default)]
-struct DatasetOverlayState {
-    /// Parsed multi-column dataset backing the overlay.
-    canonical_dataset: Option<Dataset>,
-    /// Which dataset columns feed intensity / threshold / brightness.
-    columns: OverlayColumnSelections,
-    /// Per-node scalar values resolved from the selected columns.
-    node_values: Option<OverlayDataset>,
+#[allow(clippy::large_enum_variant)]
+enum DatasetOverlayState {
+    /// No dataset-backed overlay.
+    #[default]
+    None,
+    /// A canonical dataset overlay and everything derived from it.
+    Loaded {
+        /// Parsed multi-column dataset backing the overlay.
+        canonical_dataset: Dataset,
+        /// Which dataset columns feed intensity / threshold / brightness.
+        columns: OverlayColumnSelections,
+        /// Per-node scalar values resolved from the selected columns.
+        node_values: OverlayDataset,
+    },
+}
+
+impl DatasetOverlayState {
+    /// The canonical dataset, when a dataset overlay is loaded.
+    fn dataset(&self) -> Option<&Dataset> {
+        match self {
+            Self::Loaded {
+                canonical_dataset, ..
+            } => Some(canonical_dataset),
+            Self::None => None,
+        }
+    }
+
+    /// The per-node derived scalar values, when a dataset overlay is loaded.
+    fn node_values(&self) -> Option<&OverlayDataset> {
+        match self {
+            Self::Loaded { node_values, .. } => Some(node_values),
+            Self::None => None,
+        }
+    }
+
+    /// The selected intensity/threshold/brightness columns. Returns the default
+    /// (all-zero) selection when no dataset is loaded, matching the previous
+    /// always-present field.
+    fn columns(&self) -> OverlayColumnSelections {
+        match self {
+            Self::Loaded { columns, .. } => *columns,
+            Self::None => OverlayColumnSelections::default(),
+        }
+    }
+
+    /// True once a dataset overlay is loaded.
+    fn is_loaded(&self) -> bool {
+        matches!(self, Self::Loaded { .. })
+    }
+
+    /// Replace the selected columns. No-op when no dataset is loaded.
+    fn set_columns(&mut self, new_columns: OverlayColumnSelections) {
+        if let Self::Loaded { columns, .. } = self {
+            *columns = new_columns;
+        }
+    }
+
+    /// Replace the derived per-node values. No-op when no dataset is loaded.
+    fn set_node_values(&mut self, values: OverlayDataset) {
+        if let Self::Loaded { node_values, .. } = self {
+            *node_values = values;
+        }
+    }
 }
 
 /// The render-ready overlay model and its display settings. This is what the GPU
@@ -2427,7 +2492,7 @@ impl ViewerState {
             return;
         }
 
-        draw_graph_snapshot(ui, snapshot, self.overlay.data.columns);
+        draw_graph_snapshot(ui, snapshot, self.overlay.data.columns());
     }
 
     fn draw_roi_control_contents(&mut self, ui: &mut egui::Ui, actions: &mut Vec<ViewerCommand>) {
@@ -2732,10 +2797,13 @@ impl ViewerState {
         let column_options = self
             .overlay
             .data
-            .canonical_dataset
-            .as_ref()
+            .dataset()
             .map(overlay_column_options)
             .unwrap_or_default();
+        // Edit a local copy of the column selection; the egui dropdowns bind to
+        // it and we write it back through `set_columns` only if it changed. The
+        // copy avoids borrowing into the `Loaded` variant across the closures.
+        let mut columns = self.overlay.data.columns();
         let mut columns_changed = false;
         let mut changed = false;
 
@@ -2792,12 +2860,12 @@ impl ViewerState {
                                 columns_changed |= draw_intensity_column_selector(
                                     ui,
                                     &column_options,
-                                    &mut self.overlay.data.columns.intensity,
+                                    &mut columns.intensity,
                                 );
                                 columns_changed |= draw_threshold_column_selector(
                                     ui,
                                     &column_options,
-                                    &mut self.overlay.data.columns.threshold,
+                                    &mut columns.threshold,
                                     self.overlay.render.appearance.threshold.value,
                                 );
                                 columns_changed |= draw_optional_column_selector(
@@ -2805,7 +2873,7 @@ impl ViewerState {
                                     "B",
                                     "brightness_column",
                                     &column_options,
-                                    &mut self.overlay.data.columns.brightness,
+                                    &mut columns.brightness,
                                 );
                             }
                         });
@@ -2864,6 +2932,7 @@ impl ViewerState {
         });
 
         if columns_changed {
+            self.overlay.data.set_columns(columns);
             actions.push(ViewerCommand::RefreshOverlayColumns);
         }
         if changed {
@@ -2932,8 +3001,8 @@ impl ViewerState {
     }
 
     fn selected_threshold_stat_label(&self) -> Option<String> {
-        let dataset = self.overlay.data.canonical_dataset.as_ref()?;
-        let index = self.overlay.data.columns.threshold?;
+        let dataset = self.overlay.data.dataset()?;
+        let index = self.overlay.data.columns().threshold?;
         dataset.columns.get(index)?.stat.clone()
     }
 
@@ -2946,12 +3015,11 @@ impl ViewerState {
     fn selected_threshold_range(&self) -> ValueRange {
         self.overlay
             .data
-            .canonical_dataset
-            .as_ref()
+            .dataset()
             .and_then(|dataset| {
                 self.overlay
                     .data
-                    .columns
+                    .columns()
                     .threshold
                     .and_then(|index| dataset.columns.get(index))
                     .and_then(|column| column.range)
@@ -2960,13 +3028,7 @@ impl ViewerState {
                 min: range.min as f32,
                 max: range.max as f32,
             })
-            .or_else(|| {
-                self.overlay
-                    .data
-                    .node_values
-                    .as_ref()
-                    .map(|overlay| overlay.range)
-            })
+            .or_else(|| self.overlay.data.node_values().map(|overlay| overlay.range))
             .unwrap_or(DEFAULT_OVERLAY_RANGE)
     }
 
@@ -2977,8 +3039,8 @@ impl ViewerState {
     }
 
     fn selected_threshold_q_value(&self) -> Option<f64> {
-        let dataset = self.overlay.data.canonical_dataset.as_ref()?;
-        let index = self.overlay.data.columns.threshold?;
+        let dataset = self.overlay.data.dataset()?;
+        let index = self.overlay.data.columns().threshold?;
         let column = dataset.columns.get(index)?;
         column
             .fdr_curve
@@ -3926,7 +3988,7 @@ impl ViewerState {
         {
             self.refresh_active_pair_render_geometry()?;
         }
-        if self.overlay.data.canonical_dataset.is_some() {
+        if self.overlay.data.is_loaded() {
             self.refresh_overlay_columns()?;
         } else {
             self.upload_surface_buffers();
@@ -4229,7 +4291,7 @@ impl ViewerState {
         let mesh = self.mesh.as_ref()?;
         pick_surface(
             mesh,
-            self.overlay.data.node_values.as_ref(),
+            self.overlay.data.node_values(),
             &self.camera,
             scene_size,
             cursor,
@@ -4262,7 +4324,7 @@ impl ViewerState {
                 && let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == component.side)
                 && let Some((pick, distance)) = pick_surface_with_model(
                     mesh,
-                    self.overlay.data.node_values.as_ref(),
+                    self.overlay.data.node_values(),
                     &self.camera,
                     self.scene_viewport_size(),
                     cursor,
@@ -4287,15 +4349,13 @@ impl ViewerState {
             pick.overlay_value = self
                 .overlay
                 .data
-                .node_values
-                .as_ref()
+                .node_values()
                 .and_then(|overlay| overlay.values.get(pick.node_index as usize))
                 .copied();
             pick.threshold_value = self
                 .overlay
                 .data
-                .node_values
-                .as_ref()
+                .node_values()
                 .and_then(|overlay| overlay.threshold_values.as_ref())
                 .and_then(|values| values.get(pick.node_index as usize))
                 .copied();
@@ -4692,12 +4752,7 @@ impl ViewerState {
 
         self.scene_stats = Some(SceneStats {
             geometry,
-            overlay_range: self
-                .overlay
-                .data
-                .node_values
-                .as_ref()
-                .map(|overlay| overlay.range),
+            overlay_range: self.overlay.data.node_values().map(|overlay| overlay.range),
         });
     }
 
