@@ -18,7 +18,7 @@ impl ViewerState {
         let fill_pending = self
             .roi_workspace
             .active_draft()
-            .is_some_and(|draft| draft.fill_pending);
+            .is_some_and(|draft| draft.state.fill_pending);
         if fill_pending {
             self.fill_roi_draft_from_seed(&target)?;
         } else {
@@ -99,7 +99,7 @@ impl ViewerState {
         if let Some(existing) = self
             .roi_workspace
             .active_draft()
-            .and_then(|draft| draft.target.as_ref())
+            .and_then(|draft| draft.state.target.as_ref())
         {
             ensure!(
                 existing == target,
@@ -121,7 +121,7 @@ impl ViewerState {
         };
         let was_joined = draft.is_joined();
 
-        let new_segment = if let Some(previous) = draft.anchor_nodes.last().copied() {
+        let new_segment = if let Some(previous) = draft.state.anchor_nodes.last().copied() {
             Some(
                 target
                     .mesh
@@ -136,21 +136,21 @@ impl ViewerState {
             .roi_workspace
             .active_draft_mut()
             .context("no editable ROI slot is active")?;
-        if draft.target.is_none() {
-            draft.target = Some(target.target.clone());
+        if draft.state.target.is_none() {
+            draft.state.target = Some(target.target.clone());
         }
         draft.push_history();
         if was_joined {
             draft.reopen_joined_path_for_append();
         }
-        draft.target = Some(target.target.clone());
+        draft.state.target = Some(target.target.clone());
         if let Some(segment) = new_segment {
-            draft.segments.push(segment);
+            draft.state.segments.push(segment);
         }
-        draft.anchor_nodes.push(target.local_node);
-        draft.fill_nodes = None;
-        draft.fill_seed_node = None;
-        draft.fill_pending = false;
+        draft.state.anchor_nodes.push(target.local_node);
+        draft.state.fill_nodes = None;
+        draft.state.fill_seed_node = None;
+        draft.state.fill_pending = false;
         self.rebuild_roi_layer_from_state()?;
         if was_joined {
             self.log_status(format!(
@@ -177,8 +177,9 @@ impl ViewerState {
         let mesh = self
             .roi_draft_mesh()
             .context("active surface for the ROI draft is not available")?;
-        let first = draft.anchor_nodes[0];
+        let first = draft.state.anchor_nodes[0];
         let last = *draft
+            .state
             .anchor_nodes
             .last()
             .context("ROI draft has no last point")?;
@@ -191,10 +192,10 @@ impl ViewerState {
             .active_draft_mut()
             .context("no editable ROI slot is active")?;
         draft.push_history();
-        draft.segments.push(closing.nodes);
-        draft.fill_nodes = None;
-        draft.fill_seed_node = None;
-        draft.fill_pending = false;
+        draft.state.segments.push(closing.nodes);
+        draft.state.fill_nodes = None;
+        draft.state.fill_seed_node = None;
+        draft.state.fill_pending = false;
         self.rebuild_roi_layer_from_state()?;
         self.upload_surface_buffers();
         self.update_scene_stats();
@@ -220,9 +221,9 @@ impl ViewerState {
             .active_draft_mut()
             .context("no editable ROI slot is active")?;
         draft.push_history();
-        draft.fill_nodes = Some(nodes);
-        draft.fill_seed_node = Some(target.local_node);
-        draft.fill_pending = false;
+        draft.state.fill_nodes = Some(nodes);
+        draft.state.fill_seed_node = Some(target.local_node);
+        draft.state.fill_pending = false;
         self.rebuild_roi_layer_from_state()?;
         self.log_status(format!(
             "ROI fill defined from node {} on {node_count} nodes.",
@@ -234,7 +235,7 @@ impl ViewerState {
 
     /// Mesh the active draft targets its nodes against, for fill/anchor math.
     pub(super) fn roi_draft_mesh(&self) -> Option<SurfaceMesh> {
-        let target = self.roi_workspace.active_draft()?.target.as_ref()?;
+        let target = self.roi_workspace.active_draft()?.state.target.as_ref()?;
         if let Some((left, right)) = self.active_paired_components() {
             return match &target.side {
                 SurfaceSide::Left => left.mesh.clone(),
@@ -255,8 +256,8 @@ impl ViewerState {
     /// The pick representing the active draft's anchor node, if any.
     pub(super) fn roi_draft_anchor_pick(&self) -> Option<SurfacePick> {
         let draft = self.roi_workspace.active_draft()?;
-        let target = draft.target.as_ref()?;
-        let local_node = draft.anchor_nodes.last().copied()?;
+        let target = draft.state.target.as_ref()?;
+        let local_node = draft.state.anchor_nodes.last().copied()?;
         let mesh = self.mesh.as_ref()?;
         let node_index = self.display_node_for_roi_anchor(target, local_node)?;
 

@@ -130,19 +130,27 @@ Still open (deferred, higher reach):
 *Risk:* moderate — touched the load/unload path and many readers; done as a
 mechanical anchored rewrite with the test suite as the safety net.
 
-### D. Tidy the ROI render-side type cluster
+### D. Tidy the ROI render-side type cluster — ✅ DONE (branch `refactorWindowPaneB`)
 
 `RoiLayer`, `RoiWorkspace`, `RoiSlot`, `RoiDraft`, `RoiDraftTarget`,
 `RoiDraftSnapshot`, `RoiPickTarget`, `RoiAppearanceBuild`, `RoiComponentRange`
-([`viewer/mod.rs:7499`](src/viewer/mod.rs)+) sit alongside the domain `roi::Roi`.
+sat alongside the domain `roi::Roi`.
 
-- [ ] Audit `RoiDraft` / `RoiDraftTarget` / `RoiDraftSnapshot` for merging — a
-      snapshot and its target are often the same data captured at two moments.
-- [ ] Confirm each remaining type earns its keep; collapse any that are a struct
-      wrapping a single field used in one place.
+- [x] **Merged `RoiDraftSnapshot` into a nested `RoiDraftState`.** It was an exact
+      copy of `RoiDraft`'s seven editable fields; `snapshot()`/`restore()`
+      hand-copied each. Now `RoiDraft` holds `state: RoiDraftState` plus
+      `history`/`redo_history: Vec<RoiDraftState>`; `snapshot()` is
+      `self.state.clone()` and `restore()` is `self.state = snapshot`. Removes the
+      "add a field in three places or undo silently drops it" hazard — the real
+      maintainability win. ~106 field accesses moved under `.state` (anchored
+      rewrite; the 24 ROI undo/redo/fill tests are the safety net).
+- [x] **Confirmed the rest earn their keep:** `RoiAppearanceBuild` (4-field
+      builder return), `RoiComponentRange` (multi-field, 11 uses), and
+      `RoiPickTarget` (mesh + target + local node) are all genuine multi-field
+      bundles, not single-field wrappers — kept as-is.
 
-*Risk:* low, but re-read the draw/undo paths first. Most localized of the
-remaining items — good "small commit" filler between the larger ones.
+*Risk:* was low; done as a mechanical rewrite with the ROI test suite as the
+safety net. All ~216 tests pass, clippy unchanged, fmt clean.
 
 ---
 
@@ -167,7 +175,8 @@ remaining items — good "small commit" filler between the larger ones.
    Done on `refactorWindowPaneB`; struct relocation still open.
 3. ✅ **C** — deepen `OverlayState`: rename + minimal grouping done on
    `refactorWindowPaneB`. Strong-enum / move-`OverlayAppearance` steps deferred.
-4. **D** — tidy the ROI type cluster as small-commit filler.
+4. ✅ **D** — tidy the ROI type cluster (merged `RoiDraftSnapshot` into
+   `RoiDraftState`). Done on `refactorWindowPaneB`.
 
 Run `cargo test && cargo clippy --lib && cargo fmt --all -- --check` after each
 step; the suite (~210 tests) is the safety net for "no functionality cut."

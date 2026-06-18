@@ -1442,7 +1442,7 @@ impl ViewerState {
                 let roi_draw_active = self
                     .roi_workspace
                     .active_draft()
-                    .is_some_and(|draft| draft.draw_enabled || draft.fill_pending);
+                    .is_some_and(|draft| draft.state.draw_enabled || draft.state.fill_pending);
                 if roi_draw_active {
                     if let Err(error) = self.handle_roi_draw_click_at_cursor() {
                         self.set_error(error);
@@ -2543,7 +2543,7 @@ impl ViewerState {
                                         .add_enabled(
                                             self.mesh.is_some(),
                                             egui::Button::new("Draw")
-                                                .selected(is_active && slot.draft.draw_enabled),
+                                                .selected(is_active && slot.draft.state.draw_enabled),
                                         )
                                         .on_hover_text(
                                             "Right-click the surface to add ROI anchor points",
@@ -2552,7 +2552,7 @@ impl ViewerState {
                                     if draw_clicked {
                                         actions.push(ViewerCommand::ToggleRoiDraw(
                                             index,
-                                            !slot.draft.draw_enabled,
+                                            !slot.draft.state.draw_enabled,
                                         ));
                                     }
                                     if ui
@@ -3290,8 +3290,8 @@ impl ViewerState {
                     if self.mesh.is_some() && self.roi_workspace.set_active(index) {
                         self.controller.roi.active_slot = index;
                         if let Some(draft) = self.roi_workspace.active_draft_mut() {
-                            draft.draw_enabled = active;
-                            draft.fill_pending = false;
+                            draft.state.draw_enabled = active;
+                            draft.state.fill_pending = false;
                         }
                         if active {
                             self.log_status("ROI draw on. Right-click the surface to add points.");
@@ -3313,8 +3313,8 @@ impl ViewerState {
                     if let Some(draft) = self.roi_workspace.active_draft_mut()
                         && draft.can_fill()
                     {
-                        draft.fill_pending = true;
-                        draft.draw_enabled = true;
+                        draft.state.fill_pending = true;
+                        draft.state.draw_enabled = true;
                         self.log_status(
                             "ROI fill armed. Right-click inside or outside the closed path.",
                         );
@@ -5644,19 +5644,41 @@ struct RoiSlot {
     visible: bool,
 }
 
+/// The undoable editing state of an ROI draft: the target surface, the drawn
+/// anchor nodes and stroke segments, and the fill state. Factored out of
+/// `RoiDraft` so it is also the unit stored on the undo/redo stacks — capturing
+/// or restoring a draft is a single clone of this struct rather than a
+/// hand-maintained field-by-field copy. (Was the separate `RoiDraftSnapshot`.)
+#[derive(Debug, Clone, Default)]
+struct RoiDraftState {
+    /// Surface/domain/side this draft is bound to, once a first point is placed.
+    target: Option<RoiDraftTarget>,
+    /// Ordered anchor (click) nodes of the path.
+    anchor_nodes: Vec<u32>,
+    /// Stroke segments connecting consecutive anchors (last may close the loop).
+    segments: Vec<Vec<u32>>,
+    /// Filled-interior nodes, once a closed path is filled.
+    fill_nodes: Option<Vec<u32>>,
+    /// Seed node a fill was started from.
+    fill_seed_node: Option<u32>,
+    /// A fill is requested and awaiting the next click.
+    fill_pending: bool,
+    /// Free-draw mode is active (each click extends the path).
+    draw_enabled: bool,
+}
+
+/// An in-progress drawn ROI: its label/color identity, the editable `state`,
+/// and the undo/redo history of prior states.
 #[derive(Debug, Clone)]
 struct RoiDraft {
     label: String,
     integer_label: i32,
-    target: Option<RoiDraftTarget>,
-    anchor_nodes: Vec<u32>,
-    segments: Vec<Vec<u32>>,
-    fill_nodes: Option<Vec<u32>>,
-    fill_seed_node: Option<u32>,
-    fill_pending: bool,
-    draw_enabled: bool,
-    history: Vec<RoiDraftSnapshot>,
-    redo_history: Vec<RoiDraftSnapshot>,
+    /// The current editable state (target, path, fill).
+    state: RoiDraftState,
+    /// Past states for undo, most recent last.
+    history: Vec<RoiDraftState>,
+    /// States popped by undo, available to redo.
+    redo_history: Vec<RoiDraftState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5664,17 +5686,6 @@ struct RoiDraftTarget {
     surface_id: SurfaceId,
     domain_id: SurfaceDomainId,
     side: SurfaceSide,
-}
-
-#[derive(Debug, Clone)]
-struct RoiDraftSnapshot {
-    target: Option<RoiDraftTarget>,
-    anchor_nodes: Vec<u32>,
-    segments: Vec<Vec<u32>>,
-    fill_nodes: Option<Vec<u32>>,
-    fill_seed_node: Option<u32>,
-    fill_pending: bool,
-    draw_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5785,8 +5796,8 @@ impl RoiWorkspace {
         };
         slot.finalized_roi = Some(roi);
         slot.editing = false;
-        slot.draft.draw_enabled = false;
-        slot.draft.fill_pending = false;
+        slot.draft.state.draw_enabled = false;
+        slot.draft.state.fill_pending = false;
         slot.visible = true;
         let next_index = self.push_blank_slot();
         self.active_index = next_index;
@@ -5915,32 +5926,28 @@ impl RoiDraft {
         Self {
             label: label.into(),
             integer_label,
-            target: None,
-            anchor_nodes: Vec::new(),
-            segments: Vec::new(),
-            fill_nodes: None,
-            fill_seed_node: None,
-            fill_pending: false,
-            draw_enabled: false,
+            state: RoiDraftState::default(),
             history: Vec::new(),
             redo_history: Vec::new(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.anchor_nodes.is_empty() && self.segments.is_empty() && self.fill_nodes.is_none()
+        self.state.anchor_nodes.is_empty()
+            && self.state.segments.is_empty()
+            && self.state.fill_nodes.is_none()
     }
 
     fn is_joined(&self) -> bool {
-        self.segments.last().is_some_and(|segment| {
+        self.state.segments.last().is_some_and(|segment| {
             segment.len() >= 2
-                && self.anchor_nodes.len() >= 3
-                && segment.last().copied() == self.anchor_nodes.first().copied()
+                && self.state.anchor_nodes.len() >= 3
+                && segment.last().copied() == self.state.anchor_nodes.first().copied()
         })
     }
 
     fn can_join(&self) -> bool {
-        self.anchor_nodes.len() >= 3 && !self.is_joined()
+        self.state.anchor_nodes.len() >= 3 && !self.is_joined()
     }
 
     fn can_fill(&self) -> bool {
@@ -5957,16 +5964,16 @@ impl RoiDraft {
 
     fn reopen_joined_path_for_append(&mut self) {
         if self.is_joined() {
-            self.segments.pop();
+            self.state.segments.pop();
         }
-        self.fill_nodes = None;
-        self.fill_seed_node = None;
-        self.fill_pending = false;
+        self.state.fill_nodes = None;
+        self.state.fill_seed_node = None;
+        self.state.fill_pending = false;
     }
 
     fn from_roi(roi: &Roi) -> Option<Self> {
         let mut draft = Self::new(roi.label.clone(), roi.integer_label);
-        draft.target = match (&roi.parent_surface_id, &roi.parent_domain_id) {
+        draft.state.target = match (&roi.parent_surface_id, &roi.parent_domain_id) {
             (Some(surface_id), Some(domain_id)) => Some(RoiDraftTarget {
                 surface_id: surface_id.clone(),
                 domain_id: domain_id.clone(),
@@ -5978,7 +5985,7 @@ impl RoiDraft {
         for datum in &roi.data {
             if datum.action == RoiBrushAction::FillArea {
                 if !datum.node_path.is_empty() {
-                    draft.fill_nodes = Some(datum.node_path.clone());
+                    draft.state.fill_nodes = Some(datum.node_path.clone());
                 }
                 continue;
             }
@@ -5988,24 +5995,24 @@ impl RoiDraft {
                     if datum.node_path.is_empty() {
                         continue;
                     }
-                    if draft.anchor_nodes.is_empty()
+                    if draft.state.anchor_nodes.is_empty()
                         && let Some(first) = datum.node_path.first().copied()
                     {
-                        draft.anchor_nodes.push(first);
+                        draft.state.anchor_nodes.push(first);
                     }
                     if datum.action != RoiBrushAction::JoinEnds
                         && let Some(last) = datum.node_path.last().copied()
-                        && draft.anchor_nodes.last().copied() != Some(last)
+                        && draft.state.anchor_nodes.last().copied() != Some(last)
                     {
-                        draft.anchor_nodes.push(last);
+                        draft.state.anchor_nodes.push(last);
                     }
-                    draft.segments.push(datum.node_path.clone());
+                    draft.state.segments.push(datum.node_path.clone());
                 }
                 RoiElementKind::NodeGroup if !datum.node_path.is_empty() => {
-                    if draft.segments.is_empty() && draft.anchor_nodes.is_empty() {
-                        draft.anchor_nodes = datum.node_path.clone();
+                    if draft.state.segments.is_empty() && draft.state.anchor_nodes.is_empty() {
+                        draft.state.anchor_nodes = datum.node_path.clone();
                     } else {
-                        draft.fill_nodes = Some(datum.node_path.clone());
+                        draft.state.fill_nodes = Some(datum.node_path.clone());
                     }
                 }
                 _ => {}
@@ -6015,26 +6022,14 @@ impl RoiDraft {
         (!draft.is_empty()).then_some(draft)
     }
 
-    fn snapshot(&self) -> RoiDraftSnapshot {
-        RoiDraftSnapshot {
-            target: self.target.clone(),
-            anchor_nodes: self.anchor_nodes.clone(),
-            segments: self.segments.clone(),
-            fill_nodes: self.fill_nodes.clone(),
-            fill_seed_node: self.fill_seed_node,
-            fill_pending: self.fill_pending,
-            draw_enabled: self.draw_enabled,
-        }
+    /// Capture the current editable state for the undo/redo stacks.
+    fn snapshot(&self) -> RoiDraftState {
+        self.state.clone()
     }
 
-    fn restore(&mut self, snapshot: RoiDraftSnapshot) {
-        self.target = snapshot.target;
-        self.anchor_nodes = snapshot.anchor_nodes;
-        self.segments = snapshot.segments;
-        self.fill_nodes = snapshot.fill_nodes;
-        self.fill_seed_node = snapshot.fill_seed_node;
-        self.fill_pending = snapshot.fill_pending;
-        self.draw_enabled = snapshot.draw_enabled;
+    /// Replace the editable state with a previously captured snapshot.
+    fn restore(&mut self, snapshot: RoiDraftState) {
+        self.state = snapshot;
     }
 
     fn push_history(&mut self) {
@@ -6062,7 +6057,7 @@ impl RoiDraft {
 
     fn boundary_nodes(&self) -> Vec<u32> {
         let mut nodes = Vec::new();
-        for segment in &self.segments {
+        for segment in &self.state.segments {
             if segment.is_empty() {
                 continue;
             }
@@ -6077,22 +6072,23 @@ impl RoiDraft {
             return Ok(None);
         }
 
-        let Some(target) = self.target.clone() else {
+        let Some(target) = self.state.target.clone() else {
             return Ok(None);
         };
         let mut data = Vec::new();
-        if self.segments.is_empty() && !self.anchor_nodes.is_empty() {
-            data.push(RoiDatum::node_group(self.anchor_nodes.clone())?);
+        if self.state.segments.is_empty() && !self.state.anchor_nodes.is_empty() {
+            data.push(RoiDatum::node_group(self.state.anchor_nodes.clone())?);
         }
-        for (index, segment) in self.segments.iter().enumerate() {
-            let action = if index == self.segments.len().saturating_sub(1) && self.is_joined() {
+        for (index, segment) in self.state.segments.iter().enumerate() {
+            let action = if index == self.state.segments.len().saturating_sub(1) && self.is_joined()
+            {
                 RoiBrushAction::JoinEnds
             } else {
                 RoiBrushAction::AppendStroke
             };
             data.push(RoiDatum::node_segment(segment.clone(), action)?);
         }
-        if let Some(nodes) = &self.fill_nodes {
+        if let Some(nodes) = &self.state.fill_nodes {
             data.push(RoiDatum::new(
                 RoiElementKind::NodeGroup,
                 RoiBrushAction::FillArea,
@@ -6101,7 +6097,7 @@ impl RoiDraft {
             )?);
         }
 
-        let drawing_type = if self.fill_nodes.is_some() {
+        let drawing_type = if self.state.fill_nodes.is_some() {
             RoiDrawingType::FilledArea
         } else if self.is_joined() {
             RoiDrawingType::ClosedPath
@@ -7786,22 +7782,22 @@ fn roi_slot_state_text(slot: &RoiSlot) -> String {
 
 fn roi_draft_status_text(draft: &RoiDraft) -> String {
     if draft.is_empty() {
-        if draft.draw_enabled {
+        if draft.state.draw_enabled {
             return "draw armed".to_string();
         }
         return "none".to_string();
     }
 
     let mut parts = vec![
-        format!("{} anchors", draft.anchor_nodes.len()),
-        format!("{} segments", draft.segments.len()),
+        format!("{} anchors", draft.state.anchor_nodes.len()),
+        format!("{} segments", draft.state.segments.len()),
     ];
     if draft.is_joined() {
         parts.push("joined".to_string());
     }
-    if let Some(nodes) = &draft.fill_nodes {
+    if let Some(nodes) = &draft.state.fill_nodes {
         parts.push(format!("{} filled nodes", nodes.len()));
-    } else if draft.fill_pending {
+    } else if draft.state.fill_pending {
         parts.push("fill armed".to_string());
     }
 
@@ -9146,15 +9142,15 @@ mod tests {
         let mut workspace = RoiWorkspace::default();
         {
             let draft = workspace.active_draft_mut().unwrap();
-            draft.target = Some(target);
-            draft.anchor_nodes = vec![0, 1, 2];
+            draft.state.target = Some(target);
+            draft.state.anchor_nodes = vec![0, 1, 2];
         }
 
         let rois = workspace.saveable_rois().unwrap();
 
         assert_eq!(rois.len(), 1);
         assert!(workspace.slots[0].editing);
-        assert_eq!(workspace.slots[0].draft.anchor_nodes, vec![0, 1, 2]);
+        assert_eq!(workspace.slots[0].draft.state.anchor_nodes, vec![0, 1, 2]);
 
         assert!(workspace.finalize_slot(0).unwrap());
         assert_eq!(workspace.slots.len(), 2);
@@ -9196,7 +9192,7 @@ mod tests {
         assert!(workspace.edit_slot(0).unwrap());
         assert_eq!(workspace.active_index, 0);
         assert!(workspace.slots[0].editing);
-        assert_eq!(workspace.slots[0].draft.anchor_nodes, vec![0, 2]);
+        assert_eq!(workspace.slots[0].draft.state.anchor_nodes, vec![0, 2]);
         assert_eq!(workspace.saveable_rois().unwrap().len(), 1);
     }
 
@@ -9213,35 +9209,41 @@ mod tests {
             side: SurfaceSide::Left,
         };
         let mut draft = super::RoiDraft::new("roi_1", 1);
-        draft.anchor_nodes = vec![0, 1, 2];
-        draft.segments = vec![vec![0, 1], vec![1, 2], vec![2, 0]];
-        draft.fill_nodes = Some(vec![0, 1, 2, 3]);
-        draft.fill_seed_node = Some(3);
-        draft.fill_pending = true;
+        draft.state.anchor_nodes = vec![0, 1, 2];
+        draft.state.segments = vec![vec![0, 1], vec![1, 2], vec![2, 0]];
+        draft.state.fill_nodes = Some(vec![0, 1, 2, 3]);
+        draft.state.fill_seed_node = Some(3);
+        draft.state.fill_pending = true;
 
         assert!(draft.is_joined());
-        if draft.target.is_none() {
-            draft.target = Some(target.clone());
+        if draft.state.target.is_none() {
+            draft.state.target = Some(target.clone());
         }
         draft.push_history();
         draft.reopen_joined_path_for_append();
-        draft.segments.push(vec![2, 1]);
-        draft.anchor_nodes.push(1);
+        draft.state.segments.push(vec![2, 1]);
+        draft.state.anchor_nodes.push(1);
 
         assert!(!draft.is_joined());
-        assert_eq!(draft.segments, vec![vec![0, 1], vec![1, 2], vec![2, 1]]);
-        assert_eq!(draft.anchor_nodes, vec![0, 1, 2, 1]);
-        assert_eq!(draft.fill_nodes, None);
-        assert_eq!(draft.fill_seed_node, None);
-        assert!(!draft.fill_pending);
+        assert_eq!(
+            draft.state.segments,
+            vec![vec![0, 1], vec![1, 2], vec![2, 1]]
+        );
+        assert_eq!(draft.state.anchor_nodes, vec![0, 1, 2, 1]);
+        assert_eq!(draft.state.fill_nodes, None);
+        assert_eq!(draft.state.fill_seed_node, None);
+        assert!(!draft.state.fill_pending);
 
         assert!(draft.undo());
         assert!(draft.is_joined());
-        assert_eq!(draft.target, Some(target));
-        assert_eq!(draft.segments, vec![vec![0, 1], vec![1, 2], vec![2, 0]]);
-        assert_eq!(draft.anchor_nodes, vec![0, 1, 2]);
-        assert_eq!(draft.fill_nodes, Some(vec![0, 1, 2, 3]));
-        assert_eq!(draft.fill_seed_node, Some(3));
+        assert_eq!(draft.state.target, Some(target));
+        assert_eq!(
+            draft.state.segments,
+            vec![vec![0, 1], vec![1, 2], vec![2, 0]]
+        );
+        assert_eq!(draft.state.anchor_nodes, vec![0, 1, 2]);
+        assert_eq!(draft.state.fill_nodes, Some(vec![0, 1, 2, 3]));
+        assert_eq!(draft.state.fill_seed_node, Some(3));
     }
 
     #[test]
@@ -9257,8 +9259,8 @@ mod tests {
             side: SurfaceSide::Left,
         };
         let mut draft = super::RoiDraft::new("roi_2", 2);
-        draft.target = Some(target);
-        draft.anchor_nodes = vec![0, 1, 2];
+        draft.state.target = Some(target);
+        draft.state.anchor_nodes = vec![0, 1, 2];
 
         let roi = draft.to_roi().unwrap().unwrap();
 
