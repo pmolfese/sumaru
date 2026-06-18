@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use gifti_rs::{ArrayData, DataArray, GiftiImage, Meta};
 
-use crate::color::Rgba;
+use crate::color::{LabelEntry, LabelTable, LabelTableSource, Rgba};
 use crate::dataset::{
     AfniFdrCurve, ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds,
 };
@@ -206,6 +206,21 @@ pub fn read_niml_dset(path: impl AsRef<Path>) -> Result<NimlDatasetPayload> {
 
 pub fn read_niml_dataset(path: impl AsRef<Path>, domain: &SurfaceDomain) -> Result<Dataset> {
     read_niml_dset(path)?.to_dataset(domain)
+}
+
+pub fn read_niml_dataset_with_label_table(
+    path: impl AsRef<Path>,
+    domain: &SurfaceDomain,
+) -> Result<(Dataset, Option<LabelTable>)> {
+    let elements = read_niml(path)?;
+    ensure!(
+        elements.len() == 1,
+        "expected exactly one top-level NIML dataset element"
+    );
+    let dataset = NimlDatasetPayload::from_element(&elements[0])?.to_dataset(domain)?;
+    let label_table = label_table_from_niml_dataset_element(&elements[0])?;
+
+    Ok((dataset, label_table))
 }
 
 pub fn read_gifti_dataset(path: impl AsRef<Path>, domain: &SurfaceDomain) -> Result<Dataset> {
@@ -1502,6 +1517,115 @@ impl BinaryByteOrder {
     }
 }
 
+fn label_table_from_niml_dataset_element(element: &NimlElement) -> Result<Option<LabelTable>> {
+    let NimlData::Group(children) = &element.data else {
+        return Ok(None);
+    };
+
+    children
+        .iter()
+        .find(|child| child.name == "AFNI_labeltable")
+        .map(afni_label_table_from_element)
+        .transpose()
+}
+
+fn afni_label_table_from_element(element: &NimlElement) -> Result<LabelTable> {
+    let NimlData::Group(children) = &element.data else {
+        bail!("AFNI_labeltable element is not a NIML group");
+    };
+    let table = children
+        .iter()
+        .find_map(|child| {
+            if child.name == "SPARSE_DATA" {
+                if let NimlData::Mixed(table) = &child.data {
+                    return Some(table);
+                }
+            }
+            None
+        })
+        .context("AFNI_labeltable has no mixed SPARSE_DATA payload")?;
+    ensure!(
+        table.column_count() >= 6,
+        "AFNI_labeltable SPARSE_DATA must have at least 6 columns"
+    );
+
+    let entries = (0..table.rows)
+        .map(|row| {
+            let color = Rgba::clamped(
+                mixed_float(table, row, 0)? as f32,
+                mixed_float(table, row, 1)? as f32,
+                mixed_float(table, row, 2)? as f32,
+                mixed_float(table, row, 3)? as f32,
+            );
+            let key = i32::try_from(mixed_integer(table, row, 4)?)
+                .context("AFNI_labeltable key does not fit in i32")?;
+            let label = mixed_text(table, row, 5)?.to_string();
+            LabelEntry::new(key, label, color)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let name = element
+        .attrs
+        .get("Name")
+        .or_else(|| element.attrs.get("label"))
+        .or_else(|| element.attrs.get("filename"))
+        .cloned();
+    let source = if name
+        .as_deref()
+        .is_some_and(|name| name.to_ascii_lowercase().contains("freesurfer"))
+    {
+        LabelTableSource::FreeSurfer
+    } else {
+        LabelTableSource::Unknown
+    };
+
+    LabelTable::with_name(name, source, deduplicate_afni_label_entries(entries))
+}
+
+fn deduplicate_afni_label_entries(entries: Vec<LabelEntry>) -> Vec<LabelEntry> {
+    let mut by_key = BTreeMap::new();
+    for entry in entries {
+        by_key.insert(entry.key, entry);
+    }
+
+    by_key.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn mixed_float(table: &NimlMixedTable, row: usize, column: usize) -> Result<f64> {
+    match table.get(row, column) {
+        Some(NimlValue::Float(value)) => Ok(*value),
+        Some(NimlValue::Integer(value)) => Ok(*value as f64),
+        Some(NimlValue::Text(value)) => value
+            .parse::<f64>()
+            .with_context(|| format!("AFNI_labeltable value {value:?} is not numeric")),
+        None => bail!("AFNI_labeltable row {row} column {column} is missing"),
+    }
+}
+
+fn mixed_integer(table: &NimlMixedTable, row: usize, column: usize) -> Result<i64> {
+    match table.get(row, column) {
+        Some(NimlValue::Integer(value)) => Ok(*value),
+        Some(NimlValue::Float(value)) if value.is_finite() && value.fract() == 0.0 => {
+            Ok(*value as i64)
+        }
+        Some(NimlValue::Float(value)) => {
+            bail!("AFNI_labeltable value {value} is not an integer")
+        }
+        Some(NimlValue::Text(value)) => value
+            .parse::<i64>()
+            .with_context(|| format!("AFNI_labeltable value {value:?} is not an integer")),
+        None => bail!("AFNI_labeltable row {row} column {column} is missing"),
+    }
+}
+
+fn mixed_text(table: &NimlMixedTable, row: usize, column: usize) -> Result<&str> {
+    match table.get(row, column) {
+        Some(NimlValue::Text(value)) => Ok(value),
+        Some(_) => bail!("AFNI_labeltable row {row} column {column} is not text"),
+        None => bail!("AFNI_labeltable row {row} column {column} is missing"),
+    }
+}
+
 impl NimlValueType {
     fn byte_width(&self) -> Result<usize> {
         match self {
@@ -2147,10 +2271,13 @@ fn column_role_from_niml_metadata(
     let stat_text = stat.map(compact_lower).unwrap_or_default();
     let label_text = compact_lower(label);
 
-    if type_text.contains("nodeindex") || label_text.contains("nodeindex") {
-        ColumnRole::NodeIndex
-    } else if type_text.contains("label") || type_text.contains("roi") {
+    if type_text.contains("nodeindexlabel")
+        || type_text.contains("label")
+        || type_text.contains("roi")
+    {
         ColumnRole::Label
+    } else if type_text.contains("nodeindex") || label_text.contains("nodeindex") {
+        ColumnRole::NodeIndex
     } else if type_text.contains("mask") {
         ColumnRole::Mask
     } else if type_text.contains("time") {
@@ -2495,6 +2622,73 @@ mod tests {
             ColumnData::Int32(values) => assert_eq!(values, &vec![1, 2]),
             values => panic!("unexpected column data: {values:?}"),
         }
+    }
+
+    #[test]
+    fn embedded_afni_labeltable_maps_integer_keys_to_names() {
+        let domain = SurfaceDomain::from_triangles(2, vec![[0, 1, 0]]).unwrap();
+        let elements = parse_niml_str(
+            r#"
+<AFNI_dataset ni_form="ni_group" dset_type="Node_Label" >
+<SPARSE_DATA ni_type="int" ni_dimen="2" data_type="Node_Label_data" >
+42
+0
+</SPARSE_DATA>
+<AFNI_labeltable ni_form="ni_group" dset_type="LabelTableObject" Name="FreeSurferColorLUT-test" >
+<SPARSE_DATA ni_type="4*float,int,String" ni_dimen="2" data_type="LabelTableObject_data" >
+0.1 0.2 0.3 1 42 "ctx-lh-test-region"
+0 0 0 1 0 "Unknown"
+</SPARSE_DATA>
+</AFNI_labeltable>
+<AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_LABS" >node label;</AFNI_atr>
+<AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_TYPE" >Node_Index_Label;</AFNI_atr>
+</AFNI_dataset>
+"#,
+        )
+        .unwrap();
+        let payload = NimlDatasetPayload::from_element(&elements[0]).unwrap();
+        let dataset = payload.to_dataset(&domain).unwrap();
+        let label_table = super::label_table_from_niml_dataset_element(&elements[0])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(dataset.kind, DatasetKind::SurfaceLabel);
+        assert_eq!(dataset.columns[0].role, ColumnRole::Label);
+        assert_eq!(
+            label_table.label(42).map(|entry| entry.label.as_str()),
+            Some("ctx-lh-test-region")
+        );
+        assert_eq!(
+            label_table.source,
+            crate::color::LabelTableSource::FreeSurfer
+        );
+    }
+
+    #[test]
+    fn embedded_afni_labeltable_tolerates_duplicate_keys() {
+        let elements = parse_niml_str(
+            r#"
+<AFNI_dataset ni_form="ni_group" dset_type="Node_Label" >
+<AFNI_labeltable ni_form="ni_group" dset_type="LabelTableObject" Name="FreeSurferColorLUT-test" >
+<SPARSE_DATA ni_type="4*float,int,String" ni_dimen="2" data_type="LabelTableObject_data" >
+0.1 0.2 0.3 1 42 "old-name"
+0.4 0.5 0.6 1 42 "new-name"
+</SPARSE_DATA>
+</AFNI_labeltable>
+</AFNI_dataset>
+"#,
+        )
+        .unwrap();
+
+        let label_table = super::label_table_from_niml_dataset_element(&elements[0])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(label_table.labels.len(), 1);
+        assert_eq!(
+            label_table.label(42).map(|entry| entry.label.as_str()),
+            Some("new-name")
+        );
     }
 
     #[test]

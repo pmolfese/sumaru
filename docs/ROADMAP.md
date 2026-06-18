@@ -124,6 +124,13 @@ the larger GPU/shader optimization pass.
   GIFTI/FreeSurfer label tables.
 - [ ] Add richer node/triangle inspection panels backed by the current pick and
   crosshair state.
+  - [ ] Add FreeSurfer region-name lookup to the Pick tab: when a spec surface
+    carries a `LabelDset` entry, load it at surface-load time as a label-role
+    `Dataset`, then on each node pick look up the node index in the label
+    column, map the key through the label table's name list, and display the
+    result as a "Region" row in the Pick tab. The data model (`LabelTable`,
+    `LabelEntry`, `SpecSurface::label_dataset`) is already in place; this
+    connects the load path and the pick query.
 - [ ] Promote picked-node graphing into a daily-driver workflow: persistent
   graph windows opened from `G`, clear column/timepoint labeling, multiple
   picked-node traces, graph export, and live refresh when the active overlay or
@@ -225,12 +232,28 @@ semantics need to be represented correctly before serious rendering begins.
 - [ ] Add Sumaru-to-Sumaru NIML/session communication so multiple viewer
   windows can share crosshair position, selected node, active surface, active
   overlays, ROI edits, graph windows, and controller state.
+  - [ ] Define Sumaru-to-Sumaru messages as a Sumaru-owned NIML-style protocol,
+    not AFNI-specific commands: small named messages with `origin_id`,
+    `group_id`, `instance_id`, timestamps, and enough surface/domain context to
+    route picks between compatible scenes.
   - [ ] Define the first Sumaru-to-Sumaru message subset: crosshair position,
     picked node/face, active surface/state, active overlay identity, threshold
     state, and graph-open requests.
-  - [ ] Add CLI launch options for linked sessions: join an existing Sumaru
-    session, create a new session group, name an instance, and choose whether
-    it starts as a master or follower.
+  - [ ] Implement Option 1 first: viewer-as-hub linking. One Sumaru viewer can
+    listen on a configurable host/port and other Sumaru viewers can connect to
+    it as followers. Keep the host/port interface explicit from the beginning
+    so linked windows can eventually run on separate machines, not only on
+    `127.0.0.1`.
+  - [ ] Add CLI launch options for Option 1 linked sessions: listen as a hub,
+    connect to an existing hub, create or join a session group, name an
+    instance, and choose whether the instance publishes picks, follows picks,
+    or both.
+  - [ ] Preserve the same wire protocol for Option 2: a standalone
+    `sumaru link` broker process that can coordinate linked viewers without
+    making any render window special.
+  - [ ] Add the broker after viewer-as-hub is useful, reusing the same message
+    parser/router/recorder so the broker can support multiple named groups,
+    reconnects, routing rules, and future session restore.
   - [ ] Add controller/menu controls for selecting the active master for a
     window, following one master, temporarily unlinking, and reconnecting.
   - [ ] Support flexible group layouts, including one master with several
