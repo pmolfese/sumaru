@@ -180,6 +180,10 @@ const WHITE_BACKGROUND: wgpu::Color = wgpu::Color {
 pub struct LaunchOptions {
     pub surface_path: Option<PathBuf>,
     pub spec_path: Option<PathBuf>,
+    /// Left/right surface pair loaded as a both-hemisphere scene without a spec
+    /// (`--surface-lh`/`--surface-rh`).
+    pub surface_lh_path: Option<PathBuf>,
+    pub surface_rh_path: Option<PathBuf>,
     pub surface_volume_path: Option<PathBuf>,
     pub volume_path: Option<PathBuf>,
     pub overlay_path: Option<PathBuf>,
@@ -239,6 +243,8 @@ pub fn run(options: LaunchOptions) -> Result<()> {
 struct ViewerApp {
     initial_surface_path: Option<PathBuf>,
     initial_spec_path: Option<PathBuf>,
+    initial_surface_lh_path: Option<PathBuf>,
+    initial_surface_rh_path: Option<PathBuf>,
     initial_surface_volume_path: Option<PathBuf>,
     initial_volume_path: Option<PathBuf>,
     initial_overlay_path: Option<PathBuf>,
@@ -260,6 +266,8 @@ impl ViewerApp {
         Self {
             initial_surface_path: options.surface_path,
             initial_spec_path: options.spec_path,
+            initial_surface_lh_path: options.surface_lh_path,
+            initial_surface_rh_path: options.surface_rh_path,
             initial_surface_volume_path: options.surface_volume_path,
             initial_volume_path: options.volume_path,
             initial_overlay_path: options.overlay_path,
@@ -332,6 +340,8 @@ impl ViewerApp {
             InitialScene {
                 surface_path: self.initial_surface_path.take(),
                 spec_path: self.initial_spec_path.take(),
+                surface_lh_path: self.initial_surface_lh_path.take(),
+                surface_rh_path: self.initial_surface_rh_path.take(),
                 surface_volume_path: self.initial_surface_volume_path.take(),
                 volume_path: self.initial_volume_path.take(),
                 overlay_path: self.initial_overlay_path.take(),
@@ -947,6 +957,8 @@ struct ViewerWindows {
 struct InitialScene {
     surface_path: Option<PathBuf>,
     spec_path: Option<PathBuf>,
+    surface_lh_path: Option<PathBuf>,
+    surface_rh_path: Option<PathBuf>,
     surface_volume_path: Option<PathBuf>,
     volume_path: Option<PathBuf>,
     overlay_path: Option<PathBuf>,
@@ -1060,6 +1072,8 @@ impl ViewerState {
         let InitialScene {
             surface_path: initial_surface_path,
             spec_path: initial_spec_path,
+            surface_lh_path: initial_surface_lh_path,
+            surface_rh_path: initial_surface_rh_path,
             surface_volume_path: initial_surface_volume_path,
             volume_path: initial_volume_path,
             overlay_path: initial_overlay_path,
@@ -1388,6 +1402,9 @@ impl ViewerState {
 
         if let Some(path) = initial_surface_path {
             state.load_surface_path(path)?;
+        } else if let (Some(left), Some(right)) = (initial_surface_lh_path, initial_surface_rh_path)
+        {
+            state.load_paired_surface_paths(left, right, initial_surface_volume_path)?;
         } else if let Some(path) = initial_spec_path {
             state.load_spec_path(path, initial_surface_volume_path)?;
         }
@@ -2405,11 +2422,49 @@ impl ViewerState {
             .with_context(|| format!("failed to read SUMA spec {}", spec_path.display()))?;
         let surface_volume_path = surface_volume_path
             .or_else(|| self.surface_volume_path.clone())
+            .map(canonical_or_original_path)
+            .context("loading a SUMA spec requires -sv/--sv")?;
+        self.load_spec_file(spec, Some(surface_volume_path))
+    }
+
+    /// Load a paired left/right surface set without a spec file by synthesizing a
+    /// minimal both-hemisphere `SpecFile` and routing it through the normal
+    /// paired-scene path. The surface volume is optional here (unlike `--spec`).
+    fn load_paired_surface_paths(
+        &mut self,
+        left_path: PathBuf,
+        right_path: PathBuf,
+        surface_volume_path: Option<PathBuf>,
+    ) -> Result<()> {
+        ensure!(
+            left_path.exists(),
+            "left-hemisphere surface {} does not exist",
+            left_path.display()
+        );
+        ensure!(
+            right_path.exists(),
+            "right-hemisphere surface {} does not exist",
+            right_path.display()
+        );
+        let spec = synthetic_paired_spec(&left_path, &right_path);
+        self.load_spec_file(spec, surface_volume_path)
+    }
+
+    /// Build a scene from an already-parsed (or synthesized) `SpecFile`. The
+    /// surface volume is optional: `--spec` requires it (enforced by
+    /// `load_spec_path`), but `--surface-lh/--surface-rh` do not.
+    fn load_spec_file(
+        &mut self,
+        spec: SpecFile,
+        surface_volume_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let surface_volume_path = surface_volume_path
+            .or_else(|| self.surface_volume_path.clone())
             .map(canonical_or_original_path);
-        let surface_volume_path =
-            surface_volume_path.context("loading a SUMA spec requires -sv/--sv")?;
-        let surface_volume_idcode =
-            query_afni_dataset_idcode_optional(Some(surface_volume_path.as_path()))?;
+        let surface_volume_idcode = match surface_volume_path.as_deref() {
+            Some(path) => query_afni_dataset_idcode_optional(Some(path))?,
+            None => None,
+        };
         let mut components = Vec::new();
         let mut skipped_surfaces = 0;
 
@@ -2455,13 +2510,13 @@ impl ViewerState {
         } else {
             "surfaces"
         };
-        self.surface_volume_path = Some(surface_volume_path.clone());
+        self.surface_volume_path = surface_volume_path.clone();
         self.surface_volume_idcode = surface_volume_idcode.clone();
-        self.controller.surface.current_surface_volume_path = Some(surface_volume_path.clone());
+        self.controller.surface.current_surface_volume_path = surface_volume_path.clone();
         self.surface_scene = Some(SurfaceScene {
             spec: spec.clone(),
             spec_path: spec.path.clone(),
-            surface_volume_path: Some(surface_volume_path.clone()),
+            surface_volume_path: surface_volume_path.clone(),
             surface_volume_idcode: surface_volume_idcode.clone(),
             hemisphere: spec.hemisphere,
             surfaces,
@@ -4148,6 +4203,46 @@ fn apply_spec_surface_metadata(
     mesh.metadata.lineage.local_domain_parent = surface.local_domain_parent.clone();
     mesh.metadata.lineage.local_curvature_parent = surface.local_curvature_parent.clone();
     apply_surface_volume_parent(mesh, surface_volume_idcode);
+}
+
+/// Synthesize a minimal both-hemisphere `SpecFile` from a left/right surface
+/// pair so `--surface-lh`/`--surface-rh` can reuse the normal paired-scene path.
+/// Both surfaces share one synthetic state so they pair into a single
+/// both-hemisphere scene.
+fn synthetic_paired_spec(left_path: &Path, right_path: &Path) -> SpecFile {
+    const STATE: &str = "surface";
+    let make = |path: &Path, side: SurfaceSide| -> SpecSurface {
+        let name = file_name_display(path);
+        SpecSurface {
+            name: name.clone(),
+            path: path.to_path_buf(),
+            surface_name: name,
+            surface_format: None,
+            surface_type: None,
+            state: Some(STATE.to_string()),
+            raw_state: Some(STATE.to_string()),
+            anatomical: Some(true),
+            side,
+            local_domain_parent: None,
+            local_curvature_parent: None,
+            label_dataset: None,
+            embed_dimension: None,
+        }
+    };
+    let spec_path = left_path
+        .parent()
+        .map(|parent| parent.join("paired_surfaces"))
+        .unwrap_or_else(|| PathBuf::from("paired_surfaces"));
+    SpecFile {
+        path: spec_path,
+        group: None,
+        states: vec![STATE.to_string()],
+        hemisphere: SpecHemisphere::Both,
+        surfaces: vec![
+            make(left_path, SurfaceSide::Left),
+            make(right_path, SurfaceSide::Right),
+        ],
+    }
 }
 
 fn load_spec_component_mesh(
