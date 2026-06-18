@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -2306,6 +2307,28 @@ impl ViewerState {
                             ui.close();
                         }
                     });
+
+                    // New / duplicate launch buttons, right-aligned as painted
+                    // icons so they read as window controls rather than menus.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_duplicate = self.mesh.is_some();
+                        if paint_launch_button(
+                            ui,
+                            LaunchButtonIcon::Duplicate,
+                            can_duplicate,
+                            "Duplicate sumaru window (same surface, no overlay)",
+                        ) {
+                            actions.push(ViewerCommand::LaunchDuplicateInstance);
+                        }
+                        if paint_launch_button(
+                            ui,
+                            LaunchButtonIcon::New,
+                            true,
+                            "New blank sumaru window",
+                        ) {
+                            actions.push(ViewerCommand::LaunchNewInstance);
+                        }
+                    });
                 });
             });
 
@@ -3521,7 +3544,57 @@ impl ViewerState {
                         self.set_error(error);
                     }
                 }
+                ViewerCommand::LaunchNewInstance => self.spawn_new_instance(),
+                ViewerCommand::LaunchDuplicateInstance => self.spawn_duplicate_instance(),
             }
+        }
+    }
+
+    /// Spawn a blank sumaru window with no scene carried over.
+    fn spawn_new_instance(&mut self) {
+        self.spawn_sumaru_instance(Vec::new(), "new");
+    }
+
+    /// Spawn a sumaru window preloaded with the current surface or spec (and
+    /// surface volume), but no overlay or ROI — a clean second analysis view.
+    fn spawn_duplicate_instance(&mut self) {
+        let mut args: Vec<OsString> = Vec::new();
+        // Prefer the spec when a multi-surface scene is active so the duplicate
+        // opens the whole session; otherwise carry the single surface file.
+        if let Some(scene) = self.surface_scene.as_ref() {
+            args.push("--spec".into());
+            args.push(scene.spec_path.clone().into_os_string());
+        } else if let Some(surface) = self.surface_path.as_ref() {
+            args.push("--surface".into());
+            args.push(surface.clone().into_os_string());
+        } else {
+            self.log_status("No surface or spec is loaded to duplicate.");
+            return;
+        }
+        if let Some(sv) = self.surface_volume_path.as_ref() {
+            args.push("--sv".into());
+            args.push(sv.clone().into_os_string());
+        }
+        self.spawn_sumaru_instance(args, "duplicate");
+    }
+
+    /// Launch another sumaru process from this executable, detached so it
+    /// outlives the launcher. `label` only flavors the status/error message.
+    fn spawn_sumaru_instance(&mut self, args: Vec<OsString>, label: &str) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => {
+                self.set_error(anyhow::anyhow!(
+                    "could not find the sumaru executable to launch a {label} window: {error}"
+                ));
+                return;
+            }
+        };
+        match Command::new(exe).args(args).spawn() {
+            Ok(_) => self.log_status(format!("Launched {label} sumaru window.")),
+            Err(error) => self.set_error(anyhow::anyhow!(
+                "failed to launch {label} sumaru window: {error}"
+            )),
         }
     }
 
@@ -4824,6 +4897,82 @@ impl ViewerState {
             eprintln!("sumaru: {}", message.as_ref());
         }
     }
+}
+
+/// Which launch-button glyph to paint.
+#[derive(Clone, Copy)]
+enum LaunchButtonIcon {
+    /// A `+` for spawning a blank window.
+    New,
+    /// Two overlapping rectangles for duplicating the current scene.
+    Duplicate,
+}
+
+/// Draw a small custom-painted icon button in the menu bar and report a click.
+///
+/// Uses egui's painter directly (no extra crate or font glyphs) so the `+` and
+/// copy icons stay crisp at the menu-bar height. Disabled buttons paint dimmed
+/// and ignore clicks.
+fn paint_launch_button(
+    ui: &mut egui::Ui,
+    icon: LaunchButtonIcon,
+    enabled: bool,
+    tooltip: &str,
+) -> bool {
+    let size = egui::vec2(22.0, 18.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+
+    let stroke_color = if !enabled {
+        ui.visuals().weak_text_color()
+    } else if response.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    let stroke = egui::Stroke::new(1.5, stroke_color);
+    let painter = ui.painter();
+
+    if enabled && response.hovered() {
+        painter.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+
+    let glyph = rect.shrink2(egui::vec2(6.0, 4.0));
+    match icon {
+        LaunchButtonIcon::New => {
+            let c = glyph.center();
+            let half = glyph.height().min(glyph.width()) / 2.0;
+            painter.line_segment(
+                [egui::pos2(c.x - half, c.y), egui::pos2(c.x + half, c.y)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - half), egui::pos2(c.x, c.y + half)],
+                stroke,
+            );
+        }
+        LaunchButtonIcon::Duplicate => {
+            // Two overlapping rectangles: a back sheet and a front sheet.
+            let back = egui::Rect::from_min_size(
+                glyph.min,
+                egui::vec2(glyph.width() * 0.62, glyph.height() * 0.62),
+            );
+            let front = egui::Rect::from_min_size(
+                glyph.min + egui::vec2(glyph.width() * 0.30, glyph.height() * 0.30),
+                egui::vec2(glyph.width() * 0.62, glyph.height() * 0.62),
+            );
+            painter.rect_stroke(back, 2.0, stroke, egui::StrokeKind::Middle);
+            painter.rect_filled(front, 2.0, ui.visuals().panel_fill);
+            painter.rect_stroke(front, 2.0, stroke, egui::StrokeKind::Middle);
+        }
+    }
+
+    let response = response.on_hover_text(tooltip);
+    enabled && response.clicked()
 }
 
 fn paired_component_for_node<'a>(

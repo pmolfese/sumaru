@@ -431,6 +431,12 @@ pub enum ViewerCommand {
     SelectSceneSurface(usize),
     SaveScreenshot,
     SaveMontage,
+    /// Spawn a fresh, empty sumaru window — no surface, overlay, or session
+    /// context carried over.
+    LaunchNewInstance,
+    /// Spawn a new sumaru window preloaded with the current surface/spec (and
+    /// surface volume), but no overlay or ROI, as a clean second analysis view.
+    LaunchDuplicateInstance,
 }
 
 fn value_label(value: Option<f32>) -> String {
