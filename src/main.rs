@@ -23,6 +23,26 @@ struct Cli {
     #[arg(long = "spec", value_name = "PATH")]
     spec: Option<PathBuf>,
 
+    /// Left-hemisphere GIFTI surface for a paired both-hemisphere scene without a
+    /// spec. Requires `--surface-rh`.
+    #[arg(
+        long = "surface-lh",
+        value_name = "PATH",
+        requires = "surface_rh",
+        conflicts_with_all = ["surface", "spec"]
+    )]
+    surface_lh: Option<PathBuf>,
+
+    /// Right-hemisphere GIFTI surface for a paired both-hemisphere scene without a
+    /// spec. Requires `--surface-lh`.
+    #[arg(
+        long = "surface-rh",
+        value_name = "PATH",
+        requires = "surface_lh",
+        conflicts_with_all = ["surface", "spec"]
+    )]
+    surface_rh: Option<PathBuf>,
+
     /// Surface-volume context for AFNI/NIML communication.
     #[arg(long = "sv", value_name = "PATH")]
     surface_volume: Option<PathBuf>,
@@ -205,6 +225,8 @@ fn main() -> Result<()> {
 
     let surface = cli.surface;
     let spec = cli.spec;
+    let surface_lh = cli.surface_lh;
+    let surface_rh = cli.surface_rh;
     let surface_volume = cli.surface_volume;
     let volume = cli.volume;
     let overlay = cli.overlay;
@@ -215,6 +237,8 @@ fn main() -> Result<()> {
             validate_viewer_launch(
                 &surface,
                 &spec,
+                &surface_lh,
+                &surface_rh,
                 &surface_volume,
                 &overlay,
                 &overlay_pair,
@@ -225,6 +249,8 @@ fn main() -> Result<()> {
             viewer::run(viewer::LaunchOptions {
                 surface_path: surface,
                 spec_path: spec,
+                surface_lh_path: surface_lh,
+                surface_rh_path: surface_rh,
                 surface_volume_path: surface_volume,
                 volume_path: volume,
                 overlay_path: overlay,
@@ -242,6 +268,8 @@ fn main() -> Result<()> {
             validate_no_viewer_launch_options(
                 &surface,
                 &spec,
+                &surface_lh,
+                &surface_rh,
                 &surface_volume,
                 &overlay,
                 &overlay_pair,
@@ -260,6 +288,8 @@ fn main() -> Result<()> {
             validate_no_viewer_launch_options(
                 &surface,
                 &spec,
+                &surface_lh,
+                &surface_rh,
                 &surface_volume,
                 &overlay,
                 &overlay_pair,
@@ -319,6 +349,8 @@ fn run_niml_command(
 fn validate_viewer_launch(
     surface: &Option<PathBuf>,
     spec: &Option<PathBuf>,
+    surface_lh: &Option<PathBuf>,
+    surface_rh: &Option<PathBuf>,
     surface_volume: &Option<PathBuf>,
     overlay: &Option<PathBuf>,
     overlay_pair: &Option<ExplicitOverlayPair>,
@@ -327,23 +359,29 @@ fn validate_viewer_launch(
     p_value: &Option<f64>,
 ) -> Result<()> {
     let has_overlay = overlay.is_some() || overlay_pair.is_some();
-    if surface.is_some() && spec.is_some() {
-        bail!("use either -i/--surface or -spec/--spec, not both");
-    }
+    // clap enforces that `--surface-lh`/`--surface-rh` come as a pair and never
+    // alongside `--surface`/`--spec`.
+    let has_paired_surfaces = surface_lh.is_some() && surface_rh.is_some();
+    // Any source that produces a loaded surface scene.
+    let has_surface = surface.is_some() || spec.is_some() || has_paired_surfaces;
+    // Sources that produce a both-hemisphere paired scene (needed for paired
+    // overlays).
+    let has_paired_scene = spec.is_some() || has_paired_surfaces;
+
     if spec.is_some() && surface_volume.is_none() {
         bail!("-spec/--spec requires -sv/--sv");
     }
-    if surface.is_none() && spec.is_none() && overlay.is_some() {
-        bail!("--overlay requires -i/--surface or -spec/--spec");
+    if !has_surface && overlay.is_some() {
+        bail!("--overlay requires -i/--surface, -spec/--spec, or --surface-lh/--surface-rh");
     }
-    if overlay_pair.is_some() && spec.is_none() {
-        bail!("--overlay-lh/--overlay-rh require -spec/--spec");
+    if overlay_pair.is_some() && !has_paired_scene {
+        bail!("--overlay-lh/--overlay-rh require -spec/--spec or --surface-lh/--surface-rh");
     }
-    if surface.is_none() && spec.is_none() && roi.is_some() {
-        bail!("--roi requires -i/--surface or -spec/--spec");
+    if !has_surface && roi.is_some() {
+        bail!("--roi requires -i/--surface, -spec/--spec, or --surface-lh/--surface-rh");
     }
-    if surface.is_none() && spec.is_none() && surface_volume.is_some() {
-        bail!("-sv/--sv requires -i/--surface or -spec/--spec");
+    if !has_surface && surface_volume.is_some() {
+        bail!("-sv/--sv requires -i/--surface, -spec/--spec, or --surface-lh/--surface-rh");
     }
     if !has_overlay && subs.is_some() {
         bail!("--subs requires --overlay or --overlay-lh/--overlay-rh");
@@ -358,6 +396,8 @@ fn validate_viewer_launch(
 fn validate_no_viewer_launch_options(
     surface: &Option<PathBuf>,
     spec: &Option<PathBuf>,
+    surface_lh: &Option<PathBuf>,
+    surface_rh: &Option<PathBuf>,
     surface_volume: &Option<PathBuf>,
     overlay: &Option<PathBuf>,
     overlay_pair: &Option<ExplicitOverlayPair>,
@@ -368,6 +408,8 @@ fn validate_no_viewer_launch_options(
 ) -> Result<()> {
     if surface.is_some()
         || spec.is_some()
+        || surface_lh.is_some()
+        || surface_rh.is_some()
         || surface_volume.is_some()
         || overlay.is_some()
         || overlay_pair.is_some()
