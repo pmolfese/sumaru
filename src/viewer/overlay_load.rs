@@ -5,6 +5,53 @@
 
 use super::*;
 
+/// A freshly loaded overlay before it is installed onto the viewer: the
+/// per-node values ready for rendering, the canonical dataset they were derived
+/// from (kept so columns can be re-resolved without re-reading the file), and
+/// the column selections used to build them.
+#[derive(Debug, Clone)]
+pub(super) struct LoadedOverlay {
+    pub(super) overlay_values: OverlayDataset,
+    pub(super) dataset: Dataset,
+    pub(super) columns: OverlayColumnSelections,
+}
+
+/// A `LoadedOverlay` paired with the human-facing name to show for it (the file
+/// stem, or a combined label for a left/right hemisphere pair).
+#[derive(Debug, Clone)]
+pub(super) struct LoadedOverlaySelection {
+    pub(super) overlay: LoadedOverlay,
+    pub(super) display_name: String,
+}
+
+/// The two hemisphere files that make up a paired overlay, plus the display
+/// name inferred for the pair as a whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PairedOverlayPaths {
+    pub(super) left_path: PathBuf,
+    pub(super) right_path: PathBuf,
+    pub(super) display_name: String,
+}
+
+/// Which dataset sub-bricks drive each overlay channel: `intensity` is the
+/// colored value (always present), while `threshold` and `brightness` are
+/// optional masking and modulation columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct OverlayColumnSelections {
+    pub(super) intensity: usize,
+    pub(super) threshold: Option<usize>,
+    pub(super) brightness: Option<usize>,
+}
+
+/// One entry in an overlay column picker: the dataset column index, its label,
+/// and whether it holds numeric (selectable) data.
+#[derive(Debug, Clone)]
+pub(super) struct OverlayColumnOption {
+    pub(super) index: usize,
+    pub(super) label: String,
+    pub(super) is_numeric: bool,
+}
+
 impl ViewerState {
     /// Load a single overlay file onto the current surface.
     pub(super) fn load_overlay_path(&mut self, path: PathBuf) -> Result<()> {
