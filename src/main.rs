@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long = "sv", value_name = "PATH")]
     surface_volume: Option<PathBuf>,
 
+    /// Load a NIfTI volume (.nii/.nii.gz) for orthogonal slice-plane rendering.
+    #[arg(long = "volume", visible_alias = "vol", value_name = "PATH")]
+    volume: Option<PathBuf>,
+
     /// Load this GIFTI data array as a per-vertex surface overlay.
     #[arg(long = "overlay", value_name = "PATH")]
     overlay: Option<PathBuf>,
@@ -202,6 +206,7 @@ fn main() -> Result<()> {
     let surface = cli.surface;
     let spec = cli.spec;
     let surface_volume = cli.surface_volume;
+    let volume = cli.volume;
     let overlay = cli.overlay;
     let roi = cli.roi;
 
@@ -221,6 +226,7 @@ fn main() -> Result<()> {
                 surface_path: surface,
                 spec_path: spec,
                 surface_volume_path: surface_volume,
+                volume_path: volume,
                 overlay_path: overlay,
                 overlay_pair_paths: overlay_pair,
                 roi_path: roi,

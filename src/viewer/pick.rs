@@ -19,6 +19,17 @@ struct RayTriangleHit {
     distance: f32,
 }
 
+/// Camera-space (scene-normalized) ray for a cursor position, exposed for
+/// non-mesh scene content such as volume slice-plane handles.
+pub(super) fn screen_ray(
+    camera: &Camera,
+    view_size: PhysicalSize<u32>,
+    cursor: (f64, f64),
+) -> Option<(Vec3, Vec3)> {
+    let ray = screen_ray_for_camera(camera, view_size, cursor)?;
+    Some((ray.origin, ray.direction))
+}
+
 pub(super) fn pick_surface(
     mesh: &SurfaceMesh,
     overlay: Option<&OverlayDataset>,

@@ -47,6 +47,7 @@ use crate::surface::{
     AnatomicalCorrectness, NodeMask, NormalDirection, OverlayDataset, SmoothingWeights,
     SurfaceDomain, SurfaceDomainId, SurfaceId, SurfaceKind, SurfaceMesh, SurfaceSide, ValueRange,
 };
+use crate::volume::Volume;
 use camera::{Camera, CameraMode, PresetOrientation};
 use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
@@ -56,7 +57,7 @@ use mesh::{
     RoiAppearance, SelectionHighlight, sample_colormap,
 };
 use overlay_load::*;
-use pick::{pick_surface, pick_surface_with_model};
+use pick::{pick_surface, pick_surface_with_model, screen_ray};
 use roi::*;
 use scene::*;
 use screenshot::ScreenshotImage;
@@ -75,6 +76,8 @@ mod roi;
 mod scene;
 mod screenshot;
 mod transform;
+mod volume_view;
+use volume_view::{SlicePlane, VolumeView};
 
 impl From<CameraMode> for CameraControlMode {
     fn from(mode: CameraMode) -> Self {
@@ -177,6 +180,7 @@ pub struct LaunchOptions {
     pub surface_path: Option<PathBuf>,
     pub spec_path: Option<PathBuf>,
     pub surface_volume_path: Option<PathBuf>,
+    pub volume_path: Option<PathBuf>,
     pub overlay_path: Option<PathBuf>,
     pub overlay_pair_paths: Option<ExplicitOverlayPair>,
     pub roi_path: Option<PathBuf>,
@@ -235,6 +239,7 @@ struct ViewerApp {
     initial_surface_path: Option<PathBuf>,
     initial_spec_path: Option<PathBuf>,
     initial_surface_volume_path: Option<PathBuf>,
+    initial_volume_path: Option<PathBuf>,
     initial_overlay_path: Option<PathBuf>,
     initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
     initial_roi_path: Option<PathBuf>,
@@ -255,6 +260,7 @@ impl ViewerApp {
             initial_surface_path: options.surface_path,
             initial_spec_path: options.spec_path,
             initial_surface_volume_path: options.surface_volume_path,
+            initial_volume_path: options.volume_path,
             initial_overlay_path: options.overlay_path,
             initial_overlay_pair_paths: options.overlay_pair_paths,
             initial_roi_path: options.roi_path,
@@ -326,6 +332,7 @@ impl ViewerApp {
                 surface_path: self.initial_surface_path.take(),
                 spec_path: self.initial_spec_path.take(),
                 surface_volume_path: self.initial_surface_volume_path.take(),
+                volume_path: self.initial_volume_path.take(),
                 overlay_path: self.initial_overlay_path.take(),
                 overlay_pair_paths: self.initial_overlay_pair_paths.take(),
                 roi_path: self.initial_roi_path.take(),
@@ -940,6 +947,7 @@ struct InitialScene {
     surface_path: Option<PathBuf>,
     spec_path: Option<PathBuf>,
     surface_volume_path: Option<PathBuf>,
+    volume_path: Option<PathBuf>,
     overlay_path: Option<PathBuf>,
     overlay_pair_paths: Option<ExplicitOverlayPair>,
     roi_path: Option<PathBuf>,
@@ -984,6 +992,8 @@ struct ViewerState {
     graph_snapshot: Option<GraphSnapshot>,
     surface_volume_path: Option<PathBuf>,
     surface_volume_idcode: Option<String>,
+    /// Loaded display volume and its slice-plane render state (`--volume` mode).
+    volume_view: Option<VolumeView>,
     scene_stats: Option<SceneStats>,
     /// Cached geometry-derived stats (winding/area/counts) keyed by surface id,
     /// so recolors do not recompute the expensive `winding_report`. Keyed as a
@@ -1024,6 +1034,8 @@ struct ViewerState {
     pair_dragging: bool,
     pair_drag_last_cursor: Option<(f64, f64)>,
     pair_drag_changed: bool,
+    /// Index of the volume slice currently being left-dragged, if any.
+    volume_slice_drag: Option<usize>,
     modifiers: ModifiersState,
     mode_label: Option<ModeLabel>,
 }
@@ -1048,6 +1060,7 @@ impl ViewerState {
             surface_path: initial_surface_path,
             spec_path: initial_spec_path,
             surface_volume_path: initial_surface_volume_path,
+            volume_path: initial_volume_path,
             overlay_path: initial_overlay_path,
             overlay_pair_paths: initial_overlay_pair_paths,
             roi_path: initial_roi_path,
@@ -1344,6 +1357,7 @@ impl ViewerState {
             graph_snapshot: None,
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
+            volume_view: None,
             scene_stats: None,
             scene_geometry_stats: HashMap::new(),
             scene_stats_sender,
@@ -1366,6 +1380,7 @@ impl ViewerState {
             pair_dragging: false,
             pair_drag_last_cursor: None,
             pair_drag_changed: false,
+            volume_slice_drag: None,
             modifiers: ModifiersState::empty(),
             mode_label: None,
         };
@@ -1374,6 +1389,9 @@ impl ViewerState {
             state.load_surface_path(path)?;
         } else if let Some(path) = initial_spec_path {
             state.load_spec_path(path, initial_surface_volume_path)?;
+        }
+        if let Some(path) = initial_volume_path {
+            state.load_volume_path(path)?;
         }
         if let Some(path) = initial_overlay_path {
             state.load_overlay_path(path)?;
@@ -1487,6 +1505,10 @@ impl ViewerState {
                     self.update_pair_drag(cursor);
                     return true;
                 }
+                if self.volume_slice_drag.is_some() {
+                    self.update_volume_slice_drag();
+                    return true;
+                }
 
                 self.camera.pointer_input(event)
             }
@@ -1500,6 +1522,24 @@ impl ViewerState {
                 true
             }
             WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if self.volume_slice_drag.is_some() => {
+                self.volume_slice_drag = None;
+                true
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if self.volume_view.is_some()
+                && !self.modifiers.control_key()
+                && self.try_begin_volume_slice_drag() =>
+            {
+                true
+            }
+            WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button,
                 ..
@@ -1508,6 +1548,14 @@ impl ViewerState {
                 && matches!(*button, MouseButton::Left | MouseButton::Right) =>
             {
                 self.begin_pair_drag();
+                true
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if self.volume_view.is_some() => {
+                self.select_volume_plane_at_cursor();
                 true
             }
             WindowEvent::MouseInput {
@@ -1935,6 +1983,13 @@ impl ViewerState {
             render_pass.set_index_buffer(buffers.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..buffers.index_count, 0, 0..1);
         }
+
+        if let Some(volume_view) = &self.volume_view {
+            let view_projection = self
+                .camera
+                .view_projection_matrix(self.scene_viewport_aspect());
+            volume_view.render(&self.queue, &mut render_pass, view_projection);
+        }
     }
 
     fn render_control(&mut self) -> RenderStatus {
@@ -2307,6 +2362,41 @@ impl ViewerState {
                             ui.close();
                         }
                     });
+
+                    if let Some(volume_view) = self.volume_view.as_ref() {
+                        let selected_label = volume_view.selected_label();
+                        ui.menu_button("Volume", |ui| {
+                            if ui.button("Add Axial slice").clicked() {
+                                actions.push(ViewerCommand::AddVolumeAxial);
+                                ui.close();
+                            }
+                            if ui.button("Add Coronal slice").clicked() {
+                                actions.push(ViewerCommand::AddVolumeCoronal);
+                                ui.close();
+                            }
+                            if ui.button("Add Sagittal slice").clicked() {
+                                actions.push(ViewerCommand::AddVolumeSagittal);
+                                ui.close();
+                            }
+                            ui.separator();
+                            let remove_label = match selected_label {
+                                Some(label) => format!("Remove selected {label} slice"),
+                                None => "Remove selected slice".to_string(),
+                            };
+                            if ui
+                                .add_enabled(
+                                    selected_label.is_some(),
+                                    egui::Button::new(remove_label),
+                                )
+                                .clicked()
+                            {
+                                actions.push(ViewerCommand::RemoveSelectedVolumeSlice);
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.label("Right-click a slice to select; left-drag to move.");
+                        });
+                    }
 
                     // New / duplicate launch buttons, right-aligned as painted
                     // icons so they read as window controls rather than menus.
@@ -3546,6 +3636,10 @@ impl ViewerState {
                 }
                 ViewerCommand::LaunchNewInstance => self.spawn_new_instance(),
                 ViewerCommand::LaunchDuplicateInstance => self.spawn_duplicate_instance(),
+                ViewerCommand::AddVolumeAxial => self.add_volume_slice(SlicePlane::Axial),
+                ViewerCommand::AddVolumeCoronal => self.add_volume_slice(SlicePlane::Coronal),
+                ViewerCommand::AddVolumeSagittal => self.add_volume_slice(SlicePlane::Sagittal),
+                ViewerCommand::RemoveSelectedVolumeSlice => self.remove_selected_volume_slice(),
             }
         }
     }
@@ -3595,6 +3689,126 @@ impl ViewerState {
             Err(error) => self.set_error(anyhow::anyhow!(
                 "failed to launch {label} sumaru window: {error}"
             )),
+        }
+    }
+
+    /// Load a NIfTI volume for `--volume` slice-plane rendering.
+    fn load_volume_path(&mut self, path: PathBuf) -> Result<()> {
+        let volume = Volume::read_nifti(&path)
+            .with_context(|| format!("failed to load volume {}", path.display()))?;
+        let dims = volume.dimensions;
+        let color_format = self.view.config.format;
+        let view = VolumeView::new(
+            &self.device,
+            &self.queue,
+            color_format,
+            volume,
+            path.clone(),
+        );
+        let name = view.display_name();
+        self.volume_view = Some(view);
+        self.view_window().request_redraw();
+        self.log_status(format!(
+            "Loaded volume {name} ({}x{}x{} voxels). Axial, coronal, sagittal slices shown.",
+            dims[0], dims[1], dims[2]
+        ));
+        Ok(())
+    }
+
+    /// Toggle one orthogonal slice plane in `--volume` mode.
+    /// Add a new slice of the given orientation in `--volume` mode.
+    fn add_volume_slice(&mut self, plane: SlicePlane) {
+        let device = &self.device;
+        let Some(view) = self.volume_view.as_mut() else {
+            self.log_status("No volume is loaded.");
+            return;
+        };
+        view.add_slice(device, plane);
+        let count = view.orientation_count(plane);
+        self.view_window().request_redraw();
+        self.log_status(format!(
+            "Added {} slice ({count} of that orientation) — left-drag to move it.",
+            plane.label()
+        ));
+    }
+
+    /// Remove the currently selected slice in `--volume` mode.
+    fn remove_selected_volume_slice(&mut self) {
+        let device = &self.device;
+        let Some(view) = self.volume_view.as_mut() else {
+            self.log_status("No volume is loaded.");
+            return;
+        };
+        match view.remove_selected(device) {
+            Some(label) => {
+                self.view_window().request_redraw();
+                self.log_status(format!("Removed selected {label} slice."));
+            }
+            None => self.log_status("Right-click a slice to select it, then remove it."),
+        }
+    }
+
+    /// Right-click selection: pick the slice under the cursor (or clear the
+    /// selection if the cursor is over empty space). Returns true if a volume is
+    /// loaded and the event was handled.
+    fn select_volume_plane_at_cursor(&mut self) -> bool {
+        if self.volume_view.is_none() {
+            return false;
+        }
+        let Some(cursor) = self.view_cursor_position else {
+            return true;
+        };
+        let scene_size = self.scene_viewport_size();
+        let hit = screen_ray(&self.camera, scene_size, cursor).and_then(|(origin, direction)| {
+            self.volume_view
+                .as_ref()
+                .and_then(|view| view.slice_at_ray(origin, direction))
+        });
+        let label = if let Some(view) = self.volume_view.as_mut() {
+            view.set_selected(&self.device, hit);
+            view.selected_label()
+        } else {
+            None
+        };
+        self.view_window().request_redraw();
+        match label {
+            Some(label) => {
+                self.log_status(format!("{label} slice selected — left-drag to move it."))
+            }
+            None => self.log_status("Volume slice deselected."),
+        }
+        true
+    }
+
+    /// Begin a left-drag on the selected slice. Returns true if a drag began (so
+    /// the camera should not also orbit).
+    fn try_begin_volume_slice_drag(&mut self) -> bool {
+        let Some(index) = self.volume_view.as_ref().and_then(|view| view.selected()) else {
+            return false;
+        };
+        self.volume_slice_drag = Some(index);
+        self.update_volume_slice_drag();
+        true
+    }
+
+    /// Move the actively dragged slice to follow the cursor.
+    fn update_volume_slice_drag(&mut self) {
+        let Some(index) = self.volume_slice_drag else {
+            return;
+        };
+        let Some(cursor) = self.view_cursor_position else {
+            return;
+        };
+        let scene_size = self.scene_viewport_size();
+        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
+            return;
+        };
+        let changed = match self.volume_view.as_mut() {
+            Some(view) => view.drag_slice_to_ray(&self.device, index, origin, direction),
+            None => false,
+        };
+        if changed {
+            self.view_window().request_redraw();
         }
     }
 

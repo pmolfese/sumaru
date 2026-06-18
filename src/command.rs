@@ -437,6 +437,14 @@ pub enum ViewerCommand {
     /// Spawn a new sumaru window preloaded with the current surface/spec (and
     /// surface volume), but no overlay or ROI, as a clean second analysis view.
     LaunchDuplicateInstance,
+    /// Add an axial slice plane in `--volume` mode.
+    AddVolumeAxial,
+    /// Add a coronal slice plane in `--volume` mode.
+    AddVolumeCoronal,
+    /// Add a sagittal slice plane in `--volume` mode.
+    AddVolumeSagittal,
+    /// Remove the currently selected slice in `--volume` mode.
+    RemoveSelectedVolumeSlice,
 }
 
 fn value_label(value: Option<f32>) -> String {

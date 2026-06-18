@@ -219,6 +219,12 @@ impl Camera {
         super::f32_bytes(&floats)
     }
 
+    /// The view-projection matrix, exposed for non-surface scene content (e.g.
+    /// volume slice planes) that draws in the same camera space.
+    pub(super) fn view_projection_matrix(&self, aspect: f32) -> Mat4 {
+        self.view_projection(aspect)
+    }
+
     fn view_projection(&self, aspect: f32) -> Mat4 {
         let (eye_direction, up) = self.view_axes();
         let eye = eye_direction * self.distance;
