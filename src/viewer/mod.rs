@@ -47,7 +47,6 @@ use crate::surface::{
     AnatomicalCorrectness, NodeMask, NormalDirection, OverlayDataset, SmoothingWeights,
     SurfaceDomain, SurfaceDomainId, SurfaceId, SurfaceKind, SurfaceMesh, SurfaceSide, ValueRange,
 };
-use crate::volume::Volume;
 use camera::{Camera, CameraMode, PresetOrientation};
 use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
@@ -3689,126 +3688,6 @@ impl ViewerState {
             Err(error) => self.set_error(anyhow::anyhow!(
                 "failed to launch {label} sumaru window: {error}"
             )),
-        }
-    }
-
-    /// Load a NIfTI volume for `--volume` slice-plane rendering.
-    fn load_volume_path(&mut self, path: PathBuf) -> Result<()> {
-        let volume = Volume::read_nifti(&path)
-            .with_context(|| format!("failed to load volume {}", path.display()))?;
-        let dims = volume.dimensions;
-        let color_format = self.view.config.format;
-        let view = VolumeView::new(
-            &self.device,
-            &self.queue,
-            color_format,
-            volume,
-            path.clone(),
-        );
-        let name = view.display_name();
-        self.volume_view = Some(view);
-        self.view_window().request_redraw();
-        self.log_status(format!(
-            "Loaded volume {name} ({}x{}x{} voxels). Axial, coronal, sagittal slices shown.",
-            dims[0], dims[1], dims[2]
-        ));
-        Ok(())
-    }
-
-    /// Toggle one orthogonal slice plane in `--volume` mode.
-    /// Add a new slice of the given orientation in `--volume` mode.
-    fn add_volume_slice(&mut self, plane: SlicePlane) {
-        let device = &self.device;
-        let Some(view) = self.volume_view.as_mut() else {
-            self.log_status("No volume is loaded.");
-            return;
-        };
-        view.add_slice(device, plane);
-        let count = view.orientation_count(plane);
-        self.view_window().request_redraw();
-        self.log_status(format!(
-            "Added {} slice ({count} of that orientation) — left-drag to move it.",
-            plane.label()
-        ));
-    }
-
-    /// Remove the currently selected slice in `--volume` mode.
-    fn remove_selected_volume_slice(&mut self) {
-        let device = &self.device;
-        let Some(view) = self.volume_view.as_mut() else {
-            self.log_status("No volume is loaded.");
-            return;
-        };
-        match view.remove_selected(device) {
-            Some(label) => {
-                self.view_window().request_redraw();
-                self.log_status(format!("Removed selected {label} slice."));
-            }
-            None => self.log_status("Right-click a slice to select it, then remove it."),
-        }
-    }
-
-    /// Right-click selection: pick the slice under the cursor (or clear the
-    /// selection if the cursor is over empty space). Returns true if a volume is
-    /// loaded and the event was handled.
-    fn select_volume_plane_at_cursor(&mut self) -> bool {
-        if self.volume_view.is_none() {
-            return false;
-        }
-        let Some(cursor) = self.view_cursor_position else {
-            return true;
-        };
-        let scene_size = self.scene_viewport_size();
-        let hit = screen_ray(&self.camera, scene_size, cursor).and_then(|(origin, direction)| {
-            self.volume_view
-                .as_ref()
-                .and_then(|view| view.slice_at_ray(origin, direction))
-        });
-        let label = if let Some(view) = self.volume_view.as_mut() {
-            view.set_selected(&self.device, hit);
-            view.selected_label()
-        } else {
-            None
-        };
-        self.view_window().request_redraw();
-        match label {
-            Some(label) => {
-                self.log_status(format!("{label} slice selected — left-drag to move it."))
-            }
-            None => self.log_status("Volume slice deselected."),
-        }
-        true
-    }
-
-    /// Begin a left-drag on the selected slice. Returns true if a drag began (so
-    /// the camera should not also orbit).
-    fn try_begin_volume_slice_drag(&mut self) -> bool {
-        let Some(index) = self.volume_view.as_ref().and_then(|view| view.selected()) else {
-            return false;
-        };
-        self.volume_slice_drag = Some(index);
-        self.update_volume_slice_drag();
-        true
-    }
-
-    /// Move the actively dragged slice to follow the cursor.
-    fn update_volume_slice_drag(&mut self) {
-        let Some(index) = self.volume_slice_drag else {
-            return;
-        };
-        let Some(cursor) = self.view_cursor_position else {
-            return;
-        };
-        let scene_size = self.scene_viewport_size();
-        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
-            return;
-        };
-        let changed = match self.volume_view.as_mut() {
-            Some(view) => view.drag_slice_to_ray(&self.device, index, origin, direction),
-            None => false,
-        };
-        if changed {
-            self.view_window().request_redraw();
         }
     }
 
