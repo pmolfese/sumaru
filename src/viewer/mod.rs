@@ -23,14 +23,15 @@ use crate::afni::{
     AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo, DEFAULT_AFNI_HOST,
     DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
 };
-use crate::color::Rgba;
+use crate::color::{LabelTable, Rgba};
 use crate::command::{
     BackgroundMode, CameraControlMode, ControllerState, HemisphereLayout, HemisphereLayoutState,
     OverlayThreshold, PairVisibility, SurfacePick, ViewPreset, ViewerCommand,
 };
 use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
 use crate::io::{
-    NimlElement, read_gifti_dataset, read_niml_dataset, read_niml_roi, write_niml_roi,
+    NimlElement, read_gifti_dataset, read_gifti_image, read_niml_dataset,
+    read_niml_dataset_with_label_table, read_niml_roi, write_niml_roi,
 };
 use crate::niml_debug::NimlRecorder;
 use crate::overlay::{
@@ -3483,7 +3484,7 @@ impl ViewerState {
     }
 
     fn draw_pick_section(&self, ui: &mut egui::Ui) {
-        controller_section(ui, "PICK", false, |ui| {
+        controller_section(ui, "PICK", true, |ui| {
             egui::Grid::new("pick_grid")
                 .num_columns(2)
                 .spacing([10.0, 5.0])
@@ -3492,6 +3493,9 @@ impl ViewerState {
                     stat_row(ui, "Overlay file", self.pick_overlay_display_text());
                     if let Some(pick) = self.controller.interaction.pick {
                         stat_row(ui, "Node", pick.node_index.to_string());
+                        if let Some(region) = self.pick_region_display_text(pick) {
+                            stat_row(ui, "Region", region);
+                        }
                         stat_row(ui, "Triangle", pick.face_index.to_string());
                         stat_row(ui, "Surf x,y,z", coordinate_label(pick.surface_position));
                         stat_row(ui, "Overlay Value", picked_overlay_value_label(pick));
@@ -3990,6 +3994,7 @@ impl ViewerState {
                 side: surface.side.clone(),
                 spec_surface: surface.clone(),
                 mesh: None,
+                label_lookup: None,
                 normal_cache: None,
             });
         }
@@ -4734,6 +4739,95 @@ impl ViewerState {
                 component.mesh = Some(mesh);
             }
         }
+        self.ensure_scene_surface_labels_loaded(index)?;
+
+        Ok(())
+    }
+
+    fn ensure_scene_surface_labels_loaded(&mut self, index: usize) -> Result<()> {
+        let component_count = {
+            let scene = self
+                .surface_scene
+                .as_ref()
+                .context("no SUMA spec scene is loaded")?;
+            scene
+                .surfaces
+                .get(index)
+                .context("surface index is outside loaded scene")?
+                .components
+                .len()
+        };
+
+        for component_index in 0..component_count {
+            let task = {
+                let scene = self
+                    .surface_scene
+                    .as_ref()
+                    .context("no SUMA spec scene is loaded")?;
+                let component = scene
+                    .surfaces
+                    .get(index)
+                    .and_then(|surface| surface.components.get(component_index))
+                    .context("surface component index is outside loaded scene")?;
+                let label_dataset =
+                    spec_label_dataset_for_surface(&scene.spec, &component.spec_surface);
+                if component.label_lookup.is_some() || label_dataset.is_none() {
+                    None
+                } else {
+                    let mesh = component.mesh.as_ref().with_context(|| {
+                        format!(
+                            "surface component {} is still loading before label lookup",
+                            component.name
+                        )
+                    })?;
+                    Some((
+                        component.name.clone(),
+                        label_dataset.expect("checked above"),
+                        load_spec_component_label_lookup(
+                            &scene.spec,
+                            &component.spec_surface,
+                            mesh,
+                        ),
+                    ))
+                }
+            };
+
+            let Some((component_name, path, result)) = task else {
+                continue;
+            };
+            match result {
+                Ok(Some(label_lookup)) => {
+                    if let Some(scene) = self.surface_scene.as_mut()
+                        && let Some(component) = scene
+                            .surfaces
+                            .get_mut(index)
+                            .and_then(|surface| surface.components.get_mut(component_index))
+                    {
+                        component.label_lookup = Some(label_lookup);
+                    }
+                    if self.verbose {
+                        self.log_status(format!(
+                            "Loaded label dataset {} for {component_name}.",
+                            path.display()
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    if self.verbose {
+                        self.log_status(format!(
+                            "Spec label dataset {} for {component_name} was not found.",
+                            path.display()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.log_status(format!(
+                        "Could not load spec label dataset {} for {component_name}: {error:#}",
+                        path.display()
+                    ));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -5252,6 +5346,32 @@ impl ViewerState {
         }
 
         labels.join(", ")
+    }
+
+    fn pick_region_display_text(&self, pick: SurfacePick) -> Option<String> {
+        let scene = self.surface_scene.as_ref()?;
+        let surface = scene.surfaces.get(scene.active_index)?;
+
+        if scene.hemisphere == SpecHemisphere::Both {
+            let (left, right) = self.active_paired_components()?;
+            let left_nodes = left.mesh.as_ref()?.vertices.len() as u32;
+            let (component, local_node) = if pick.node_index < left_nodes {
+                (left, pick.node_index)
+            } else {
+                (right, pick.node_index.checked_sub(left_nodes)?)
+            };
+
+            return component
+                .label_lookup
+                .as_ref()
+                .and_then(|lookup| lookup.region_for_node(local_node));
+        }
+
+        let component = surface.components.first()?;
+        component
+            .label_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.region_for_node(pick.node_index))
     }
 
     fn picked_paired_component(&self, pick: SurfacePick) -> Option<&SceneSurfaceComponent> {
@@ -6921,7 +7041,50 @@ struct SceneSurfaceComponent {
     side: SurfaceSide,
     spec_surface: SpecSurface,
     mesh: Option<SurfaceMesh>,
+    label_lookup: Option<SurfaceLabelLookup>,
     normal_cache: Option<Arc<Vec<[f32; 3]>>>,
+}
+
+#[derive(Debug, Clone)]
+struct SurfaceLabelLookup {
+    label_table: Option<LabelTable>,
+    node_keys: Vec<Option<i32>>,
+}
+
+impl SurfaceLabelLookup {
+    fn from_dataset(
+        dataset: Dataset,
+        label_table: Option<LabelTable>,
+        node_count: usize,
+    ) -> Result<Self> {
+        let column =
+            preferred_label_column(&dataset).context("label dataset has no label column")?;
+        let mut node_keys = vec![None; node_count];
+
+        for row in 0..dataset.row_count {
+            let Some(node) = dataset.node_for_row(row) else {
+                continue;
+            };
+            let Some(slot) = node_keys.get_mut(node as usize) else {
+                continue;
+            };
+            *slot = label_value_for_row(column, row);
+        }
+
+        Ok(Self {
+            label_table,
+            node_keys,
+        })
+    }
+
+    fn region_for_node(&self, node_index: u32) -> Option<String> {
+        let key = *self.node_keys.get(node_index as usize)?.as_ref()?;
+        self.label_table
+            .as_ref()
+            .and_then(|table| table.label(key))
+            .map(|entry| entry.label.clone())
+            .or_else(|| Some(format!("label {key}")))
+    }
 }
 
 impl SceneSurface {
@@ -8485,6 +8648,105 @@ fn load_spec_component_mesh(
     apply_spec_surface_metadata(&mut mesh, spec, surface, surface_volume_idcode);
 
     Ok(mesh)
+}
+
+fn load_spec_component_label_lookup(
+    spec: &SpecFile,
+    surface: &SpecSurface,
+    mesh: &SurfaceMesh,
+) -> Result<Option<SurfaceLabelLookup>> {
+    let Some(path) = spec_label_dataset_for_surface(spec, surface) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let (dataset, label_table) = load_label_dataset_from_path(&path, mesh)?;
+    SurfaceLabelLookup::from_dataset(dataset, label_table, mesh.vertices.len()).map(Some)
+}
+
+fn spec_label_dataset_for_surface(spec: &SpecFile, surface: &SpecSurface) -> Option<PathBuf> {
+    let mut current = surface;
+    let mut seen = HashSet::new();
+
+    loop {
+        if let Some(path) = current.label_dataset.clone() {
+            return Some(path);
+        }
+        let parent = current.local_domain_parent.as_deref()?;
+        if !seen.insert(current.name.clone()) || parent == current.name {
+            return None;
+        }
+        current = spec.surfaces.iter().find(|candidate| {
+            candidate.name == parent
+                && (candidate.side == current.side || current.side == SurfaceSide::Unknown)
+        })?;
+    }
+}
+
+fn load_label_dataset_from_path(
+    path: &Path,
+    mesh: &SurfaceMesh,
+) -> Result<(Dataset, Option<LabelTable>)> {
+    if is_niml_dset_path(path) {
+        read_niml_dataset_with_label_table(path, &mesh.domain)
+    } else if is_gifti_path(path) {
+        let image = read_gifti_image(path)
+            .with_context(|| format!("failed to read GIFTI label dataset {}", path.display()))?;
+        let label_table = image
+            .label_table
+            .as_ref()
+            .map(LabelTable::from_gifti)
+            .transpose()?;
+        let dataset = read_gifti_dataset(path, &mesh.domain)?;
+        Ok((dataset, label_table))
+    } else {
+        read_niml_dataset_with_label_table(path, &mesh.domain)
+    }
+}
+
+fn preferred_label_column(dataset: &Dataset) -> Option<&DataColumn> {
+    dataset
+        .columns
+        .iter()
+        .find(|column| column.role == ColumnRole::Label)
+        .or_else(|| {
+            dataset
+                .columns
+                .iter()
+                .find(|column| label_value_column(column))
+        })
+}
+
+fn label_value_column(column: &DataColumn) -> bool {
+    matches!(
+        &column.values,
+        ColumnData::Int32(_)
+            | ColumnData::UInt32(_)
+            | ColumnData::Float32(_)
+            | ColumnData::Float64(_)
+    )
+}
+
+fn label_value_for_row(column: &DataColumn, row: usize) -> Option<i32> {
+    match &column.values {
+        ColumnData::Int32(values) => values.get(row).copied(),
+        ColumnData::UInt32(values) => values.get(row).and_then(|value| i32::try_from(*value).ok()),
+        ColumnData::Float32(values) => values
+            .get(row)
+            .and_then(|value| finite_integer_label_value(*value as f64)),
+        ColumnData::Float64(values) => values
+            .get(row)
+            .and_then(|value| finite_integer_label_value(*value)),
+        ColumnData::Text(_) => None,
+    }
+}
+
+fn finite_integer_label_value(value: f64) -> Option<i32> {
+    (value.is_finite() && value.fract() == 0.0)
+        .then_some(value as i64)
+        .and_then(|value| i32::try_from(value).ok())
 }
 
 fn afni_component_is_sendable(
@@ -10800,25 +11062,27 @@ mod tests {
         RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
         SurfacePick, afni_component_is_sendable, afni_rgba_overlay_signature,
         apply_afni_rgba_to_color_cache, canonical_overlay_columns, component_transforms,
-        pair_hemisphere_matrices, paired_component_for_node, paired_overlay_dataset,
-        paired_overlay_path_for_side, paired_overlay_paths, paired_spec_montage_shots,
-        resolve_overlay_subs, roi_appearance_for_mesh, roi_fill_nodes_from_seed,
-        scene_surface_display_label, scene_surfaces_from_components, selection_for_component,
-        selection_scale_from_model_matrices, standard_montage_shots, surface_pick_for_mesh_node,
-        threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
+        load_spec_component_label_lookup, load_spec_component_mesh, pair_hemisphere_matrices,
+        paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
+        paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
+        roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
+        scene_surfaces_from_components, selection_for_component,
+        selection_scale_from_model_matrices, spec_label_dataset_for_surface,
+        standard_montage_shots, surface_pick_for_mesh_node, threshold_and_mask_from_appearance,
+        timestamped_png_name_from_unix_seconds,
     };
     use crate::afni::AfniRgbaOverlay;
     use crate::color::Rgba;
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{MaskMode, Threshold};
     use crate::roi::Roi;
-    use crate::spec::{SpecFile, SpecHemisphere, SpecSurface};
+    use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, read_spec};
     use crate::surface::{
         AnatomicalCorrectness, OverlayDataset, SurfaceDomain, SurfaceKind, SurfaceMesh,
         SurfaceSide, ValueRange,
     };
     use glam::{Mat4, Vec3};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn background_toggles_between_black_and_white() {
@@ -11495,6 +11759,84 @@ mod tests {
     }
 
     #[test]
+    fn spec_label_dataset_inherits_from_local_domain_parent() {
+        let parent_label = PathBuf::from("lh.aparc.a2009s.annot.niml.dset");
+        let spec = SpecFile {
+            path: PathBuf::from("lh.spec"),
+            group: Some("subj".to_string()),
+            states: vec!["smoothwm".to_string(), "inf_200".to_string()],
+            hemisphere: SpecHemisphere::Left,
+            surfaces: vec![
+                SpecSurface {
+                    name: "lh.smoothwm".to_string(),
+                    path: PathBuf::from("lh.smoothwm.gii"),
+                    surface_name: "lh.smoothwm.gii".to_string(),
+                    surface_format: None,
+                    surface_type: None,
+                    state: Some("smoothwm".to_string()),
+                    raw_state: Some("smoothwm".to_string()),
+                    anatomical: Some(true),
+                    side: SurfaceSide::Left,
+                    local_domain_parent: Some("lh.smoothwm".to_string()),
+                    local_curvature_parent: None,
+                    label_dataset: Some(parent_label.clone()),
+                    embed_dimension: None,
+                },
+                SpecSurface {
+                    name: "lh.inf_200".to_string(),
+                    path: PathBuf::from("lh.inf_200.gii"),
+                    surface_name: "lh.inf_200.gii".to_string(),
+                    surface_format: None,
+                    surface_type: None,
+                    state: Some("inf_200".to_string()),
+                    raw_state: Some("inf_200".to_string()),
+                    anatomical: Some(false),
+                    side: SurfaceSide::Left,
+                    local_domain_parent: Some("lh.smoothwm".to_string()),
+                    local_curvature_parent: None,
+                    label_dataset: None,
+                    embed_dimension: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            spec_label_dataset_for_surface(&spec, &spec.surfaces[1]),
+            Some(parent_label)
+        );
+    }
+
+    #[test]
+    fn spec_label_lookup_loads_both_inherited_hemispheres_from_local_fixture() {
+        let spec_path = Path::new("testing/SUMA/sub-3_both.spec");
+        if !spec_path.exists() {
+            eprintln!("skipping local both-spec label lookup test: {spec_path:?} is absent");
+            return;
+        }
+
+        let spec = read_spec(spec_path).unwrap();
+        for (side, surface_name) in [
+            (SurfaceSide::Left, "lh.inf_200"),
+            (SurfaceSide::Right, "rh.inf_200"),
+        ] {
+            let surface = spec
+                .surfaces
+                .iter()
+                .find(|surface| surface.side == side && surface.name == surface_name)
+                .unwrap();
+            let mesh = load_spec_component_mesh(&spec, surface, None).unwrap();
+            let lookup = load_spec_component_label_lookup(&spec, surface, &mesh)
+                .unwrap()
+                .unwrap();
+
+            assert!(
+                lookup.region_for_node(49_397).is_some(),
+                "{side:?} inherited label lookup should resolve a region"
+            );
+        }
+    }
+
+    #[test]
     fn both_spec_components_are_paired_by_normalized_state() {
         let spec = both_spec(["std.smoothwm", "std.pial"]);
         let (surfaces, skipped_states, messages) = scene_surfaces_from_components(
@@ -11912,6 +12254,7 @@ mod tests {
                 embed_dimension: None,
             },
             mesh: Some(mesh),
+            label_lookup: None,
             normal_cache: None,
         }
     }

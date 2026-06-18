@@ -1,185 +1,45 @@
 # Refactor Plan
 
-A streamlining pass focused on **combining types that pull single duty** and
-**collapsing repeated field groups** — without cutting any functionality. Every
-item below preserves behavior; the goal is fewer parallel representations of the
-same concept and a smaller, more navigable `viewer/mod.rs`.
+A streamlining pass focused on **combining types that pull single duty**,
+**collapsing repeated field groups**, and **making `viewer/mod.rs` navigable** —
+without cutting any functionality. Every item preserves behavior; the goal is
+fewer parallel representations of the same concept and a smaller, more readable
+viewer.
 
-Findings come from the current tree (notably the ~80-field `ViewerState` and the
-~6,000-line `impl ViewerState`). Items are grouped by payoff vs. risk.
+The original Tier 2 (value-type merges) and the core of Tier 1 (field-group
+collapses) are **done** — see [Completed work](#completed-work) at the bottom.
+What follows is the remaining work, reordered so the **biggest
+interpretability / maintainability wins come first**.
 
----
+## Where the leverage is now
 
-## Tier 1 — High payoff, mostly mechanical
+The type-layer cleanup is largely finished, so the dominant remaining problem is
+**file/structure size**, not duplicate types. Ranked by payoff:
 
-Status: items 1-3 done across `refactorT1`, `refactor2`, and `refactorOverlay`.
+1. **Split `viewer/mod.rs`** — the single largest readability win left. ~11.8k
+   lines / ~6k-line `impl ViewerState`. Nothing else moves the "can a new reader
+   find anything" needle as much. (Item A)
+2. **Finish `WindowPane`** — the field collapse landed, but the four copies of
+   resize/redraw/repaint logic are still inline. Folding them into methods is
+   low-risk, deletes real duplication, and is the natural completion of work
+   already in the tree. (Item B)
+3. **Deepen `OverlayState`** — the wrapper groups the fields, but still mixes
+   four lifetimes (source identity, dataset, derived scalars, render cache).
+   Splitting them clarifies the most-touched data in the app. (Item C)
+4. **Tidy the ROI render-side type cluster** — nine `Roi*` view structs; some
+   are a snapshot and its target holding the same data. Smaller, more localized
+   win. (Item D)
 
-### 1. Collapse the four per-window field groups into a `WindowPane` — ✅ DONE (branch `refactorT1`)
-
-Outcome: the ~36 window/egui fields collapsed into four `WindowPane`s, dropping
-`ViewerState` from ~80 fields to 59. Done as two compile-green milestones —
-`EguiPane` (20 egui fields → 4) then `WindowPane` (wrapping window/surface/config/
-size/last_requested_size/repaint_at/frame_rendered/egui). The `upload_pending_egui_textures`
-and `free_pending_egui_textures` free functions became `EguiPane` methods. All
-~210 tests pass, fmt clean, clippy unchanged at 4. The four `*_window()` accessor
-methods were kept (bodies now read `&self.view.window` etc.).
-
-Not yet done: `ViewerState::new` still takes 17 arguments (a separate clippy
-warning) — that's about constructor *parameters*, not fields. Bundling the four
-windows + the `initial_*` options into structs would clear it; deferred as an
-optional follow-on so this milestone stays a pure field-collapse.
-
-Original notes:
-
-`ViewerState` carries four near-identical sets of fields, one per window (view,
-control, roi_control, graph):
-
-- `*_window`, `*_surface`, `*_config`, `*_size`, `last_requested_*_size`,
-  `*_repaint_at`, `*_frame_rendered`
-- the egui quintet: `*_egui_ctx`, `*_egui_state`, `*_egui_renderer`,
-  `*_pending_egui_textures`, `*_allocated_egui_textures`
-
-That's ~40 fields expressing the same shape four times
-([`viewer/mod.rs:560`](src/viewer/mod.rs) onward).
-
-- [x] Introduced `struct EguiPane { ctx, state, renderer, pending_textures, allocated_textures }`
-      with `upload_pending` / `free_pending` methods (folded from the two free
-      helpers). `repaint_delay_to_instant` stayed a free function — it operates on
-      an egui `FullOutput`, not on pane state, so it didn't belong on `EguiPane`.
-- [x] Introduced `struct WindowPane { window, surface, config, size, last_requested_size, repaint_at, frame_rendered, egui: EguiPane }`.
-- [x] Replaced the 4× field groups with `view`, `control`, `roi_control`, `graph`
-      of type `WindowPane`. ~36 fields → 4 (`ViewerState`: ~80 → 59).
-- [ ] Resize/redraw/repaint logic is not yet deduplicated into `WindowPane`
-      methods — the field bundling landed, but the per-window resize/redraw bodies
-      are still written out separately. A good follow-up within this item.
-
-*Risk:* low-moderate (lots of call sites, but each change is a rename). No logic
-changes. Biggest single readability win.
-
-**Smoke-test follow-ups (separate commit):** running the four-window app to
-verify the rename surfaced two *pre-existing* graph-dock bugs (not caused by the
-refactor), both fixed: (1) the docked graph only refreshed on `g` — it now
-follows node picks live; (2) the dock snapped back when resized because egui's
-panel-resize state didn't persist — the height is now owned in
-`graph_dock_height_points` with a self-managed drag handle, and the 3D viewport
-reserves that height so the dock stays put.
-
-### 2. Unify the overlay state held on `ViewerState` — wrapper done
-Eight parallel `overlay_*` fields describe one logical thing
-([`viewer/mod.rs:609`](src/viewer/mod.rs)):
-`overlay`, `overlay_values`, `overlay_dataset`, `overlay_columns`,
-`overlay_appearance`, `overlay_path`, `overlay_pair_paths`,
-`overlay_display_name`.
-
-- [x] Group them into a `struct OverlayState { … }` (kept as a single field, or
-      `Option<OverlayState>` for the load/unload lifecycle). `reset_scene_state`
-      becomes one assignment instead of eight.
-- [ ] Audit which of these must be `Option` independently vs. which always travel
-      together (e.g. `overlay`/`overlay_dataset`/`overlay_values` likely live and
-      die as a unit).
-
-Outcome so far: `ViewerState` now owns one `ViewerOverlayState` with the previous
-overlay model, lookup values, canonical dataset, column selections, render
-appearance, source paths, and display label. This was kept mechanical: direct
-file overlays, paired overlays, AFNI `SUMA_irgba` overlays, picking, graphing,
-and controller display still use the same data and behavior. The deeper
-load/unload optionality audit remains part of the next cleanup pass.
-
-*Risk:* moderate (touches load/unload and many readers). High clarity payoff.
-
-### 3. Pick one source of truth for the overlay scalars — ✅ done
-The same overlay attributes previously lived in **three** structs and were
-hand-synced:
-
-- `overlay::Overlay` (domain: `intensity_range`, `threshold`, `opacity`, `symmetric_range`, …)
-- `viewer/mesh.rs::OverlayAppearance` (`range`, `symmetric_range`, `colormap`, `threshold`, `opacity`, `dim`)
-- `command.rs::OverlayCommandState` (previously `visible`, `symmetric_range`, `intensity_range`, `threshold`, `opacity`)
-
-The cost shows up as manual mirroring, e.g.
-[`viewer/mod.rs:3786`](src/viewer/mod.rs) copies `intensity_range`, `threshold`,
-and `opacity` from `overlay_appearance` into `controller.overlay` by hand.
-
-- [x] Decide ownership: `OverlayAppearance` (render-facing) is the natural home
-      for `range`/`colormap`/`threshold`/`opacity`/`dim`; `OverlayCommandState`
-      should keep only what the controller uniquely needs (e.g. `visible`) and
-      borrow the rest, instead of storing a second copy.
-- [x] Remove the hand-sync lines once the duplication is gone.
-
-Outcome: `ViewerOverlayState.appearance` now owns the display scalars, including
-the symmetric-range toggle. `OverlayCommandState` keeps only `visible`.
-Incoming AFNI overlay display updates are routed to the viewer as
-`AfniRouteAction::OverlayState`, and outgoing AFNI overlay state is serialized
-from an explicit `AfniOverlayState` snapshot rather than from controller-owned
-mirror fields.
-
-*Risk:* moderate — requires care to keep the command/controller boundary intact,
-but eliminates a class of "the two copies drifted" bugs.
+Do them roughly in this order: **B is a quick completion**, **A is the big
+structural payoff** (and is much easier *after* B shrinks the per-window noise),
+then **C**, then **D**.
 
 ---
 
-## Tier 2 — Merge duplicate value types ✅ DONE (branch `refactor2`)
+## Remaining work
 
-Outcome: range encodings collapsed from five to two (one `f32` render type,
-one `f64` domain type), and the two near-identical threshold types collapsed to
-one. Item 6 was examined and intentionally left as-is — see its note. All ~210
-tests pass, clippy unchanged, fmt clean.
+### A. Split `viewer/mod.rs` along its existing seams — biggest win
 
-### 4. One min/max range type instead of five encodings — ✅ done
-The same `{ min, max }` pair appears as:
-
-- `surface.rs::ValueRange` (`f32`)
-- `overlay.rs::OverlayRange` (`f64`)
-- `dataset.rs::ColumnRange` (`f64`)
-- `OverlayCommandState.intensity_range: Option<[f32; 2]>`
-- ad-hoc `[f32; 2]` / tuples in the viewer
-
-- [x] Kept `ValueRange` (`f32`) as the render/UI range; added `PartialEq`.
-- [x] Merged `OverlayRange` into `dataset::ColumnRange` (`f64`) — the audit showed
-      the domain genuinely wants `f64` (column data is `f64`) and there was already
-      a `From<ColumnRange> for OverlayRange` glue impl, now deleted. Its interval
-      methods (`contains`/`normalized`/`validate`) moved onto `ColumnRange`.
-- [x] Replaced `OverlayCommandState.intensity_range: Option<[f32; 2]>` with
-      `Option<ValueRange>`, collapsing a hand-built array in the sync code into a
-      direct copy of `overlay_appearance.range`.
-
-Result: two range types (`ValueRange` f32 / `ColumnRange` f64) along the existing
-domain/render boundary, instead of three named types plus `[f32; 2]` and tuples.
-
-### 5. One threshold type instead of three — ✅ done (render/command merged)
-- `overlay.rs::Threshold { mode: ThresholdMode, range: Option<OverlayRange> }`
-- `viewer/mesh.rs::OverlayThreshold { enabled, absolute, value, hide_failed }`
-- `command.rs::OverlayThresholdCommandState { value, absolute, hide_failed }`
-
-The last two are identical except `OverlayThreshold` has an `enabled` flag where
-the command form uses `Option<…>`.
-
-- [x] Merged `OverlayThresholdCommandState` into a single `command::OverlayThreshold`
-      `{ enabled, absolute, value, hide_failed }`, used by the render appearance and
-      AFNI wire protocol. The `enabled` flag is the one on/off convention;
-      `AfniOverlayState` still wraps it in `Option`, but there the `Option` means
-      "field present in this partial wire update," which is a *different* concept —
-      so that is correct, not a second convention. The later OverlayState cleanup
-      removed the controller mirror field entirely.
-- [x] Left the richer domain `Threshold`/`ThresholdMode` (Above/Below/Between/Outside)
-      alone — merging it into the scalar render form would lose the mode enum, i.e.
-      cut functionality. Documented here as an intentional split, not a duplicate.
-
-### 6. One overlay-column-selection type — ⏭️ examined, intentionally not merged
-- `overlay.rs::OverlayColumns` + `ColumnSelection { index, label }` (carries `String` labels, not `Copy`)
-- `viewer/mod.rs::OverlayColumnSelections { intensity, threshold, brightness }` (index-only, `Copy`)
-
-On inspection these are a legitimate layer boundary, not harmful duplication:
-`OverlayColumnSelections` is a `Copy` index bundle bound directly to egui
-`&mut usize` dropdowns and passed by value to ~10 functions, converted to the
-labeled domain `OverlayColumns` at a single boundary
-(`canonical_overlay_columns`). Merging would lose `Copy`, force `.index` at ~15
-sites, and complicate the UI binding — i.e. it would *de*-streamline. Left as-is.
-
----
-
-## Tier 3 — Structural / file-level
-
-### 7. Split `viewer/mod.rs` (~11.8k lines) along its existing seams
 `impl ViewerState` alone is ~6,000 lines. Method-name clustering already reveals
 natural modules: `roi_*` (27), `draw_*` (18), `afni_*` (18), `pair*`/`paired_*`
 (28), `graph_*` (12), `overlay_*`/`load_*` (20), `pick_*` (10), `capture_*`/`save_*`.
@@ -191,10 +51,61 @@ natural modules: `roi_*` (27), `draw_*` (18), `afni_*` (18), `pair*`/`paired_*`
 - [ ] Relocate the ~45 small local structs (`LoadedOverlay`, `SceneStats`,
       `GraphSnapshot`, `MontageShot`, …) to the module that owns them.
 
-*Risk:* low per move (pure relocation), but high churn — do it in small,
-verifiable commits after Tier 1/2 shrink the surface.
+*Risk:* low per move (pure relocation, no logic change), but high churn — do it
+in small, individually-verifiable commits, one method cluster at a time. Easiest
+after Item B removes the per-window resize boilerplate.
 
-### 8. Tidy the ROI render-side type cluster
+*Why first among the structural items:* every later edit to the viewer pays the
+"scroll through 11.8k lines" tax. This is the change that compounds.
+
+### B. Finish `WindowPane` — dedupe per-window logic + constructor args
+
+The field collapse is done (four `WindowPane`s, `ViewerState` 80 → 59 fields).
+Two pieces of the original item remain:
+
+- [ ] **Deduplicate resize/redraw/repaint** into `WindowPane` methods. The four
+      windows (view, control, roi_control, graph) still have their resize and
+      redraw bodies written out separately; with the fields now bundled, these
+      collapse into shared methods on `WindowPane`. Removes the last of the 4×
+      duplication this item set out to kill.
+- [ ] **Bundle `ViewerState::new`'s 17 arguments** (a standing clippy
+      `too_many_arguments` warning). Group the four windows + the `initial_*`
+      options into structs. Clears the warning and makes the constructor
+      readable.
+
+*Risk:* low. The hard part (field bundling) is already merged; this is
+mechanical follow-through with an obvious test signal.
+
+*Why second:* small, finishes work already in flight, and shrinks `mod.rs`
+before the big split (Item A) so there's less to relocate.
+
+### C. Deepen `OverlayState` — separate the four lifetimes
+
+`ViewerState` now owns one `ViewerOverlayState`, but it still mixes loaded source
+identity, the canonical dataset, derived per-node scalar values, and the
+render-ready color cache in one flat struct. Options, lowest-risk first:
+
+- [ ] **Minimal grouping (recommended start):** split the wrapper into nested
+      `OverlaySourceInfo`, `DatasetOverlayState`, and `OverlayRenderCache`
+      structs, preserving current behavior. Lowest-risk readability pass.
+- [ ] **Rename-only pass** (can land first or instead): `model` → `render_model`,
+      `values` → `node_values`, `dataset` → `canonical_dataset`. Tiny, clarifies
+      intent before any reshape.
+- [ ] **Strong enum** (higher payoff, more reach): make loaded content explicit
+      as either canonical-dataset overlay data *or* AFNI-baked RGBA cache. Gives
+      real invariants but touches more call sites.
+- [ ] **Move display state:** promote `OverlayAppearance` out of `viewer/mesh.rs`
+      into a reusable overlay/display module so viewer UI, AFNI interop, and
+      future GPU shader recoloring share one display-state type. (Pairs well with
+      the GPU/shader work in `ROADMAP.md`.)
+- [ ] Audit which sub-parts must be `Option` independently vs. which always live
+      and die together (`overlay`/`dataset`/`values` likely a unit).
+
+*Risk:* moderate — touches the load/unload path and many readers. High clarity
+payoff because this is the most frequently-touched data in the app.
+
+### D. Tidy the ROI render-side type cluster
+
 `RoiLayer`, `RoiWorkspace`, `RoiSlot`, `RoiDraft`, `RoiDraftTarget`,
 `RoiDraftSnapshot`, `RoiPickTarget`, `RoiAppearanceBuild`, `RoiComponentRange`
 ([`viewer/mod.rs:7499`](src/viewer/mod.rs)+) sit alongside the domain `roi::Roi`.
@@ -204,29 +115,111 @@ verifiable commits after Tier 1/2 shrink the surface.
 - [ ] Confirm each remaining type earns its keep; collapse any that are a struct
       wrapping a single field used in one place.
 
-*Risk:* low, but needs the draw/undo paths re-read first.
+*Risk:* low, but re-read the draw/undo paths first. Most localized of the
+remaining items — good "small commit" filler between the larger ones.
 
 ---
 
 ## Explicitly *not* recommended (yet)
 
 - **`Rgba` vs `[f32; 4]`.** `[f32; 4]` is the GPU/vertex-buffer currency; forcing
-  `Rgba` everywhere would add conversions in the hot path for little gain. Better
-  to keep `Rgba` at the color/colormap boundary and `[f32; 4]` at the GPU
-  boundary, with conversions centralized (they mostly already are).
+  `Rgba` everywhere would add conversions in the hot path for little gain. Keep
+  `Rgba` at the color/colormap boundary and `[f32; 4]` at the GPU boundary, with
+  conversions centralized (they mostly already are).
 - **The `*Id(String)` newtypes** (`SurfaceId`, `SurfaceDomainId`, `RoiId`). These
-  are doing real type-safety work; leave them.
+  do real type-safety work; leave them.
+- **Merging the overlay-column-selection types.** Examined and intentionally
+  kept separate — see Completed item 6.
 
 ---
 
 ## Suggested sequencing
 
-1. ✅ Tier 2 first (items 4–6): small, self-contained type merges that *reduce the
-   blast radius* of everything after them. Done (merged on `refactor2`).
-2. Tier 1 next (items 1–3): the field-group collapses. **Item 1 done** (`WindowPane`/
-   `EguiPane`); items 2 (`OverlayState`) and 3 (single source of truth) remain.
-   Optional alongside: bundle `ViewerState::new`'s 17 args to clear that warning.
-3. Tier 3 last (items 7–8): pure relocation once the type surface is smaller.
+1. **B** — finish `WindowPane` (dedupe resize/redraw + bundle constructor args).
+   Quick, completes in-flight work, shrinks `mod.rs`.
+2. **A** — split `viewer/mod.rs` into topical submodules. The big structural
+   payoff; easier once B is done.
+3. **C** — deepen `OverlayState` (start with the minimal grouping / rename pass).
+4. **D** — tidy the ROI type cluster as small-commit filler.
 
 Run `cargo test && cargo clippy --lib && cargo fmt --all -- --check` after each
 step; the suite (~210 tests) is the safety net for "no functionality cut."
+
+---
+
+## Completed work
+
+Archived for reference. Branches: `refactor2` (Tier 2), `refactorT1`
+(WindowPane/EguiPane), `refactorOverlay` (OverlayState + single source of truth).
+All landed with ~210 tests passing, fmt clean.
+
+### 1. Collapse per-window field groups into `WindowPane` — ✅ done (`refactorT1`)
+
+~36 window/egui fields collapsed into four `WindowPane`s, dropping `ViewerState`
+from ~80 fields to 59. Two compile-green milestones: `EguiPane` (20 egui
+fields → 4) then `WindowPane` (window/surface/config/size/last_requested_size/
+repaint_at/frame_rendered/egui). `upload_pending_egui_textures` /
+`free_pending_egui_textures` became `EguiPane` methods; `repaint_delay_to_instant`
+stayed a free function (operates on egui `FullOutput`, not pane state). The four
+`*_window()` accessors were kept (bodies now read `&self.view.window` etc.).
+
+*Remaining follow-through tracked as Item B above* (dedupe resize/redraw, bundle
+the 17 constructor args).
+
+**Smoke-test follow-ups (separate commit):** verifying the rename surfaced two
+*pre-existing* graph-dock bugs (not caused by the refactor), both fixed: (1) the
+docked graph only refreshed on `g` — now follows node picks live; (2) the dock
+snapped back when resized because egui's panel-resize state didn't persist —
+height is now owned in `graph_dock_height_points` with a self-managed drag
+handle, and the 3D viewport reserves that height.
+
+### 2. Unify the overlay state into `ViewerOverlayState` — ✅ wrapper done (`refactorOverlay`)
+
+Eight parallel `overlay_*` fields (`overlay`, `overlay_values`,
+`overlay_dataset`, `overlay_columns`, `overlay_appearance`, `overlay_path`,
+`overlay_pair_paths`, `overlay_display_name`) grouped into one
+`ViewerOverlayState`. `reset_scene_state` became one assignment instead of eight.
+Kept mechanical: direct file overlays, paired overlays, AFNI `SUMA_irgba`
+overlays, picking, graphing, and controller display all unchanged.
+
+*Deeper restructure (separate the four lifetimes) tracked as Item C above.*
+
+### 3. One source of truth for overlay scalars — ✅ done (`refactorOverlay`)
+
+The same attributes previously lived in three hand-synced structs
+(`overlay::Overlay`, `viewer/mesh.rs::OverlayAppearance`,
+`command.rs::OverlayCommandState`). Now `ViewerOverlayState.appearance` owns the
+display scalars (range/colormap/threshold/opacity/dim + symmetric-range toggle);
+`OverlayCommandState` keeps only `visible`. Incoming AFNI overlay updates route
+to the viewer as `AfniRouteAction::OverlayState`; outgoing state serializes from
+an explicit `AfniOverlayState` snapshot, not controller mirror fields. Removed a
+class of "the two copies drifted" bugs.
+
+### 4. One min/max range type instead of five encodings — ✅ done (`refactor2`)
+
+Collapsed `ValueRange` (f32), `OverlayRange` (f64), `ColumnRange` (f64),
+`Option<[f32; 2]>`, and ad-hoc tuples down to **two** types along the
+domain/render boundary: `ValueRange` (f32, render/UI) and `ColumnRange` (f64,
+domain). `OverlayRange` merged into `ColumnRange` (its `contains`/`normalized`/
+`validate` methods moved over; the `From` glue impl deleted).
+`OverlayCommandState.intensity_range` became `Option<ValueRange>`.
+
+### 5. One threshold type instead of three — ✅ done (`refactor2`)
+
+Merged `OverlayThresholdCommandState` into a single `command::OverlayThreshold`
+`{ enabled, absolute, value, hide_failed }`, used by the render appearance and
+AFNI wire protocol. (`AfniOverlayState` still wraps it in `Option`, but there the
+`Option` means "field present in this partial wire update" — a different concept,
+correctly kept.) The richer domain `Threshold`/`ThresholdMode`
+(Above/Below/Between/Outside) was left alone — merging it would lose the mode
+enum, i.e. cut functionality.
+
+### 6. Overlay-column-selection types — ⏭️ examined, intentionally not merged
+
+`overlay.rs::OverlayColumns` + `ColumnSelection { index, label }` (carries
+`String`, not `Copy`) vs. `viewer/mod.rs::OverlayColumnSelections { intensity,
+threshold, brightness }` (index-only, `Copy`). A legitimate layer boundary:
+`OverlayColumnSelections` is a `Copy` index bundle bound directly to egui
+`&mut usize` dropdowns and converted to the labeled domain type at a single
+boundary (`canonical_overlay_columns`). Merging would lose `Copy`, force `.index`
+at ~15 sites, and complicate UI binding — i.e. *de*-streamline. Left as-is.
