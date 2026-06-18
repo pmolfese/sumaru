@@ -71,15 +71,39 @@ AFNI, SUMA, SUMAvista, and `sumaru`.
 
 ### Move Toward `afni_rust`
 
+- [x] Split `sumaru`'s `io.rs` into topical submodules (`io/niml`, `io/gifti`,
+  `io/roi`) behind a thin `crate::io` re-export facade. This is the migration
+  seam: callers keep using `crate::io::*` while the implementation can later be
+  swapped for `afni_rust` one reader at a time.
 - [ ] Review `/Users/molfesepj/Documents/Programming/afni_rust` for existing
   format models, parser/writer APIs, error types, fixture strategy, and places
   where `sumaru` and the crate disagree.
+- [ ] **Parity milestone — verify `afni_rust` matches `sumaru`'s behavior before
+  adopting it.** This gates the whole migration; do it reader-by-reader, lowest
+  risk first (GIFTI/ROI), NIML last.
+  - [ ] Run `afni_rust`'s parsers against `sumaru`'s existing golden fixtures
+    (`tests/afni_niml_recordings.rs`, the `io` unit-test samples, and the
+    `local_reference_files` set) and diff the decoded structures.
+  - [ ] Reconcile every divergence: binary byte-order, label-table dedup, ROI
+    datum records, sparse node-index handling, and stat metadata strings.
+  - [ ] Add a cross-check test that fails if the two implementations disagree on
+    a shared fixture, so parity can't silently regress during migration.
 - [ ] Decide the boundary between `sumaru`'s canonical runtime models and
   reusable AFNI/SUMA I/O crate models.
 - [ ] Add adapter traits so `sumaru` can swap local parsers for `afni_rust`
   readers/writers without changing viewer or analysis code.
 - [ ] Move stable NIML, spec, dataset, ROI, and future AFNI volume I/O into
   `afni_rust` once APIs and fixtures are stable enough to share.
+- [ ] Move the **NIML communication layer** into `afni_rust` so future Rust AFNI
+  programs can talk NIML without depending on `sumaru`. Keep the boundary clean:
+  - Crate owns the reusable, transport-level pieces: the NIML element model
+    (already present), the SUMA/AFNI message catalog, wire framing, and a
+    viewer-agnostic connect/send/recv client.
+  - `sumaru` keeps the application dispatch — the handlers that map a decoded
+    message onto `ViewerState`/controller state — so no rendering types leak
+    into the crate.
+  - This is also the foundation the *Linked Sumaru Sessions* work reuses: the
+    AFNI link and the future sumaru-to-sumaru link share one crate-level client.
 - [ ] Keep shared fixtures and golden summaries aligned between `sumaru`,
   `afni_rust`, AFNI/SUMA, and SUMAvista.
 

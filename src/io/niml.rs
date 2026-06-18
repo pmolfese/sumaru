@@ -1,22 +1,8 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
+//! NIML wire format: the element model, the ASCII/binary parser, the
+//! serializer, dataset-payload reading, label-table decoding, and the
+//! low-level text/number helpers the other `io` submodules build on.
 
-use anyhow::{Context, Result, bail, ensure};
-use gifti_rs::{ArrayData, DataArray, GiftiImage, Meta};
-
-use crate::color::{LabelEntry, LabelTable, LabelTableSource, Rgba};
-use crate::dataset::{
-    AfniFdrCurve, ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds,
-};
-use crate::roi::{Roi, RoiBrushAction, RoiDatum, RoiDrawingType, RoiElementKind, RoiSource};
-use crate::surface::{SurfaceDomain, SurfaceSide};
-
-const NIFTI_INTENT_CORREL: i32 = 2;
-const NIFTI_INTENT_TTEST: i32 = 3;
-const NIFTI_INTENT_FTEST: i32 = 4;
-const NIFTI_INTENT_ZSCORE: i32 = 5;
-const NIFTI_INTENT_CHISQ: i32 = 6;
+use super::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NimlElement {
@@ -69,13 +55,6 @@ pub enum NimlValueType {
     Other(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NimlRoiDatumRecord {
-    pub action_code: i32,
-    pub element_type_code: i32,
-    pub node_path: Vec<u32>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct NimlDatasetPayload {
     pub dset_type: String,
@@ -90,22 +69,6 @@ pub struct NimlDatasetPayload {
     pub column_stats: Vec<String>,
     pub fdr_curves: BTreeMap<usize, AfniFdrCurve>,
     pub history: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NimlRoiPayload {
-    pub self_idcode: Option<String>,
-    pub domain_parent_idcode: Option<String>,
-    pub parent_side: SurfaceSide,
-    pub label: String,
-    pub integer_label: i32,
-    pub roi_type_code: Option<i32>,
-    pub drawing_type: RoiDrawingType,
-    pub color_plane_name: Option<String>,
-    pub fill_color: Option<Rgba>,
-    pub edge_color: Option<Rgba>,
-    pub edge_thickness: Option<u32>,
-    pub records: Vec<NimlRoiDatumRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,41 +184,6 @@ pub fn read_niml_dataset_with_label_table(
     let label_table = label_table_from_niml_dataset_element(&elements[0])?;
 
     Ok((dataset, label_table))
-}
-
-pub fn read_gifti_dataset(path: impl AsRef<Path>, domain: &SurfaceDomain) -> Result<Dataset> {
-    let path = path.as_ref();
-    let image = read_gifti_image(path)
-        .with_context(|| format!("failed to read GIFTI dataset {}", path.display()))?;
-    gifti_image_to_dataset(&image, domain, path)
-}
-
-pub fn read_gifti_image(path: impl AsRef<Path>) -> Result<GiftiImage> {
-    read_gifti_compat(path.as_ref())
-}
-
-pub fn read_niml_roi_str(text: &str) -> Result<Vec<NimlRoiPayload>> {
-    parse_niml_str(text)?
-        .iter()
-        .filter(|element| element.name == "Node_ROI")
-        .map(NimlRoiPayload::from_element)
-        .collect()
-}
-
-pub fn read_niml_roi(path: impl AsRef<Path>) -> Result<Vec<NimlRoiPayload>> {
-    read_niml(path)?
-        .iter()
-        .filter(|element| element.name == "Node_ROI")
-        .map(NimlRoiPayload::from_element)
-        .collect()
-}
-
-pub fn write_niml_roi(path: impl AsRef<Path>, rois: &[Roi]) -> Result<()> {
-    let elements = rois
-        .iter()
-        .map(|roi| NimlRoiPayload::from_roi(roi).to_element())
-        .collect::<Vec<_>>();
-    write_niml_ascii(path, &elements)
 }
 
 pub fn niml_reference_checks() -> Vec<NimlReferenceCheck> {
@@ -447,7 +375,7 @@ impl NimlMixedTable {
 }
 
 impl NimlValueType {
-    fn from_name(name: &str) -> Self {
+    pub(crate) fn from_name(name: &str) -> Self {
         match name.trim().to_ascii_lowercase().as_str() {
             "byte" | "uint8" => Self::UInt8,
             "short" | "int16" => Self::Int16,
@@ -461,7 +389,7 @@ impl NimlValueType {
         }
     }
 
-    fn canonical_name(&self) -> &str {
+    pub(crate) fn canonical_name(&self) -> &str {
         match self {
             Self::UInt8 => "byte",
             Self::Int16 => "short",
@@ -475,14 +403,14 @@ impl NimlValueType {
         }
     }
 
-    fn is_numeric(&self) -> bool {
+    pub(crate) fn is_numeric(&self) -> bool {
         matches!(
             self,
             Self::UInt8 | Self::Int16 | Self::Int32 | Self::Float32 | Self::Float64
         )
     }
 
-    fn is_integer(&self) -> bool {
+    pub(crate) fn is_integer(&self) -> bool {
         matches!(self, Self::UInt8 | Self::Int16 | Self::Int32)
     }
 }
@@ -709,7 +637,7 @@ impl NimlDatasetPayload {
         Ok(dataset)
     }
 
-    fn data_column_for_sparse_column(
+    pub(crate) fn data_column_for_sparse_column(
         &self,
         matrix: &NimlNumericMatrix,
         column: usize,
@@ -778,13 +706,13 @@ impl NimlDatasetPayload {
     }
 }
 
-fn fdr_curve_column_index(atr_name: &str) -> Option<usize> {
+pub(crate) fn fdr_curve_column_index(atr_name: &str) -> Option<usize> {
     atr_name
         .strip_prefix("FDRCURVE_")
         .and_then(|value| value.parse::<usize>().ok())
 }
 
-fn fdr_curve_from_matrix(matrix: &NimlNumericMatrix) -> Result<AfniFdrCurve> {
+pub(crate) fn fdr_curve_from_matrix(matrix: &NimlNumericMatrix) -> Result<AfniFdrCurve> {
     ensure!(
         matrix.column_count() == 1,
         "FDR curve matrix has {} columns; expected 1",
@@ -796,189 +724,8 @@ fn fdr_curve_from_matrix(matrix: &NimlNumericMatrix) -> Result<AfniFdrCurve> {
     AfniFdrCurve::from_afni_values(&values)
 }
 
-fn read_gifti_compat(path: &Path) -> Result<GiftiImage> {
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read GIFTI file {}", path.display()))?;
-    let xml = std::str::from_utf8(&bytes)
-        .with_context(|| format!("GIFTI file {} is not valid UTF-8", path.display()))?;
-    let normalized = normalize_gifti_intent_names(xml);
-
-    gifti_rs::parse_str(&normalized)
-        .with_context(|| format!("failed to parse GIFTI file {}", path.display()))
-}
-
-fn normalize_gifti_intent_names(xml: &str) -> String {
-    let mut normalized = xml.to_string();
-    for (name, code) in [
-        ("NIFTI_INTENT_CORREL", NIFTI_INTENT_CORREL),
-        ("NIFTI_INTENT_TTEST", NIFTI_INTENT_TTEST),
-        ("NIFTI_INTENT_FTEST", NIFTI_INTENT_FTEST),
-        ("NIFTI_INTENT_ZSCORE", NIFTI_INTENT_ZSCORE),
-        ("NIFTI_INTENT_CHISQ", NIFTI_INTENT_CHISQ),
-    ] {
-        normalized =
-            normalized.replace(&format!("Intent=\"{name}\""), &format!("Intent=\"{code}\""));
-        normalized = normalized.replace(&format!("Intent='{name}'"), &format!("Intent='{code}'"));
-    }
-    normalized
-}
-
-fn gifti_image_to_dataset(
-    image: &GiftiImage,
-    domain: &SurfaceDomain,
-    path: &Path,
-) -> Result<Dataset> {
-    let columns = image
-        .data_arrays
-        .iter()
-        .enumerate()
-        .filter(|(_, array)| {
-            array.intent != gifti_rs::intent::POINTSET
-                && array.intent != gifti_rs::intent::TRIANGLE
-                && array.data.len() == domain.node_count
-        })
-        .map(|(index, array)| gifti_array_to_data_column(array, index))
-        .collect::<Result<Vec<_>>>()?;
-
-    ensure!(
-        !columns.is_empty(),
-        "GIFTI dataset has no scalar data arrays matching {} surface nodes",
-        domain.node_count
-    );
-
-    let parent_ids = DatasetParentIds {
-        source_dataset_id: gifti_meta_value(&image.meta, "UniqueID"),
-        domain_parent_id: Some(domain.id.as_str().to_string()),
-        surface_parent_id: None,
-        volume_parent_id: None,
-        originator_id: path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned()),
-    };
-
-    Dataset::dense(DatasetKind::SurfaceScalar, domain, columns)
-        .map(|dataset| dataset.with_parent_ids(parent_ids))
-}
-
-fn gifti_array_to_data_column(array: &DataArray, index: usize) -> Result<DataColumn> {
-    let label = gifti_meta_value(&array.meta, "Name").unwrap_or_else(|| format!("col_{index}"));
-    let role = column_role_from_gifti_intent(array.intent);
-    let stat = gifti_stat_from_array(array);
-
-    DataColumn::new(label, role, None, column_data_from_gifti_array(array)?)
-        .map(|column| column.with_stat(stat))
-}
-
-fn column_data_from_gifti_array(array: &DataArray) -> Result<ColumnData> {
-    match &array.data {
-        ArrayData::UInt8(values) => Ok(ColumnData::UInt32(
-            values.iter().map(|value| u32::from(*value)).collect(),
-        )),
-        ArrayData::Int8(values) => Ok(ColumnData::Int32(
-            values.iter().map(|value| i32::from(*value)).collect(),
-        )),
-        ArrayData::UInt16(values) => Ok(ColumnData::UInt32(
-            values.iter().map(|value| u32::from(*value)).collect(),
-        )),
-        ArrayData::Int16(values) => Ok(ColumnData::Int32(
-            values.iter().map(|value| i32::from(*value)).collect(),
-        )),
-        ArrayData::UInt32(values) => Ok(ColumnData::UInt32(values.clone())),
-        ArrayData::Int32(values) => Ok(ColumnData::Int32(values.clone())),
-        ArrayData::UInt64(values) => Ok(ColumnData::UInt32(
-            values
-                .iter()
-                .map(|value| {
-                    u32::try_from(*value).with_context(|| {
-                        format!("GIFTI UInt64 value {value} does not fit in Dataset UInt32")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        ArrayData::Int64(values) => Ok(ColumnData::Int32(
-            values
-                .iter()
-                .map(|value| {
-                    i32::try_from(*value).with_context(|| {
-                        format!("GIFTI Int64 value {value} does not fit in Dataset Int32")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        ArrayData::Float32(values) => Ok(ColumnData::Float32(values.clone())),
-        ArrayData::Float64(values) => Ok(ColumnData::Float64(values.clone())),
-    }
-}
-
-fn column_role_from_gifti_intent(intent: i32) -> ColumnRole {
-    match intent {
-        NIFTI_INTENT_TTEST | NIFTI_INTENT_FTEST | NIFTI_INTENT_ZSCORE | NIFTI_INTENT_CHISQ
-        | NIFTI_INTENT_CORREL => ColumnRole::Statistic,
-        gifti_rs::intent::LABEL => ColumnRole::Label,
-        gifti_rs::intent::TIME_SERIES => ColumnRole::TimePoint,
-        gifti_rs::intent::NODE_INDEX => ColumnRole::NodeIndex,
-        gifti_rs::intent::SHAPE | gifti_rs::intent::NONE => ColumnRole::Intensity,
-        _ => ColumnRole::Unknown,
-    }
-}
-
-fn gifti_stat_from_array(array: &DataArray) -> Option<String> {
-    let params = ["intent_p1", "intent_p2", "intent_p3"]
-        .iter()
-        .filter_map(|key| gifti_meta_value(&array.meta, key))
-        .filter_map(|value| value.parse::<f64>().ok())
-        .map(format_stat_parameter)
-        .collect::<Vec<_>>();
-
-    match array.intent {
-        NIFTI_INTENT_TTEST => params
-            .first()
-            .map(|df| format!("Ttest({df})"))
-            .or_else(|| Some("Ttest".to_string())),
-        NIFTI_INTENT_FTEST => {
-            if params.len() >= 2 {
-                Some(format!("Ftest({},{})", params[0], params[1]))
-            } else {
-                Some("Ftest".to_string())
-            }
-        }
-        NIFTI_INTENT_ZSCORE => Some("Zscore".to_string()),
-        NIFTI_INTENT_CHISQ => params
-            .first()
-            .map(|df| format!("ChiSq({df})"))
-            .or_else(|| Some("ChiSq".to_string())),
-        NIFTI_INTENT_CORREL => params
-            .first()
-            .map(|df| format!("Correlation({df})"))
-            .or_else(|| Some("Correlation".to_string())),
-        _ => None,
-    }
-}
-
-fn format_stat_parameter(value: f64) -> String {
-    if value.fract().abs() < 1.0e-9 {
-        format!("{}", value as i64)
-    } else {
-        format!("{value}")
-    }
-}
-
-fn gifti_meta_value(meta: &Meta, key: &str) -> Option<String> {
-    meta.iter().find_map(|(name, value)| {
-        name.eq_ignore_ascii_case(key)
-            .then(|| value.trim())
-            .and_then(|trimmed| {
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-    })
-}
-
 impl DatasetKind {
-    fn from_niml_payload(payload: &NimlDatasetPayload) -> Self {
+    pub(crate) fn from_niml_payload(payload: &NimlDatasetPayload) -> Self {
         let dset_type = compact_lower(&payload.dset_type);
         if dset_type.contains("roi") {
             return Self::Roi;
@@ -1011,191 +758,17 @@ impl DatasetKind {
     }
 }
 
-impl NimlRoiPayload {
-    pub fn from_roi(roi: &Roi) -> Self {
-        Self {
-            self_idcode: Some(roi.id.as_str().to_string()),
-            domain_parent_idcode: roi
-                .parent_domain_id
-                .as_ref()
-                .map(|id| id.as_str().to_string()),
-            parent_side: roi.parent_side.clone(),
-            label: roi.label.clone(),
-            integer_label: roi.integer_label,
-            roi_type_code: Some(drawing_type_to_code(roi.drawing_type)),
-            drawing_type: roi.drawing_type,
-            color_plane_name: Some(roi_plane_name(&roi.parent_side)),
-            fill_color: Some(roi.fill_color),
-            edge_color: Some(roi.edge_color),
-            edge_thickness: Some(roi.edge_thickness),
-            records: roi
-                .data
-                .iter()
-                .map(NimlRoiDatumRecord::from_roi_datum)
-                .collect(),
-        }
-    }
-
-    pub fn from_element(element: &NimlElement) -> Result<Self> {
-        ensure!(
-            element.name == "Node_ROI",
-            "expected Node_ROI element, got {}",
-            element.name
-        );
-        let NimlData::RoiDatums(records) = &element.data else {
-            bail!("Node_ROI payload is not SUMA_NIML_ROI_DATUM data");
-        };
-
-        let label = element
-            .attrs
-            .get("Label")
-            .cloned()
-            .unwrap_or_else(|| "ROI".to_string());
-        let integer_label = parse_i32_attr(&element.attrs, "iLabel")?.unwrap_or(0);
-        let roi_type_code = parse_i32_attr(&element.attrs, "Type")?;
-        let fill_color = element
-            .attrs
-            .get("FillColor")
-            .map(|value| parse_rgba(value))
-            .transpose()?;
-        let edge_color = element
-            .attrs
-            .get("EdgeColor")
-            .map(|value| parse_rgba(value))
-            .transpose()?;
-        let edge_thickness = parse_u32_attr(&element.attrs, "EdgeThickness")?;
-
-        Ok(Self {
-            self_idcode: element
-                .attrs
-                .get("self_idcode")
-                .or_else(|| element.attrs.get("idcode_str"))
-                .or_else(|| element.attrs.get("Object_ID"))
-                .cloned(),
-            domain_parent_idcode: element
-                .attrs
-                .get("domain_parent_idcode")
-                .or_else(|| element.attrs.get("Parent_idcode_str"))
-                .or_else(|| element.attrs.get("Parent_ID"))
-                .cloned(),
-            parent_side: element
-                .attrs
-                .get("Parent_side")
-                .map_or(SurfaceSide::Unknown, |value| side_from_text(value)),
-            label,
-            integer_label,
-            roi_type_code,
-            drawing_type: roi_type_code
-                .map(drawing_type_from_code)
-                .unwrap_or(RoiDrawingType::Collection),
-            color_plane_name: element.attrs.get("ColPlaneName").cloned(),
-            fill_color,
-            edge_color,
-            edge_thickness,
-            records: records.clone(),
-        })
-    }
-
-    pub fn to_roi(&self) -> Result<Roi> {
-        let mut roi = Roi::new(self.label.clone(), self.integer_label)?
-            .with_source(RoiSource::NimlRoi, self.self_idcode.clone())?
-            .with_drawing_type(self.drawing_type);
-
-        if let Some(id) = &self.self_idcode {
-            roi = roi.with_id(id.clone())?;
-        }
-        if let (Some(fill), Some(edge), Some(thickness)) =
-            (self.fill_color, self.edge_color, self.edge_thickness)
-        {
-            roi = roi.with_style(fill, edge, thickness)?;
-        }
-        roi.parent_side = self.parent_side.clone();
-        roi = roi.with_data(
-            self.records
-                .iter()
-                .map(NimlRoiDatumRecord::to_roi_datum)
-                .collect::<Result<Vec<_>>>()?,
-        )?;
-
-        Ok(roi)
-    }
-
-    pub fn to_element(&self) -> NimlElement {
-        let mut attrs = BTreeMap::new();
-        if let Some(value) = &self.self_idcode {
-            attrs.insert("self_idcode".to_string(), value.clone());
-        }
-        if let Some(value) = &self.domain_parent_idcode {
-            attrs.insert("domain_parent_idcode".to_string(), value.clone());
-        }
-        attrs.insert(
-            "Parent_side".to_string(),
-            side_to_niml(&self.parent_side).to_string(),
-        );
-        attrs.insert("Label".to_string(), self.label.clone());
-        attrs.insert("iLabel".to_string(), self.integer_label.to_string());
-        attrs.insert(
-            "Type".to_string(),
-            self.roi_type_code
-                .unwrap_or_else(|| drawing_type_to_code(self.drawing_type))
-                .to_string(),
-        );
-        if let Some(value) = &self.color_plane_name {
-            attrs.insert("ColPlaneName".to_string(), value.clone());
-        }
-        if let Some(value) = self.fill_color {
-            attrs.insert("FillColor".to_string(), rgba_to_string(value));
-        }
-        if let Some(value) = self.edge_color {
-            attrs.insert("EdgeColor".to_string(), rgba_to_string(value));
-        }
-        if let Some(value) = self.edge_thickness {
-            attrs.insert("EdgeThickness".to_string(), value.to_string());
-        }
-
-        NimlElement {
-            name: "Node_ROI".to_string(),
-            attrs,
-            data: NimlData::RoiDatums(self.records.clone()),
-        }
-    }
-}
-
-impl NimlRoiDatumRecord {
-    fn from_roi_datum(datum: &RoiDatum) -> Self {
-        let node_path = if datum.kind == RoiElementKind::FaceGroup {
-            datum.triangle_path.clone()
-        } else {
-            datum.node_path.clone()
-        };
-
-        Self {
-            action_code: brush_action_to_code(datum.action),
-            element_type_code: roi_element_kind_to_code(datum.kind),
-            node_path,
-        }
-    }
-
-    fn to_roi_datum(&self) -> Result<RoiDatum> {
-        let action = brush_action_from_code(self.action_code);
-        match roi_element_kind_from_code(self.element_type_code) {
-            RoiElementKind::FaceGroup => RoiDatum::face_group(self.node_path.clone()),
-            kind => RoiDatum::new(kind, action, self.node_path.clone(), Vec::new()),
-        }
-    }
-}
-
-struct NimlByteParser<'a> {
-    input: &'a [u8],
-    pos: usize,
+pub(crate) struct NimlByteParser<'a> {
+    pub(crate) input: &'a [u8],
+    pub(crate) pos: usize,
 }
 
 impl<'a> NimlByteParser<'a> {
-    fn new(input: &'a [u8]) -> Self {
+    pub(crate) fn new(input: &'a [u8]) -> Self {
         Self { input, pos: 0 }
     }
 
-    fn parse(&mut self) -> Result<Vec<NimlElement>> {
+    pub(crate) fn parse(&mut self) -> Result<Vec<NimlElement>> {
         let mut elements = Vec::new();
         loop {
             self.skip_whitespace();
@@ -1210,7 +783,7 @@ impl<'a> NimlByteParser<'a> {
         }
     }
 
-    fn parse_element(&mut self) -> Result<NimlElement> {
+    pub(crate) fn parse_element(&mut self) -> Result<NimlElement> {
         self.skip_whitespace();
         self.expect(b"<")?;
         ensure!(
@@ -1280,11 +853,11 @@ impl<'a> NimlByteParser<'a> {
         Ok(NimlElement { name, attrs, data })
     }
 
-    fn is_end(&self) -> bool {
+    pub(crate) fn is_end(&self) -> bool {
         self.pos >= self.input.len()
     }
 
-    fn skip_whitespace(&mut self) {
+    pub(crate) fn skip_whitespace(&mut self) {
         while self
             .input
             .get(self.pos)
@@ -1294,11 +867,11 @@ impl<'a> NimlByteParser<'a> {
         }
     }
 
-    fn peek(&self, token: &[u8]) -> bool {
+    pub(crate) fn peek(&self, token: &[u8]) -> bool {
         self.input[self.pos..].starts_with(token)
     }
 
-    fn expect(&mut self, token: &[u8]) -> Result<()> {
+    pub(crate) fn expect(&mut self, token: &[u8]) -> Result<()> {
         ensure!(
             self.peek(token),
             "expected {:?} at byte {}, found {:?}",
@@ -1312,7 +885,7 @@ impl<'a> NimlByteParser<'a> {
         Ok(())
     }
 
-    fn consume_until(&mut self, token: &[u8]) -> Result<()> {
+    pub(crate) fn consume_until(&mut self, token: &[u8]) -> Result<()> {
         let Some(index) = find_bytes(&self.input[self.pos..], token) else {
             bail!("did not find marker {:?}", String::from_utf8_lossy(token));
         };
@@ -1320,7 +893,7 @@ impl<'a> NimlByteParser<'a> {
         Ok(())
     }
 
-    fn read_name(&mut self) -> Result<String> {
+    pub(crate) fn read_name(&mut self) -> Result<String> {
         let start = self.pos;
         while let Some(byte) = self.input.get(self.pos) {
             if byte.is_ascii_whitespace() || *byte == b'>' || *byte == b'/' {
@@ -1333,7 +906,7 @@ impl<'a> NimlByteParser<'a> {
             .context("NIML tag name is not UTF-8")
     }
 
-    fn read_header(&mut self) -> Result<String> {
+    pub(crate) fn read_header(&mut self) -> Result<String> {
         let start = self.pos;
         let mut in_quote = false;
         while let Some(byte) = self.input.get(self.pos) {
@@ -1351,7 +924,10 @@ impl<'a> NimlByteParser<'a> {
     }
 }
 
-fn parse_element_data_bytes(attrs: &BTreeMap<String, String>, body: &[u8]) -> Result<NimlData> {
+pub(crate) fn parse_element_data_bytes(
+    attrs: &BTreeMap<String, String>,
+    body: &[u8],
+) -> Result<NimlData> {
     let Some(ni_type) = attrs.get("ni_type") else {
         let body = std::str::from_utf8(body).context("NIML text payload is not UTF-8")?;
         return Ok(NimlData::Text(unescape_niml(body.trim())));
@@ -1410,7 +986,7 @@ fn parse_element_data_bytes(attrs: &BTreeMap<String, String>, body: &[u8]) -> Re
     )?))
 }
 
-fn parse_numeric_matrix(
+pub(crate) fn parse_numeric_matrix(
     body: &str,
     column_types: Vec<NimlValueType>,
     rows: usize,
@@ -1434,7 +1010,7 @@ fn parse_numeric_matrix(
     NimlNumericMatrix::new(column_types, rows, values)
 }
 
-fn parse_binary_numeric_matrix(
+pub(crate) fn parse_binary_numeric_matrix(
     body: &[u8],
     column_types: Vec<NimlValueType>,
     rows: usize,
@@ -1469,7 +1045,7 @@ fn parse_binary_numeric_matrix(
     NimlNumericMatrix::new(column_types, rows, values)
 }
 
-fn parse_mixed_table(
+pub(crate) fn parse_mixed_table(
     body: &str,
     column_types: Vec<NimlValueType>,
     rows: usize,
@@ -1492,14 +1068,14 @@ fn parse_mixed_table(
 }
 
 #[derive(Debug, Clone, Copy)]
-enum BinaryByteOrder {
+pub(crate) enum BinaryByteOrder {
     Native,
     Little,
     Big,
 }
 
 impl BinaryByteOrder {
-    fn from_ni_form(ni_form: &str) -> Result<Self> {
+    pub(crate) fn from_ni_form(ni_form: &str) -> Result<Self> {
         match ni_form.to_ascii_lowercase().as_str() {
             "binary" => Ok(Self::Native),
             "binary.lsbfirst" => Ok(Self::Little),
@@ -1508,7 +1084,7 @@ impl BinaryByteOrder {
         }
     }
 
-    fn is_little(self) -> bool {
+    pub(crate) fn is_little(self) -> bool {
         match self {
             Self::Native => cfg!(target_endian = "little"),
             Self::Little => true,
@@ -1517,7 +1093,9 @@ impl BinaryByteOrder {
     }
 }
 
-fn label_table_from_niml_dataset_element(element: &NimlElement) -> Result<Option<LabelTable>> {
+pub(crate) fn label_table_from_niml_dataset_element(
+    element: &NimlElement,
+) -> Result<Option<LabelTable>> {
     let NimlData::Group(children) = &element.data else {
         return Ok(None);
     };
@@ -1529,7 +1107,7 @@ fn label_table_from_niml_dataset_element(element: &NimlElement) -> Result<Option
         .transpose()
 }
 
-fn afni_label_table_from_element(element: &NimlElement) -> Result<LabelTable> {
+pub(crate) fn afni_label_table_from_element(element: &NimlElement) -> Result<LabelTable> {
     let NimlData::Group(children) = &element.data else {
         bail!("AFNI_labeltable element is not a NIML group");
     };
@@ -1582,7 +1160,7 @@ fn afni_label_table_from_element(element: &NimlElement) -> Result<LabelTable> {
     LabelTable::with_name(name, source, deduplicate_afni_label_entries(entries))
 }
 
-fn deduplicate_afni_label_entries(entries: Vec<LabelEntry>) -> Vec<LabelEntry> {
+pub(crate) fn deduplicate_afni_label_entries(entries: Vec<LabelEntry>) -> Vec<LabelEntry> {
     let mut by_key = BTreeMap::new();
     for entry in entries {
         by_key.insert(entry.key, entry);
@@ -1591,7 +1169,7 @@ fn deduplicate_afni_label_entries(entries: Vec<LabelEntry>) -> Vec<LabelEntry> {
     by_key.into_iter().map(|(_, entry)| entry).collect()
 }
 
-fn mixed_float(table: &NimlMixedTable, row: usize, column: usize) -> Result<f64> {
+pub(crate) fn mixed_float(table: &NimlMixedTable, row: usize, column: usize) -> Result<f64> {
     match table.get(row, column) {
         Some(NimlValue::Float(value)) => Ok(*value),
         Some(NimlValue::Integer(value)) => Ok(*value as f64),
@@ -1602,7 +1180,7 @@ fn mixed_float(table: &NimlMixedTable, row: usize, column: usize) -> Result<f64>
     }
 }
 
-fn mixed_integer(table: &NimlMixedTable, row: usize, column: usize) -> Result<i64> {
+pub(crate) fn mixed_integer(table: &NimlMixedTable, row: usize, column: usize) -> Result<i64> {
     match table.get(row, column) {
         Some(NimlValue::Integer(value)) => Ok(*value),
         Some(NimlValue::Float(value)) if value.is_finite() && value.fract() == 0.0 => {
@@ -1618,7 +1196,7 @@ fn mixed_integer(table: &NimlMixedTable, row: usize, column: usize) -> Result<i6
     }
 }
 
-fn mixed_text(table: &NimlMixedTable, row: usize, column: usize) -> Result<&str> {
+pub(crate) fn mixed_text(table: &NimlMixedTable, row: usize, column: usize) -> Result<&str> {
     match table.get(row, column) {
         Some(NimlValue::Text(value)) => Ok(value),
         Some(_) => bail!("AFNI_labeltable row {row} column {column} is not text"),
@@ -1627,7 +1205,7 @@ fn mixed_text(table: &NimlMixedTable, row: usize, column: usize) -> Result<&str>
 }
 
 impl NimlValueType {
-    fn byte_width(&self) -> Result<usize> {
+    pub(crate) fn byte_width(&self) -> Result<usize> {
         match self {
             Self::UInt8 => Ok(1),
             Self::Int16 => Ok(2),
@@ -1638,7 +1216,7 @@ impl NimlValueType {
     }
 }
 
-fn decode_binary_value(
+pub(crate) fn decode_binary_value(
     value_type: &NimlValueType,
     bytes: &[u8],
     byte_order: BinaryByteOrder,
@@ -1683,7 +1261,7 @@ fn decode_binary_value(
     })
 }
 
-fn binary_payload_len(attrs: &BTreeMap<String, String>) -> Result<usize> {
+pub(crate) fn binary_payload_len(attrs: &BTreeMap<String, String>) -> Result<usize> {
     let ni_type = attrs
         .get("ni_type")
         .context("binary NIML element has no ni_type")?;
@@ -1706,23 +1284,23 @@ fn binary_payload_len(attrs: &BTreeMap<String, String>) -> Result<usize> {
     Ok(rows * row_width)
 }
 
-fn element_is_binary(attrs: &BTreeMap<String, String>) -> bool {
+pub(crate) fn element_is_binary(attrs: &BTreeMap<String, String>) -> bool {
     attrs
         .get("ni_form")
         .is_some_and(|value| value.to_ascii_lowercase().starts_with("binary"))
 }
 
-struct MixedValueParser<'a> {
-    input: &'a str,
-    pos: usize,
+pub(crate) struct MixedValueParser<'a> {
+    pub(crate) input: &'a str,
+    pub(crate) pos: usize,
 }
 
 impl<'a> MixedValueParser<'a> {
-    fn new(input: &'a str) -> Self {
+    pub(crate) fn new(input: &'a str) -> Self {
         Self { input, pos: 0 }
     }
 
-    fn parse_value(&mut self, value_type: &NimlValueType) -> Result<NimlValue> {
+    pub(crate) fn parse_value(&mut self, value_type: &NimlValueType) -> Result<NimlValue> {
         self.skip_delimiters();
         match value_type {
             NimlValueType::String | NimlValueType::CString => {
@@ -1746,7 +1324,7 @@ impl<'a> MixedValueParser<'a> {
         }
     }
 
-    fn parse_token(&mut self) -> Result<String> {
+    pub(crate) fn parse_token(&mut self) -> Result<String> {
         self.skip_delimiters();
         ensure!(
             self.pos < self.input.len(),
@@ -1782,7 +1360,7 @@ impl<'a> MixedValueParser<'a> {
         Ok(unescape_niml(&self.input[start..self.pos]))
     }
 
-    fn skip_delimiters(&mut self) {
+    pub(crate) fn skip_delimiters(&mut self) {
         while let Some(byte) = self.input.as_bytes().get(self.pos) {
             if byte.is_ascii_whitespace() || *byte == b';' {
                 self.pos += 1;
@@ -1792,12 +1370,12 @@ impl<'a> MixedValueParser<'a> {
         }
     }
 
-    fn is_done_or_at_closing_text(&self) -> bool {
+    pub(crate) fn is_done_or_at_closing_text(&self) -> bool {
         self.pos >= self.input.len()
     }
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
@@ -1806,65 +1384,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn parse_roi_datum_records(body: &str, rows: usize) -> Result<Vec<NimlRoiDatumRecord>> {
-    let values = body
-        .split_whitespace()
-        .map(|token| {
-            token
-                .parse::<i32>()
-                .with_context(|| format!("invalid SUMA_NIML_ROI_DATUM value {token:?}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut records = Vec::new();
-    let mut pos = 0;
-
-    while pos < values.len() {
-        ensure!(
-            pos + 3 <= values.len(),
-            "malformed SUMA_NIML_ROI_DATUM record header"
-        );
-        let action_code = values[pos];
-        let element_type_code = values[pos + 1];
-        let node_count = values[pos + 2];
-        ensure!(
-            node_count >= 0,
-            "SUMA_NIML_ROI_DATUM record has negative node count"
-        );
-        pos += 3;
-        let node_count = node_count as usize;
-        ensure!(
-            pos + node_count <= values.len(),
-            "malformed SUMA_NIML_ROI_DATUM node path"
-        );
-        let mut node_path = Vec::with_capacity(node_count);
-        for value in &values[pos..pos + node_count] {
-            ensure!(
-                *value >= 0,
-                "SUMA_NIML_ROI_DATUM node path contains negative node index"
-            );
-            node_path.push(*value as u32);
-        }
-        pos += node_count;
-        records.push(NimlRoiDatumRecord {
-            action_code,
-            element_type_code,
-            node_path,
-        });
-    }
-
-    if rows > 0 {
-        ensure!(
-            records.len() == rows,
-            "SUMA_NIML_ROI_DATUM contains {} records but ni_dimen says {}",
-            records.len(),
-            rows
-        );
-    }
-
-    Ok(records)
-}
-
-fn parse_attrs(header: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) fn parse_attrs(header: &str) -> Result<BTreeMap<String, String>> {
     let mut attrs = BTreeMap::new();
     let bytes = header.as_bytes();
     let mut pos = 0;
@@ -1915,7 +1435,7 @@ fn parse_attrs(header: &str) -> Result<BTreeMap<String, String>> {
     Ok(attrs)
 }
 
-fn serialize_element(element: &NimlElement, out: &mut String) {
+pub(crate) fn serialize_element(element: &NimlElement, out: &mut String) {
     let mut attrs = element.attrs.clone();
     match &element.data {
         NimlData::Group(_) => {
@@ -2026,7 +1546,7 @@ fn serialize_element(element: &NimlElement, out: &mut String) {
     out.push_str(">\n");
 }
 
-fn push_atr(children: &mut Vec<NimlElement>, atr_name: &str, text: &str) {
+pub(crate) fn push_atr(children: &mut Vec<NimlElement>, atr_name: &str, text: &str) {
     if text.trim().is_empty() {
         return;
     }
@@ -2035,7 +1555,7 @@ fn push_atr(children: &mut Vec<NimlElement>, atr_name: &str, text: &str) {
     children.push(NimlElement::text("AFNI_atr", attrs, text.to_string()));
 }
 
-fn split_semicolons(text: &str) -> Vec<String> {
+pub(crate) fn split_semicolons(text: &str) -> Vec<String> {
     strip_outer_quotes(text.trim())
         .split(';')
         .map(|piece| strip_outer_quotes(piece.trim()))
@@ -2044,14 +1564,14 @@ fn split_semicolons(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn join_semicolons(values: &[String]) -> String {
+pub(crate) fn join_semicolons(values: &[String]) -> String {
     if values.is_empty() {
         return String::new();
     }
     format!("{};", values.join(";"))
 }
 
-fn strip_outer_quotes(text: &str) -> &str {
+pub(crate) fn strip_outer_quotes(text: &str) -> &str {
     if text.len() >= 2 && text.starts_with('"') && text.ends_with('"') {
         &text[1..text.len() - 1]
     } else {
@@ -2059,7 +1579,7 @@ fn strip_outer_quotes(text: &str) -> &str {
     }
 }
 
-fn ni_type_string(types: &[NimlValueType]) -> String {
+pub(crate) fn ni_type_string(types: &[NimlValueType]) -> String {
     types
         .iter()
         .map(NimlValueType::canonical_name)
@@ -2067,7 +1587,7 @@ fn ni_type_string(types: &[NimlValueType]) -> String {
         .join(",")
 }
 
-fn parse_i32_attr(attrs: &BTreeMap<String, String>, key: &str) -> Result<Option<i32>> {
+pub(crate) fn parse_i32_attr(attrs: &BTreeMap<String, String>, key: &str) -> Result<Option<i32>> {
     attrs
         .get(key)
         .map(|value| {
@@ -2078,7 +1598,7 @@ fn parse_i32_attr(attrs: &BTreeMap<String, String>, key: &str) -> Result<Option<
         .transpose()
 }
 
-fn parse_u32_attr(attrs: &BTreeMap<String, String>, key: &str) -> Result<Option<u32>> {
+pub(crate) fn parse_u32_attr(attrs: &BTreeMap<String, String>, key: &str) -> Result<Option<u32>> {
     attrs
         .get(key)
         .map(|value| {
@@ -2089,125 +1609,7 @@ fn parse_u32_attr(attrs: &BTreeMap<String, String>, key: &str) -> Result<Option<
         .transpose()
 }
 
-fn parse_rgba(value: &str) -> Result<Rgba> {
-    let components = value
-        .split_whitespace()
-        .map(|piece| {
-            piece
-                .parse::<f32>()
-                .with_context(|| format!("invalid color component {piece:?}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ensure!(
-        components.len() == 3 || components.len() == 4,
-        "NIML color must have three or four components"
-    );
-    let alpha = components.get(3).copied().unwrap_or(1.0);
-    Ok(Rgba::clamped(
-        components[0],
-        components[1],
-        components[2],
-        alpha,
-    ))
-}
-
-fn rgba_to_string(value: Rgba) -> String {
-    format!(
-        "{} {} {} {}",
-        format_float(value.red as f64),
-        format_float(value.green as f64),
-        format_float(value.blue as f64),
-        format_float(value.alpha as f64)
-    )
-}
-
-fn side_from_text(value: &str) -> SurfaceSide {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "l" | "lh" | "left" => SurfaceSide::Left,
-        "r" | "rh" | "right" => SurfaceSide::Right,
-        "lr" | "both" | "bilateral" => SurfaceSide::Both,
-        "" | "no_side" | "none" | "unknown" => SurfaceSide::Unknown,
-        _ => SurfaceSide::Other(value.trim().to_string()),
-    }
-}
-
-fn side_to_niml(side: &SurfaceSide) -> &str {
-    match side {
-        SurfaceSide::Left => "L",
-        SurfaceSide::Right => "R",
-        SurfaceSide::Both => "LR",
-        SurfaceSide::Unknown => "no_side",
-        SurfaceSide::Other(value) => value,
-    }
-}
-
-fn drawing_type_from_code(value: i32) -> RoiDrawingType {
-    match value {
-        0 => RoiDrawingType::OpenPath,
-        1 => RoiDrawingType::ClosedPath,
-        2 => RoiDrawingType::FilledArea,
-        _ => RoiDrawingType::Collection,
-    }
-}
-
-fn drawing_type_to_code(value: RoiDrawingType) -> i32 {
-    match value {
-        RoiDrawingType::OpenPath => 0,
-        RoiDrawingType::ClosedPath => 1,
-        RoiDrawingType::FilledArea => 2,
-        RoiDrawingType::Collection => 4,
-    }
-}
-
-fn roi_element_kind_to_code(value: RoiElementKind) -> i32 {
-    match value {
-        RoiElementKind::NodeGroup => 1,
-        RoiElementKind::EdgeGroup => 2,
-        RoiElementKind::FaceGroup => 3,
-        RoiElementKind::NodeSegment => 4,
-        RoiElementKind::Unknown => 0,
-    }
-}
-
-fn roi_element_kind_from_code(value: i32) -> RoiElementKind {
-    match value {
-        1 => RoiElementKind::NodeGroup,
-        2 => RoiElementKind::EdgeGroup,
-        3 => RoiElementKind::FaceGroup,
-        4 => RoiElementKind::NodeSegment,
-        _ => RoiElementKind::Unknown,
-    }
-}
-
-fn brush_action_from_code(value: i32) -> RoiBrushAction {
-    match value {
-        1 => RoiBrushAction::AppendStroke,
-        2 => RoiBrushAction::AppendStrokeOrFill,
-        3 => RoiBrushAction::JoinEnds,
-        4 => RoiBrushAction::FillArea,
-        _ => RoiBrushAction::Unknown,
-    }
-}
-
-fn brush_action_to_code(value: RoiBrushAction) -> i32 {
-    match value {
-        RoiBrushAction::AppendStroke => 1,
-        RoiBrushAction::AppendStrokeOrFill => 2,
-        RoiBrushAction::JoinEnds => 3,
-        RoiBrushAction::FillArea => 4,
-        RoiBrushAction::Unknown => 0,
-    }
-}
-
-fn roi_plane_name(side: &SurfaceSide) -> String {
-    match side {
-        SurfaceSide::Left => "ROI.L.iS_0".to_string(),
-        SurfaceSide::Right => "ROI.R.iS_0".to_string(),
-        _ => "Sumaru_ROI".to_string(),
-    }
-}
-
-fn strip_niml_comment_prefixes(text: &str) -> String {
+pub(crate) fn strip_niml_comment_prefixes(text: &str) -> String {
     let mut cleaned = String::new();
     for line in text.lines() {
         let stripped = line.trim_start();
@@ -2222,7 +1624,7 @@ fn strip_niml_comment_prefixes(text: &str) -> String {
     cleaned
 }
 
-fn format_float(value: f64) -> String {
+pub(crate) fn format_float(value: f64) -> String {
     let mut formatted = format!("{value:.10}");
     while formatted.contains('.') && formatted.ends_with('0') {
         formatted.pop();
@@ -2233,7 +1635,7 @@ fn format_float(value: f64) -> String {
     formatted
 }
 
-fn format_mixed_value(value: &NimlValue) -> String {
+pub(crate) fn format_mixed_value(value: &NimlValue) -> String {
     match value {
         NimlValue::Integer(value) => value.to_string(),
         NimlValue::Float(value) => format_float(*value),
@@ -2247,7 +1649,7 @@ fn format_mixed_value(value: &NimlValue) -> String {
     }
 }
 
-fn numeric_matrix_integer_value(
+pub(crate) fn numeric_matrix_integer_value(
     matrix: &NimlNumericMatrix,
     row: usize,
     column: usize,
@@ -2262,7 +1664,7 @@ fn numeric_matrix_integer_value(
     Ok(value as i64)
 }
 
-fn column_role_from_niml_metadata(
+pub(crate) fn column_role_from_niml_metadata(
     afni_type: Option<&str>,
     stat: Option<&str>,
     label: &str,
@@ -2296,7 +1698,7 @@ fn column_role_from_niml_metadata(
     }
 }
 
-fn compact_lower(value: &str) -> String {
+pub(crate) fn compact_lower(value: &str) -> String {
     value
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -2304,7 +1706,7 @@ fn compact_lower(value: &str) -> String {
         .collect()
 }
 
-fn escape_niml(text: &str) -> String {
+pub(crate) fn escape_niml(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('\'', "&apos;")
         .replace('"', "&quot;")
@@ -2312,545 +1714,10 @@ fn escape_niml(text: &str) -> String {
         .replace('<', "&lt;")
 }
 
-fn unescape_niml(text: &str) -> String {
+pub(crate) fn unescape_niml(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
-}
-
-const MINIMAL_DSET_SAMPLE: &str = r#"
-<AFNI_dataset
-  ni_form="ni_group"
-  dset_type="Node_Bucket"
-  self_idcode="XYZ_TEST"
-  filename="toy.niml.dset"
-  label="toy.niml.dset" >
-<SPARSE_DATA
-  ni_type="float,float"
-  ni_dimen="2"
-  data_type="Node_Bucket_data" >
-1.5 2.5
-3.5 4.5
-</SPARSE_DATA>
-<INDEX_LIST
-  ni_type="int"
-  ni_dimen="2"
-  data_type="Node_Bucket_node_indices" >
-10
-12
-</INDEX_LIST>
-<AFNI_atr
-  ni_type="String"
-  ni_dimen="1"
-  atr_name="COLMS_LABS" >
-effect;stat;
-</AFNI_atr>
-</AFNI_dataset>
-"#;
-
-const MINIMAL_ROI_SAMPLE: &str = r#"
-# <Node_ROI
-#  ni_type = "SUMA_NIML_ROI_DATUM"
-#  ni_dimen = "2"
-#  self_idcode = "XYZ_ROI"
-#  domain_parent_idcode = "DOMAIN"
-#  Parent_side = "L"
-#  Label = "V1"
-#  iLabel = "7"
-#  Type = "4"
-#  ColPlaneName = "ROI.L.iS_0"
-#  FillColor = "0.5 0.1 0.9 1.0"
-#  EdgeColor = "0.0 0.0 1.0 1.0"
-#  EdgeThickness = "2"
-# >
- 1 4 3 1 2 3
- 4 1 2 8 9
-# </Node_ROI>
-"#;
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        NimlData, NimlDatasetPayload, NimlElement, NimlMixedTable, NimlNumericMatrix, NimlValue,
-        NimlValueType, expand_niml_type, niml_reference_checks, parse_niml_bytes, parse_niml_str,
-        read_niml_dset_str, read_niml_roi_str, serialize_niml_ascii,
-    };
-    use crate::color::Rgba;
-    use crate::dataset::{ColumnData, ColumnRole, DatasetKind};
-    use crate::roi::{Roi, RoiBrushAction, RoiDatum, RoiDrawingType, RoiElementKind, RoiSource};
-    use crate::surface::{SurfaceDomain, SurfaceSide};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn niml_type_expansion_matches_reference_repeat_syntax() {
-        let types = expand_niml_type("int,3*float,String,SUMA_NIML_ROI_DATUM").unwrap();
-
-        assert_eq!(
-            types,
-            vec![
-                NimlValueType::Int32,
-                NimlValueType::Float32,
-                NimlValueType::Float32,
-                NimlValueType::Float32,
-                NimlValueType::String,
-                NimlValueType::SumaRoiDatum,
-            ]
-        );
-    }
-
-    #[test]
-    fn ascii_niml_parser_reads_dataset_group_contract() {
-        let elements = parse_niml_str(super::MINIMAL_DSET_SAMPLE).unwrap();
-
-        assert_eq!(elements.len(), 1);
-        assert_eq!(elements[0].name, "AFNI_dataset");
-        let NimlData::Group(children) = &elements[0].data else {
-            panic!("expected group");
-        };
-        assert_eq!(children[0].name, "SPARSE_DATA");
-        let NimlData::Numeric(matrix) = &children[0].data else {
-            panic!("expected numeric sparse data");
-        };
-        assert_eq!(matrix.rows, 2);
-        assert_eq!(matrix.column_count(), 2);
-        assert_eq!(matrix.get(1, 1), Some(4.5));
-    }
-
-    #[test]
-    fn dataset_payload_roundtrips_sparse_data_and_attributes() {
-        let payload = read_niml_dset_str(super::MINIMAL_DSET_SAMPLE).unwrap();
-
-        assert_eq!(payload.dset_type, "Node_Bucket");
-        assert_eq!(payload.node_indices, Some(vec![10, 12]));
-        assert_eq!(payload.column_labels, vec!["effect", "stat"]);
-
-        let element = payload.to_element().unwrap();
-        let serialized = serialize_niml_ascii(&[element]);
-        let reparsed = read_niml_dset_str(&serialized).unwrap();
-
-        assert_eq!(reparsed.node_indices, Some(vec![10, 12]));
-        assert_eq!(
-            reparsed.sparse_data.unwrap().values,
-            vec![1.5, 2.5, 3.5, 4.5]
-        );
-    }
-
-    #[test]
-    fn binary_little_endian_numeric_payload_reads_fixed_width_values() {
-        let mut bytes =
-            b"<SPARSE_DATA ni_type=\"float,int\" ni_dimen=\"2\" ni_form=\"binary.lsbfirst\" >"
-                .to_vec();
-        bytes.extend_from_slice(&1.5_f32.to_le_bytes());
-        bytes.extend_from_slice(&10_i32.to_le_bytes());
-        bytes.extend_from_slice(&2.5_f32.to_le_bytes());
-        bytes.extend_from_slice(&12_i32.to_le_bytes());
-        bytes.extend_from_slice(b"</SPARSE_DATA>");
-
-        let elements = parse_niml_bytes(&bytes).unwrap();
-        let NimlData::Numeric(matrix) = &elements[0].data else {
-            panic!("expected binary numeric matrix");
-        };
-
-        assert_eq!(matrix.rows, 2);
-        assert_eq!(
-            matrix.column_types,
-            vec![NimlValueType::Float32, NimlValueType::Int32]
-        );
-        assert_eq!(matrix.get(0, 0), Some(1.5));
-        assert_eq!(matrix.get(1, 1), Some(12.0));
-    }
-
-    #[test]
-    fn bare_niml_attributes_are_preserved_as_empty_values() {
-        let text = r#"<AFNI_dataset
-            dset_type="Node_Bucket"
-            domain_parent_idcode
-            geometry_parent_idcode
-            ni_form="ni_group">
-            </AFNI_dataset>"#;
-
-        let elements = parse_niml_str(text).unwrap();
-
-        assert_eq!(
-            elements[0].attrs.get("domain_parent_idcode"),
-            Some(&String::new())
-        );
-        assert_eq!(
-            elements[0].attrs.get("geometry_parent_idcode"),
-            Some(&String::new())
-        );
-        assert_eq!(
-            elements[0].attrs.get("dset_type").map(String::as_str),
-            Some("Node_Bucket")
-        );
-    }
-
-    #[test]
-    fn binary_big_endian_double_payload_reads_values() {
-        let mut bytes =
-            b"<SPARSE_DATA ni_type=\"double\" ni_dimen=\"2\" ni_form=\"binary.msbfirst\" >"
-                .to_vec();
-        bytes.extend_from_slice(&1.25_f64.to_be_bytes());
-        bytes.extend_from_slice(&2.75_f64.to_be_bytes());
-        bytes.extend_from_slice(b"</SPARSE_DATA>");
-
-        let elements = parse_niml_bytes(&bytes).unwrap();
-        let NimlData::Numeric(matrix) = &elements[0].data else {
-            panic!("expected binary numeric matrix");
-        };
-
-        assert_eq!(matrix.column_types, vec![NimlValueType::Float64]);
-        assert_eq!(matrix.values, vec![1.25, 2.75]);
-    }
-
-    #[test]
-    fn mixed_ascii_rows_preserve_string_and_numeric_columns() {
-        let elements = parse_niml_str(
-            r#"<MIXED ni_type="int,String,float" ni_dimen="2" >
-1 "alpha beta" 2.5
-2 gamma 3.5
-</MIXED>"#,
-        )
-        .unwrap();
-        let NimlData::Mixed(table) = &elements[0].data else {
-            panic!("expected mixed table");
-        };
-
-        assert_eq!(table.rows, 2);
-        assert_eq!(table.get(0, 0), Some(&NimlValue::Integer(1)));
-        assert_eq!(
-            table.get(0, 1),
-            Some(&NimlValue::Text("alpha beta".to_string()))
-        );
-        assert_eq!(table.get(1, 2), Some(&NimlValue::Float(3.5)));
-
-        let serialized = serialize_niml_ascii(&elements);
-        let reparsed = parse_niml_str(&serialized).unwrap();
-        assert_eq!(reparsed, elements);
-    }
-
-    #[test]
-    fn canonical_dataset_conversion_builds_sparse_dataset() {
-        let domain = SurfaceDomain::from_triangles(20, vec![[0, 1, 2]]).unwrap();
-        let payload = read_niml_dset_str(
-            r#"
-<AFNI_dataset ni_form="ni_group" dset_type="Node_Bucket" self_idcode="XYZ_DATA" filename="toy.niml.dset" >
-<SPARSE_DATA ni_type="float,float" ni_dimen="2" data_type="Node_Bucket_data" >
-1.5 2.5
-3.5 4.5
-</SPARSE_DATA>
-<INDEX_LIST ni_type="int" ni_dimen="2" data_type="Node_Bucket_node_indices" >
-10
-12
-</INDEX_LIST>
-<AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_LABS" >effect;Tstat;</AFNI_atr>
-<AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_TYPE" >Generic_Float;Generic_Float;</AFNI_atr>
-<AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_STATSYM" >none;Ttest(10);</AFNI_atr>
-<AFNI_atr ni_type="float" ni_dimen="5" atr_name="FDRCURVE_000001" >
-0 1 2 1 0.5
-</AFNI_atr>
-</AFNI_dataset>
-"#,
-        )
-        .unwrap();
-
-        let dataset = payload.to_dataset(&domain).unwrap();
-
-        assert_eq!(dataset.kind, DatasetKind::SurfaceScalar);
-        assert_eq!(dataset.node_indices, Some(vec![10, 12]));
-        assert_eq!(
-            dataset.parent_ids.source_dataset_id.as_deref(),
-            Some("XYZ_DATA")
-        );
-        assert_eq!(dataset.columns[0].label, "effect");
-        assert_eq!(dataset.columns[0].role, ColumnRole::Intensity);
-        assert_eq!(dataset.columns[1].role, ColumnRole::Statistic);
-        assert_eq!(dataset.columns[1].stat.as_deref(), Some("Ttest(10)"));
-        assert!(payload.fdr_curves.contains_key(&1));
-        assert!(dataset.columns[0].fdr_curve.is_none());
-        assert_eq!(
-            dataset.columns[1].fdr_curve.as_ref().unwrap().z_value(1.0),
-            Some(1.0)
-        );
-        assert!(
-            dataset.columns[1]
-                .fdr_curve
-                .as_ref()
-                .unwrap()
-                .q_value(1.0)
-                .unwrap()
-                < 0.32
-        );
-        match &dataset.columns[0].values {
-            ColumnData::Float32(values) => assert_eq!(values, &vec![1.5, 3.5]),
-            values => panic!("unexpected column data: {values:?}"),
-        }
-    }
-
-    #[test]
-    fn canonical_dataset_conversion_builds_dense_dataset_without_index_list() {
-        let domain = SurfaceDomain::from_triangles(2, vec![[0, 1, 0]]).unwrap();
-        let payload = NimlDatasetPayload {
-            dset_type: "Node_Bucket".to_string(),
-            self_idcode: Some("XYZ_DENSE".to_string()),
-            filename: None,
-            label: None,
-            sparse_data: Some(
-                NimlNumericMatrix::from_rows(
-                    vec![NimlValueType::Int32],
-                    vec![vec![1.0], vec![2.0]],
-                )
-                .unwrap(),
-            ),
-            node_indices: None,
-            column_ranges: Vec::new(),
-            column_labels: vec!["roi".to_string()],
-            column_types: vec!["ROI_Label".to_string()],
-            column_stats: vec!["none".to_string()],
-            fdr_curves: BTreeMap::new(),
-            history: None,
-        };
-
-        let dataset = payload.to_dataset(&domain).unwrap();
-
-        assert_eq!(dataset.kind, DatasetKind::SurfaceLabel);
-        assert!(!dataset.is_sparse());
-        assert_eq!(dataset.columns[0].role, ColumnRole::Label);
-        match &dataset.columns[0].values {
-            ColumnData::Int32(values) => assert_eq!(values, &vec![1, 2]),
-            values => panic!("unexpected column data: {values:?}"),
-        }
-    }
-
-    #[test]
-    fn embedded_afni_labeltable_maps_integer_keys_to_names() {
-        let domain = SurfaceDomain::from_triangles(2, vec![[0, 1, 0]]).unwrap();
-        let elements = parse_niml_str(
-            r#"
-<AFNI_dataset ni_form="ni_group" dset_type="Node_Label" >
-<SPARSE_DATA ni_type="int" ni_dimen="2" data_type="Node_Label_data" >
-42
-0
-</SPARSE_DATA>
-<AFNI_labeltable ni_form="ni_group" dset_type="LabelTableObject" Name="FreeSurferColorLUT-test" >
-<SPARSE_DATA ni_type="4*float,int,String" ni_dimen="2" data_type="LabelTableObject_data" >
-0.1 0.2 0.3 1 42 "ctx-lh-test-region"
-0 0 0 1 0 "Unknown"
-</SPARSE_DATA>
-</AFNI_labeltable>
-<AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_LABS" >node label;</AFNI_atr>
-<AFNI_atr ni_type="String" ni_dimen="1" atr_name="COLMS_TYPE" >Node_Index_Label;</AFNI_atr>
-</AFNI_dataset>
-"#,
-        )
-        .unwrap();
-        let payload = NimlDatasetPayload::from_element(&elements[0]).unwrap();
-        let dataset = payload.to_dataset(&domain).unwrap();
-        let label_table = super::label_table_from_niml_dataset_element(&elements[0])
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(dataset.kind, DatasetKind::SurfaceLabel);
-        assert_eq!(dataset.columns[0].role, ColumnRole::Label);
-        assert_eq!(
-            label_table.label(42).map(|entry| entry.label.as_str()),
-            Some("ctx-lh-test-region")
-        );
-        assert_eq!(
-            label_table.source,
-            crate::color::LabelTableSource::FreeSurfer
-        );
-    }
-
-    #[test]
-    fn embedded_afni_labeltable_tolerates_duplicate_keys() {
-        let elements = parse_niml_str(
-            r#"
-<AFNI_dataset ni_form="ni_group" dset_type="Node_Label" >
-<AFNI_labeltable ni_form="ni_group" dset_type="LabelTableObject" Name="FreeSurferColorLUT-test" >
-<SPARSE_DATA ni_type="4*float,int,String" ni_dimen="2" data_type="LabelTableObject_data" >
-0.1 0.2 0.3 1 42 "old-name"
-0.4 0.5 0.6 1 42 "new-name"
-</SPARSE_DATA>
-</AFNI_labeltable>
-</AFNI_dataset>
-"#,
-        )
-        .unwrap();
-
-        let label_table = super::label_table_from_niml_dataset_element(&elements[0])
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(label_table.labels.len(), 1);
-        assert_eq!(
-            label_table.label(42).map(|entry| entry.label.as_str()),
-            Some("new-name")
-        );
-    }
-
-    #[test]
-    fn mixed_table_constructor_validates_value_count() {
-        let error = NimlMixedTable::new(
-            vec![NimlValueType::Int32, NimlValueType::String],
-            2,
-            vec![NimlValue::Integer(1)],
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("expected 4"));
-    }
-
-    #[test]
-    fn commented_node_roi_reads_suma_datum_records() {
-        let rois = read_niml_roi_str(super::MINIMAL_ROI_SAMPLE).unwrap();
-
-        assert_eq!(rois.len(), 1);
-        assert_eq!(rois[0].self_idcode.as_deref(), Some("XYZ_ROI"));
-        assert_eq!(rois[0].parent_side, SurfaceSide::Left);
-        assert_eq!(rois[0].label, "V1");
-        assert_eq!(rois[0].integer_label, 7);
-        assert_eq!(
-            rois[0].fill_color,
-            Some(Rgba::new_unchecked(0.5, 0.1, 0.9, 1.0))
-        );
-        assert_eq!(rois[0].records[0].action_code, 1);
-        assert_eq!(rois[0].records[0].element_type_code, 4);
-        assert_eq!(rois[0].records[0].node_path, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn roi_payload_converts_to_roi_model() {
-        let payload = read_niml_roi_str(super::MINIMAL_ROI_SAMPLE)
-            .unwrap()
-            .remove(0);
-        let roi = payload.to_roi().unwrap();
-
-        assert_eq!(roi.id.as_str(), "XYZ_ROI");
-        assert_eq!(roi.label, "V1");
-        assert_eq!(roi.parent_side, SurfaceSide::Left);
-        assert_eq!(roi.drawing_type, RoiDrawingType::Collection);
-        assert_eq!(roi.data[0].kind, RoiElementKind::NodeSegment);
-        assert_eq!(roi.data[0].action, RoiBrushAction::AppendStroke);
-        assert_eq!(roi.unique_nodes(), vec![1, 2, 3, 8, 9]);
-    }
-
-    #[test]
-    fn roi_payload_roundtrips_through_ascii_niml_element() {
-        let payload = read_niml_roi_str(super::MINIMAL_ROI_SAMPLE)
-            .unwrap()
-            .remove(0);
-        let serialized = serialize_niml_ascii(&[payload.to_element()]);
-        let reparsed = read_niml_roi_str(&serialized).unwrap();
-
-        assert_eq!(reparsed[0].label, "V1");
-        assert_eq!(reparsed[0].records, payload.records);
-    }
-
-    #[test]
-    fn drawn_roi_exports_suma_edge_join_and_fill_records() {
-        let roi = Roi::new("drawn", 3)
-            .unwrap()
-            .with_source(RoiSource::Drawn, None)
-            .unwrap()
-            .with_drawing_type(RoiDrawingType::FilledArea)
-            .with_data(vec![
-                RoiDatum::node_segment(vec![1, 2, 3], RoiBrushAction::AppendStroke).unwrap(),
-                RoiDatum::node_segment(vec![3, 4, 1], RoiBrushAction::JoinEnds).unwrap(),
-                RoiDatum::new(
-                    RoiElementKind::NodeGroup,
-                    RoiBrushAction::FillArea,
-                    vec![1, 2, 3, 4, 5],
-                    Vec::new(),
-                )
-                .unwrap(),
-            ])
-            .unwrap();
-        let payload = super::NimlRoiPayload::from_roi(&roi);
-
-        assert_eq!(payload.records.len(), 3);
-        assert_eq!(
-            payload
-                .records
-                .iter()
-                .map(|record| (record.action_code, record.element_type_code))
-                .collect::<Vec<_>>(),
-            vec![(1, 4), (3, 4), (4, 1)]
-        );
-
-        let serialized = serialize_niml_ascii(&[payload.to_element()]);
-        let reparsed = read_niml_roi_str(&serialized).unwrap();
-        assert_eq!(reparsed[0].label, "drawn");
-        assert_eq!(reparsed[0].records[1].action_code, 3);
-        assert_eq!(reparsed[0].records[2].node_path, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn reference_contract_checks_cover_c_matlab_python_alignment() {
-        let checks = niml_reference_checks();
-
-        assert_eq!(checks.len(), 3);
-        assert!(checks.iter().all(|check| check.passed), "{checks:?}");
-        assert!(checks.iter().all(|check| !check.references.is_empty()));
-    }
-
-    #[test]
-    fn numeric_matrix_rejects_wrong_value_count() {
-        let error = NimlNumericMatrix::new(vec![NimlValueType::Float32], 2, vec![1.0]).unwrap_err();
-
-        assert!(error.to_string().contains("expected 2"));
-    }
-
-    #[test]
-    fn dataset_payload_requires_sparse_data_before_writing() {
-        let payload = NimlDatasetPayload {
-            dset_type: "Node_Bucket".to_string(),
-            self_idcode: None,
-            filename: None,
-            label: None,
-            sparse_data: None,
-            node_indices: None,
-            column_ranges: Vec::new(),
-            column_labels: Vec::new(),
-            column_types: Vec::new(),
-            column_stats: Vec::new(),
-            fdr_curves: BTreeMap::new(),
-            history: None,
-        };
-
-        assert!(
-            payload
-                .to_element()
-                .unwrap_err()
-                .to_string()
-                .contains("SPARSE_DATA")
-        );
-    }
-
-    #[test]
-    fn parser_preserves_unknown_text_elements() {
-        let elements = parse_niml_str(
-            r#"<AFNI_atr ni_type="String" ni_dimen="1" atr_name="NOTE" >hello &lt;sumaru&gt;</AFNI_atr>"#,
-        )
-        .unwrap();
-
-        let NimlData::Text(text) = &elements[0].data else {
-            panic!("expected text");
-        };
-        assert_eq!(text, "hello <sumaru>");
-    }
-
-    #[test]
-    fn explicit_element_constructors_make_serializable_groups() {
-        let matrix =
-            NimlNumericMatrix::from_rows(vec![NimlValueType::Int32], vec![vec![1.0]]).unwrap();
-        let child = NimlElement::numeric("INDEX_LIST", Default::default(), matrix);
-        let root = NimlElement::group("AFNI_dataset", Default::default(), vec![child]);
-        let text = serialize_niml_ascii(&[root]);
-
-        assert!(text.contains("ni_form=\"ni_group\""));
-        assert!(text.contains("ni_type=\"int\""));
-    }
 }
