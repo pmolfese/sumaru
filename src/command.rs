@@ -445,6 +445,20 @@ pub enum ViewerCommand {
     AddVolumeSagittal,
     /// Remove the currently selected slice in `--volume` mode.
     RemoveSelectedVolumeSlice,
+    /// Copy the picked vertex index to the clipboard.
+    CopyVertexIndex,
+    /// Copy the picked vertex coordinate in RAS (paper/MNI) convention.
+    CopyXyzRas,
+    /// Copy the picked vertex coordinate in RAI (AFNI DICOM) convention.
+    CopyXyzRai,
+    /// Read a coordinate from the clipboard and jump to the nearest vertex.
+    PasteLocation,
+    /// Show or hide the "Go to Location" popup.
+    SetGoToLocationOpen(bool),
+    /// Jump using the "Go to Location" popup's XYZ field.
+    SubmitGoToXyz,
+    /// Jump using the "Go to Location" popup's vertex-index field.
+    SubmitGoToVertex,
 }
 
 fn value_label(value: Option<f32>) -> String {

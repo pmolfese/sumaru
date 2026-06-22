@@ -65,6 +65,7 @@ use transform::*;
 mod afni;
 mod camera;
 mod capture;
+mod edit;
 mod gpu;
 mod graph;
 mod input;
@@ -78,6 +79,7 @@ mod screenshot;
 mod transform;
 mod ui;
 mod volume_view;
+use edit::{CoordConvention, GoToLocationState};
 use volume_view::{SlicePlane, VolumeView};
 
 impl From<CameraMode> for CameraControlMode {
@@ -178,7 +180,8 @@ const WHITE_BACKGROUND: wgpu::Color = wgpu::Color {
 
 #[derive(Debug, Default)]
 pub struct LaunchOptions {
-    pub surface_path: Option<PathBuf>,
+    pub surface_paths: Vec<PathBuf>,
+    pub onestate: bool,
     pub spec_path: Option<PathBuf>,
     /// Left/right surface pair loaded as a both-hemisphere scene without a spec
     /// (`--surface-lh`/`--surface-rh`).
@@ -241,7 +244,8 @@ pub fn run(options: LaunchOptions) -> Result<()> {
 }
 
 struct ViewerApp {
-    initial_surface_path: Option<PathBuf>,
+    initial_surface_paths: Vec<PathBuf>,
+    initial_onestate: bool,
     initial_spec_path: Option<PathBuf>,
     initial_surface_lh_path: Option<PathBuf>,
     initial_surface_rh_path: Option<PathBuf>,
@@ -264,7 +268,8 @@ struct ViewerApp {
 impl ViewerApp {
     fn new(options: LaunchOptions, event_proxy: EventLoopProxy<ViewerEvent>) -> Self {
         Self {
-            initial_surface_path: options.surface_path,
+            initial_surface_paths: options.surface_paths,
+            initial_onestate: options.onestate,
             initial_spec_path: options.spec_path,
             initial_surface_lh_path: options.surface_lh_path,
             initial_surface_rh_path: options.surface_rh_path,
@@ -289,7 +294,7 @@ impl ViewerApp {
         let view_window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
-                    .with_title(window_title(self.initial_surface_path.as_ref()))
+                    .with_title(window_title(self.initial_surface_paths.first()))
                     .with_inner_size(PhysicalSize::new(1280, 900)),
             )?,
         );
@@ -338,7 +343,8 @@ impl ViewerApp {
                 graph: graph_window,
             },
             InitialScene {
-                surface_path: self.initial_surface_path.take(),
+                surface_paths: std::mem::take(&mut self.initial_surface_paths),
+                onestate: self.initial_onestate,
                 spec_path: self.initial_spec_path.take(),
                 surface_lh_path: self.initial_surface_lh_path.take(),
                 surface_rh_path: self.initial_surface_rh_path.take(),
@@ -955,7 +961,8 @@ struct ViewerWindows {
 /// instead of eight.
 #[derive(Default)]
 struct InitialScene {
-    surface_path: Option<PathBuf>,
+    surface_paths: Vec<PathBuf>,
+    onestate: bool,
     spec_path: Option<PathBuf>,
     surface_lh_path: Option<PathBuf>,
     surface_rh_path: Option<PathBuf>,
@@ -1007,6 +1014,8 @@ struct ViewerState {
     surface_volume_idcode: Option<String>,
     /// Loaded display volume and its slice-plane render state (`--volume` mode).
     volume_view: Option<VolumeView>,
+    /// State for the Edit menu's "Go to Location" popup.
+    go_to_location: GoToLocationState,
     scene_stats: Option<SceneStats>,
     /// Cached geometry-derived stats (winding/area/counts) keyed by surface id,
     /// so recolors do not recompute the expensive `winding_report`. Keyed as a
@@ -1070,7 +1079,8 @@ impl ViewerState {
             graph: graph_window,
         } = windows;
         let InitialScene {
-            surface_path: initial_surface_path,
+            surface_paths: initial_surface_paths,
+            onestate: initial_onestate,
             spec_path: initial_spec_path,
             surface_lh_path: initial_surface_lh_path,
             surface_rh_path: initial_surface_rh_path,
@@ -1373,6 +1383,7 @@ impl ViewerState {
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             volume_view: None,
+            go_to_location: GoToLocationState::default(),
             scene_stats: None,
             scene_geometry_stats: HashMap::new(),
             scene_stats_sender,
@@ -1400,8 +1411,15 @@ impl ViewerState {
             mode_label: None,
         };
 
-        if let Some(path) = initial_surface_path {
-            state.load_surface_path(path)?;
+        if initial_surface_paths.len() == 1 {
+            state.load_surface_path(
+                initial_surface_paths
+                    .into_iter()
+                    .next()
+                    .expect("checked single initial surface"),
+            )?;
+        } else if !initial_surface_paths.is_empty() {
+            state.load_surface_paths(initial_surface_paths, initial_onestate)?;
         } else if let (Some(left), Some(right)) = (initial_surface_lh_path, initial_surface_rh_path)
         {
             state.load_paired_surface_paths(left, right, initial_surface_volume_path)?;
@@ -2308,6 +2326,13 @@ impl ViewerState {
                 ViewerCommand::AddVolumeCoronal => self.add_volume_slice(SlicePlane::Coronal),
                 ViewerCommand::AddVolumeSagittal => self.add_volume_slice(SlicePlane::Sagittal),
                 ViewerCommand::RemoveSelectedVolumeSlice => self.remove_selected_volume_slice(),
+                ViewerCommand::CopyVertexIndex => self.copy_vertex_index(),
+                ViewerCommand::CopyXyzRas => self.copy_picked_xyz(CoordConvention::Ras),
+                ViewerCommand::CopyXyzRai => self.copy_picked_xyz(CoordConvention::Rai),
+                ViewerCommand::PasteLocation => self.paste_location(),
+                ViewerCommand::SetGoToLocationOpen(open) => self.go_to_location.open = open,
+                ViewerCommand::SubmitGoToXyz => self.submit_go_to_xyz(),
+                ViewerCommand::SubmitGoToVertex => self.submit_go_to_vertex(),
             }
         }
     }
@@ -2324,8 +2349,26 @@ impl ViewerState {
         // Prefer the spec when a multi-surface scene is active so the duplicate
         // opens the whole session; otherwise carry the single surface file.
         if let Some(scene) = self.surface_scene.as_ref() {
-            args.push("--spec".into());
-            args.push(scene.spec_path.clone().into_os_string());
+            if scene.spec_path.exists() {
+                args.push("--spec".into());
+                args.push(scene.spec_path.clone().into_os_string());
+            } else {
+                let paths = scene
+                    .surfaces
+                    .iter()
+                    .flat_map(|surface| surface.components.iter())
+                    .map(|component| component.path.clone())
+                    .collect::<Vec<_>>();
+                if paths.is_empty() {
+                    self.log_status("No command-line surfaces are loaded to duplicate.");
+                    return;
+                }
+                if scene.surfaces.len() == 1 && paths.len() > 1 {
+                    args.push("--onestate".into());
+                }
+                args.push("--surface".into());
+                args.extend(paths.into_iter().map(PathBuf::into_os_string));
+            }
         } else if let Some(surface) = self.surface_path.as_ref() {
             args.push("--surface".into());
             args.push(surface.clone().into_os_string());
@@ -2413,6 +2456,26 @@ impl ViewerState {
         Ok(())
     }
 
+    fn load_surface_paths(&mut self, paths: Vec<PathBuf>, onestate: bool) -> Result<()> {
+        ensure!(!paths.is_empty(), "no command-line surfaces were provided");
+        for path in &paths {
+            ensure!(path.exists(), "surface {} does not exist", path.display());
+        }
+        let surface_count = paths.len();
+        let spec = synthetic_surface_spec(&paths, onestate);
+        self.load_spec_file_grouped_by_state(spec, None)?;
+        self.log_status(format!(
+            "Loaded {surface_count} command-line surfaces{}.",
+            if onestate {
+                " in one state"
+            } else {
+                " as separate states"
+            }
+        ));
+
+        Ok(())
+    }
+
     fn load_spec_path(
         &mut self,
         spec_path: PathBuf,
@@ -2458,6 +2521,23 @@ impl ViewerState {
         spec: SpecFile,
         surface_volume_path: Option<PathBuf>,
     ) -> Result<()> {
+        self.load_spec_file_inner(spec, surface_volume_path, false)
+    }
+
+    fn load_spec_file_grouped_by_state(
+        &mut self,
+        spec: SpecFile,
+        surface_volume_path: Option<PathBuf>,
+    ) -> Result<()> {
+        self.load_spec_file_inner(spec, surface_volume_path, true)
+    }
+
+    fn load_spec_file_inner(
+        &mut self,
+        spec: SpecFile,
+        surface_volume_path: Option<PathBuf>,
+        group_by_state: bool,
+    ) -> Result<()> {
         let surface_volume_path = surface_volume_path
             .or_else(|| self.surface_volume_path.clone())
             .map(canonical_or_original_path);
@@ -2490,8 +2570,11 @@ impl ViewerState {
             });
         }
 
-        let (surfaces, skipped_states, messages) =
-            scene_surfaces_from_components(&spec, components);
+        let (surfaces, skipped_states, messages) = if group_by_state {
+            scene_surfaces_grouped_by_state(&spec, components)
+        } else {
+            scene_surfaces_from_components(&spec, components)
+        };
         for message in messages {
             self.log_status(message);
         }
@@ -4203,6 +4286,63 @@ fn apply_spec_surface_metadata(
     mesh.metadata.lineage.local_domain_parent = surface.local_domain_parent.clone();
     mesh.metadata.lineage.local_curvature_parent = surface.local_curvature_parent.clone();
     apply_surface_volume_parent(mesh, surface_volume_idcode);
+}
+
+/// Synthesize a minimal single-group `SpecFile` from command-line `-i`
+/// surfaces. This mirrors SUMA's generated states for command-line surfaces:
+/// by default each input gets `iS_N`, while `-onestate` puts every input in
+/// the shared `iS` state.
+fn synthetic_surface_spec(paths: &[PathBuf], onestate: bool) -> SpecFile {
+    let mut states = Vec::new();
+    let mut seen_states = HashSet::new();
+    let surfaces = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let state = if onestate {
+                "iS".to_string()
+            } else {
+                format!("iS_{index}")
+            };
+            if seen_states.insert(state.clone()) {
+                states.push(state.clone());
+            }
+            let name = file_name_display(path);
+            SpecSurface {
+                name: name.clone(),
+                path: path.clone(),
+                surface_name: name,
+                surface_format: Some("GIFTI".to_string()),
+                surface_type: None,
+                state: Some(state.clone()),
+                raw_state: Some(state),
+                anatomical: Some(true),
+                side: SurfaceSide::Unknown,
+                local_domain_parent: None,
+                local_curvature_parent: None,
+                label_dataset: None,
+                embed_dimension: None,
+            }
+        })
+        .collect();
+    let spec_name = if onestate {
+        "onestate_surfaces"
+    } else {
+        "i_surfaces"
+    };
+    let spec_path = paths
+        .first()
+        .and_then(|path| path.parent())
+        .map(|parent| parent.join(spec_name))
+        .unwrap_or_else(|| PathBuf::from(spec_name));
+
+    SpecFile {
+        path: spec_path,
+        group: None,
+        states,
+        hemisphere: SpecHemisphere::Unknown,
+        surfaces,
+    }
 }
 
 /// Synthesize a minimal both-hemisphere `SpecFile` from a left/right surface
@@ -6667,13 +6807,13 @@ mod tests {
         OverlayAppearance, OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR,
         PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation,
         RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
-        SurfacePick, afni_component_is_sendable, afni_rgba_overlay_signature,
+        SceneSurfaceLayout, SurfacePick, afni_component_is_sendable, afni_rgba_overlay_signature,
         apply_afni_rgba_to_color_cache, canonical_overlay_columns, component_transforms,
         load_spec_component_label_lookup, load_spec_component_mesh, pair_hemisphere_matrices,
         paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
         paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
         roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
-        scene_surfaces_from_components, selection_for_component,
+        scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
         selection_scale_from_model_matrices, spec_label_dataset_for_surface,
         standard_montage_shots, surface_pick_for_mesh_node, threshold_and_mask_from_appearance,
         timestamped_png_name_from_unix_seconds,
@@ -7534,6 +7674,69 @@ mod tests {
         );
 
         assert_eq!(surfaces.len(), 2);
+        assert_eq!(skipped_states, 0);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn command_line_onestate_components_share_one_identity_scene_surface() {
+        let spec = SpecFile {
+            path: PathBuf::from("onestate_surfaces"),
+            group: None,
+            states: vec!["iS".to_string()],
+            hemisphere: SpecHemisphere::Unknown,
+            surfaces: Vec::new(),
+        };
+        let (mut surfaces, skipped_states, messages) = scene_surfaces_grouped_by_state(
+            &spec,
+            vec![
+                component("iS", SurfaceSide::Left, 0.0),
+                component("iS", SurfaceSide::Right, 10.0),
+            ],
+        );
+
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].state.as_deref(), Some("iS"));
+        assert_eq!(surfaces[0].layout, SceneSurfaceLayout::Identity);
+        assert_eq!(surfaces[0].components.len(), 2);
+        assert_eq!(skipped_states, 0);
+        assert!(messages.is_empty());
+
+        let mesh = surfaces[0]
+            .display_mesh(HemisphereLayoutState::acorn())
+            .unwrap()
+            .mesh;
+        assert_eq!(mesh.vertices[0], [0.0, 0.0, 0.0]);
+        assert_eq!(mesh.vertices[3], [10.0, 0.0, 0.0]);
+        assert_eq!(component_x_gap(&mesh), 9.0);
+    }
+
+    #[test]
+    fn command_line_default_components_keep_separate_states() {
+        let spec = SpecFile {
+            path: PathBuf::from("i_surfaces"),
+            group: None,
+            states: vec!["iS_0".to_string(), "iS_1".to_string()],
+            hemisphere: SpecHemisphere::Unknown,
+            surfaces: Vec::new(),
+        };
+        let (surfaces, skipped_states, messages) = scene_surfaces_grouped_by_state(
+            &spec,
+            vec![
+                component("iS_0", SurfaceSide::Left, 0.0),
+                component("iS_1", SurfaceSide::Right, 10.0),
+            ],
+        );
+
+        assert_eq!(surfaces.len(), 2);
+        assert_eq!(
+            surfaces
+                .iter()
+                .map(|surface| surface.state.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("iS_0"), Some("iS_1")]
+        );
+        assert!(surfaces.iter().all(|surface| surface.components.len() == 1));
         assert_eq!(skipped_states, 0);
         assert!(messages.is_empty());
     }
