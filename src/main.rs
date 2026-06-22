@@ -545,6 +545,8 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &None,
+                &None,
                 &None
             )
             .is_ok()
@@ -562,6 +564,8 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &None,
+                &None,
                 &None
             )
             .is_err()
@@ -570,6 +574,8 @@ mod tests {
             validate_viewer_launch(
                 &None,
                 &path("surface.spec"),
+                &None,
+                &None,
                 &path("SurfVol.nii"),
                 &None,
                 &None,
@@ -586,6 +592,8 @@ mod tests {
         assert!(
             validate_viewer_launch(
                 &path("surface.gii"),
+                &None,
+                &None,
                 &None,
                 &path("SurfVol.nii"),
                 &None,
@@ -604,6 +612,8 @@ mod tests {
             validate_viewer_launch(
                 &None,
                 &None,
+                &None,
+                &None,
                 &path("SurfVol.nii"),
                 &None,
                 &None,
@@ -619,6 +629,8 @@ mod tests {
     fn overlay_still_requires_a_surface_context() {
         assert!(
             validate_viewer_launch(
+                &None,
+                &None,
                 &None,
                 &None,
                 &None,
@@ -641,6 +653,8 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &None,
+                &None,
                 &path("roi.niml.roi"),
                 &None,
                 &None
@@ -650,6 +664,8 @@ mod tests {
         assert!(
             validate_viewer_launch(
                 &path("surface.gii"),
+                &None,
+                &None,
                 &None,
                 &None,
                 &None,
@@ -668,6 +684,8 @@ mod tests {
             validate_viewer_launch(
                 &path("surface.gii"),
                 &path("surface.spec"),
+                &None,
+                &None,
                 &None,
                 &None,
                 &None,
@@ -735,6 +753,8 @@ mod tests {
             validate_viewer_launch(
                 &cli.surface,
                 &cli.spec,
+                &None,
+                &None,
                 &cli.surface_volume,
                 &cli.overlay,
                 &overlay_pair,
@@ -768,6 +788,8 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &None,
+                &None,
                 &pair,
                 &None,
                 &None,
@@ -787,6 +809,8 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &None,
+                &None,
                 &Some(vec!["0".to_string(), "1".to_string()]),
                 &None
             )
@@ -795,6 +819,8 @@ mod tests {
         assert!(
             validate_viewer_launch(
                 &path("surface.gii"),
+                &None,
+                &None,
                 &None,
                 &None,
                 &None,
@@ -886,6 +912,8 @@ mod tests {
 
         assert!(
             validate_no_viewer_launch_options(
+                &None,
+                &None,
                 &None,
                 &None,
                 &None,
