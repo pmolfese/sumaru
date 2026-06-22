@@ -102,6 +102,49 @@ impl ViewerState {
                         }
                     });
 
+                    /*
+                    ui.menu_button("Edit", |ui| {
+                        let has_pick = self.controller.interaction.pick.is_some();
+                        if ui
+                            .add_enabled(has_pick, egui::Button::new("Copy Vertex Index"))
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::CopyVertexIndex);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(has_pick, egui::Button::new("Copy XYZ (RAS)"))
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::CopyXyzRas);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(has_pick, egui::Button::new("Copy XYZ (RAI, AFNI)"))
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::CopyXyzRai);
+                            ui.close();
+                        }
+                        ui.separator();
+                        let has_surface = self.mesh.is_some();
+                        if ui
+                            .add_enabled(has_surface, egui::Button::new("Paste Location"))
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::PasteLocation);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(has_surface, egui::Button::new("Go to Location..."))
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::SetGoToLocationOpen(true));
+                            ui.close();
+                        }
+                    });
+                    */
+
                     ui.menu_button("View", |ui| {
                         ui.label(format!("Mode: {}", self.camera.mode().label()));
                         ui.separator();
@@ -220,47 +263,6 @@ impl ViewerState {
                             .clicked()
                         {
                             actions.push(ViewerCommand::OpenGraphForPick);
-                            ui.close();
-                        }
-                    });
-
-                    ui.menu_button("Edit", |ui| {
-                        let has_pick = self.controller.interaction.pick.is_some();
-                        if ui
-                            .add_enabled(has_pick, egui::Button::new("Copy Vertex Index"))
-                            .clicked()
-                        {
-                            actions.push(ViewerCommand::CopyVertexIndex);
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(has_pick, egui::Button::new("Copy XYZ (RAS)"))
-                            .clicked()
-                        {
-                            actions.push(ViewerCommand::CopyXyzRas);
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(has_pick, egui::Button::new("Copy XYZ (RAI, AFNI)"))
-                            .clicked()
-                        {
-                            actions.push(ViewerCommand::CopyXyzRai);
-                            ui.close();
-                        }
-                        ui.separator();
-                        let has_surface = self.mesh.is_some();
-                        if ui
-                            .add_enabled(has_surface, egui::Button::new("Paste Location"))
-                            .clicked()
-                        {
-                            actions.push(ViewerCommand::PasteLocation);
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(has_surface, egui::Button::new("Go to Location..."))
-                            .clicked()
-                        {
-                            actions.push(ViewerCommand::SetGoToLocationOpen(true));
                             ui.close();
                         }
                     });
