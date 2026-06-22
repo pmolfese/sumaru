@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"
+arboard = "3"
 clap = { version = "4", features = ["derive"] }
 egui = "0.34.3"
 egui-wgpu = "0.34.3"

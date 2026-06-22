@@ -15,9 +15,13 @@ use sumaru::viewer::{self, AfniViewerOptions, ExplicitOverlayPair};
 #[derive(Debug, Parser)]
 #[command(version, about = "SUMA in Rust")]
 struct Cli {
-    /// Launch the viewer with this GIFTI surface.
-    #[arg(short = 'i', long = "surface", value_name = "PATH")]
-    surface: Option<PathBuf>,
+    /// Launch the viewer with one or more GIFTI surfaces.
+    #[arg(short = 'i', long = "surface", value_name = "PATH", num_args = 1..)]
+    surface_paths: Vec<PathBuf>,
+
+    /// Make all command-line -i/--surface inputs share one display state.
+    #[arg(long = "onestate")]
+    onestate: bool,
 
     /// Launch the viewer from this SUMA spec file.
     #[arg(long = "spec", value_name = "PATH")]
@@ -29,7 +33,7 @@ struct Cli {
         long = "surface-lh",
         value_name = "PATH",
         requires = "surface_rh",
-        conflicts_with_all = ["surface", "spec"]
+        conflicts_with_all = ["surface_paths", "spec"]
     )]
     surface_lh: Option<PathBuf>,
 
@@ -39,7 +43,7 @@ struct Cli {
         long = "surface-rh",
         value_name = "PATH",
         requires = "surface_lh",
-        conflicts_with_all = ["surface", "spec"]
+        conflicts_with_all = ["surface_paths", "spec"]
     )]
     surface_rh: Option<PathBuf>,
 
@@ -199,7 +203,9 @@ enum NimlSendCommands {
 struct SubSpec(Vec<String>);
 
 fn main() -> Result<()> {
-    let cli = Cli::parse_from(normalized_afni_style_args());
+    let args = normalized_afni_style_args();
+    let cli = Cli::parse_from(args.clone());
+    validate_onestate_order(&args)?;
     let verbose = cli.verbose;
     let preload = cli.preload && !cli.no_preload;
     let subs = cli.subs.map(|subs| subs.0);
@@ -223,7 +229,8 @@ fn main() -> Result<()> {
         )?,
     };
 
-    let surface = cli.surface;
+    let surface_paths = cli.surface_paths;
+    let onestate = cli.onestate;
     let spec = cli.spec;
     let surface_lh = cli.surface_lh;
     let surface_rh = cli.surface_rh;
@@ -235,7 +242,7 @@ fn main() -> Result<()> {
     match cli.command {
         None => {
             validate_viewer_launch(
-                &surface,
+                &surface_paths,
                 &spec,
                 &surface_lh,
                 &surface_rh,
@@ -247,7 +254,8 @@ fn main() -> Result<()> {
                 &p_value,
             )?;
             viewer::run(viewer::LaunchOptions {
-                surface_path: surface,
+                surface_paths,
+                onestate,
                 spec_path: spec,
                 surface_lh_path: surface_lh,
                 surface_rh_path: surface_rh,
@@ -266,7 +274,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Inspect { path }) => {
             validate_no_viewer_launch_options(
-                &surface,
+                &surface_paths,
                 &spec,
                 &surface_lh,
                 &surface_rh,
@@ -277,6 +285,7 @@ fn main() -> Result<()> {
                 &subs,
                 &p_value,
                 &niml_record_path,
+                onestate,
             )?;
             if afni_requested {
                 bail!("AFNI connection flags only apply to viewer launches and `niml send`");
@@ -286,7 +295,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Niml { command }) => {
             validate_no_viewer_launch_options(
-                &surface,
+                &surface_paths,
                 &spec,
                 &surface_lh,
                 &surface_rh,
@@ -297,6 +306,7 @@ fn main() -> Result<()> {
                 &subs,
                 &p_value,
                 &niml_record_path,
+                onestate,
             )?;
             run_niml_command(command, &afni.port_config, verbose)?;
         }
@@ -347,7 +357,7 @@ fn run_niml_command(
 }
 
 fn validate_viewer_launch(
-    surface: &Option<PathBuf>,
+    surface_paths: &[PathBuf],
     spec: &Option<PathBuf>,
     surface_lh: &Option<PathBuf>,
     surface_rh: &Option<PathBuf>,
@@ -363,7 +373,7 @@ fn validate_viewer_launch(
     // alongside `--surface`/`--spec`.
     let has_paired_surfaces = surface_lh.is_some() && surface_rh.is_some();
     // Any source that produces a loaded surface scene.
-    let has_surface = surface.is_some() || spec.is_some() || has_paired_surfaces;
+    let has_surface = !surface_paths.is_empty() || spec.is_some() || has_paired_surfaces;
     // Sources that produce a both-hemisphere paired scene (needed for paired
     // overlays).
     let has_paired_scene = spec.is_some() || has_paired_surfaces;
@@ -394,7 +404,7 @@ fn validate_viewer_launch(
 }
 
 fn validate_no_viewer_launch_options(
-    surface: &Option<PathBuf>,
+    surface_paths: &[PathBuf],
     spec: &Option<PathBuf>,
     surface_lh: &Option<PathBuf>,
     surface_rh: &Option<PathBuf>,
@@ -405,8 +415,9 @@ fn validate_no_viewer_launch_options(
     subs: &Option<Vec<String>>,
     p_value: &Option<f64>,
     niml_record_path: &Option<PathBuf>,
+    onestate: bool,
 ) -> Result<()> {
-    if surface.is_some()
+    if !surface_paths.is_empty()
         || spec.is_some()
         || surface_lh.is_some()
         || surface_rh.is_some()
@@ -417,6 +428,7 @@ fn validate_no_viewer_launch_options(
         || subs.is_some()
         || p_value.is_some()
         || niml_record_path.is_some()
+        || onestate
     {
         bail!("viewer launch options and subcommands cannot be mixed");
     }
@@ -435,6 +447,28 @@ fn explicit_overlay_pair(
         }),
         _ => None,
     }
+}
+
+fn validate_onestate_order(args: &[OsString]) -> Result<()> {
+    let mut saw_surface = false;
+    for arg in args.iter().skip(1) {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if is_surface_arg(arg) {
+            saw_surface = true;
+            continue;
+        }
+        if arg == "--onestate" && saw_surface {
+            bail!("-onestate/--onestate must precede all -i/--surface options");
+        }
+    }
+
+    Ok(())
+}
+
+fn is_surface_arg(arg: &str) -> bool {
+    arg == "-i" || arg == "--surface" || arg.starts_with("--surface=")
 }
 
 fn parse_subs(value: &str) -> Result<SubSpec, String> {
@@ -510,6 +544,13 @@ fn normalize_afni_style_arg(arg: OsString) -> OsString {
         OsString::from("--spec")
     } else if arg == "-sv" {
         OsString::from("--sv")
+    } else if arg == "-onestate" {
+        OsString::from("--onestate")
+    } else if matches!(
+        arg.to_str(),
+        Some("-i_gii" | "-i_GII" | "-i_gifti" | "-i_GIFTI")
+    ) {
+        OsString::from("-i")
     } else if arg == "-np" {
         OsString::from("--np")
     } else if arg == "-npb" {
@@ -524,7 +565,7 @@ mod tests {
     use super::{
         Cli, Commands, NimlCommands, NimlSendCommands, SubSpec, explicit_overlay_pair,
         normalize_afni_style_arg, parse_niml_viewer_command, parse_p_value, parse_subs, parse_xyz,
-        validate_no_viewer_launch_options, validate_viewer_launch,
+        validate_no_viewer_launch_options, validate_onestate_order, validate_viewer_launch,
     };
     use clap::Parser;
     use std::ffi::OsString;
@@ -534,11 +575,15 @@ mod tests {
         Some(PathBuf::from(value))
     }
 
+    fn surface(value: &str) -> Vec<PathBuf> {
+        vec![PathBuf::from(value)]
+    }
+
     #[test]
     fn regular_surface_launch_does_not_require_spec_or_surface_volume() {
         assert!(
             validate_viewer_launch(
-                &path("surface.gii"),
+                &surface("surface.gii"),
                 &None,
                 &None,
                 &None,
@@ -557,7 +602,7 @@ mod tests {
     fn spec_launch_requires_surface_volume_context() {
         assert!(
             validate_viewer_launch(
-                &None,
+                &[],
                 &path("surface.spec"),
                 &None,
                 &None,
@@ -572,7 +617,7 @@ mod tests {
         );
         assert!(
             validate_viewer_launch(
-                &None,
+                &[],
                 &path("surface.spec"),
                 &None,
                 &None,
@@ -591,7 +636,7 @@ mod tests {
     fn surface_volume_can_attach_to_direct_surface_launch() {
         assert!(
             validate_viewer_launch(
-                &path("surface.gii"),
+                &surface("surface.gii"),
                 &None,
                 &None,
                 &None,
@@ -610,7 +655,7 @@ mod tests {
     fn surface_volume_without_surface_context_is_rejected() {
         assert!(
             validate_viewer_launch(
-                &None,
+                &[],
                 &None,
                 &None,
                 &None,
@@ -629,7 +674,7 @@ mod tests {
     fn overlay_still_requires_a_surface_context() {
         assert!(
             validate_viewer_launch(
-                &None,
+                &[],
                 &None,
                 &None,
                 &None,
@@ -648,7 +693,7 @@ mod tests {
     fn roi_requires_surface_context() {
         assert!(
             validate_viewer_launch(
-                &None,
+                &[],
                 &None,
                 &None,
                 &None,
@@ -663,7 +708,7 @@ mod tests {
         );
         assert!(
             validate_viewer_launch(
-                &path("surface.gii"),
+                &surface("surface.gii"),
                 &None,
                 &None,
                 &None,
@@ -682,7 +727,7 @@ mod tests {
     fn surface_and_spec_remain_mutually_exclusive() {
         assert!(
             validate_viewer_launch(
-                &path("surface.gii"),
+                &surface("surface.gii"),
                 &path("surface.spec"),
                 &None,
                 &None,
@@ -723,6 +768,71 @@ mod tests {
     }
 
     #[test]
+    fn surface_launch_options_accept_multiple_inputs_and_onestate() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--onestate",
+            "-i",
+            "lh.inflated.gii",
+            "rh.inflated.gii",
+        ]);
+
+        assert!(cli.onestate);
+        assert_eq!(
+            cli.surface_paths,
+            vec![
+                PathBuf::from("lh.inflated.gii"),
+                PathBuf::from("rh.inflated.gii")
+            ]
+        );
+
+        let cli = Cli::parse_from(["sumaru", "-i", "lh.inflated.gii", "-i", "rh.inflated.gii"]);
+        assert!(!cli.onestate);
+        assert_eq!(cli.surface_paths.len(), 2);
+    }
+
+    #[test]
+    fn suma_style_surface_flags_normalize_for_clap() {
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-onestate")),
+            OsString::from("--onestate")
+        );
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-i_gii")),
+            OsString::from("-i")
+        );
+
+        let cli = Cli::parse_from([
+            OsString::from("sumaru"),
+            normalize_afni_style_arg(OsString::from("-onestate")),
+            normalize_afni_style_arg(OsString::from("-i_gii")),
+            OsString::from("lh.inflated.gii"),
+            OsString::from("rh.inflated.gii"),
+        ]);
+        assert!(cli.onestate);
+        assert_eq!(cli.surface_paths.len(), 2);
+    }
+
+    #[test]
+    fn onestate_must_precede_surface_flags() {
+        let valid = [
+            OsString::from("sumaru"),
+            OsString::from("--onestate"),
+            OsString::from("-i"),
+            OsString::from("lh.inflated.gii"),
+        ];
+        assert!(validate_onestate_order(&valid).is_ok());
+
+        let invalid = [
+            OsString::from("sumaru"),
+            OsString::from("-i"),
+            OsString::from("lh.inflated.gii"),
+            OsString::from("--onestate"),
+        ];
+        assert!(validate_onestate_order(&invalid).is_err());
+    }
+
+    #[test]
     fn explicit_paired_overlay_launch_options_parse_and_validate() {
         let cli = Cli::parse_from([
             "sumaru",
@@ -751,7 +861,7 @@ mod tests {
         );
         assert!(
             validate_viewer_launch(
-                &cli.surface,
+                &cli.surface_paths,
                 &cli.spec,
                 &None,
                 &None,
@@ -784,7 +894,7 @@ mod tests {
         let pair = explicit_overlay_pair(path("left.niml.dset"), path("right.niml.dset"));
         assert!(
             validate_viewer_launch(
-                &path("surface.gii"),
+                &surface("surface.gii"),
                 &None,
                 &None,
                 &None,
@@ -803,7 +913,7 @@ mod tests {
     fn subs_and_p_value_require_overlay() {
         assert!(
             validate_viewer_launch(
-                &path("surface.gii"),
+                &surface("surface.gii"),
                 &None,
                 &None,
                 &None,
@@ -818,7 +928,7 @@ mod tests {
         );
         assert!(
             validate_viewer_launch(
-                &path("surface.gii"),
+                &surface("surface.gii"),
                 &None,
                 &None,
                 &None,
@@ -912,7 +1022,7 @@ mod tests {
 
         assert!(
             validate_no_viewer_launch_options(
-                &None,
+                &[],
                 &None,
                 &None,
                 &None,
@@ -923,6 +1033,7 @@ mod tests {
                 &None,
                 &None,
                 &Some(PathBuf::from("session.nimlrec")),
+                false,
             )
             .is_err()
         );

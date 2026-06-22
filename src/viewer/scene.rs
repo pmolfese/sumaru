@@ -33,6 +33,12 @@ pub(super) struct SurfaceRenderInstance {
     pub(super) model_matrix: Mat4,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SceneSurfaceLayout {
+    Identity,
+    PairedHemisphere,
+}
+
 #[derive(Clone)]
 pub(super) struct PreparedGeometryCache {
     pub(super) surface_id: SurfaceId,
@@ -83,6 +89,7 @@ pub(super) struct SceneSurface {
     pub(super) name: String,
     pub(super) state: Option<String>,
     pub(super) path: PathBuf,
+    pub(super) layout: SceneSurfaceLayout,
     pub(super) components: Vec<SceneSurfaceComponent>,
     pub(super) display_cache: Option<DisplayMeshCache>,
 }
@@ -159,6 +166,7 @@ impl SceneSurface {
             name: component.name.clone(),
             state: component.state.clone(),
             path: component.path.clone(),
+            layout: SceneSurfaceLayout::Identity,
             components: vec![component],
             display_cache: None,
         }
@@ -174,7 +182,23 @@ impl SceneSurface {
             name: state.clone(),
             state: Some(state),
             path: spec_path,
+            layout: SceneSurfaceLayout::PairedHemisphere,
             components: vec![left, right],
+            display_cache: None,
+        }
+    }
+
+    pub(super) fn grouped(
+        state: String,
+        spec_path: PathBuf,
+        components: Vec<SceneSurfaceComponent>,
+    ) -> Self {
+        Self {
+            name: state.clone(),
+            state: Some(state),
+            path: spec_path,
+            layout: SceneSurfaceLayout::Identity,
+            components,
             display_cache: None,
         }
     }
@@ -220,7 +244,7 @@ impl SceneSurface {
             });
         }
 
-        let mut mesh = composite_component_mesh(&self.components, layout)?;
+        let mut mesh = composite_component_mesh(&self.components, layout, self.layout)?;
         mesh.metadata.label = Some(self.name.clone());
         mesh.metadata.source_file = Some(self.path.clone());
         mesh.metadata.side = SurfaceSide::Both;
@@ -282,6 +306,54 @@ pub(super) fn scene_surfaces_from_components(
     }
 
     paired_scene_surfaces(spec, components)
+}
+
+pub(super) fn scene_surfaces_grouped_by_state(
+    spec: &SpecFile,
+    components: Vec<SceneSurfaceComponent>,
+) -> (Vec<SceneSurface>, usize, Vec<String>) {
+    let mut by_state = BTreeMap::<String, Vec<SceneSurfaceComponent>>::new();
+    let mut skipped_states = 0;
+    let mut messages = Vec::new();
+
+    for component in components {
+        let Some(state) = component.state.clone() else {
+            skipped_states += 1;
+            messages.push(format!(
+                "Skipping command-line surface {} because it has no state.",
+                component.path.display()
+            ));
+            continue;
+        };
+        by_state.entry(state).or_default().push(component);
+    }
+
+    let mut ordered_states = Vec::new();
+    let mut seen = HashSet::new();
+    for state in &spec.states {
+        if by_state.contains_key(state) && seen.insert(state.clone()) {
+            ordered_states.push(state.clone());
+        }
+    }
+    for state in by_state.keys() {
+        if seen.insert(state.clone()) {
+            ordered_states.push(state.clone());
+        }
+    }
+
+    let surfaces = ordered_states
+        .into_iter()
+        .filter_map(|state| {
+            let components = by_state.remove(&state)?;
+            if components.len() == 1 {
+                components.into_iter().next().map(SceneSurface::single)
+            } else {
+                Some(SceneSurface::grouped(state, spec.path.clone(), components))
+            }
+        })
+        .collect();
+
+    (surfaces, skipped_states, messages)
 }
 
 pub(super) fn paired_scene_surfaces(
@@ -371,8 +443,12 @@ pub(super) fn paired_scene_surfaces(
 pub(super) fn composite_component_mesh(
     components: &[SceneSurfaceComponent],
     layout: HemisphereLayoutState,
+    component_layout: SceneSurfaceLayout,
 ) -> Result<SurfaceMesh> {
-    let transforms = component_transforms(components, layout);
+    let transforms = match component_layout {
+        SceneSurfaceLayout::Identity => vec![ComponentTransform::default(); components.len()],
+        SceneSurfaceLayout::PairedHemisphere => component_transforms(components, layout),
+    };
     let vertex_count: usize = components
         .iter()
         .filter_map(|component| component.mesh.as_ref())
