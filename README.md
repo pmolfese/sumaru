@@ -29,6 +29,14 @@ NIML. No SUMA install, no X11, no MATLAB: one Rust binary.
 - **A real library, not just a GUI.** Most behavior lives in the library crate,
   so batch tools, tests, and future renderers share one data model.
 
+### Install
+```
+git clone https://github.com/pmolfese/sumaru
+cd sumaru
+cargo build --release
+```
+Then copy the sumaru binary to somewhere on your path. Use (mostly) like SUMA. 
+
 ### A look at the interface
 
 <table>
