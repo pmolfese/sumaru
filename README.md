@@ -1,43 +1,73 @@
 <h1 align="center">sumaru</h1>
 
-<p align="center"><strong>SUMA, in Rust.</strong></p>
+<p align="center"><strong>An experimental Rust viewer for SUMA-style neuroimaging data.</strong></p>
 
 <p align="center">
-A ground-up Rust rebuild of AFNI's SUMA surface tooling — a fast, native
-surface and volume viewer for neuroimaging, built on <code>winit</code>,
-<code>wgpu</code>, and <code>egui</code>, with a clean, testable library core
-underneath.
+I have been working on <code>sumaru</code> as a way to try out some ideas about
+3D neuroimaging viewers: native GPU rendering, a testable Rust data model, and
+day-to-day compatibility with the kinds of files people already use with
+AFNI/SUMA.
 </p>
 
 <p align="center">
   <img src="docs/images/hero-surface-overlay.png" alt="sumaru viewing an inflated cortical surface with a thresholded statistical overlay" width="820">
 </p>
 
-`sumaru` reads the file formats SUMA workflows depend on — GIFTI surfaces,
-`.niml.dset`/`.gii.dset` overlays, `.spec` scenes, `.niml.roi` regions, and NIfTI
-volumes — renders them on the GPU, and talks to a running AFNI/SUMA session over
-NIML. No SUMA install, no X11, no MATLAB: one Rust binary.
+`sumaru` is not SUMA, and it is not trying to replace the full AFNI ecosystem.
+It started as an experiment. The nice surprise is that it has become functional
+enough to use like a partial SUMA-style drop-in for common 3D viewing tasks:
+opening GIFTI surfaces, loading `.niml.dset`/`.gii.dset` overlays, stepping
+through `.spec` scenes, drawing or reading `.niml.roi` regions, checking NIfTI
+slice planes, and talking to a running AFNI/SUMA session over NIML.
 
-### Why sumaru
+If your current SUMA workflow is working, keep using it. This project may be
+worth considering when you want a small native viewer, a Rust codebase that is
+pleasant to experiment in, or a quick way to look at surface and volume data
+without moving it into a different ecosystem.
 
-- **Native and fast.** GPU rendering through `wgpu`; surfaces, overlays, ROIs,
-  and volume slices share one render pass.
-- **AFNI-compatible.** Speaks the same NIML talk protocol as SUMA/PySuma —
-  connect to a live AFNI session and exchange crosshairs, picks, and overlays.
-- **Surfaces *and* volumes.** Inflated/pial/sphere surfaces, paired-hemisphere
-  layouts, drawn ROIs, and orthogonal NIfTI slice planes in the same 3D scene.
-- **A real library, not just a GUI.** Most behavior lives in the library crate,
-  so batch tools, tests, and future renderers share one data model.
+## Why This Might Be Useful
 
-### Install
+- **It works with familiar files.** The goal is to open the files scientists
+  already have from AFNI/SUMA and related surface workflows, not ask for a new
+  project format first.
+- **It is responsive enough for everyday inspection.** Rendering goes through
+  `wgpu`, so surface rotation, overlays, ROIs, paired hemispheres, and volume
+  slices can stay interactive while you are checking data.
+- **Surfaces and volumes can share one scene.** This is handy for sanity checks:
+  Does the surface line up with the anatomical volume? Is the overlay sitting
+  where expected? Are the slice planes telling the same story as the surface?
+- **It can sit next to AFNI.** The NIML talk bridge is early, but it already
+  supports the practical path of connecting to AFNI/SUMA and exchanging picks,
+  geometry, and overlay colors.
+- **The internals are meant to be testable.** Most of the behavior lives in the
+  library crate rather than being buried inside the GUI. That matters for
+  scientific software, where boring details like coordinates, thresholds, and
+  file parsing deserve tests.
+
+## Status
+
+This is research software and still changing. It is quite functional for a
+viewer, but it is also an experiment: some SUMA features are missing, behavior
+may move around, and you should verify results with the same care you would give
+any new tool in an analysis workflow.
+
+At the moment, the project is most useful for people who are comfortable trying
+a source build, comparing behavior against tools they already trust, and filing
+small, concrete issues when real datasets expose rough edges.
+
+## Install
+
+This is currently a source build:
+
 ```
 git clone https://github.com/pmolfese/sumaru
 cd sumaru
 cargo build --release
 ```
-Then copy the sumaru binary to somewhere on your path. Use (mostly) like SUMA. 
+Then copy the `sumaru` binary to somewhere on your path, or run it through
+`cargo run` while experimenting.
 
-### A look at the interface
+## A Look at the Interface
 
 <table>
   <tr>
@@ -45,7 +75,7 @@ Then copy the sumaru binary to somewhere on your path. Use (mostly) like SUMA.
     <td width="50%"><img src="docs/images/paired-hemispheres.png" alt="Paired-hemisphere open layout" width="100%"></td>
   </tr>
   <tr>
-    <td align="center"><em>Volume mode — draggable axial / coronal / sagittal slice planes</em></td>
+    <td align="center"><em>Volume mode: draggable axial / coronal / sagittal slice planes</em></td>
     <td align="center"><em>Paired-hemisphere "acorn" layout from a both-hemisphere spec</em></td>
   </tr>
   <tr>
@@ -58,18 +88,21 @@ Then copy the sumaru binary to somewhere on your path. Use (mostly) like SUMA.
   </tr>
 </table>
 
-> Screenshots live in [`docs/images/`](docs/images/) — see its README for the
-> exact filenames to drop in.
+Screenshot files are kept in [`docs/images/`](docs/images/) so they can be
+refreshed as the viewer changes.
 
-## Current Scope
+## What Works Right Now
 
-- GIFTI surface/shape/dataset I/O through `gifti-rs` from `PennLINC/gifti-rs`
-- NIFTI volume I/O through `nifti` from `Enet4/nifti-rs`
-- SUMA `.spec` parsing for single-hemisphere multi-surface scenes
+- GIFTI surface/shape/dataset I/O through `gifti-rs` from `PennLINC/gifti-rs`.
+- NIfTI volume I/O through `nifti` from `Enet4/nifti-rs`.
+- SUMA `.spec` parsing for the common single-hemisphere and paired-hemisphere
+  viewer cases I have been testing.
 - A surface viewer through `winit`, `wgpu`, and `egui`, with overlays, drawn
-  ROIs, and paired-hemisphere layouts
-- A `--volume` mode that renders orthogonal NIfTI slice planes in the 3D scene
-- Headless file inspection:
+  ROIs, and paired-hemisphere layouts.
+- A `--volume` mode that renders orthogonal NIfTI slice planes in the 3D scene.
+- Headless file inspection for quick metadata checks.
+
+Some useful ways to launch it:
 
 ```sh
 cargo run
@@ -104,13 +137,15 @@ AFNI/SUMA `.niml.dset`, or an AFNI-converted `.gii.dset`. Multi-column datasets
 are parsed into the canonical `Dataset` table first; the controller can then
 choose intensity, threshold, and brightness columns from the dataset. If the
 selected threshold column carries an AFNI stat label such as `Ttest(48)`, the
-threshold control can operate in p-value mode.
+threshold control can operate in p-value mode. Treat this as a viewer
+convenience rather than a statistics package: it is meant to help inspect the
+data you already understand.
 
 ## AFNI NIML Talk
 
-`sumaru` now has a non-`wgpu` AFNI/SUMA NIML talk layer in the library crate and
-a first live viewer bridge. The first concrete AFNI-compatible message subset
-is the same practical path used by SUMA and PySuma:
+`sumaru` has an early AFNI/SUMA NIML talk layer in the library crate and a live
+viewer bridge. The first useful AFNI-compatible message subset follows the same
+practical path used by SUMA and PySuma:
 
 - `SUMA_ixyz`: surface node index and XYZ coordinates sent to AFNI
 - `SUMA_node_normals`: per-node normals sent to AFNI
@@ -123,7 +158,7 @@ toggle AFNI/SUMA NIML talk. Press `Control+T` to force-resend the active surface
 geometry. Port selection follows AFNI/SUMA conventions: `--afni-port PORT` uses
 an explicit port, while `-np OFFSET`/`--np OFFSET` and `-npb BLOC`/`--npb BLOC`
 resolve the same AFNI-style port offsets. `--afni-host` defaults to `127.0.0.1`.
-AFNI must be listening for NIML before Sumaru can connect: launch AFNI with
+AFNI must be listening for NIML before `sumaru` can connect: launch AFNI with
 `-niml` (and usually `-yesplugouts` for SUMA-style sessions), or press the
 `NIML+PO` button in the AFNI GUI after launch.
 
@@ -135,7 +170,7 @@ cargo run -- inspect path/to/file
 ```
 
 For reproducible AFNI talk debugging, add
-`--niml-record path/to/session.nimlrec` to a viewer launch. Sumaru records each
+`--niml-record path/to/session.nimlrec` to a viewer launch. `sumaru` records each
 sent and received NIML event with direction, timestamp, and the serialized
 payload. Recording is intentionally plain `.nimlrec` for live-session speed;
 gzip the file afterward if you want to archive or share it. The debug readers
@@ -160,7 +195,7 @@ Example:
 cargo run -- --spec path/to/fsaverage_lh.spec --sv path/to/SurfVol.nii --talk-afni --niml-record afni_session.nimlrec
 ```
 
-The same module also defines Sumaru-side NIML state messages for active surface,
+The same module also defines `sumaru`-side NIML state messages for active surface,
 crosshair and selected node/triangle, dataset loading, overlay/threshold
 settings, controller commands, and ROI state. Those messages route through
 shared controller/command state rather than directly mutating viewer-only
@@ -232,9 +267,15 @@ stay correct under any orientation.
 
 ## Design Direction
 
+The project is mostly a place to try viewer and data-model ideas in the open.
 The binary crate should stay thin. Most behavior should live in the library
 crate so future renderers, GUI experiments, batch tools, and tests can share
 the same data model.
+
+That split is intentional: for scientific viewing software, the interesting
+parts are not only the pixels on screen. File parsing, coordinate transforms,
+overlay tables, ROI state, and AFNI interop should be understandable and
+testable without needing to launch the GUI.
 
 See `docs/ROADMAP.md` for the active to-do plan and `docs/COMPLETED.md` for
 the completed-work ledger.
@@ -261,7 +302,7 @@ the completed-work ledger.
 - `src/afni.rs` contains the first AFNI/SUMA NIML talk layer. It resolves
   AFNI-style ports, builds `SUMA_ixyz`/`SUMA_node_normals`/`SUMA_ijk` surface
   registration elements, parses `SUMA_irgba` overlays, maps incoming NIML
-  messages to shared controller actions, and emits Sumaru state messages.
+  messages to shared controller actions, and emits `sumaru` state messages.
 - `src/command.rs` contains the shared controller and command state used to
   route viewer menus, keyboard shortcuts, controller panels, and AFNI messages
   through the same non-`wgpu` model. It owns the canonical `OverlayThreshold`
