@@ -115,23 +115,7 @@ impl ViewerState {
             return None;
         }
 
-        let mut min = f32::INFINITY;
-        let mut max = f32::NEG_INFINITY;
-        for point in &points {
-            min = min.min(point.value);
-            max = max.max(point.value);
-        }
-        if !min.is_finite() || !max.is_finite() {
-            return None;
-        }
-        if (max - min).abs() <= f32::EPSILON {
-            min -= 1.0;
-            max += 1.0;
-        } else {
-            let padding = (max - min) * 0.08;
-            min -= padding;
-            max += padding;
-        }
+        let y_range = graph_y_range_for_points(&points)?;
 
         Some(GraphSnapshot {
             node_index: pick.node_index,
@@ -139,7 +123,107 @@ impl ViewerState {
             surface_label: self.pick_surface_display_text(),
             overlay_label: self.pick_overlay_display_text(),
             points,
-            y_range: ValueRange { min, max },
+            y_range,
         })
+    }
+}
+
+fn graph_y_range_for_points(points: &[GraphPoint]) -> Option<ValueRange> {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for point in points {
+        min = min.min(point.value);
+        max = max.max(point.value);
+    }
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+
+    Some(padded_graph_y_range(min, max))
+}
+
+fn padded_graph_y_range(min: f32, max: f32) -> ValueRange {
+    let span = max - min;
+    let magnitude = min.abs().max(max.abs());
+    let padding = if span > 0.0 {
+        graph_y_padding(span, magnitude)
+    } else if magnitude > 0.0 {
+        graph_y_padding(magnitude, magnitude)
+    } else {
+        1.0
+    };
+    let padded = ValueRange {
+        min: min - padding,
+        max: max + padding,
+    };
+    if padded.min < padded.max {
+        padded
+    } else if magnitude > 0.0 {
+        let fallback_padding = graph_y_padding(magnitude, magnitude).max(magnitude);
+        ValueRange {
+            min: min - fallback_padding,
+            max: max + fallback_padding,
+        }
+    } else {
+        ValueRange {
+            min: -1.0,
+            max: 1.0,
+        }
+    }
+}
+
+fn graph_y_padding(base: f32, magnitude: f32) -> f32 {
+    let padding = (base * 0.08).max(magnitude * f32::EPSILON);
+    if padding > 0.0 {
+        padding
+    } else {
+        base.max(magnitude)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn graph_point(value: f32) -> GraphPoint {
+        GraphPoint {
+            column_index: 0,
+            label: "value".to_string(),
+            value,
+        }
+    }
+
+    #[test]
+    fn graph_y_range_tracks_small_nonzero_values() {
+        let range =
+            graph_y_range_for_points(&[graph_point(1.0e-10), graph_point(1.2e-10)]).unwrap();
+
+        assert!(range.min < 1.0e-10);
+        assert!(range.max > 1.2e-10);
+        assert!(range.min.abs() < 1.0e-8);
+        assert!(range.max.abs() < 1.0e-8);
+    }
+
+    #[test]
+    fn graph_y_range_for_constant_small_value_stays_local() {
+        let range = graph_y_range_for_points(&[graph_point(-2.0e-12)]).unwrap();
+
+        assert!(range.min < -2.0e-12);
+        assert!(range.max > -2.0e-12);
+        assert!(range.min.abs() < 1.0e-10);
+        assert!(range.max.abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn graph_y_range_for_all_zero_values_uses_visible_fallback() {
+        let range = graph_y_range_for_points(&[graph_point(0.0), graph_point(0.0)]).unwrap();
+
+        assert_eq!(
+            range,
+            ValueRange {
+                min: -1.0,
+                max: 1.0
+            }
+        );
     }
 }

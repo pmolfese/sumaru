@@ -1112,11 +1112,7 @@ impl ViewerState {
                             );
                         }
                         if let Some(range) = stats.overlay_range {
-                            stat_row(
-                                ui,
-                                "Overlay range",
-                                format!("{:.4} to {:.4}", range.min, range.max),
-                            );
+                            stat_row(ui, "Overlay range", value_range_label(range));
                         }
                     });
             } else {

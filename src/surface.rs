@@ -2444,9 +2444,12 @@ impl OverlayDataset {
         let image = gifti_rs::read(path)
             .with_context(|| format!("failed to read GIFTI overlay {}", path.display()))?;
         let mut values = None;
-        for array in image.data_arrays.iter().filter(|array| {
-            array.intent != gifti_rs::intent::POINTSET && array.intent != gifti_rs::intent::TRIANGLE
-        }) {
+        for array in image
+            .data_arrays
+            .iter()
+            .filter(|array| array.intent != gifti_rs::intent::TRIANGLE)
+            .filter(|array| !gifti_array_is_surface_pointset(array))
+        {
             if let Some(candidate) = overlay_values_from_array(array, vertex_count) {
                 values = Some(candidate);
                 break;
@@ -2826,6 +2829,10 @@ fn overlay_values_from_array(array: &DataArray, vertex_count: usize) -> Option<V
     }
 
     Some(numeric_values_from_array(array))
+}
+
+fn gifti_array_is_surface_pointset(array: &DataArray) -> bool {
+    array.intent == gifti_rs::intent::POINTSET && array.dims.len() == 2 && array.dims[1] == 3
 }
 
 fn numeric_values_from_array(array: &DataArray) -> Vec<f32> {

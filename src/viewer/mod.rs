@@ -6303,14 +6303,14 @@ fn draw_graph_snapshot(
     painter.text(
         egui::pos2(rect.left() + 8.0, plot_rect.top() - 6.0),
         egui::Align2::LEFT_TOP,
-        format!("{y_max:.4}"),
+        scalar_value_label(y_max),
         egui::FontId::monospace(12.0),
         muted_color(),
     );
     painter.text(
         egui::pos2(rect.left() + 8.0, plot_rect.bottom() - 12.0),
         egui::Align2::LEFT_TOP,
-        format!("{y_min:.4}"),
+        scalar_value_label(y_min),
         egui::FontId::monospace(12.0),
         muted_color(),
     );
@@ -6352,9 +6352,9 @@ fn draw_graph_snapshot(
         {
             ui.separator();
             ui.label(format!(
-                "I {} = {:.6}",
+                "I {} = {}",
                 truncate_middle(&current.label, 24),
-                current.value
+                scalar_value_label(current.value)
             ));
         }
         if let Some(current) = snapshot
@@ -6364,9 +6364,9 @@ fn draw_graph_snapshot(
         {
             ui.separator();
             ui.label(format!(
-                "T {} = {:.6}",
+                "T {} = {}",
                 truncate_middle(&current.label, 24),
-                current.value
+                scalar_value_label(current.value)
             ));
         }
         if let Some(current) = snapshot
@@ -6376,9 +6376,9 @@ fn draw_graph_snapshot(
         {
             ui.separator();
             ui.label(format!(
-                "B {} = {:.6}",
+                "B {} = {}",
                 truncate_middle(&current.label, 24),
-                current.value
+                scalar_value_label(current.value)
             ));
         }
     });
@@ -6725,8 +6725,30 @@ fn threshold_bounds(range: ValueRange, absolute: bool) -> (f32, f32) {
     }
 }
 
+fn scalar_value_label(value: f32) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if value == 0.0 {
+        return "0.0000".to_string();
+    }
+    if value.abs() < 0.0001 {
+        format!("{value:.3e}")
+    } else {
+        format!("{value:.4}")
+    }
+}
+
+fn value_range_label(range: ValueRange) -> String {
+    format!(
+        "{} to {}",
+        scalar_value_label(range.min),
+        scalar_value_label(range.max)
+    )
+}
+
 fn threshold_value_display(value: f32) -> String {
-    format!("{value:.4}")
+    scalar_value_label(value)
 }
 
 fn threshold_p_value_display(pvalue: Option<f64>) -> String {
@@ -6780,7 +6802,7 @@ fn normal_direction_label(direction: NormalDirection) -> &'static str {
 }
 
 fn overlay_value_label(value: Option<f32>) -> String {
-    value.map_or_else(|| "not loaded".to_string(), |value| format!("{value:.4}"))
+    value.map_or_else(|| "not loaded".to_string(), scalar_value_label)
 }
 
 fn picked_overlay_value_label(pick: SurfacePick) -> String {
@@ -6852,6 +6874,14 @@ mod tests {
             winit::dpi::PhysicalSize::new(420, 700),
             winit::dpi::PhysicalSize::new(460, 700)
         ));
+    }
+
+    #[test]
+    fn scalar_value_labels_use_scientific_notation_for_tiny_values() {
+        assert_eq!(super::scalar_value_label(0.012345), "0.0123");
+        assert_eq!(super::scalar_value_label(0.0), "0.0000");
+        assert!(super::scalar_value_label(1.2e-10).contains('e'));
+        assert!(super::overlay_value_label(Some(-3.4e-8)).contains('e'));
     }
 
     #[test]

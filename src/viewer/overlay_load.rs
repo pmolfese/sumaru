@@ -88,8 +88,8 @@ impl ViewerState {
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.log_status(format!(
-            "Loaded overlay range {:.4} to {:.4}. {column_summary}",
-            range.min, range.max
+            "Loaded overlay range {}. {column_summary}",
+            value_range_label(range)
         ));
 
         Ok(())
@@ -136,8 +136,8 @@ impl ViewerState {
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.log_status(format!(
-            "Loaded paired overlays range {:.4} to {:.4}. {column_summary}",
-            range.min, range.max
+            "Loaded paired overlays range {}. {column_summary}",
+            value_range_label(range)
         ));
 
         Ok(())
