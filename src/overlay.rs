@@ -243,7 +243,7 @@ impl Overlay {
             if clipped_out {
                 color[3] = 0.0;
             } else {
-                color[3] = opacity;
+                color[3] = color[3].clamp(0.0, 1.0) * opacity;
             }
 
             if !passes_threshold {
@@ -634,6 +634,48 @@ mod tests {
         assert_color_close(
             overlay.color_cache.colors[2],
             [1.0, 117.0 / 255.0, 24.0 / 255.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn overlay_label_colormap_leaves_unlabeled_zero_values_transparent() {
+        let domain = triangle_domain();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceLabel,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "label",
+                    ColumnRole::Label,
+                    None,
+                    ColumnData::Int32(vec![0, 1, 2]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let table = LabelTable::new(
+            LabelTableSource::Manual,
+            vec![
+                LabelEntry::new(1, "1", Rgba::from_u8(0, 194, 255, 255)).unwrap(),
+                LabelEntry::new(2, "2", Rgba::from_u8(255, 242, 0, 255)).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut overlay = Overlay::from_dataset(&dataset, &domain, OverlayColumns::new(0))
+            .unwrap()
+            .with_colormap(ColorMap::labels(table));
+
+        overlay.rebuild_color_cache(&dataset, &domain).unwrap();
+
+        assert_color_close(overlay.color_cache.colors[0], [0.0, 0.0, 0.0, 0.0]);
+        assert_color_close(
+            overlay.color_cache.colors[1],
+            [0.0, 194.0 / 255.0, 1.0, 1.0],
+        );
+        assert_color_close(
+            overlay.color_cache.colors[2],
+            [1.0, 242.0 / 255.0, 0.0, 1.0],
         );
     }
 
