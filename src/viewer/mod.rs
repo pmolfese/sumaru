@@ -47,7 +47,7 @@ use crate::surface::{
     AnatomicalCorrectness, NodeMask, NormalDirection, OverlayDataset, SmoothingWeights,
     SurfaceDomain, SurfaceDomainId, SurfaceId, SurfaceKind, SurfaceMesh, SurfaceSide, ValueRange,
 };
-use camera::{Camera, CameraMode, PresetOrientation};
+use camera::{Camera, CameraMode, CameraNudgeDirection, PresetOrientation};
 use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
 };
@@ -801,6 +801,7 @@ impl WindowPane {
 
         command_buffers.push(encoder.finish());
         queue.submit(command_buffers);
+        let _ = device.poll(wgpu::PollType::Poll);
         output.present();
 
         RenderStatus::Rendered
@@ -1497,6 +1498,7 @@ impl ViewerState {
     fn resize_view(&mut self, size: PhysicalSize<u32>) {
         if self.view.resize(&self.device, size) {
             self.depth_buffer = DepthBuffer::new(&self.device, size.width, size.height);
+            self.poll_device_for_cleanup();
         }
     }
 
@@ -1674,9 +1676,14 @@ impl ViewerState {
 
         command_buffers.push(encoder.finish());
         self.queue.submit(command_buffers);
+        self.poll_device_for_cleanup();
         output.present();
 
         RenderStatus::Rendered
+    }
+
+    fn poll_device_for_cleanup(&self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 
     fn schedule_momentum_repaint(&mut self) {
@@ -3339,10 +3346,15 @@ impl ViewerState {
             self.visible_anatomical_shading_colors()
         };
         if self.mesh.is_none() {
+            let dropped_gpu_resources =
+                self.surface_buffers.is_some() || self.surface_render_set.is_some();
             self.surface_buffers = None;
             self.surface_render_set = None;
             self.prepared_geometry_cache = None;
             self.anatomical_shading_cache = None;
+            if dropped_gpu_resources {
+                self.poll_device_for_cleanup();
+            }
             return;
         }
 
@@ -3352,6 +3364,7 @@ impl ViewerState {
             return;
         }
 
+        let dropped_render_set = self.surface_render_set.is_some();
         self.surface_render_set = None;
         let mesh = self
             .mesh
@@ -3409,6 +3422,7 @@ impl ViewerState {
         let index_count = prepared_surface.index_count();
 
         if let Some(buffers) = self.surface_buffers.as_mut() {
+            let mut replaced_gpu_resources = dropped_render_set;
             if buffers.vertex_bytes_len == vertex_bytes.len() {
                 self.queue
                     .write_buffer(&buffers.vertex_buffer, 0, &vertex_bytes);
@@ -3421,6 +3435,7 @@ impl ViewerState {
                             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                         });
                 buffers.vertex_bytes_len = vertex_bytes.len();
+                replaced_gpu_resources = true;
             }
 
             if buffers.surface_id != surface_id
@@ -3436,8 +3451,12 @@ impl ViewerState {
                         });
                 buffers.index_bytes_len = index_bytes.len();
                 buffers.index_count = index_count;
+                replaced_gpu_resources = true;
             }
             buffers.surface_id = surface_id;
+            if replaced_gpu_resources {
+                self.poll_device_for_cleanup();
+            }
             return;
         }
 
@@ -3464,6 +3483,9 @@ impl ViewerState {
             index_bytes_len: index_bytes.len(),
             index_count,
         });
+        if dropped_render_set {
+            self.poll_device_for_cleanup();
+        }
     }
 
     fn upload_paired_surface_render_set(&mut self, surface_colors: Option<&[[f32; 4]]>) -> bool {
@@ -3625,8 +3647,13 @@ impl ViewerState {
             });
         }
 
+        let dropped_gpu_resources =
+            self.surface_buffers.is_some() || self.surface_render_set.is_some();
         self.surface_buffers = None;
         self.surface_render_set = Some(SurfaceRenderSet { instances });
+        if dropped_gpu_resources {
+            self.poll_device_for_cleanup();
+        }
         true
     }
 

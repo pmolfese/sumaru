@@ -61,6 +61,10 @@ impl CameraCommandState {
         self.last_preset = Some(preset);
     }
 
+    pub fn note_manual_motion(&mut self) {
+        self.last_preset = None;
+    }
+
     pub fn note_reset(&mut self) {
         self.reset_generation = self.reset_generation.wrapping_add(1);
         self.last_preset = None;
@@ -490,6 +494,9 @@ mod tests {
         assert_eq!(state.camera.toggle_mode(), CameraControlMode::Turntable);
         state.camera.set_preset(ViewPreset::Top);
         assert_eq!(state.camera.last_preset, Some(ViewPreset::Top));
+        state.camera.note_manual_motion();
+        assert_eq!(state.camera.last_preset, None);
+        state.camera.set_preset(ViewPreset::Top);
         state.camera.note_reset();
 
         assert_eq!(state.camera.reset_generation, 1);

@@ -224,6 +224,26 @@ impl ViewerState {
                         self.controller.camera.set_preset(ViewPreset::Bottom);
                         true
                     }
+                    PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                        self.camera.nudge(CameraNudgeDirection::Left);
+                        self.controller.camera.note_manual_motion();
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowRight) => {
+                        self.camera.nudge(CameraNudgeDirection::Right);
+                        self.controller.camera.note_manual_motion();
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowUp) => {
+                        self.camera.nudge(CameraNudgeDirection::Up);
+                        self.controller.camera.note_manual_motion();
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowDown) => {
+                        self.camera.nudge(CameraNudgeDirection::Down);
+                        self.controller.camera.note_manual_motion();
+                        true
+                    }
                     _ => false,
                 }
             }
