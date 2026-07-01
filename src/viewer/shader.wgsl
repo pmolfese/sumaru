@@ -1,7 +1,11 @@
 struct Uniforms {
     view_projection: mat4x4<f32>,
     model: mat4x4<f32>,
-    light_direction: vec4<f32>,
+    light_direction_primary: vec4<f32>,
+    light_direction_secondary: vec4<f32>,
+    light_direction_tertiary: vec4<f32>,
+    light_weights: vec4<f32>,
+    lighting_params: vec4<f32>,
     surface_color: vec4<f32>,
 }
 
@@ -35,11 +39,16 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let normal = normalize(input.normal);
-    let light = normalize(uniforms.light_direction.xyz);
-    let diffuse = abs(dot(normal, light));
-    let lit = 0.28 + diffuse * 0.72;
+    let primary = normalize(uniforms.light_direction_primary.xyz);
+    let secondary = normalize(uniforms.light_direction_secondary.xyz);
+    let tertiary = normalize(uniforms.light_direction_tertiary.xyz);
+    let diffuse =
+        abs(dot(normal, primary)) * uniforms.light_weights.x
+        + abs(dot(normal, secondary)) * uniforms.light_weights.y
+        + abs(dot(normal, tertiary)) * uniforms.light_weights.z;
+    let lit = clamp(uniforms.lighting_params.x + diffuse * uniforms.lighting_params.y, 0.0, 1.0);
 
-    return vec4<f32>(input.color.rgb * lit, input.color.a);
+    return vec4<f32>(input.color.rgb * lit, input.color.a * uniforms.surface_color.a);
 }
 
 struct OverlayInput {

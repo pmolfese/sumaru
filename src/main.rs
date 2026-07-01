@@ -59,22 +59,14 @@ struct Cli {
     #[arg(long = "overlay", value_name = "PATH")]
     overlay: Option<PathBuf>,
 
-    /// Explicit left-hemisphere overlay for both-hemisphere spec launches.
-    #[arg(
-        long = "overlay-lh",
-        value_name = "PATH",
-        conflicts_with = "overlay",
-        requires = "overlay_rh"
-    )]
+    /// Explicit left-hemisphere overlay for a both-hemisphere launch. May be
+    /// used without `--overlay-rh` to leave the right hemisphere uncolored.
+    #[arg(long = "overlay-lh", value_name = "PATH", conflicts_with = "overlay")]
     overlay_lh: Option<PathBuf>,
 
-    /// Explicit right-hemisphere overlay for both-hemisphere spec launches.
-    #[arg(
-        long = "overlay-rh",
-        value_name = "PATH",
-        conflicts_with = "overlay",
-        requires = "overlay_lh"
-    )]
+    /// Explicit right-hemisphere overlay for a both-hemisphere launch. May be
+    /// used without `--overlay-lh` to leave the left hemisphere uncolored.
+    #[arg(long = "overlay-rh", value_name = "PATH", conflicts_with = "overlay")]
     overlay_rh: Option<PathBuf>,
 
     /// Load this SUMA .niml.roi annotation over the active surface.
@@ -441,11 +433,11 @@ fn explicit_overlay_pair(
     right_path: Option<PathBuf>,
 ) -> Option<ExplicitOverlayPair> {
     match (left_path, right_path) {
-        (Some(left_path), Some(right_path)) => Some(ExplicitOverlayPair {
+        (None, None) => None,
+        (left_path, right_path) => Some(ExplicitOverlayPair {
             left_path,
             right_path,
         }),
-        _ => None,
     }
 }
 
@@ -853,11 +845,11 @@ mod tests {
         let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
         assert_eq!(
             overlay_pair.as_ref().map(|pair| &pair.left_path),
-            Some(&PathBuf::from("left.weird.name.niml.dset"))
+            Some(&Some(PathBuf::from("left.weird.name.niml.dset")))
         );
         assert_eq!(
             overlay_pair.as_ref().map(|pair| &pair.right_path),
-            Some(&PathBuf::from("right.other.name.niml.dset"))
+            Some(&Some(PathBuf::from("right.other.name.niml.dset")))
         );
         assert!(
             validate_viewer_launch(
@@ -875,7 +867,57 @@ mod tests {
             .is_ok()
         );
 
-        assert!(Cli::try_parse_from(["sumaru", "--overlay-lh", "left.niml.dset"]).is_err());
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--spec",
+            "scene_both.spec",
+            "--sv",
+            "SurfVol.nii",
+            "--overlay-lh",
+            "left.only.niml.dset",
+        ]);
+        let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
+        assert_eq!(
+            overlay_pair.as_ref().map(|pair| &pair.left_path),
+            Some(&Some(PathBuf::from("left.only.niml.dset")))
+        );
+        assert_eq!(
+            overlay_pair.as_ref().map(|pair| &pair.right_path),
+            Some(&None)
+        );
+        assert!(
+            validate_viewer_launch(
+                &cli.surface_paths,
+                &cli.spec,
+                &None,
+                &None,
+                &cli.surface_volume,
+                &cli.overlay,
+                &overlay_pair,
+                &cli.roi,
+                &cli.subs.map(|subs| subs.0),
+                &cli.p_value,
+            )
+            .is_ok()
+        );
+
+        let cli = Cli::parse_from(["sumaru", "--overlay-lh", "left.niml.dset"]);
+        let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
+        assert!(
+            validate_viewer_launch(
+                &cli.surface_paths,
+                &cli.spec,
+                &None,
+                &None,
+                &cli.surface_volume,
+                &cli.overlay,
+                &overlay_pair,
+                &cli.roi,
+                &cli.subs.map(|subs| subs.0),
+                &cli.p_value,
+            )
+            .is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "sumaru",

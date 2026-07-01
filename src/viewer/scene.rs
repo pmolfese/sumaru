@@ -11,9 +11,15 @@ pub(super) struct SurfaceBuffers {
     pub(super) surface_id: SurfaceId,
     pub(super) vertex_buffer: wgpu::Buffer,
     pub(super) vertex_bytes_len: usize,
-    pub(super) index_buffer: wgpu::Buffer,
-    pub(super) index_bytes_len: usize,
-    pub(super) index_count: u32,
+    pub(super) triangle_index_buffer: wgpu::Buffer,
+    pub(super) triangle_index_bytes_len: usize,
+    pub(super) triangle_index_count: u32,
+    pub(super) line_index_buffer: wgpu::Buffer,
+    pub(super) line_index_bytes_len: usize,
+    pub(super) line_index_count: u32,
+    pub(super) point_index_buffer: wgpu::Buffer,
+    pub(super) point_index_bytes_len: usize,
+    pub(super) point_index_count: u32,
 }
 
 /// Per-hemisphere resident geometry for both-spec scenes. Positions and normals
@@ -26,11 +32,51 @@ pub(super) struct SurfaceRenderSet {
 pub(super) struct SurfaceRenderInstance {
     pub(super) side: SurfaceSide,
     pub(super) vertex_buffer: wgpu::Buffer,
-    pub(super) index_buffer: wgpu::Buffer,
-    pub(super) index_count: u32,
+    pub(super) triangle_index_buffer: wgpu::Buffer,
+    pub(super) triangle_index_count: u32,
+    pub(super) line_index_buffer: wgpu::Buffer,
+    pub(super) line_index_count: u32,
+    pub(super) point_index_buffer: wgpu::Buffer,
+    pub(super) point_index_count: u32,
     pub(super) uniform_buffer: wgpu::Buffer,
     pub(super) bind_group: wgpu::BindGroup,
     pub(super) model_matrix: Mat4,
+}
+
+impl SurfaceBuffers {
+    pub(super) fn index_buffer(&self, style: SurfaceRenderStyle) -> &wgpu::Buffer {
+        match style {
+            SurfaceRenderStyle::Filled => &self.triangle_index_buffer,
+            SurfaceRenderStyle::Triangles => &self.line_index_buffer,
+            SurfaceRenderStyle::Vertices => &self.point_index_buffer,
+        }
+    }
+
+    pub(super) fn index_count(&self, style: SurfaceRenderStyle) -> u32 {
+        match style {
+            SurfaceRenderStyle::Filled => self.triangle_index_count,
+            SurfaceRenderStyle::Triangles => self.line_index_count,
+            SurfaceRenderStyle::Vertices => self.point_index_count,
+        }
+    }
+}
+
+impl SurfaceRenderInstance {
+    pub(super) fn index_buffer(&self, style: SurfaceRenderStyle) -> &wgpu::Buffer {
+        match style {
+            SurfaceRenderStyle::Filled => &self.triangle_index_buffer,
+            SurfaceRenderStyle::Triangles => &self.line_index_buffer,
+            SurfaceRenderStyle::Vertices => &self.point_index_buffer,
+        }
+    }
+
+    pub(super) fn index_count(&self, style: SurfaceRenderStyle) -> u32 {
+        match style {
+            SurfaceRenderStyle::Filled => self.triangle_index_count,
+            SurfaceRenderStyle::Triangles => self.line_index_count,
+            SurfaceRenderStyle::Vertices => self.point_index_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

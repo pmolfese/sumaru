@@ -27,7 +27,8 @@ use crate::afni::{
 use crate::color::{LabelTable, Rgba};
 use crate::command::{
     BackgroundMode, CameraControlMode, ControllerState, HemisphereLayout, HemisphereLayoutState,
-    OverlayThreshold, PairVisibility, SurfacePick, ViewPreset, ViewerCommand,
+    LightingMode, OverlayThreshold, PairVisibility, SurfacePick, SurfaceRenderStyle, ViewPreset,
+    ViewerCommand,
 };
 use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
 use crate::io::{
@@ -202,8 +203,22 @@ pub struct LaunchOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplicitOverlayPair {
-    pub left_path: PathBuf,
-    pub right_path: PathBuf,
+    pub left_path: Option<PathBuf>,
+    pub right_path: Option<PathBuf>,
+}
+
+impl ExplicitOverlayPair {
+    fn primary_path(&self) -> Option<&Path> {
+        self.left_path.as_deref().or(self.right_path.as_deref())
+    }
+
+    fn path_for_side(&self, side: &SurfaceSide) -> Option<&Path> {
+        match side {
+            SurfaceSide::Left => self.left_path.as_deref(),
+            SurfaceSide::Right => self.right_path.as_deref(),
+            _ => self.primary_path(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +377,11 @@ impl ViewerApp {
             self.niml_record_path.clone(),
             self.event_proxy.clone(),
         ))?);
+        if let Some(state) = self.state.as_ref() {
+            // Keep the render window as the launch focus instead of whichever
+            // auxiliary pane was created most recently.
+            state.view_window().focus_window();
+        }
 
         Ok(())
     }
@@ -976,6 +996,12 @@ struct InitialScene {
     overlay_p_value: Option<f64>,
 }
 
+struct SurfaceRenderPipelines {
+    filled: wgpu::RenderPipeline,
+    triangles: wgpu::RenderPipeline,
+    vertices: wgpu::RenderPipeline,
+}
+
 struct ViewerState {
     view: WindowPane,
     control: WindowPane,
@@ -989,7 +1015,7 @@ struct ViewerState {
     /// the self-managed resize handle sticks and drives the 3D viewport split.
     graph_dock_height_points: f32,
     startup_redraw_until: Instant,
-    render_pipeline: wgpu::RenderPipeline,
+    surface_render_pipelines: SurfaceRenderPipelines,
     surface_buffers: Option<SurfaceBuffers>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
@@ -1197,7 +1223,12 @@ impl ViewerState {
         let camera = Camera::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera uniform buffer"),
-            contents: &camera.uniform_bytes(view_config.width as f32 / view_config.height as f32),
+            contents: &camera.uniform_bytes_with_model(
+                view_config.width as f32 / view_config.height as f32,
+                Mat4::IDENTITY,
+                LightingMode::default(),
+                1.0,
+            ),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let uniform_bind_group_layout =
@@ -1231,46 +1262,62 @@ impl ViewerState {
             bind_group_layouts: &[Some(&uniform_bind_group_layout)],
             immediate_size: 0,
         });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("surface render pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: VERTEX_STRIDE,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &VERTEX_ATTRIBUTES,
-                }],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_surface_pipeline = |label: &str, topology: wgpu::PrimitiveTopology| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: VERTEX_STRIDE,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &VERTEX_ATTRIBUTES,
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let surface_render_pipelines = SurfaceRenderPipelines {
+            filled: make_surface_pipeline(
+                "surface render pipeline filled",
+                wgpu::PrimitiveTopology::TriangleList,
+            ),
+            triangles: make_surface_pipeline(
+                "surface render pipeline triangles",
+                wgpu::PrimitiveTopology::LineList,
+            ),
+            vertices: make_surface_pipeline(
+                "surface render pipeline vertices",
+                wgpu::PrimitiveTopology::PointList,
+            ),
+        };
         let depth_buffer = DepthBuffer::new(&device, view_config.width, view_config.height);
         let view_egui_ctx = egui::Context::default();
         view_egui_ctx.set_visuals(egui::Visuals::dark());
@@ -1362,7 +1409,7 @@ impl ViewerState {
             graph_dock_pre_open_size: None,
             graph_dock_height_points: GRAPH_DOCK_DEFAULT_HEIGHT_POINTS,
             startup_redraw_until: Instant::now(),
-            render_pipeline,
+            surface_render_pipelines,
             surface_buffers: None,
             uniform_buffer,
             uniform_bind_group,
@@ -1549,17 +1596,32 @@ impl ViewerState {
 
     fn update_render_uniforms_for_camera(&mut self, camera: &Camera) {
         let aspect = self.scene_viewport_aspect();
+        let lighting_mode = self.controller.display.lighting_mode;
+        let surface_opacity = self.surface_opacity();
         if let Some(render_set) = self.surface_render_set.as_ref() {
             for instance in &render_set.instances {
                 self.queue.write_buffer(
                     &instance.uniform_buffer,
                     0,
-                    &camera.uniform_bytes_with_model(aspect, instance.model_matrix),
+                    &camera.uniform_bytes_with_model(
+                        aspect,
+                        instance.model_matrix,
+                        lighting_mode,
+                        surface_opacity,
+                    ),
                 );
             }
         } else {
-            self.queue
-                .write_buffer(&self.uniform_buffer, 0, &camera.uniform_bytes(aspect));
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                0,
+                &camera.uniform_bytes_with_model(
+                    aspect,
+                    Mat4::IDENTITY,
+                    lighting_mode,
+                    surface_opacity,
+                ),
+            );
         }
     }
 
@@ -1699,6 +1761,22 @@ impl ViewerState {
         );
     }
 
+    fn active_surface_render_style(&self) -> SurfaceRenderStyle {
+        self.controller.display.surface_render_style
+    }
+
+    fn surface_opacity(&self) -> f32 {
+        f32::from(self.controller.display.surface_opacity_percent) / 100.0
+    }
+
+    fn active_surface_pipeline(&self) -> &wgpu::RenderPipeline {
+        match self.active_surface_render_style() {
+            SurfaceRenderStyle::Filled => &self.surface_render_pipelines.filled,
+            SurfaceRenderStyle::Triangles => &self.surface_render_pipelines.triangles,
+            SurfaceRenderStyle::Vertices => &self.surface_render_pipelines.vertices,
+        }
+    }
+
     fn encode_surface_render_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1738,9 +1816,10 @@ impl ViewerState {
             1.0,
         );
         render_pass.set_scissor_rect(0, 0, viewport_size.width, viewport_size.height);
+        let surface_style = self.active_surface_render_style();
 
         if let Some(render_set) = &self.surface_render_set {
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(self.active_surface_pipeline());
             for instance in &render_set.instances {
                 if !self
                     .controller
@@ -1752,16 +1831,21 @@ impl ViewerState {
                 }
                 render_pass.set_bind_group(0, &instance.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(instance.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..instance.index_count, 0, 0..1);
+                render_pass.set_index_buffer(
+                    instance.index_buffer(surface_style).slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..instance.index_count(surface_style), 0, 0..1);
             }
         } else if let Some(buffers) = &self.surface_buffers {
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(self.active_surface_pipeline());
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(buffers.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..buffers.index_count, 0, 0..1);
+            render_pass.set_index_buffer(
+                buffers.index_buffer(surface_style).slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            render_pass.draw_indexed(0..buffers.index_count(surface_style), 0, 0..1);
         }
 
         if let Some(volume_view) = &self.volume_view {
@@ -2101,6 +2185,17 @@ impl ViewerState {
                     let mode = self.camera.toggle_mode();
                     self.controller.camera.mode = mode.into();
                     self.show_mode_label(mode);
+                }
+                ViewerCommand::ToggleLightingMode => {
+                    self.cycle_lighting_mode();
+                }
+                ViewerCommand::ToggleSurfaceRenderStyle => {
+                    self.cycle_surface_render_style();
+                }
+                ViewerCommand::CycleSurfaceOpacity => {
+                    self.cycle_surface_opacity();
+                    let camera = self.camera.clone();
+                    self.update_render_uniforms_for_camera(&camera);
                 }
                 ViewerCommand::ToggleCameraMomentum => self.toggle_camera_momentum(),
                 ViewerCommand::ToggleBackground => self.controller.display.background.toggle(),
@@ -3079,11 +3174,10 @@ impl ViewerState {
             && let Some(component) = self.picked_paired_component(pick)
             && let Some(pair) = self.overlay.source.pair_paths.as_ref()
         {
-            return match component.side {
-                SurfaceSide::Left => file_name_display(&pair.left_path),
-                SurfaceSide::Right => file_name_display(&pair.right_path),
-                _ => file_name_display(path),
-            };
+            return pair
+                .path_for_side(&component.side)
+                .map(file_name_display)
+                .unwrap_or_else(|| "none".to_string());
         }
 
         if let Some(pick) = self.controller.interaction.pick
@@ -3417,9 +3511,13 @@ impl ViewerState {
             )
         };
         let vertex_bytes = prepared_surface.vertex_bytes();
-        let index_bytes = prepared_surface.index_bytes();
+        let triangle_index_bytes = prepared_surface.index_bytes();
+        let line_index_bytes = prepared_surface.line_index_bytes();
+        let point_index_bytes = prepared_surface.point_index_bytes();
         let surface_id = mesh.metadata.id.clone();
-        let index_count = prepared_surface.index_count();
+        let triangle_index_count = prepared_surface.index_count();
+        let line_index_count = prepared_surface.line_index_count();
+        let point_index_count = prepared_surface.point_index_count();
 
         if let Some(buffers) = self.surface_buffers.as_mut() {
             let mut replaced_gpu_resources = dropped_render_set;
@@ -3439,18 +3537,40 @@ impl ViewerState {
             }
 
             if buffers.surface_id != surface_id
-                || buffers.index_bytes_len != index_bytes.len()
-                || buffers.index_count != index_count
+                || buffers.triangle_index_bytes_len != triangle_index_bytes.len()
+                || buffers.triangle_index_count != triangle_index_count
+                || buffers.line_index_bytes_len != line_index_bytes.len()
+                || buffers.line_index_count != line_index_count
+                || buffers.point_index_bytes_len != point_index_bytes.len()
+                || buffers.point_index_count != point_index_count
             {
-                buffers.index_buffer =
+                buffers.triangle_index_buffer =
                     self.device
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("surface index buffer"),
-                            contents: &index_bytes,
+                            label: Some("surface triangle index buffer"),
+                            contents: &triangle_index_bytes,
                             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                         });
-                buffers.index_bytes_len = index_bytes.len();
-                buffers.index_count = index_count;
+                buffers.line_index_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("surface line index buffer"),
+                            contents: &line_index_bytes,
+                            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        });
+                buffers.point_index_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("surface point index buffer"),
+                            contents: &point_index_bytes,
+                            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        });
+                buffers.triangle_index_bytes_len = triangle_index_bytes.len();
+                buffers.triangle_index_count = triangle_index_count;
+                buffers.line_index_bytes_len = line_index_bytes.len();
+                buffers.line_index_count = line_index_count;
+                buffers.point_index_bytes_len = point_index_bytes.len();
+                buffers.point_index_count = point_index_count;
                 replaced_gpu_resources = true;
             }
             buffers.surface_id = surface_id;
@@ -3467,21 +3587,41 @@ impl ViewerState {
                 contents: &vertex_bytes,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
-        let index_buffer = self
+        let triangle_index_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("surface triangle index buffer"),
+                    contents: &triangle_index_bytes,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                });
+        let line_index_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("surface index buffer"),
-                contents: &index_bytes,
+                label: Some("surface line index buffer"),
+                contents: &line_index_bytes,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             });
+        let point_index_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("surface point index buffer"),
+                    contents: &point_index_bytes,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                });
 
         self.surface_buffers = Some(SurfaceBuffers {
             surface_id,
             vertex_buffer,
             vertex_bytes_len: vertex_bytes.len(),
-            index_buffer,
-            index_bytes_len: index_bytes.len(),
-            index_count,
+            triangle_index_buffer,
+            triangle_index_bytes_len: triangle_index_bytes.len(),
+            triangle_index_count,
+            line_index_buffer,
+            line_index_bytes_len: line_index_bytes.len(),
+            line_index_count,
+            point_index_buffer,
+            point_index_bytes_len: point_index_bytes.len(),
+            point_index_count,
         });
         if dropped_render_set {
             self.poll_device_for_cleanup();
@@ -3600,13 +3740,23 @@ impl ViewerState {
                 )
             };
             let vertex_bytes = prepared_surface.vertex_bytes();
-            let index_bytes = prepared_surface.index_bytes();
+            let triangle_index_bytes = prepared_surface.index_bytes();
+            let line_index_bytes = prepared_surface.line_index_bytes();
+            let point_index_bytes = prepared_surface.point_index_bytes();
+            let triangle_index_count = prepared_surface.index_count();
+            let line_index_count = prepared_surface.line_index_count();
+            let point_index_count = prepared_surface.point_index_count();
             let model_matrix = matrices
                 .iter()
                 .find(|(side, _)| *side == component.side)
                 .map(|(_, matrix)| *matrix)
                 .unwrap_or(Mat4::IDENTITY);
-            let uniform_bytes = self.camera.uniform_bytes_with_model(aspect, model_matrix);
+            let uniform_bytes = self.camera.uniform_bytes_with_model(
+                aspect,
+                model_matrix,
+                self.controller.display.lighting_mode,
+                self.surface_opacity(),
+            );
             let vertex_buffer = self
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3614,13 +3764,27 @@ impl ViewerState {
                     contents: &vertex_bytes,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 });
-            let index_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("paired surface index buffer"),
-                    contents: &index_bytes,
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                });
+            let triangle_index_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("paired surface triangle index buffer"),
+                        contents: &triangle_index_bytes,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    });
+            let line_index_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("paired surface line index buffer"),
+                        contents: &line_index_bytes,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    });
+            let point_index_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("paired surface point index buffer"),
+                        contents: &point_index_bytes,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    });
             let uniform_buffer =
                 self.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3639,8 +3803,12 @@ impl ViewerState {
             instances.push(SurfaceRenderInstance {
                 side: component.side,
                 vertex_buffer,
-                index_buffer,
-                index_count: prepared_surface.index_count(),
+                triangle_index_buffer,
+                triangle_index_count,
+                line_index_buffer,
+                line_index_count,
+                point_index_buffer,
+                point_index_count,
                 uniform_buffer,
                 bind_group,
                 model_matrix,
@@ -3763,6 +3931,41 @@ impl ViewerState {
 
     fn show_mode_label(&mut self, mode: CameraMode) {
         self.show_transient_label(mode.label());
+    }
+
+    fn show_lighting_mode_label(&mut self, mode: LightingMode) {
+        self.show_transient_label(format!("lighting: {}", mode.label()));
+    }
+
+    fn show_surface_render_style_label(&mut self, style: SurfaceRenderStyle) {
+        self.show_transient_label(format!("surface: {}", style.label()));
+    }
+
+    fn show_surface_opacity_label(&mut self, percent: u8) {
+        self.show_transient_label(format!("opacity: {percent}%"));
+    }
+
+    fn cycle_lighting_mode(&mut self) -> LightingMode {
+        let mode = self.controller.display.lighting_mode.cycled();
+        self.controller.display.lighting_mode = mode;
+        self.show_lighting_mode_label(mode);
+        mode
+    }
+
+    fn cycle_surface_render_style(&mut self) -> SurfaceRenderStyle {
+        let style = self.controller.display.surface_render_style.cycled();
+        self.controller.display.surface_render_style = style;
+        self.show_surface_render_style_label(style);
+        style
+    }
+
+    fn cycle_surface_opacity(&mut self) -> u8 {
+        let current = i16::from(self.controller.display.surface_opacity_percent);
+        let next = current - 30;
+        let next = if next < 0 { 100 } else { next as u8 };
+        self.controller.display.surface_opacity_percent = next;
+        self.show_surface_opacity_label(next);
+        next
     }
 
     fn toggle_camera_momentum(&mut self) {
@@ -5040,11 +5243,41 @@ fn paired_overlay_path_for_side(path: &Path, side: &SurfaceSide) -> Option<PathB
 }
 
 fn explicit_overlay_pair_display_name(pair: &ExplicitOverlayPair) -> String {
-    format!(
-        "LH {} / RH {}",
-        file_name_display(&pair.left_path),
-        file_name_display(&pair.right_path)
-    )
+    match (&pair.left_path, &pair.right_path) {
+        (Some(left_path), Some(right_path)) => format!(
+            "LH {} / RH {}",
+            file_name_display(left_path),
+            file_name_display(right_path)
+        ),
+        (Some(left_path), None) => format!("LH {}", file_name_display(left_path)),
+        (None, Some(right_path)) => format!("RH {}", file_name_display(right_path)),
+        (None, None) => "none".to_string(),
+    }
+}
+
+fn single_hemisphere_overlay_dataset(
+    dataset: Dataset,
+    domain: &SurfaceDomain,
+    node_offset: u32,
+) -> Result<Dataset> {
+    let kind = dataset.kind.clone();
+    let columns = dataset.columns;
+    let parent_ids = dataset.parent_ids;
+    let row_count = dataset.row_count;
+    let node_indices = if let Some(indices) = dataset.node_indices {
+        indices
+            .into_iter()
+            .map(|node| node + node_offset)
+            .collect::<Vec<_>>()
+    } else {
+        (0..row_count as u32)
+            .map(|node| node + node_offset)
+            .collect::<Vec<_>>()
+    };
+
+    Dataset::sparse(kind, domain, node_indices, columns)
+        .map(|dataset| dataset.with_parent_ids(parent_ids))
+        .context("failed to remap hemisphere overlay into the active paired surface")
 }
 
 fn paired_overlay_paths_for_pattern(
@@ -6858,14 +7091,15 @@ mod tests {
         RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
         SceneSurfaceLayout, SurfacePick, afni_component_is_sendable, afni_rgba_overlay_signature,
         apply_afni_rgba_to_color_cache, canonical_overlay_columns, component_transforms,
-        load_spec_component_label_lookup, load_spec_component_mesh, pair_hemisphere_matrices,
-        paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
-        paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
-        roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
-        scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
-        selection_scale_from_model_matrices, spec_label_dataset_for_surface,
-        standard_montage_shots, surface_pick_for_mesh_node, threshold_and_mask_from_appearance,
-        timestamped_png_name_from_unix_seconds,
+        explicit_overlay_pair_display_name, load_spec_component_label_lookup,
+        load_spec_component_mesh, pair_hemisphere_matrices, paired_component_for_node,
+        paired_overlay_dataset, paired_overlay_path_for_side, paired_overlay_paths,
+        paired_spec_montage_shots, resolve_overlay_subs, roi_appearance_for_mesh,
+        roi_fill_nodes_from_seed, scene_surface_display_label, scene_surfaces_from_components,
+        scene_surfaces_grouped_by_state, selection_for_component,
+        selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
+        spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
+        threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
     };
     use crate::afni::AfniRgbaOverlay;
     use crate::color::Rgba;
@@ -6879,6 +7113,8 @@ mod tests {
     };
     use glam::{Mat4, Vec3};
     use std::path::{Path, PathBuf};
+
+    use super::ExplicitOverlayPair;
 
     #[test]
     fn background_toggles_between_black_and_white() {
@@ -8053,6 +8289,44 @@ mod tests {
             panic!("expected float values");
         };
         assert_eq!(values, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn single_hemisphere_overlay_dataset_offsets_right_hemisphere_nodes() {
+        let right_domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let composite_domain =
+            SurfaceDomain::from_triangles(6, vec![[0, 1, 2], [3, 4, 5]]).unwrap();
+        let right = scalar_dataset(&right_domain, vec![4.0, 5.0, 6.0]);
+
+        let remapped = single_hemisphere_overlay_dataset(right, &composite_domain, 3).unwrap();
+
+        assert_eq!(remapped.row_count, 3);
+        assert_eq!(remapped.node_indices.as_deref(), Some(&[3, 4, 5][..]));
+        let ColumnData::Float32(values) = &remapped.columns[0].values else {
+            panic!("expected float values");
+        };
+        assert_eq!(values, &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn explicit_overlay_pair_display_name_handles_single_hemisphere() {
+        let left_only = ExplicitOverlayPair {
+            left_path: Some(PathBuf::from("left.niml.dset")),
+            right_path: None,
+        };
+        let right_only = ExplicitOverlayPair {
+            left_path: None,
+            right_path: Some(PathBuf::from("right.niml.dset")),
+        };
+
+        assert_eq!(
+            explicit_overlay_pair_display_name(&left_only),
+            "LH left.niml.dset"
+        );
+        assert_eq!(
+            explicit_overlay_pair_display_name(&right_only),
+            "RH right.niml.dset"
+        );
     }
 
     #[test]

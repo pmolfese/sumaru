@@ -104,6 +104,9 @@ pub enum ViewPreset {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayCommandState {
     pub background: BackgroundMode,
+    pub lighting_mode: LightingMode,
+    pub surface_render_style: SurfaceRenderStyle,
+    pub surface_opacity_percent: u8,
     pub anatomical_shading_visible: bool,
     pub pair_layout: HemisphereLayout,
     pub pair_state: HemisphereLayoutState,
@@ -114,10 +117,71 @@ impl Default for DisplayCommandState {
     fn default() -> Self {
         Self {
             background: BackgroundMode::Black,
+            lighting_mode: LightingMode::default(),
+            surface_render_style: SurfaceRenderStyle::default(),
+            surface_opacity_percent: 100,
             anatomical_shading_visible: false,
             pair_layout: HemisphereLayout::Closed,
             pair_state: HemisphereLayoutState::closed(),
             pair_visibility: PairVisibility::both(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LightingMode {
+    Directional,
+    DirectionalSoft,
+    Headlight,
+    #[default]
+    Studio,
+    Flat,
+}
+
+impl LightingMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Directional => "fixed",
+            Self::DirectionalSoft => "fixed soft",
+            Self::Headlight => "headlight",
+            Self::Studio => "studio",
+            Self::Flat => "flat",
+        }
+    }
+
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::Directional => Self::DirectionalSoft,
+            Self::DirectionalSoft => Self::Headlight,
+            Self::Headlight => Self::Studio,
+            Self::Studio => Self::Flat,
+            Self::Flat => Self::Directional,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurfaceRenderStyle {
+    #[default]
+    Filled,
+    Triangles,
+    Vertices,
+}
+
+impl SurfaceRenderStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::Triangles => "triangles",
+            Self::Vertices => "vertices",
+        }
+    }
+
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::Filled => Self::Triangles,
+            Self::Triangles => Self::Vertices,
+            Self::Vertices => Self::Filled,
         }
     }
 }
@@ -409,6 +473,9 @@ pub enum ViewerCommand {
     RefreshOverlayAppearance,
     ResetCamera,
     ToggleCameraMode,
+    ToggleLightingMode,
+    ToggleSurfaceRenderStyle,
+    CycleSurfaceOpacity,
     ToggleCameraMomentum,
     ToggleBackground,
     SetAnatomicalShadingVisible(bool),
@@ -472,7 +539,8 @@ fn value_label(value: Option<f32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundMode, CameraControlMode, ControllerState, PairVisibility, SurfacePick, ViewPreset,
+        BackgroundMode, CameraControlMode, ControllerState, LightingMode, PairVisibility,
+        SurfacePick, SurfaceRenderStyle, ViewPreset,
     };
     use crate::surface::SurfaceSide;
 
@@ -485,6 +553,37 @@ mod tests {
 
         background.toggle();
         assert_eq!(background, BackgroundMode::Black);
+    }
+
+    #[test]
+    fn lighting_mode_cycles_through_all_presets() {
+        let mut mode = LightingMode::Directional;
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::DirectionalSoft);
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::Headlight);
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::Studio);
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::Flat);
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::Directional);
+    }
+
+    #[test]
+    fn lighting_mode_default_is_studio() {
+        assert_eq!(LightingMode::default(), LightingMode::Studio);
+    }
+
+    #[test]
+    fn surface_render_style_cycles_through_all_presets() {
+        let mut style = SurfaceRenderStyle::Filled;
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::Triangles);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::Vertices);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::Filled);
     }
 
     #[test]

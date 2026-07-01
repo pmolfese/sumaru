@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use glam::Vec3;
 
 use crate::color::ColorMap;
@@ -231,6 +233,43 @@ impl PreparedSurface {
         }
 
         bytes
+    }
+
+    pub(super) fn line_index_count(&self) -> u32 {
+        self.line_indices().len() as u32
+    }
+
+    pub(super) fn line_index_bytes(&self) -> Vec<u8> {
+        indices_to_bytes(&self.line_indices())
+    }
+
+    pub(super) fn point_index_count(&self) -> u32 {
+        self.vertices.len() as u32
+    }
+
+    pub(super) fn point_index_bytes(&self) -> Vec<u8> {
+        let indices = (0..self.vertices.len() as u32).collect::<Vec<_>>();
+        indices_to_bytes(&indices)
+    }
+
+    fn line_indices(&self) -> Vec<u32> {
+        let mut seen = BTreeSet::new();
+        let mut indices = Vec::new();
+
+        for triangle in self.indices.chunks_exact(3) {
+            for &(a, b) in &[
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ] {
+                let edge = normalized_edge(a, b);
+                if seen.insert(edge) {
+                    indices.extend_from_slice(&[a, b]);
+                }
+            }
+        }
+
+        indices
     }
 }
 
@@ -476,6 +515,18 @@ impl OverlayColorMap {
             Self::Grayscale => ColorMap::grayscale(),
         }
     }
+}
+
+fn indices_to_bytes(indices: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(indices));
+    for index in indices {
+        bytes.extend_from_slice(&index.to_ne_bytes());
+    }
+    bytes
+}
+
+fn normalized_edge(a: u32, b: u32) -> (u32, u32) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 pub(super) fn compose_vertex_color(

@@ -95,19 +95,18 @@ impl ViewerState {
         Ok(())
     }
 
-    /// Load an explicit left/right overlay pair onto a paired scene.
+    /// Load an explicit hemisphere overlay selection onto a paired scene.
     pub(super) fn load_overlay_pair_paths(&mut self, pair: ExplicitOverlayPair) -> Result<()> {
         let mesh = self
             .mesh
             .as_ref()
-            .context("load a both-hemisphere spec before loading explicit paired overlays")?;
+            .context("load a both-hemisphere scene before loading hemisphere overlays")?;
         let loaded_selection = self
             .load_explicit_paired_overlay_selection(&pair, mesh)
             .with_context(|| {
                 format!(
-                    "failed to load paired overlays {} and {}",
-                    pair.left_path.display(),
-                    pair.right_path.display()
+                    "failed to load hemisphere overlays {}",
+                    explicit_overlay_pair_display_name(&pair)
                 )
             })?;
         let loaded_overlay = loaded_selection.overlay;
@@ -127,16 +126,20 @@ impl ViewerState {
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
-        self.overlay.source.path = Some(pair.left_path.clone());
+        let primary_path = pair
+            .primary_path()
+            .context("explicit hemisphere overlay selection is empty")?
+            .to_path_buf();
+        self.overlay.source.path = Some(primary_path.clone());
         self.overlay.source.pair_paths = Some(pair.clone());
-        self.controller.surface.current_overlay_path = Some(pair.left_path.clone());
+        self.controller.surface.current_overlay_path = Some(primary_path);
         self.overlay.source.display_name = Some(loaded_selection.display_name);
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.log_status(format!(
-            "Loaded paired overlays range {}. {column_summary}",
+            "Loaded hemisphere overlay range {}. {column_summary}",
             value_range_label(range)
         ));
 
@@ -275,7 +278,7 @@ impl ViewerState {
         })
     }
 
-    /// Build the overlay model for an explicit paired-hemisphere selection.
+    /// Build the overlay model for an explicit hemisphere selection.
     pub(super) fn load_explicit_paired_overlay_selection(
         &self,
         pair: &ExplicitOverlayPair,
@@ -292,28 +295,58 @@ impl ViewerState {
             .mesh
             .as_ref()
             .context("right hemisphere surface is still loading")?;
-        ensure!(
-            pair.left_path.exists(),
-            "left hemisphere overlay {} does not exist",
-            pair.left_path.display()
-        );
-        ensure!(
-            pair.right_path.exists(),
-            "right hemisphere overlay {} does not exist",
-            pair.right_path.display()
-        );
+        let dataset = match (&pair.left_path, &pair.right_path) {
+            (Some(left_path), Some(right_path)) => {
+                ensure!(
+                    left_path.exists(),
+                    "left hemisphere overlay {} does not exist",
+                    left_path.display()
+                );
+                ensure!(
+                    right_path.exists(),
+                    "right hemisphere overlay {} does not exist",
+                    right_path.display()
+                );
 
-        let left_dataset = load_dataset_from_path(&pair.left_path, left_mesh)
-            .with_context(|| format!("failed to load {}", pair.left_path.display()))?;
-        let right_dataset = load_dataset_from_path(&pair.right_path, right_mesh)
-            .with_context(|| format!("failed to load {}", pair.right_path.display()))?;
-        let dataset = paired_overlay_dataset(
-            left_dataset,
-            right_dataset,
-            &mesh.domain,
-            left_mesh.vertices.len() as u32,
-        )?;
-        let overlay = loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "paired NIML")?;
+                let left_dataset = load_dataset_from_path(left_path, left_mesh)
+                    .with_context(|| format!("failed to load {}", left_path.display()))?;
+                let right_dataset = load_dataset_from_path(right_path, right_mesh)
+                    .with_context(|| format!("failed to load {}", right_path.display()))?;
+                paired_overlay_dataset(
+                    left_dataset,
+                    right_dataset,
+                    &mesh.domain,
+                    left_mesh.vertices.len() as u32,
+                )?
+            }
+            (Some(left_path), None) => {
+                ensure!(
+                    left_path.exists(),
+                    "left hemisphere overlay {} does not exist",
+                    left_path.display()
+                );
+                let left_dataset = load_dataset_from_path(left_path, left_mesh)
+                    .with_context(|| format!("failed to load {}", left_path.display()))?;
+                single_hemisphere_overlay_dataset(left_dataset, &mesh.domain, 0)?
+            }
+            (None, Some(right_path)) => {
+                ensure!(
+                    right_path.exists(),
+                    "right hemisphere overlay {} does not exist",
+                    right_path.display()
+                );
+                let right_dataset = load_dataset_from_path(right_path, right_mesh)
+                    .with_context(|| format!("failed to load {}", right_path.display()))?;
+                single_hemisphere_overlay_dataset(
+                    right_dataset,
+                    &mesh.domain,
+                    left_mesh.vertices.len() as u32,
+                )?
+            }
+            (None, None) => bail!("no hemisphere overlay path was provided"),
+        };
+        let overlay =
+            loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "hemisphere overlay")?;
 
         Ok(LoadedOverlaySelection {
             overlay,
@@ -329,8 +362,8 @@ impl ViewerState {
         self.active_paired_components()?;
         let paths = paired_overlay_paths(path)?;
         Some(ExplicitOverlayPair {
-            left_path: paths.left_path,
-            right_path: paths.right_path,
+            left_path: Some(paths.left_path),
+            right_path: Some(paths.right_path),
         })
     }
 

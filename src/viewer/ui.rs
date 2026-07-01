@@ -147,6 +147,18 @@ impl ViewerState {
 
                     ui.menu_button("View", |ui| {
                         ui.label(format!("Mode: {}", self.camera.mode().label()));
+                        ui.label(format!(
+                            "Surface: {}",
+                            self.controller.display.surface_render_style.label()
+                        ));
+                        ui.label(format!(
+                            "Opacity: {}%",
+                            self.controller.display.surface_opacity_percent
+                        ));
+                        ui.label(format!(
+                            "Lighting: {}",
+                            self.controller.display.lighting_mode.label()
+                        ));
                         ui.separator();
                         if ui.button("Reset").clicked() {
                             actions.push(ViewerCommand::ResetCamera);
@@ -154,6 +166,18 @@ impl ViewerState {
                         }
                         if ui.button("Cycle Camera").clicked() {
                             actions.push(ViewerCommand::ToggleCameraMode);
+                            ui.close();
+                        }
+                        if ui.button("Cycle Surface Style").clicked() {
+                            actions.push(ViewerCommand::ToggleSurfaceRenderStyle);
+                            ui.close();
+                        }
+                        if ui.button("Cycle Surface Opacity").clicked() {
+                            actions.push(ViewerCommand::CycleSurfaceOpacity);
+                            ui.close();
+                        }
+                        if ui.button("Cycle Lighting").clicked() {
+                            actions.push(ViewerCommand::ToggleLightingMode);
                             ui.close();
                         }
                         if ui
