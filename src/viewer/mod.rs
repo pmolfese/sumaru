@@ -24,7 +24,7 @@ use crate::afni::{
     AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo, DEFAULT_AFNI_HOST,
     DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
 };
-use crate::color::{LabelTable, Rgba};
+use crate::color::{ColorMap, LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
 use crate::command::{
     BackgroundMode, CameraControlMode, ControllerState, HemisphereLayout, HemisphereLayoutState,
     LightingMode, OverlayThreshold, PairVisibility, SurfacePick, SurfaceRenderStyle, ViewPreset,
@@ -4726,6 +4726,65 @@ fn finite_integer_label_value(value: f64) -> Option<i32> {
         .and_then(|value| i32::try_from(value).ok())
 }
 
+fn auto_overlay_label_table(dataset: &Dataset, intensity_index: usize) -> Option<LabelTable> {
+    const MAX_AUTO_DISCRETE_LABELS: usize = 64;
+
+    let column = dataset.columns.get(intensity_index)?;
+    let keys = discrete_integer_column_keys(column)?
+        .into_iter()
+        .filter(|key| *key != 0)
+        .collect::<Vec<_>>();
+    if keys.is_empty() || keys.len() > MAX_AUTO_DISCRETE_LABELS {
+        return None;
+    }
+
+    let labels = keys
+        .into_iter()
+        .map(|key| LabelEntry::new(key, key.to_string(), stable_label_color(key, 255)))
+        .collect::<Result<Vec<_>>>()
+        .ok()?;
+
+    LabelTable::with_name(
+        Some(format!("{} discrete labels", column.label)),
+        LabelTableSource::Manual,
+        labels,
+    )
+    .ok()
+}
+
+fn discrete_integer_column_keys(column: &DataColumn) -> Option<BTreeSet<i32>> {
+    let mut keys = BTreeSet::new();
+    match &column.values {
+        ColumnData::UInt32(values) => {
+            for value in values {
+                keys.insert(i32::try_from(*value).ok()?);
+            }
+        }
+        ColumnData::Int32(values) => {
+            keys.extend(values.iter().copied());
+        }
+        ColumnData::Float32(values) => {
+            for value in values {
+                if !value.is_finite() {
+                    continue;
+                }
+                keys.insert(finite_integer_label_value(*value as f64)?);
+            }
+        }
+        ColumnData::Float64(values) => {
+            for value in values {
+                if !value.is_finite() {
+                    continue;
+                }
+                keys.insert(finite_integer_label_value(*value)?);
+            }
+        }
+        ColumnData::Text(_) => return None,
+    }
+
+    Some(keys)
+}
+
 fn afni_component_is_sendable(
     component: &SceneSurfaceComponent,
     mesh: Option<&SurfaceMesh>,
@@ -5958,23 +6017,7 @@ fn robust_finite_range(values: &[f32]) -> Option<(f32, f32)> {
 }
 
 fn roi_fill_color_for_label(integer_label: i32) -> Rgba {
-    const PALETTE: [[u8; 3]; 10] = [
-        [239, 58, 49],
-        [48, 166, 86],
-        [48, 116, 230],
-        [239, 181, 42],
-        [205, 82, 206],
-        [28, 175, 190],
-        [241, 126, 40],
-        [139, 93, 224],
-        [142, 196, 58],
-        [228, 77, 126],
-    ];
-    let label = integer_label.max(1);
-    let index = (label - 1).rem_euclid(PALETTE.len() as i32) as usize;
-    let [red, green, blue] = PALETTE[index];
-
-    Rgba::from_u8(red, green, blue, 205)
+    stable_label_color(integer_label, 205)
 }
 
 fn roi_edge_color_for_label(integer_label: i32) -> Rgba {
@@ -6079,6 +6122,21 @@ fn overlay_range_from_value_range(range: ValueRange) -> ColumnRange {
     ColumnRange {
         min: range.min as f64,
         max: range.max as f64,
+    }
+}
+
+fn resolved_overlay_color_map(
+    dataset: &Dataset,
+    intensity_index: usize,
+    colormap: OverlayColorMap,
+) -> ColorMap {
+    match colormap {
+        OverlayColorMap::DiscreteLabels => auto_overlay_label_table(dataset, intensity_index)
+            .map(ColorMap::labels)
+            .unwrap_or_else(ColorMap::spectrum_red_to_blue),
+        _ => colormap
+            .continuous_color_map()
+            .expect("non-discrete overlay color maps are continuous"),
     }
 }
 
@@ -7090,8 +7148,8 @@ mod tests {
         PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation,
         RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
         SceneSurfaceLayout, SurfacePick, afni_component_is_sendable, afni_rgba_overlay_signature,
-        apply_afni_rgba_to_color_cache, canonical_overlay_columns, component_transforms,
-        explicit_overlay_pair_display_name, load_spec_component_label_lookup,
+        apply_afni_rgba_to_color_cache, auto_overlay_label_table, canonical_overlay_columns,
+        component_transforms, explicit_overlay_pair_display_name, load_spec_component_label_lookup,
         load_spec_component_mesh, pair_hemisphere_matrices, paired_component_for_node,
         paired_overlay_dataset, paired_overlay_path_for_side, paired_overlay_paths,
         paired_spec_montage_shots, resolve_overlay_subs, roi_appearance_for_mesh,
@@ -7125,6 +7183,97 @@ mod tests {
 
         background.toggle();
         assert_eq!(background, BackgroundMode::Black);
+    }
+
+    #[test]
+    fn auto_overlay_label_table_detects_small_integer_palettes() {
+        let domain = SurfaceDomain::from_triangles(4, vec![[0, 1, 2], [1, 2, 3]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "labels",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Int32(vec![1, 2, 3, 4]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let table = auto_overlay_label_table(&dataset, 0).expect("should build label table");
+
+        assert_eq!(
+            table.label(1).unwrap().color,
+            Rgba::from_u8(0, 194, 255, 255)
+        );
+        assert_eq!(
+            table.label(2).unwrap().color,
+            Rgba::from_u8(255, 242, 0, 255)
+        );
+        assert_eq!(
+            table.label(3).unwrap().color,
+            Rgba::from_u8(57, 255, 20, 255)
+        );
+        assert_eq!(
+            table.label(4).unwrap().color,
+            Rgba::from_u8(255, 117, 24, 255)
+        );
+    }
+
+    #[test]
+    fn auto_overlay_label_table_treats_zero_as_unlabeled_background() {
+        let domain = SurfaceDomain::from_triangles(4, vec![[0, 1, 2], [1, 2, 3]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "labels",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Int32(vec![0, 1, 0, 2]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let table = auto_overlay_label_table(&dataset, 0).expect("should build label table");
+
+        assert!(table.label(0).is_none());
+        assert_eq!(table.color_for_key(0), Rgba::TRANSPARENT);
+        assert_eq!(
+            table.label(1).unwrap().color,
+            Rgba::from_u8(0, 194, 255, 255)
+        );
+        assert_eq!(
+            table.label(2).unwrap().color,
+            Rgba::from_u8(255, 242, 0, 255)
+        );
+    }
+
+    #[test]
+    fn auto_overlay_label_table_rejects_non_integer_columns() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "effect",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![1.0, 2.5, 3.0]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert!(auto_overlay_label_table(&dataset, 0).is_none());
     }
 
     #[test]

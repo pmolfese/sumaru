@@ -955,7 +955,22 @@ impl ViewerState {
                             });
                     });
                     ui.add_space(8.0);
-                    changed |= self.draw_overlay_range_controls(ui);
+                    if self
+                        .overlay
+                        .render
+                        .appearance
+                        .colormap
+                        .uses_continuous_range()
+                    {
+                        changed |= self.draw_overlay_range_controls(ui);
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "Discrete integer labels use a fixed value-to-color palette.",
+                            )
+                            .color(muted_color()),
+                        );
+                    }
                     ui.add_space(6.0);
                     changed |= ui
                         .add(

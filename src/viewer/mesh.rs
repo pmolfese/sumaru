@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use glam::Vec3;
 
-use crate::color::ColorMap;
+use crate::color::{ColorMap, stable_label_color};
 use crate::command::OverlayThreshold;
 use crate::overlay::Overlay;
 use crate::surface::{SurfaceMesh, ValueRange};
@@ -95,6 +95,7 @@ pub(super) struct OverlayAppearance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OverlayColorMap {
+    DiscreteLabels,
     SpectrumRedToBlue,
     SpectrumRedToBlueGap,
     SpectrumYellowToRed,
@@ -464,7 +465,8 @@ impl OverlayAppearance {
 }
 
 impl OverlayColorMap {
-    pub(super) const ALL: [Self; 13] = [
+    pub(super) const ALL: [Self; 14] = [
+        Self::DiscreteLabels,
         Self::SpectrumRedToBlue,
         Self::SpectrumRedToBlueGap,
         Self::SpectrumYellowToRed,
@@ -482,6 +484,7 @@ impl OverlayColorMap {
 
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::DiscreteLabels => "discrete labels",
             Self::SpectrumRedToBlue => "Spectrum:red_to_blue",
             Self::SpectrumRedToBlueGap => "Spectrum:red_to_blue+gap",
             Self::SpectrumYellowToRed => "Spectrum:yellow_to_red",
@@ -498,22 +501,27 @@ impl OverlayColorMap {
         }
     }
 
-    pub(super) fn to_color_map(self) -> ColorMap {
+    pub(super) fn continuous_color_map(self) -> Option<ColorMap> {
         match self {
-            Self::SpectrumRedToBlue => ColorMap::spectrum_red_to_blue(),
-            Self::SpectrumRedToBlueGap => ColorMap::spectrum_red_to_blue_gap(),
-            Self::SpectrumYellowToRed => ColorMap::spectrum_yellow_to_red(),
-            Self::SpectrumYellowToCyan => ColorMap::spectrum_yellow_to_cyan(),
-            Self::SpectrumYellowToCyanGap => ColorMap::spectrum_yellow_to_cyan_gap(),
-            Self::ColorCircleAjj => ColorMap::color_circle_ajj(),
-            Self::ColorCircleZss => ColorMap::color_circle_zss(),
-            Self::RedsAndBlues => ColorMap::reds_and_blues(),
-            Self::RedsAndBluesWithGreen => ColorMap::reds_and_blues_with_green(),
-            Self::AfniP2Spanned => ColorMap::afni_p2_spanned(),
-            Self::BlueWhiteRed => ColorMap::blue_white_red(),
-            Self::Fire => ColorMap::fire(),
-            Self::Grayscale => ColorMap::grayscale(),
+            Self::DiscreteLabels => None,
+            Self::SpectrumRedToBlue => Some(ColorMap::spectrum_red_to_blue()),
+            Self::SpectrumRedToBlueGap => Some(ColorMap::spectrum_red_to_blue_gap()),
+            Self::SpectrumYellowToRed => Some(ColorMap::spectrum_yellow_to_red()),
+            Self::SpectrumYellowToCyan => Some(ColorMap::spectrum_yellow_to_cyan()),
+            Self::SpectrumYellowToCyanGap => Some(ColorMap::spectrum_yellow_to_cyan_gap()),
+            Self::ColorCircleAjj => Some(ColorMap::color_circle_ajj()),
+            Self::ColorCircleZss => Some(ColorMap::color_circle_zss()),
+            Self::RedsAndBlues => Some(ColorMap::reds_and_blues()),
+            Self::RedsAndBluesWithGreen => Some(ColorMap::reds_and_blues_with_green()),
+            Self::AfniP2Spanned => Some(ColorMap::afni_p2_spanned()),
+            Self::BlueWhiteRed => Some(ColorMap::blue_white_red()),
+            Self::Fire => Some(ColorMap::fire()),
+            Self::Grayscale => Some(ColorMap::grayscale()),
         }
+    }
+
+    pub(super) fn uses_continuous_range(self) -> bool {
+        !matches!(self, Self::DiscreteLabels)
     }
 }
 
@@ -602,12 +610,16 @@ fn colors_match(left: [f32; 4], right: [f32; 4]) -> bool {
 }
 
 pub(super) fn sample_colormap(colormap: OverlayColorMap, t: f32) -> [f32; 4] {
-    colormap
-        .to_color_map()
-        .as_continuous()
-        .expect("viewer color maps are continuous")
-        .sample(t)
-        .to_array()
+    if let Some(colormap) = colormap.continuous_color_map() {
+        return colormap
+            .as_continuous()
+            .expect("viewer color maps are continuous")
+            .sample(t)
+            .to_array();
+    }
+
+    let index = (t.clamp(0.0, 1.0) * 9.0).round() as i32 + 1;
+    stable_label_color(index, 255).to_array()
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {

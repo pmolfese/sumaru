@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 
-use crate::color::{ColorMap, ContinuousColorMap};
+use crate::color::{ColorMap, ContinuousColorMap, LabelTable};
 use crate::dataset::{ColumnData, ColumnRange, DataColumn, Dataset};
 use crate::surface::{SurfaceDomain, SurfaceDomainId};
 
@@ -185,14 +185,16 @@ impl Overlay {
             .map(|selection| selected_numeric_column(dataset, selection))
             .transpose()
             .context("overlay brightness column is invalid")?;
-        let intensity_range = self.resolved_intensity_range(intensity_column)?;
         let brightness_range: Option<ColumnRange> =
             brightness_column.and_then(|column| column.range);
         self.threshold.validate()?;
-        let colormap = self
-            .colormap
-            .as_continuous()
-            .context("overlay color cache currently requires a continuous color map")?;
+        let intensity_mapping = match &self.colormap {
+            ColorMap::Continuous(colormap) => IntensityColorMapping::Continuous {
+                colormap,
+                range: self.resolved_intensity_range(intensity_column)?,
+            },
+            ColorMap::Labels(label_table) => IntensityColorMapping::Labels(label_table),
+        };
 
         let mut colors = vec![[0.0, 0.0, 0.0, 0.0]; domain.node_count];
         let opacity = self.opacity.clamp(0.0, 1.0);
@@ -213,9 +215,21 @@ impl Overlay {
 
             let threshold_value = threshold_column.and_then(|column| numeric_value(column, row));
             let passes_threshold = self.threshold.passes(threshold_value);
-            let clipped_out = self.clip_mode == ClipMode::HideOutsideIntensityRange
-                && !intensity_range.contains(value);
-            let mut color = map_value(value, intensity_range, colormap);
+            let clipped_out = matches!(
+                intensity_mapping,
+                IntensityColorMapping::Continuous { range, .. }
+                    if self.clip_mode == ClipMode::HideOutsideIntensityRange
+                        && !range.contains(value)
+            );
+            let mut color = match intensity_mapping {
+                IntensityColorMapping::Continuous { colormap, range } => {
+                    map_value(value, range, colormap)
+                }
+                IntensityColorMapping::Labels(label_table) => {
+                    map_label_value(intensity_column, row, label_table)
+                        .unwrap_or([0.35, 0.35, 0.35, opacity])
+                }
+            };
 
             if let (Some(column), Some(range)) = (brightness_column, brightness_range)
                 && let Some(brightness) = numeric_value(column, row)
@@ -467,6 +481,37 @@ fn map_value(value: f64, range: ColumnRange, colormap: &ContinuousColorMap) -> [
     colormap.sample(normalized).to_array()
 }
 
+fn map_label_value(column: &DataColumn, row: usize, label_table: &LabelTable) -> Option<[f32; 4]> {
+    integer_value(column, row).map(|value| label_table.color_for_key(value).to_array())
+}
+
+fn integer_value(column: &DataColumn, row: usize) -> Option<i32> {
+    match &column.values {
+        ColumnData::UInt32(values) => values.get(row).and_then(|value| i32::try_from(*value).ok()),
+        ColumnData::Int32(values) => values.get(row).copied(),
+        ColumnData::Float32(values) => values
+            .get(row)
+            .and_then(|value| finite_integer(*value as f64)),
+        ColumnData::Float64(values) => values.get(row).and_then(|value| finite_integer(*value)),
+        ColumnData::Text(_) => None,
+    }
+}
+
+fn finite_integer(value: f64) -> Option<i32> {
+    (value.is_finite() && value.fract() == 0.0)
+        .then_some(value as i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+#[derive(Clone, Copy)]
+enum IntensityColorMapping<'a> {
+    Continuous {
+        colormap: &'a ContinuousColorMap,
+        range: ColumnRange,
+    },
+    Labels(&'a LabelTable),
+}
+
 trait ColumnDataKind {
     fn is_numeric(&self) -> bool;
 }
@@ -482,7 +527,7 @@ mod tests {
     use super::{
         ClipMode, MaskMode, Overlay, OverlayColumns, OverlayLayerRole, RangeSelection, Threshold,
     };
-    use crate::color::ColorMap;
+    use crate::color::{ColorMap, LabelEntry, LabelTable, LabelTableSource, Rgba};
     use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::surface::SurfaceDomain;
 
@@ -544,6 +589,52 @@ mod tests {
         let error = Overlay::from_dataset(&dataset, &domain, OverlayColumns::new(0)).unwrap_err();
 
         assert!(error.to_string().contains("intensity column is invalid"));
+    }
+
+    #[test]
+    fn overlay_label_colormap_maps_integer_values_to_label_colors() {
+        let domain = triangle_domain();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceLabel,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "label",
+                    ColumnRole::Label,
+                    None,
+                    ColumnData::Int32(vec![1, 2, 4]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let table = LabelTable::new(
+            LabelTableSource::Manual,
+            vec![
+                LabelEntry::new(1, "1", Rgba::from_u8(0, 194, 255, 255)).unwrap(),
+                LabelEntry::new(2, "2", Rgba::from_u8(255, 242, 0, 255)).unwrap(),
+                LabelEntry::new(4, "4", Rgba::from_u8(255, 117, 24, 255)).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut overlay = Overlay::from_dataset(&dataset, &domain, OverlayColumns::new(0))
+            .unwrap()
+            .with_colormap(ColorMap::labels(table));
+
+        overlay.rebuild_color_cache(&dataset, &domain).unwrap();
+
+        assert_color_close(
+            overlay.color_cache.colors[0],
+            [0.0, 194.0 / 255.0, 1.0, 1.0],
+        );
+        assert_color_close(
+            overlay.color_cache.colors[1],
+            [1.0, 242.0 / 255.0, 0.0, 1.0],
+        );
+        assert_color_close(
+            overlay.color_cache.colors[2],
+            [1.0, 117.0 / 255.0, 24.0 / 255.0, 1.0],
+        );
     }
 
     #[test]

@@ -79,6 +79,7 @@ impl ViewerState {
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         self.overlay.source.path = Some(path.clone());
         self.overlay.source.pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
         self.controller.surface.current_overlay_path = Some(path.clone());
@@ -88,8 +89,13 @@ impl ViewerState {
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.log_status(format!(
-            "Loaded overlay range {}. {column_summary}",
-            value_range_label(range)
+            "Loaded overlay range {}. {column_summary}{}",
+            value_range_label(range),
+            if auto_discrete_labels {
+                " Using discrete integer label colors."
+            } else {
+                ""
+            }
         ));
 
         Ok(())
@@ -126,6 +132,7 @@ impl ViewerState {
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         let primary_path = pair
             .primary_path()
             .context("explicit hemisphere overlay selection is empty")?
@@ -139,8 +146,13 @@ impl ViewerState {
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.log_status(format!(
-            "Loaded hemisphere overlay range {}. {column_summary}",
-            value_range_label(range)
+            "Loaded hemisphere overlay range {}. {column_summary}{}",
+            value_range_label(range),
+            if auto_discrete_labels {
+                " Using discrete integer label colors."
+            } else {
+                ""
+            }
         ));
 
         Ok(())
@@ -392,14 +404,39 @@ impl ViewerState {
         } else {
             range
         };
+        let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         self.sanitize_overlay_appearance();
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
-        self.log_status(format!("Overlay columns: {column_summary}"));
+        self.log_status(format!(
+            "Overlay columns: {column_summary}{}",
+            if auto_discrete_labels {
+                " Using discrete integer label colors."
+            } else {
+                ""
+            }
+        ));
 
         Ok(())
+    }
+
+    fn maybe_apply_discrete_overlay_palette(&mut self) -> bool {
+        let Some(dataset) = self.overlay.data.dataset() else {
+            return false;
+        };
+        let intensity_index = self.overlay.data.columns().intensity;
+        if auto_overlay_label_table(dataset, intensity_index).is_some() {
+            self.overlay.render.appearance.colormap = OverlayColorMap::DiscreteLabels;
+            self.overlay.render.appearance.symmetric_range = false;
+            true
+        } else {
+            if self.overlay.render.appearance.colormap == OverlayColorMap::DiscreteLabels {
+                self.overlay.render.appearance.colormap = OverlayColorMap::SpectrumRedToBlue;
+            }
+            false
+        }
     }
 
     /// Recompute overlay appearance defaults from the selected columns.
@@ -433,13 +470,18 @@ impl ViewerState {
             self.overlay.data.columns(),
             self.overlay.render.appearance.threshold.enabled,
         );
+        let intensity_index = columns.intensity.index;
         let (threshold, mask_mode) =
             threshold_and_mask_from_appearance(self.overlay.render.appearance);
         // Build with an empty cache, apply the real display settings, then
         // compute the color cache exactly once (from_dataset would compute it a
         // first time with default settings and throw that away).
         let mut overlay = Overlay::without_color_cache(dataset, domain, columns)?
-            .with_colormap(self.overlay.render.appearance.colormap.to_color_map())
+            .with_colormap(resolved_overlay_color_map(
+                dataset,
+                intensity_index,
+                self.overlay.render.appearance.colormap,
+            ))
             .with_intensity_range(RangeSelection::Manual(overlay_range_from_value_range(
                 self.overlay.render.appearance.range,
             )))
