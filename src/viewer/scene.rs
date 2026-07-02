@@ -22,9 +22,9 @@ pub(super) struct SurfaceBuffers {
     pub(super) point_index_count: u32,
 }
 
-/// Per-hemisphere resident geometry for both-spec scenes. Positions and normals
-/// remain in each source surface's mesh space; the model matrix moves them into
-/// the active paired layout.
+/// Multi-draw resident geometry. Used for both-spec per-hemisphere rendering
+/// and for chunked single-surface draws when one AFNI colorized buffer would
+/// exceed the active wgpu device limits.
 pub(super) struct SurfaceRenderSet {
     pub(super) instances: Vec<SurfaceRenderInstance>,
 }

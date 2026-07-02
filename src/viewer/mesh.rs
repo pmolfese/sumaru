@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use glam::Vec3;
 
 use crate::color::{ColorMap, stable_label_color};
 use crate::command::OverlayThreshold;
+#[cfg(test)]
 use crate::overlay::Overlay;
 use crate::surface::{SurfaceMesh, ValueRange};
 
@@ -122,6 +124,7 @@ impl PreparedSurface {
         Self::from_geometry_with_selection(&geometry, None, overlay, overlay_dim, None, None)
     }
 
+    #[cfg(test)]
     pub(super) fn from_geometry_with_selection(
         geometry: &PreparedGeometry,
         surface_colors: Option<&[[f32; 4]]>,
@@ -183,10 +186,38 @@ impl PreparedSurface {
         roi_colors: Option<&[Option<[f32; 4]>]>,
         selection: Option<SelectionHighlight>,
     ) -> Self {
-        let mut vertices = Vec::with_capacity(geometry.indices.len());
-        let mut indices = Vec::with_capacity(geometry.indices.len());
+        let mut prepared = Self::from_geometry_cell_color_range(
+            geometry,
+            surface_colors,
+            roi_colors,
+            0..geometry.triangle_count(),
+        );
+        if let Some(selection) = selection {
+            append_selection_highlight(
+                &mut prepared.vertices,
+                &mut prepared.indices,
+                geometry,
+                selection,
+            );
+        }
 
-        for triangle in geometry.indices.chunks_exact(3) {
+        prepared
+    }
+
+    pub(super) fn from_geometry_cell_color_range(
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        triangle_range: Range<usize>,
+    ) -> Self {
+        let triangle_count = geometry.triangle_count();
+        let start_triangle = triangle_range.start.min(triangle_count);
+        let end_triangle = triangle_range.end.min(triangle_count).max(start_triangle);
+        let triangle_indices = &geometry.indices[start_triangle * 3..end_triangle * 3];
+        let mut vertices = Vec::with_capacity(triangle_indices.len());
+        let mut indices = Vec::with_capacity(triangle_indices.len());
+
+        for triangle in triangle_indices.chunks_exact(3) {
             let face_color = cell_color_for_triangle(triangle, surface_colors, roi_colors);
             let start = vertices.len() as u32;
             for index in triangle {
@@ -203,9 +234,16 @@ impl PreparedSurface {
             }
         }
 
-        if let Some(selection) = selection {
-            append_selection_highlight(&mut vertices, &mut indices, geometry, selection);
-        }
+        Self { vertices, indices }
+    }
+
+    pub(super) fn selection_highlight(
+        geometry: &PreparedGeometry,
+        selection: SelectionHighlight,
+    ) -> Self {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        append_selection_highlight(&mut vertices, &mut indices, geometry, selection);
 
         Self { vertices, indices }
     }
@@ -271,6 +309,10 @@ impl PreparedSurface {
         }
 
         indices
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.vertices.is_empty() || self.indices.is_empty()
     }
 }
 
@@ -418,6 +460,10 @@ fn append_crosshair_marker(
 }
 
 impl PreparedGeometry {
+    pub(super) fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+
     pub(super) fn from_surface(surface: &SurfaceMesh) -> Self {
         let normals = surface.vertex_normals();
         let center = Vec3::from_array(surface.bounds.center);
@@ -444,6 +490,28 @@ impl PreparedGeometry {
 
         Self { vertices, indices }
     }
+}
+
+pub(super) fn cell_color_chunk_ranges(
+    triangle_count: usize,
+    max_triangles_per_chunk: usize,
+) -> Vec<Range<usize>> {
+    if triangle_count == 0 {
+        return Vec::new();
+    }
+
+    let max_triangles_per_chunk = max_triangles_per_chunk.max(1);
+    let mut ranges = Vec::with_capacity(triangle_count.div_ceil(max_triangles_per_chunk));
+    let mut start = 0;
+    while start < triangle_count {
+        let end = start
+            .saturating_add(max_triangles_per_chunk)
+            .min(triangle_count);
+        ranges.push(start..end);
+        start = end;
+    }
+
+    ranges
 }
 
 impl OverlayAppearance {
@@ -629,7 +697,8 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SURFACE_COLOR, PreparedGeometry, PreparedSurface, RoiAppearance, SelectionHighlight,
+        DEFAULT_SURFACE_COLOR, PreparedGeometry, PreparedSurface, RoiAppearance,
+        SelectionHighlight, cell_color_chunk_ranges,
     };
     use crate::color::ColorMap;
     use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
@@ -719,6 +788,60 @@ mod tests {
         for vertex in prepared.vertices {
             assert_eq!(vertex.color, [0.0, 0.0, 1.0, 1.0]);
         }
+    }
+
+    #[test]
+    fn cell_color_chunk_ranges_cover_all_triangles() {
+        assert_eq!(
+            cell_color_chunk_ranges(0, 3),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        assert_eq!(cell_color_chunk_ranges(5, 2), vec![0..2, 2..4, 4..5]);
+        assert_eq!(cell_color_chunk_ranges(3, 0), vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn prepared_surface_cell_color_chunks_use_local_indices() {
+        let mesh = square_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let colors = vec![
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+        ];
+        let chunks = cell_color_chunk_ranges(geometry.triangle_count(), 1)
+            .into_iter()
+            .map(|range| {
+                PreparedSurface::from_geometry_cell_color_range(
+                    &geometry,
+                    Some(&colors),
+                    None,
+                    range,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), 2);
+        for chunk in &chunks {
+            assert_eq!(chunk.indices, vec![0, 1, 2]);
+            assert_eq!(chunk.vertices.len(), 3);
+            assert_eq!(chunk.index_count(), 3);
+        }
+    }
+
+    #[test]
+    fn prepared_surface_selection_highlight_can_be_its_own_chunk() {
+        let mesh = triangle_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let chunk = PreparedSurface::selection_highlight(
+            &geometry,
+            SelectionHighlight::normalized(2, 0, [0.0, 0.0, 0.0]),
+        );
+
+        assert_eq!(chunk.vertices.len(), 15);
+        assert_eq!(chunk.indices.len(), 51);
+        assert!(!chunk.is_empty());
     }
 
     #[test]
@@ -830,6 +953,17 @@ mod tests {
         let vertices = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
 
         SurfaceMesh::new(vertices, vec![[0, 1, 2]]).unwrap()
+    }
+
+    fn square_mesh() -> SurfaceMesh {
+        let vertices = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+
+        SurfaceMesh::new(vertices, vec![[0, 1, 2], [0, 2, 3]]).unwrap()
     }
 
     fn scalar_overlay(mesh: &SurfaceMesh, values: Vec<f32>) -> (Dataset, Overlay) {

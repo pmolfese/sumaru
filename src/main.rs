@@ -92,6 +92,11 @@ struct Cli {
     #[arg(long = "preload")]
     preload: bool,
 
+    /// Request the GPU adapter's native maximum buffer size for very large
+    /// surfaces. Off by default to keep portable wgpu limits.
+    #[arg(long = "big-mem")]
+    big_mem: bool,
+
     /// Deprecated: on-demand spec loading is now the default.
     #[arg(long = "no-preload", hide = true, conflicts_with = "preload")]
     no_preload: bool,
@@ -200,6 +205,7 @@ fn main() -> Result<()> {
     validate_onestate_order(&args)?;
     let verbose = cli.verbose;
     let preload = cli.preload && !cli.no_preload;
+    let big_mem = cli.big_mem;
     let subs = cli.subs.map(|subs| subs.0);
     let p_value = cli.p_value;
     let niml_record_path = cli.niml_record;
@@ -260,6 +266,7 @@ fn main() -> Result<()> {
                 overlay_p_value: p_value,
                 verbose,
                 preload,
+                big_mem,
                 afni,
                 niml_record_path,
             })?;
@@ -278,6 +285,7 @@ fn main() -> Result<()> {
                 &p_value,
                 &niml_record_path,
                 onestate,
+                big_mem,
             )?;
             if afni_requested {
                 bail!("AFNI connection flags only apply to viewer launches and `niml send`");
@@ -299,6 +307,7 @@ fn main() -> Result<()> {
                 &p_value,
                 &niml_record_path,
                 onestate,
+                big_mem,
             )?;
             run_niml_command(command, &afni.port_config, verbose)?;
         }
@@ -408,6 +417,7 @@ fn validate_no_viewer_launch_options(
     p_value: &Option<f64>,
     niml_record_path: &Option<PathBuf>,
     onestate: bool,
+    big_mem: bool,
 ) -> Result<()> {
     if !surface_paths.is_empty()
         || spec.is_some()
@@ -421,6 +431,7 @@ fn validate_no_viewer_launch_options(
         || p_value.is_some()
         || niml_record_path.is_some()
         || onestate
+        || big_mem
     {
         bail!("viewer launch options and subcommands cannot be mixed");
     }
@@ -1076,6 +1087,32 @@ mod tests {
                 &None,
                 &Some(PathBuf::from("session.nimlrec")),
                 false,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn big_mem_is_a_viewer_only_opt_in() {
+        let cli = Cli::parse_from(["sumaru", "--surface", "surface.gii", "--big-mem"]);
+        assert!(cli.big_mem);
+
+        assert!(
+            validate_no_viewer_launch_options(
+                &[],
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                false,
+                true,
             )
             .is_err()
         );
