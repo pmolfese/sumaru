@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -20,9 +21,9 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::afni::{
-    AfniConnection, AfniConnectionEvent, AfniNimlSession, AfniOverlayState, AfniPortConfig,
-    AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo, DEFAULT_AFNI_HOST,
-    DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
+    AFNI_SURFACE_REGISTRATION_PARTS, AfniConnection, AfniConnectionEvent, AfniNimlSession,
+    AfniOverlayState, AfniPortConfig, AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair,
+    AfniSurfaceInfo, DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
 };
 use crate::color::{ColorMap, LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
 use crate::command::{
@@ -108,7 +109,11 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
 const VERTEX_STRIDE: wgpu::BufferAddress = 40;
 const PREPARED_VERTEX_BYTES: usize = 10 * std::mem::size_of::<f32>();
 const AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE: usize = 3 * PREPARED_VERTEX_BYTES;
-const AFNI_CELL_COLOR_MAX_CHUNK_VERTEX_BYTES: usize = 192 * 1024 * 1024;
+const AFNI_CELL_COLOR_MAX_CHUNK_VERTEX_BYTES: usize = 32 * 1024 * 1024;
+const AFNI_EVENTS_PER_DRAIN: usize = 4;
+const AFNI_ELEMENTS_PER_DRAIN: usize = 4;
+const AFNI_CELL_COLOR_UPLOAD_CHUNKS_PER_TICK: usize = 1;
+const AFNI_SURFACE_REGISTRATION_PARTS_PER_TICK: usize = 1;
 const SELECTION_HIGHLIGHT_VERTEX_COUNT: usize = 15;
 const MODE_LABEL_DURATION: Duration = Duration::from_secs(2);
 const MOMENTUM_FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -1145,6 +1150,10 @@ struct ViewerState {
     afni_connection: Option<AfniConnection>,
     afni_session: AfniNimlSession,
     afni_recorder: Option<NimlRecorder>,
+    pending_afni_surface_registrations: VecDeque<PendingAfniSurfaceRegistration>,
+    pending_afni_redraw_after_registrations: bool,
+    pending_afni_elements: VecDeque<NimlElement>,
+    pending_cell_color_upload: Option<PendingCellColorUpload>,
     afni_rgba_colors: Option<Vec<[f32; 4]>>,
     /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
     /// resends identical colorizations on every redraw; this lets us skip the
@@ -1536,6 +1545,10 @@ impl ViewerState {
             afni_connection: None,
             afni_session: AfniNimlSession::new(),
             afni_recorder,
+            pending_afni_surface_registrations: VecDeque::new(),
+            pending_afni_redraw_after_registrations: false,
+            pending_afni_elements: VecDeque::new(),
+            pending_cell_color_upload: None,
             afni_rgba_colors: None,
             afni_rgba_signatures: HashMap::new(),
             sent_crosshair_node: None,
@@ -3649,31 +3662,38 @@ impl ViewerState {
     fn upload_chunked_cell_color_surface_render_set(
         &mut self,
         surface_id: SurfaceId,
-        geometry: &PreparedGeometry,
-        surface_colors: Option<&[[f32; 4]]>,
-        roi_colors: Option<&[Option<[f32; 4]>]>,
+        geometry: Arc<PreparedGeometry>,
+        surface_colors: Option<Arc<Vec<[f32; 4]>>>,
+        roi_colors: Option<Vec<Option<[f32; 4]>>>,
         selection: Option<SelectionHighlight>,
         dropped_render_set: bool,
     ) {
-        let mut instances = Vec::new();
-        let mesh_chunk_count = self.push_cell_color_surface_instances(
-            &mut instances,
+        let max_triangles =
+            afni_cell_color_max_triangles_per_chunk(self.device.limits().max_buffer_size);
+        let ranges = cell_color_chunk_ranges(geometry.triangle_count(), max_triangles);
+        let mesh_chunk_count = ranges.len();
+        let dropped_gpu_resources = dropped_render_set || self.surface_buffers.is_some();
+        self.surface_buffers = None;
+        self.surface_render_set = Some(SurfaceRenderSet {
+            instances: Vec::new(),
+        });
+        self.pending_cell_color_upload = Some(PendingCellColorUpload {
+            surface_id: surface_id.clone(),
             geometry,
             surface_colors,
             roi_colors,
             selection,
-            SurfaceSide::Unknown,
-            Mat4::IDENTITY,
-            CHUNKED_SURFACE_BUFFER_LABELS,
-        );
-        let dropped_gpu_resources = dropped_render_set || self.surface_buffers.is_some();
-        self.surface_buffers = None;
-        self.surface_render_set = Some(SurfaceRenderSet { instances });
+            ranges: ranges.into_iter().collect(),
+            mesh_chunk_count,
+            chunks_uploaded: 0,
+            side: SurfaceSide::Unknown,
+            model_matrix: Mat4::IDENTITY,
+            labels: CHUNKED_SURFACE_BUFFER_LABELS,
+        });
         if self.verbose {
-            let max_triangles =
-                afni_cell_color_max_triangles_per_chunk(self.device.limits().max_buffer_size);
             self.log_status(format!(
-                "AFNI colorized surface {} split into {} GPU chunks (up to {} triangles each).",
+                "AFNI colorized surface {} split into {} GPU chunks \
+                 (up to {} triangles each); uploading progressively.",
                 surface_id.as_str(),
                 mesh_chunk_count,
                 max_triangles
@@ -3682,9 +3702,11 @@ impl ViewerState {
         if dropped_gpu_resources {
             self.poll_device_for_cleanup();
         }
+        self.process_pending_cell_color_upload();
     }
 
     fn upload_surface_buffers(&mut self) {
+        self.pending_cell_color_upload = None;
         let afni_surface_colors = (self.controller.overlay.visible)
             .then(|| self.afni_rgba_colors.clone())
             .flatten();
@@ -3762,9 +3784,9 @@ impl ViewerState {
             let surface_id = mesh.metadata.id.clone();
             self.upload_chunked_cell_color_surface_render_set(
                 surface_id,
-                &geometry,
-                surface_color_slice,
-                roi_color_slice,
+                geometry.clone(),
+                surface_colors.clone(),
+                roi_colors.clone(),
                 selection,
                 dropped_render_set,
             );
@@ -4549,6 +4571,26 @@ struct ControlUiOutput {
 enum ViewerEvent {
     AfniMessagesReady,
     SceneStatsReady,
+}
+
+struct PendingCellColorUpload {
+    surface_id: SurfaceId,
+    geometry: Arc<PreparedGeometry>,
+    surface_colors: Option<Arc<Vec<[f32; 4]>>>,
+    roi_colors: Option<Vec<Option<[f32; 4]>>>,
+    selection: Option<SelectionHighlight>,
+    ranges: VecDeque<Range<usize>>,
+    mesh_chunk_count: usize,
+    chunks_uploaded: usize,
+    side: SurfaceSide,
+    model_matrix: Mat4,
+    labels: SurfaceInstanceBufferLabels,
+}
+
+struct PendingAfniSurfaceRegistration {
+    mesh: Arc<SurfaceMesh>,
+    info: AfniSurfaceInfo,
+    next_part: usize,
 }
 
 struct PreloadTask {
@@ -7397,7 +7439,7 @@ mod tests {
         OverlayAppearance, OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR,
         PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PreparedGeometry,
         PresetOrientation, RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface,
-        SceneSurfaceComponent, SceneSurfaceLayout, SurfacePick,
+        SceneSurfaceComponent, SceneSurfaceLayout, SurfacePick, ViewerCommand,
         afni_cell_color_max_triangles_per_chunk, afni_cell_color_needs_chunking,
         afni_component_is_sendable, afni_rgba_overlay_signature, apply_afni_rgba_to_color_cache,
         auto_overlay_label_table, canonical_overlay_columns, component_transforms,
@@ -7412,7 +7454,7 @@ mod tests {
         threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
         viewer_required_wgpu_limits,
     };
-    use crate::afni::AfniRgbaOverlay;
+    use crate::afni::{AfniRgbaOverlay, AfniRouteAction};
     use crate::color::Rgba;
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{MaskMode, Threshold};
@@ -7626,6 +7668,50 @@ mod tests {
             afni_rgba_overlay_signature(&base),
             afni_rgba_overlay_signature(&renamed)
         );
+    }
+
+    #[test]
+    fn afni_route_coalescing_keeps_latest_rgba_per_surface() {
+        fn rgba(surface: &str, parent: Option<&str>, red: u8) -> AfniRouteAction {
+            AfniRouteAction::RgbaOverlay(AfniRgbaOverlay {
+                surface_idcode: surface.to_string(),
+                local_domain_parent_id: parent.map(str::to_string),
+                node_indices: vec![1],
+                rgba: vec![[red, 0, 0, 255]],
+                threshold: None,
+                function_idcode: None,
+                volume_idcode: None,
+            })
+        }
+
+        let actions = vec![
+            rgba("lh", Some("smoothwm"), 1),
+            AfniRouteAction::ViewerCommand(ViewerCommand::ResetCamera),
+            rgba("rh", Some("smoothwm"), 2),
+            rgba("lh", Some("smoothwm"), 3),
+        ];
+
+        let coalesced = super::afni::coalesce_afni_route_actions(actions);
+
+        assert_eq!(coalesced.len(), 3);
+        assert!(matches!(
+            coalesced[0],
+            AfniRouteAction::ViewerCommand(ViewerCommand::ResetCamera)
+        ));
+        match &coalesced[1] {
+            AfniRouteAction::RgbaOverlay(overlay) => {
+                assert_eq!(overlay.surface_idcode, "rh");
+                assert_eq!(overlay.rgba[0][0], 2);
+            }
+            _ => panic!("expected right hemisphere RGBA update"),
+        }
+        match &coalesced[2] {
+            AfniRouteAction::RgbaOverlay(overlay) => {
+                assert_eq!(overlay.surface_idcode, "lh");
+                assert_eq!(overlay.rgba[0][0], 3);
+            }
+            _ => panic!("expected latest left hemisphere RGBA update"),
+        }
     }
 
     #[test]

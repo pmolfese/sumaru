@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -107,6 +107,19 @@ pub struct AfniRgbaOverlay {
     pub volume_idcode: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfniSurfaceRegistrationPart {
+    Coordinates,
+    Normals,
+    Triangles,
+}
+
+pub const AFNI_SURFACE_REGISTRATION_PARTS: [AfniSurfaceRegistrationPart; 3] = [
+    AfniSurfaceRegistrationPart::Coordinates,
+    AfniSurfaceRegistrationPart::Normals,
+    AfniSurfaceRegistrationPart::Triangles,
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AfniIncomingMessage {
     RgbaOverlay(AfniRgbaOverlay),
@@ -187,13 +200,27 @@ pub enum AfniConnectionEvent {
 }
 
 #[derive(Debug)]
+enum AfniWriteCommand {
+    Elements(Vec<NimlElement>),
+    SurfaceRegistrationPart {
+        mesh: Arc<SurfaceMesh>,
+        info: AfniSurfaceInfo,
+        part: AfniSurfaceRegistrationPart,
+    },
+    Flush(Sender<std::result::Result<(), String>>),
+    Disconnect,
+}
+
+type WakeCallback = Arc<Mutex<Box<dyn Fn() + Send>>>;
+
+#[derive(Debug)]
 pub struct AfniConnection {
     stream: TcpStream,
     receiver: Receiver<AfniConnectionEvent>,
+    writer_sender: Sender<AfniWriteCommand>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
-    recorder: Option<NimlRecorder>,
-    verbose: bool,
+    writer: Option<JoinHandle<()>>,
 }
 
 impl AfniConnection {
@@ -237,10 +264,19 @@ impl AfniConnection {
 
         let reader_stream = stream.try_clone()?;
         reader_stream.set_read_timeout(Some(AFNI_READ_TIMEOUT))?;
+        let writer_stream = stream.try_clone()?;
+        writer_stream.set_write_timeout(Some(AFNI_WRITE_TIMEOUT))?;
         let (sender, receiver) = mpsc::channel();
+        let (writer_sender, writer_receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = stop.clone();
+        let writer_stop = stop.clone();
         let reader_recorder = recorder.clone();
+        let writer_recorder = recorder;
+        let wake: WakeCallback = Arc::new(Mutex::new(Box::new(wake)));
+        let reader_wake = wake.clone();
+        let writer_wake = wake;
+        let writer_event_sender = sender.clone();
         let reader = thread::spawn(move || {
             read_afni_stream(
                 reader_stream,
@@ -248,33 +284,58 @@ impl AfniConnection {
                 reader_stop,
                 verbose,
                 reader_recorder,
-                wake,
+                reader_wake,
+            );
+        });
+        let writer = thread::spawn(move || {
+            write_afni_stream(
+                writer_stream,
+                writer_receiver,
+                writer_event_sender,
+                writer_stop,
+                verbose,
+                writer_recorder,
+                writer_wake,
             );
         });
 
         Ok(Self {
             stream,
             receiver,
+            writer_sender,
             stop,
             reader: Some(reader),
-            recorder,
-            verbose,
+            writer: Some(writer),
         })
     }
 
     pub fn send_elements(&mut self, elements: &[NimlElement]) -> Result<()> {
-        let payload = serialize_niml_ascii(elements);
-        log_niml_elements(self.verbose, "tx", elements, payload.len());
-        self.stream
-            .write_all(payload.as_bytes())
-            .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
-        self.stream
-            .flush()
-            .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
-        if let Some(recorder) = self.recorder.as_ref() {
-            recorder.record_payload(NimlDirection::Tx, payload.as_bytes())?;
+        self.writer_sender
+            .send(AfniWriteCommand::Elements(elements.to_vec()))
+            .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
+    }
+
+    pub fn send_surface_registration_part(
+        &mut self,
+        mesh: Arc<SurfaceMesh>,
+        info: AfniSurfaceInfo,
+        part: AfniSurfaceRegistrationPart,
+    ) -> Result<()> {
+        self.writer_sender
+            .send(AfniWriteCommand::SurfaceRegistrationPart { mesh, info, part })
+            .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.writer_sender
+            .send(AfniWriteCommand::Flush(sender))
+            .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))?;
+        match receiver.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => bail!("{message}"),
+            Err(_) => bail!("AFNI/SUMA NIML writer stopped before flushing"),
         }
-        Ok(())
     }
 
     pub fn try_recv(&self) -> Option<AfniConnectionEvent> {
@@ -283,9 +344,13 @@ impl AfniConnection {
 
     pub fn disconnect(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        let _ = self.writer_sender.send(AfniWriteCommand::Disconnect);
         let _ = self.stream.shutdown(Shutdown::Both);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
         }
     }
 }
@@ -402,7 +467,7 @@ fn read_afni_stream(
     stop: Arc<AtomicBool>,
     verbose: bool,
     recorder: Option<NimlRecorder>,
-    wake: impl Fn() + Send + 'static,
+    wake: WakeCallback,
 ) {
     let mut pending = Vec::new();
     let mut chunk = [0_u8; 65_536];
@@ -411,7 +476,7 @@ fn read_afni_stream(
         match stream.read(&mut chunk) {
             Ok(0) => {
                 let _ = sender.send(AfniConnectionEvent::Disconnected);
-                wake();
+                wake_gui(&wake);
                 return;
             }
             Ok(read) => {
@@ -427,10 +492,10 @@ fn read_afni_stream(
                                 let _ = sender.send(AfniConnectionEvent::Error(format!(
                                     "failed to record AFNI NIML message: {error:#}"
                                 )));
-                                wake();
+                                wake_gui(&wake);
                             }
                             let _ = sender.send(AfniConnectionEvent::Elements(elements));
-                            wake();
+                            wake_gui(&wake);
                         }
                         pending.clear();
                     }
@@ -439,7 +504,7 @@ fn read_afni_stream(
                             "AFNI NIML stream exceeded {} pending bytes before parsing: {error:#}",
                             AFNI_MAX_PENDING_BYTES
                         )));
-                        wake();
+                        wake_gui(&wake);
                         pending.clear();
                     }
                     Err(_) => {
@@ -462,11 +527,80 @@ fn read_afni_stream(
                     let _ = sender.send(AfniConnectionEvent::Error(format!(
                         "AFNI NIML read failed: {error}"
                     )));
-                    wake();
+                    wake_gui(&wake);
                 }
                 return;
             }
         }
+    }
+}
+
+fn write_afni_stream(
+    mut stream: TcpStream,
+    receiver: mpsc::Receiver<AfniWriteCommand>,
+    sender: mpsc::Sender<AfniConnectionEvent>,
+    stop: Arc<AtomicBool>,
+    verbose: bool,
+    recorder: Option<NimlRecorder>,
+    wake: WakeCallback,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let command = match receiver.recv_timeout(AFNI_READ_TIMEOUT) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let result = match command {
+            AfniWriteCommand::Elements(elements) => {
+                write_afni_elements(&mut stream, &elements, verbose, recorder.as_ref())
+            }
+            AfniWriteCommand::SurfaceRegistrationPart { mesh, info, part } => {
+                surface_registration_element(&mesh, &info, part).and_then(|element| {
+                    write_afni_elements(&mut stream, &[element], verbose, recorder.as_ref())
+                })
+            }
+            AfniWriteCommand::Flush(completion) => {
+                let _ = completion.send(Ok(()));
+                continue;
+            }
+            AfniWriteCommand::Disconnect => break,
+        };
+
+        if let Err(error) = result {
+            let _ = sender.send(AfniConnectionEvent::Error(format!("{error:#}")));
+            let _ = sender.send(AfniConnectionEvent::Disconnected);
+            wake_gui(&wake);
+            stop.store(true, Ordering::Relaxed);
+            let _ = stream.shutdown(Shutdown::Both);
+            break;
+        }
+    }
+}
+
+fn write_afni_elements(
+    stream: &mut TcpStream,
+    elements: &[NimlElement],
+    verbose: bool,
+    recorder: Option<&NimlRecorder>,
+) -> Result<()> {
+    let payload = serialize_niml_ascii(elements);
+    log_niml_elements(verbose, "tx", elements, payload.len());
+    stream
+        .write_all(payload.as_bytes())
+        .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
+    stream
+        .flush()
+        .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
+    if let Some(recorder) = recorder {
+        recorder.record_payload(NimlDirection::Tx, payload.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn wake_gui(wake: &WakeCallback) {
+    if let Ok(wake) = wake.lock() {
+        (*wake)();
     }
 }
 
@@ -526,11 +660,22 @@ pub fn surface_registration_elements(
     mesh: &SurfaceMesh,
     info: &AfniSurfaceInfo,
 ) -> Result<Vec<NimlElement>> {
-    Ok(vec![
-        surface_ixyz_element(mesh, info)?,
-        surface_normals_element(mesh, info)?,
-        surface_ijk_element(mesh, info)?,
-    ])
+    AFNI_SURFACE_REGISTRATION_PARTS
+        .into_iter()
+        .map(|part| surface_registration_element(mesh, info, part))
+        .collect()
+}
+
+pub fn surface_registration_element(
+    mesh: &SurfaceMesh,
+    info: &AfniSurfaceInfo,
+    part: AfniSurfaceRegistrationPart,
+) -> Result<NimlElement> {
+    match part {
+        AfniSurfaceRegistrationPart::Coordinates => surface_ixyz_element(mesh, info),
+        AfniSurfaceRegistrationPart::Normals => surface_normals_element(mesh, info),
+        AfniSurfaceRegistrationPart::Triangles => surface_ijk_element(mesh, info),
+    }
 }
 
 pub fn outgoing_state_elements(
@@ -746,6 +891,11 @@ impl AfniNimlSession {
             return Ok(None);
         }
         surface_registration_elements(mesh, info).map(Some)
+    }
+
+    pub fn reserve_surface_registration(&mut self, info: &AfniSurfaceInfo) -> bool {
+        self.registered_surface_ids
+            .insert(info.surface_idcode.clone())
     }
 
     pub fn receive_element(
