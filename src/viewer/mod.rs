@@ -126,8 +126,9 @@ const STARTUP_REDRAW_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_REDRAW_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const SUMA_CONVEXITY_SMOOTHING_ITERATIONS: usize = 5;
 /// Overlay color for nodes AFNI did not colorize (absent from the `SUMA_irgba`
-/// node list, or sent with zero alpha). Transparent so the anatomical underlay
-/// shows through, matching SUMA.
+/// node list, or sent with zero alpha). Transparent so those nodes can either
+/// resolve to the anatomical underlay or be discarded for interior
+/// shine-through mode.
 const AFNI_TRANSPARENT_NODE_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 const SUMA_CONVEXITY_OPACITY: f32 = 0.85;
 const CONTROL_CONTENT_WIDTH_POINTS: f32 = 560.0;
@@ -538,11 +539,19 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
 
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Occluded(occluded) => {
+                    state.set_view_occluded(occluded);
+                }
                 WindowEvent::Resized(size) => {
                     state.resize_view(size);
-                    state.view_window().request_redraw();
+                    if !state.view.occluded {
+                        state.view_window().request_redraw();
+                    }
                 }
                 WindowEvent::RedrawRequested => {
+                    if state.view.occluded {
+                        return;
+                    }
                     state.update();
 
                     match state.render_view() {
@@ -571,19 +580,29 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             }
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::Control, occluded);
+                }
                 WindowEvent::Resized(size) => {
                     state.resize_control(size);
-                    state.control_window().request_redraw();
-                }
-                WindowEvent::RedrawRequested => match state.render_control() {
-                    RenderStatus::Rendered => state.control.frame_rendered = true,
-                    RenderStatus::Skipped => {}
-                    RenderStatus::Reconfigure => {
-                        state.resize_control(state.control.size);
+                    if !state.control.occluded {
                         state.control_window().request_redraw();
                     }
-                    RenderStatus::ValidationError => eprintln!("control validation error"),
-                },
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.control.occluded {
+                        return;
+                    }
+                    match state.render_control() {
+                        RenderStatus::Rendered => state.control.frame_rendered = true,
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_control(state.control.size);
+                            state.control_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("control validation error"),
+                    }
+                }
                 _ => {}
             }
             return;
@@ -602,19 +621,29 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 WindowEvent::CloseRequested => {
                     state.apply_commands(vec![ViewerCommand::SetRoiControllerOpen(false)]);
                 }
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::RoiControl, occluded);
+                }
                 WindowEvent::Resized(size) => {
                     state.resize_roi_control(size);
-                    state.roi_control_window().request_redraw();
-                }
-                WindowEvent::RedrawRequested => match state.render_roi_control() {
-                    RenderStatus::Rendered => {}
-                    RenderStatus::Skipped => {}
-                    RenderStatus::Reconfigure => {
-                        state.resize_roi_control(state.roi_control.size);
+                    if !state.roi_control.occluded {
                         state.roi_control_window().request_redraw();
                     }
-                    RenderStatus::ValidationError => eprintln!("ROI control validation error"),
-                },
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.roi_control.occluded {
+                        return;
+                    }
+                    match state.render_roi_control() {
+                        RenderStatus::Rendered => {}
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_roi_control(state.roi_control.size);
+                            state.roi_control_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("ROI control validation error"),
+                    }
+                }
                 _ => {}
             }
             return;
@@ -633,19 +662,29 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 WindowEvent::CloseRequested => {
                     state.apply_commands(vec![ViewerCommand::SetGraphWindowOpen(false)]);
                 }
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::Graph, occluded);
+                }
                 WindowEvent::Resized(size) => {
                     state.resize_graph(size);
-                    state.graph_window().request_redraw();
-                }
-                WindowEvent::RedrawRequested => match state.render_graph() {
-                    RenderStatus::Rendered => {}
-                    RenderStatus::Skipped => {}
-                    RenderStatus::Reconfigure => {
-                        state.resize_graph(state.graph.size);
+                    if !state.graph.occluded {
                         state.graph_window().request_redraw();
                     }
-                    RenderStatus::ValidationError => eprintln!("graph validation error"),
-                },
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.graph.occluded {
+                        return;
+                    }
+                    match state.render_graph() {
+                        RenderStatus::Rendered => {}
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_graph(state.graph.size);
+                            state.graph_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("graph validation error"),
+                    }
+                }
                 _ => {}
             }
         }
@@ -659,6 +698,12 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         match event {
             ViewerEvent::AfniMessagesReady => {
                 state.afni_work_scheduled.store(false, Ordering::Release);
+                if state.view.occluded {
+                    if state.verbose {
+                        state.log_status("Deferred AFNI drain while the view window is occluded.");
+                    }
+                    return;
+                }
                 if state.drain_afni_events() {
                     state.control_window().request_redraw();
                     if state.controller.panels.roi_controller_open {
@@ -702,9 +747,16 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             .roi_controller_open
             .then_some(state.roi_control.repaint_at)
             .flatten();
-        let view_due = next_view.is_some_and(|at| at <= now);
-        let control_due = next_control.is_some_and(|at| at <= now);
-        let roi_control_due = next_roi_control.is_some_and(|at| at <= now);
+        let next_graph = state
+            .controller
+            .panels
+            .graph_window_open
+            .then_some(state.graph.repaint_at)
+            .flatten();
+        let view_due = repaint_due(now, next_view, state.view.occluded);
+        let control_due = repaint_due(now, next_control, state.control.occluded);
+        let roi_control_due = repaint_due(now, next_roi_control, state.roi_control.occluded);
+        let graph_due = repaint_due(now, next_graph, state.graph.occluded);
         if view_due {
             state.view_window().request_redraw();
         }
@@ -714,15 +766,22 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         if roi_control_due {
             state.roi_control_window().request_redraw();
         }
+        if graph_due {
+            state.graph_window().request_redraw();
+        }
 
-        let next_wake = [next_view, next_control, next_roi_control]
-            .into_iter()
-            .flatten()
-            .filter(|at| *at > now)
-            .min();
+        let next_wake = next_visible_repaint_wake(
+            now,
+            [
+                (next_view, state.view.occluded),
+                (next_control, state.control.occluded),
+                (next_roi_control, state.roi_control.occluded),
+                (next_graph, state.graph.occluded),
+            ],
+        );
         match next_wake {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None if view_due || control_due || roi_control_due => {
+            None if view_due || control_due || roi_control_due || graph_due => {
                 event_loop.set_control_flow(ControlFlow::Wait)
             }
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -798,7 +857,15 @@ struct WindowPane {
     last_requested_size: Option<PhysicalSize<u32>>,
     repaint_at: Option<Instant>,
     frame_rendered: bool,
+    occluded: bool,
     egui: EguiPane,
+}
+
+#[derive(Clone, Copy)]
+enum AuxWindowPane {
+    Control,
+    RoiControl,
+    Graph,
 }
 
 impl WindowPane {
@@ -817,6 +884,7 @@ impl WindowPane {
             last_requested_size: None,
             repaint_at: None,
             frame_rendered: false,
+            occluded: false,
             egui,
         }
     }
@@ -1702,11 +1770,59 @@ impl ViewerState {
     }
 
     fn request_missing_startup_redraws(&self) {
-        if !self.view.frame_rendered {
+        if !self.view.frame_rendered && !self.view.occluded {
             self.view.window.request_redraw();
         }
-        if !self.control.frame_rendered {
+        if !self.control.frame_rendered && !self.control.occluded {
             self.control.window.request_redraw();
+        }
+    }
+
+    fn set_view_occluded(&mut self, occluded: bool) {
+        if self.view.occluded == occluded {
+            return;
+        }
+
+        self.view.occluded = occluded;
+        if occluded {
+            self.view.repaint_at = None;
+            if self.verbose {
+                self.log_status("View window occluded; deferring AFNI/live redraw work.");
+            }
+            return;
+        }
+
+        self.camera_tick_at = Instant::now();
+        if self.verbose {
+            self.log_status("View window visible again; resuming AFNI/live redraw work.");
+        }
+        if self.afni_connection.is_some() {
+            self.request_afni_work();
+        }
+        self.view.window.request_redraw();
+        self.control.window.request_redraw();
+        if self.controller.panels.roi_controller_open {
+            self.roi_control.window.request_redraw();
+        }
+        if self.controller.panels.graph_window_open {
+            self.graph.window.request_redraw();
+        }
+    }
+
+    fn set_aux_window_occluded(&mut self, pane: AuxWindowPane, occluded: bool) {
+        let window = match pane {
+            AuxWindowPane::Control => &mut self.control,
+            AuxWindowPane::RoiControl => &mut self.roi_control,
+            AuxWindowPane::Graph => &mut self.graph,
+        };
+        if window.occluded == occluded {
+            return;
+        }
+        window.occluded = occluded;
+        if occluded {
+            window.repaint_at = None;
+        } else {
+            window.window.request_redraw();
         }
     }
 
@@ -2415,6 +2531,14 @@ impl ViewerState {
                     } else {
                         "Anatomical shading hidden."
                     });
+                }
+                ViewerCommand::ToggleAfniUncoloredTransparency => {
+                    let enabled = !self.controller.display.afni_uncolored_nodes_transparent;
+                    self.controller.display.afni_uncolored_nodes_transparent = enabled;
+                    self.show_afni_interior_color_label(enabled);
+                    if self.afni_live_overlay_active && self.controller.overlay.visible {
+                        self.upload_surface_buffers();
+                    }
                 }
                 ViewerCommand::SetOverlayVisible(visible) => {
                     if self.overlay.is_loaded() {
@@ -3900,6 +4024,7 @@ impl ViewerState {
             Some(Arc::new(afni_colors_over_underlay(
                 &afni,
                 underlay.as_deref().map(Vec::as_slice),
+                self.controller.display.afni_uncolored_nodes_transparent,
             )))
         } else {
             underlay
@@ -4504,6 +4629,14 @@ impl ViewerState {
 
     fn show_surface_opacity_label(&mut self, percent: u8) {
         self.show_transient_label(format!("opacity: {percent}%"));
+    }
+
+    fn show_afni_interior_color_label(&mut self, enabled: bool) {
+        self.show_transient_label(if enabled {
+            "interior shine-through on"
+        } else {
+            "interior shine-through off"
+        });
     }
 
     fn cycle_lighting_mode(&mut self) -> LightingMode {
@@ -5500,9 +5633,13 @@ fn afni_rgba_to_suma_node_color(rgba: [u8; 4]) -> [f32; 4] {
 /// Flatten AFNI's per-node RGBA color cache into opaque surface colors by
 /// blending each node over the anatomical underlay using its alpha. AFNI colors
 /// are rendered as the surface itself (not a separate overlay plane), so a
-/// sub-threshold node (alpha 0) must resolve to the underlay here or it would
-/// paint the surface black.
-fn afni_colors_over_underlay(afni: &[[f32; 4]], underlay: Option<&[[f32; 4]]>) -> Vec<[f32; 4]> {
+/// sub-threshold node (alpha 0) either resolves to the underlay or becomes a
+/// discarded fragment for interior shine-through mode.
+fn afni_colors_over_underlay(
+    afni: &[[f32; 4]],
+    underlay: Option<&[[f32; 4]]>,
+    transparent_uncolored_nodes: bool,
+) -> Vec<[f32; 4]> {
     afni.iter()
         .enumerate()
         .map(|(index, color)| {
@@ -5511,6 +5648,9 @@ fn afni_colors_over_underlay(afni: &[[f32; 4]], underlay: Option<&[[f32; 4]]>) -
                 .copied()
                 .unwrap_or(mesh::DEFAULT_SURFACE_COLOR);
             let alpha = color[3].clamp(0.0, 1.0);
+            if transparent_uncolored_nodes && alpha <= f32::EPSILON {
+                return [base[0], base[1], base[2], 0.0];
+            }
             [
                 base[0] * (1.0 - alpha) + color[0] * alpha,
                 base[1] * (1.0 - alpha) + color[1] * alpha,
@@ -7556,6 +7696,21 @@ fn repaint_delay_to_instant(full_output: &egui::FullOutput) -> Option<Instant> {
     }
 }
 
+fn repaint_due(now: Instant, repaint_at: Option<Instant>, occluded: bool) -> bool {
+    !occluded && repaint_at.is_some_and(|at| at <= now)
+}
+
+fn next_visible_repaint_wake<const N: usize>(
+    now: Instant,
+    panes: [(Option<Instant>, bool); N],
+) -> Option<Instant> {
+    panes
+        .into_iter()
+        .filter_map(|(repaint_at, occluded)| (!occluded).then_some(repaint_at).flatten())
+        .filter(|at| *at > now)
+        .min()
+}
+
 fn graph_initial_inner_size(view_size: PhysicalSize<u32>) -> PhysicalSize<u32> {
     let max_width = graph_max_inner_width(view_size);
     let max_height = graph_max_inner_height(view_size);
@@ -8127,17 +8282,33 @@ mod tests {
             [0.6, 0.6, 0.6, 1.0],
         ];
 
-        let composed = super::afni_colors_over_underlay(&afni, Some(&underlay));
+        let composed = super::afni_colors_over_underlay(&afni, Some(&underlay), false);
 
         assert_eq!(composed[0], [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(composed[1], [0.4, 0.4, 0.4, 1.0]);
         assert_eq!(composed[2], [0.3, 0.3, 0.8, 1.0]);
 
+        let shine_through = super::afni_colors_over_underlay(&afni, Some(&underlay), true);
+        assert_eq!(shine_through[0], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(shine_through[1], [0.4, 0.4, 0.4, 0.0]);
+        assert_eq!(shine_through[2], [0.3, 0.3, 0.8, 1.0]);
+
         // With no underlay, transparent nodes resolve to the default surface so
         // the surface is never painted black.
-        let without = super::afni_colors_over_underlay(&afni, None);
+        let without = super::afni_colors_over_underlay(&afni, None, false);
         assert_eq!(without[1], super::mesh::DEFAULT_SURFACE_COLOR);
         assert_eq!(without[0], [1.0, 0.0, 0.0, 1.0]);
+
+        let without_underlay_shine = super::afni_colors_over_underlay(&afni, None, true);
+        assert_eq!(
+            without_underlay_shine[1],
+            [
+                super::mesh::DEFAULT_SURFACE_COLOR[0],
+                super::mesh::DEFAULT_SURFACE_COLOR[1],
+                super::mesh::DEFAULT_SURFACE_COLOR[2],
+                0.0,
+            ]
+        );
     }
 
     #[test]

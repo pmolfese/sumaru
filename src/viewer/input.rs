@@ -204,6 +204,14 @@ impl ViewerState {
                         self.apply_commands(vec![ViewerCommand::RaiseSurfaceOpacity]);
                         true
                     }
+                    PhysicalKey::Code(KeyCode::KeyI)
+                        if !self.modifiers.shift_key()
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key() =>
+                    {
+                        self.apply_commands(vec![ViewerCommand::ToggleAfniUncoloredTransparency]);
+                        true
+                    }
                     PhysicalKey::Code(KeyCode::KeyV)
                         if self.modifiers.shift_key()
                             && !self.modifiers.control_key()

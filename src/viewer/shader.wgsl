@@ -56,6 +56,9 @@ fn flat_vs_main(input: VertexInput) -> FlatVertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if input.color.a <= 0.001 {
+        discard;
+    }
     let normal = normalize(input.normal);
     let primary = normalize(uniforms.light_direction_primary.xyz);
     let secondary = normalize(uniforms.light_direction_secondary.xyz);
@@ -71,6 +74,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
 @fragment
 fn flat_fs_main(input: FlatVertexOutput) -> @location(0) vec4<f32> {
+    if input.color.a <= 0.001 {
+        discard;
+    }
     let normal = normalize(input.normal);
     let primary = normalize(uniforms.light_direction_primary.xyz);
     let secondary = normalize(uniforms.light_direction_secondary.xyz);
