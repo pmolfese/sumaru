@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,9 +22,9 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::afni::{
-    AFNI_SURFACE_REGISTRATION_PARTS, AfniConnection, AfniConnectionEvent, AfniNimlSession,
-    AfniOverlayState, AfniPortConfig, AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair,
-    AfniSurfaceInfo, DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
+    AfniConnection, AfniConnectionEvent, AfniIncomingMessage, AfniNimlSession, AfniOverlayState,
+    AfniPortConfig, AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo,
+    DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
 };
 use crate::color::{ColorMap, LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
 use crate::command::{
@@ -115,9 +116,9 @@ const AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE: usize = 3 * PREPARED_VERTEX_BYT
 const AFNI_CELL_COLOR_BYTES_PER_TRIANGLE: usize = 3 * PREPARED_COLOR_BYTES;
 const AFNI_CELL_COLOR_MAX_CHUNK_VERTEX_BYTES: usize = 32 * 1024 * 1024;
 const AFNI_EVENTS_PER_DRAIN: usize = 4;
-const AFNI_ELEMENTS_PER_DRAIN: usize = 4;
+const AFNI_MESSAGES_PER_DRAIN: usize = 4;
 const AFNI_CELL_COLOR_UPLOAD_CHUNKS_PER_TICK: usize = 1;
-const AFNI_SURFACE_REGISTRATION_PARTS_PER_TICK: usize = 1;
+const AFNI_SURFACE_REGISTRATIONS_PER_TICK: usize = 1;
 const SELECTION_HIGHLIGHT_VERTEX_COUNT: usize = 15;
 const MODE_LABEL_DURATION: Duration = Duration::from_secs(2);
 const MOMENTUM_FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -657,6 +658,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
 
         match event {
             ViewerEvent::AfniMessagesReady => {
+                state.afni_work_scheduled.store(false, Ordering::Release);
                 if state.drain_afni_events() {
                     state.control_window().request_redraw();
                     if state.controller.panels.roi_controller_open {
@@ -1181,10 +1183,12 @@ struct ViewerState {
     afni_session: AfniNimlSession,
     afni_recorder: Option<NimlRecorder>,
     pending_afni_surface_registrations: VecDeque<PendingAfniSurfaceRegistration>,
+    registered_afni_scene_components: HashSet<(usize, usize)>,
     pending_afni_redraw_after_registrations: bool,
-    pending_afni_elements: VecDeque<NimlElement>,
+    pending_afni_messages: VecDeque<AfniIncomingMessage>,
     pending_cell_color_upload: Option<PendingCellColorUpload>,
     deferred_afni_rgba_overlays: Vec<AfniRgbaOverlay>,
+    afni_work_scheduled: Arc<AtomicBool>,
     afni_rgba_colors: Option<Vec<[f32; 4]>>,
     /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
     /// resends identical colorizations on every redraw; this lets us skip the
@@ -1602,10 +1606,12 @@ impl ViewerState {
             afni_session: AfniNimlSession::new(),
             afni_recorder,
             pending_afni_surface_registrations: VecDeque::new(),
+            registered_afni_scene_components: HashSet::new(),
             pending_afni_redraw_after_registrations: false,
-            pending_afni_elements: VecDeque::new(),
+            pending_afni_messages: VecDeque::new(),
             pending_cell_color_upload: None,
             deferred_afni_rgba_overlays: Vec::new(),
+            afni_work_scheduled: Arc::new(AtomicBool::new(false)),
             afni_rgba_colors: None,
             afni_rgba_signatures: HashMap::new(),
             sent_crosshair_node: None,
@@ -4531,7 +4537,10 @@ impl ViewerState {
 
     fn step_surface_opacity(&mut self, delta_percent: i16) -> u8 {
         let current = i16::from(self.controller.display.surface_opacity_percent);
-        let next = (current + delta_percent).clamp(0, 100) as u8;
+        // Wrap around the 0..=100 range so stepping past an end cycles to the
+        // other: pressing "o" at 0% jumps back to 100%.
+        let next = current + delta_percent;
+        let next = next.rem_euclid(110).clamp(0, 100) as u8;
         self.controller.display.surface_opacity_percent = next;
         self.show_surface_opacity_label(next);
         next
@@ -4886,7 +4895,6 @@ struct PendingCellColorUpload {
 struct PendingAfniSurfaceRegistration {
     mesh: Arc<SurfaceMesh>,
     info: AfniSurfaceInfo,
-    next_part: usize,
 }
 
 struct PreloadTask {

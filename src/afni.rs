@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -30,6 +30,9 @@ const AFNI_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const AFNI_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const AFNI_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 const AFNI_VERBOSE_READ_PROGRESS_STEP: usize = 8 * 1024 * 1024;
+const AFNI_MESSAGE_EVENT_CAPACITY: usize = 1;
+const AFNI_KEEP_READING_PROCINS: &str = "<?keep_reading ?>\n";
+const AFNI_PAUSE_READING_PROCINS: &str = "<?pause_reading ?>\n";
 
 const AFNI_PORT_NAMES: &[&str] = &[
     "AFNI_SUMA_NIML",
@@ -196,7 +199,13 @@ pub struct AfniNimlSession {
 
 #[derive(Debug)]
 pub enum AfniConnectionEvent {
-    Elements(Vec<NimlElement>),
+    Messages(Vec<AfniIncomingMessage>),
+    Error(String),
+    Disconnected,
+}
+
+#[derive(Debug)]
+enum AfniConnectionControlEvent {
     Error(String),
     Disconnected,
 }
@@ -204,10 +213,9 @@ pub enum AfniConnectionEvent {
 #[derive(Debug)]
 enum AfniWriteCommand {
     Elements(Vec<NimlElement>),
-    SurfaceRegistrationPart {
+    SurfaceRegistration {
         mesh: Arc<SurfaceMesh>,
         info: AfniSurfaceInfo,
-        part: AfniSurfaceRegistrationPart,
     },
     Flush(Sender<std::result::Result<(), String>>),
     Disconnect,
@@ -218,7 +226,8 @@ type WakeCallback = Arc<Mutex<Box<dyn Fn() + Send>>>;
 #[derive(Debug)]
 pub struct AfniConnection {
     stream: TcpStream,
-    receiver: Receiver<AfniConnectionEvent>,
+    control_receiver: Receiver<AfniConnectionControlEvent>,
+    message_receiver: Receiver<Vec<AfniIncomingMessage>>,
     writer_sender: Sender<AfniWriteCommand>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
@@ -268,7 +277,8 @@ impl AfniConnection {
         reader_stream.set_read_timeout(Some(AFNI_READ_TIMEOUT))?;
         let writer_stream = stream.try_clone()?;
         writer_stream.set_write_timeout(Some(AFNI_WRITE_TIMEOUT))?;
-        let (sender, receiver) = mpsc::channel();
+        let (control_sender, control_receiver) = mpsc::channel();
+        let (message_sender, message_receiver) = mpsc::sync_channel(AFNI_MESSAGE_EVENT_CAPACITY);
         let (writer_sender, writer_receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = stop.clone();
@@ -278,11 +288,12 @@ impl AfniConnection {
         let wake: WakeCallback = Arc::new(Mutex::new(Box::new(wake)));
         let reader_wake = wake.clone();
         let writer_wake = wake;
-        let writer_event_sender = sender.clone();
+        let writer_control_sender = control_sender.clone();
         let reader = thread::spawn(move || {
             read_afni_stream(
                 reader_stream,
-                sender,
+                control_sender,
+                message_sender,
                 reader_stop,
                 verbose,
                 reader_recorder,
@@ -293,7 +304,7 @@ impl AfniConnection {
             write_afni_stream(
                 writer_stream,
                 writer_receiver,
-                writer_event_sender,
+                writer_control_sender,
                 writer_stop,
                 verbose,
                 writer_recorder,
@@ -303,7 +314,8 @@ impl AfniConnection {
 
         Ok(Self {
             stream,
-            receiver,
+            control_receiver,
+            message_receiver,
             writer_sender,
             stop,
             reader: Some(reader),
@@ -317,14 +329,13 @@ impl AfniConnection {
             .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
     }
 
-    pub fn send_surface_registration_part(
+    pub fn send_surface_registration(
         &mut self,
         mesh: Arc<SurfaceMesh>,
         info: AfniSurfaceInfo,
-        part: AfniSurfaceRegistrationPart,
     ) -> Result<()> {
         self.writer_sender
-            .send(AfniWriteCommand::SurfaceRegistrationPart { mesh, info, part })
+            .send(AfniWriteCommand::SurfaceRegistration { mesh, info })
             .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
     }
 
@@ -341,7 +352,17 @@ impl AfniConnection {
     }
 
     pub fn try_recv(&self) -> Option<AfniConnectionEvent> {
-        self.receiver.try_recv().ok()
+        if let Ok(event) = self.control_receiver.try_recv() {
+            return Some(match event {
+                AfniConnectionControlEvent::Error(message) => AfniConnectionEvent::Error(message),
+                AfniConnectionControlEvent::Disconnected => AfniConnectionEvent::Disconnected,
+            });
+        }
+
+        self.message_receiver
+            .try_recv()
+            .ok()
+            .map(AfniConnectionEvent::Messages)
     }
 
     pub fn disconnect(&mut self) {
@@ -537,15 +558,157 @@ fn expected_binary_niml_message_len(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AfniIncomingMessageKey {
+    RgbaOverlay(String, Option<String>),
+    SurfaceSelection,
+    Crosshair,
+    SurfaceCrosshair,
+    DatasetLoad,
+    OverlayState,
+    RoiUpdate,
+    ResetCamera,
+    SetBackground,
+    OpenSurfaceController,
+    OpenRoiController,
+}
+
+fn afni_incoming_message_key(message: &AfniIncomingMessage) -> Option<AfniIncomingMessageKey> {
+    match message {
+        AfniIncomingMessage::RgbaOverlay(overlay) => Some(AfniIncomingMessageKey::RgbaOverlay(
+            overlay.surface_idcode.clone(),
+            overlay.local_domain_parent_id.clone(),
+        )),
+        AfniIncomingMessage::SurfaceSelection(_) => Some(AfniIncomingMessageKey::SurfaceSelection),
+        AfniIncomingMessage::Crosshair(_) => Some(AfniIncomingMessageKey::Crosshair),
+        AfniIncomingMessage::SurfaceCrosshair(_) => Some(AfniIncomingMessageKey::SurfaceCrosshair),
+        AfniIncomingMessage::DatasetLoad(_) => Some(AfniIncomingMessageKey::DatasetLoad),
+        AfniIncomingMessage::OverlayState(_) => Some(AfniIncomingMessageKey::OverlayState),
+        AfniIncomingMessage::RoiUpdate(_) => Some(AfniIncomingMessageKey::RoiUpdate),
+        AfniIncomingMessage::ControllerCommand(command) => match command {
+            AfniControllerCommand::ResetCamera => Some(AfniIncomingMessageKey::ResetCamera),
+            AfniControllerCommand::ToggleOverlay => None,
+            AfniControllerCommand::SetBackground(_) => Some(AfniIncomingMessageKey::SetBackground),
+            AfniControllerCommand::OpenSurfaceController(_) => {
+                Some(AfniIncomingMessageKey::OpenSurfaceController)
+            }
+            AfniControllerCommand::OpenRoiController(_) => {
+                Some(AfniIncomingMessageKey::OpenRoiController)
+            }
+        },
+    }
+}
+
+fn merge_afni_overlay_state(existing: &mut AfniOverlayState, incoming: AfniOverlayState) {
+    if incoming.visible.is_some() {
+        existing.visible = incoming.visible;
+    }
+    if incoming.symmetric_range.is_some() {
+        existing.symmetric_range = incoming.symmetric_range;
+    }
+    if incoming.intensity_range.is_some() {
+        existing.intensity_range = incoming.intensity_range;
+    }
+    if incoming.threshold.is_some() {
+        existing.threshold = incoming.threshold;
+    }
+    if incoming.opacity.is_some() {
+        existing.opacity = incoming.opacity;
+    }
+    if incoming.overlay_path.is_some() {
+        existing.overlay_path = incoming.overlay_path;
+    }
+}
+
+fn merge_afni_roi_update(existing: &mut AfniRoiUpdate, incoming: AfniRoiUpdate) {
+    if incoming.path.is_some() {
+        existing.path = incoming.path;
+    }
+    if incoming.visible.is_some() {
+        existing.visible = incoming.visible;
+    }
+}
+
+fn merge_afni_incoming_message(existing: &mut AfniIncomingMessage, incoming: AfniIncomingMessage) {
+    match (existing, incoming) {
+        (
+            AfniIncomingMessage::OverlayState(existing),
+            AfniIncomingMessage::OverlayState(incoming),
+        ) => {
+            merge_afni_overlay_state(existing, incoming);
+        }
+        (AfniIncomingMessage::RoiUpdate(existing), AfniIncomingMessage::RoiUpdate(incoming)) => {
+            merge_afni_roi_update(existing, incoming);
+        }
+        (slot, incoming) => *slot = incoming,
+    }
+}
+
+pub(crate) fn enqueue_coalesced_afni_messages(
+    queue: &mut VecDeque<AfniIncomingMessage>,
+    messages: impl IntoIterator<Item = AfniIncomingMessage>,
+) {
+    for message in messages {
+        if matches!(
+            message,
+            AfniIncomingMessage::ControllerCommand(AfniControllerCommand::ToggleOverlay)
+        ) {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(
+                    queued,
+                    AfniIncomingMessage::ControllerCommand(AfniControllerCommand::ToggleOverlay)
+                )
+            }) {
+                queue.remove(index);
+                continue;
+            }
+        }
+
+        let Some(key) = afni_incoming_message_key(&message) else {
+            queue.push_back(message);
+            continue;
+        };
+
+        if let Some(existing) = queue
+            .iter_mut()
+            .find(|queued| afni_incoming_message_key(queued).as_ref() == Some(&key))
+        {
+            merge_afni_incoming_message(existing, message);
+        } else {
+            queue.push_back(message);
+        }
+    }
+}
+
+fn flush_deferred_afni_messages(
+    sender: &SyncSender<Vec<AfniIncomingMessage>>,
+    deferred: &mut VecDeque<AfniIncomingMessage>,
+) -> std::result::Result<bool, TrySendError<Vec<AfniIncomingMessage>>> {
+    if deferred.is_empty() {
+        return Ok(false);
+    }
+
+    let batch = deferred.iter().cloned().collect::<Vec<_>>();
+    match sender.try_send(batch) {
+        Ok(()) => {
+            deferred.clear();
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn read_afni_stream(
     mut stream: TcpStream,
-    sender: mpsc::Sender<AfniConnectionEvent>,
+    control_sender: Sender<AfniConnectionControlEvent>,
+    message_sender: SyncSender<Vec<AfniIncomingMessage>>,
     stop: Arc<AtomicBool>,
     verbose: bool,
     recorder: Option<NimlRecorder>,
     wake: WakeCallback,
 ) {
     let mut pending = Vec::new();
+    let mut deferred_messages = VecDeque::new();
     let mut chunk = [0_u8; 65_536];
     let mut message_start: Option<Instant> = None;
     let mut next_progress = AFNI_VERBOSE_READ_PROGRESS_STEP;
@@ -557,7 +720,7 @@ fn read_afni_stream(
     while !stop.load(Ordering::Relaxed) {
         match stream.read(&mut chunk) {
             Ok(0) => {
-                let _ = sender.send(AfniConnectionEvent::Disconnected);
+                let _ = control_sender.send(AfniConnectionControlEvent::Disconnected);
                 wake_gui(&wake);
                 return;
             }
@@ -656,20 +819,48 @@ fn read_afni_stream(
                                 && let Err(error) =
                                     recorder.record_payload(NimlDirection::Rx, &pending)
                             {
-                                let _ = sender.send(AfniConnectionEvent::Error(format!(
-                                    "failed to record AFNI NIML message: {error:#}"
-                                )));
+                                let _ = control_sender.send(AfniConnectionControlEvent::Error(
+                                    format!("failed to record AFNI NIML message: {error:#}"),
+                                ));
                                 wake_gui(&wake);
                             }
-                            let _ = sender.send(AfniConnectionEvent::Elements(elements));
-                            wake_gui(&wake);
+                            let mut messages = Vec::new();
+                            for element in elements {
+                                match parse_incoming_message(&element) {
+                                    Ok(Some(message)) => messages.push(message),
+                                    Ok(None) => {
+                                        if verbose {
+                                            eprintln!("sumaru niml rx-ignore: {}", element.name);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = control_sender.send(
+                                            AfniConnectionControlEvent::Error(format!(
+                                                "failed to route AFNI/SUMA NIML element {}: {error:#}",
+                                                element.name
+                                            )),
+                                        );
+                                        wake_gui(&wake);
+                                    }
+                                }
+                            }
+                            enqueue_coalesced_afni_messages(&mut deferred_messages, messages);
+                            match flush_deferred_afni_messages(
+                                &message_sender,
+                                &mut deferred_messages,
+                            ) {
+                                Ok(true) => wake_gui(&wake),
+                                Ok(false) => {}
+                                Err(TrySendError::Full(_)) => {}
+                                Err(TrySendError::Disconnected(_)) => return,
+                            }
                         }
                         pending.clear();
                         message_start = None;
                         expected_binary_len = None;
                     }
                     Err(error) if pending.len() > AFNI_MAX_PENDING_BYTES => {
-                        let _ = sender.send(AfniConnectionEvent::Error(format!(
+                        let _ = control_sender.send(AfniConnectionControlEvent::Error(format!(
                             "AFNI NIML stream exceeded {} pending bytes before parsing: {error:#}",
                             AFNI_MAX_PENDING_BYTES
                         )));
@@ -693,11 +884,17 @@ fn read_afni_stream(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                match flush_deferred_afni_messages(&message_sender, &mut deferred_messages) {
+                    Ok(true) => wake_gui(&wake),
+                    Ok(false) => {}
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
                 continue;
             }
             Err(error) => {
                 if !stop.load(Ordering::Relaxed) {
-                    let _ = sender.send(AfniConnectionEvent::Error(format!(
+                    let _ = control_sender.send(AfniConnectionControlEvent::Error(format!(
                         "AFNI NIML read failed: {error}"
                     )));
                     wake_gui(&wake);
@@ -720,7 +917,7 @@ fn bytes_per_second_mib(bytes: usize, elapsed: Duration) -> f64 {
 fn write_afni_stream(
     mut stream: TcpStream,
     receiver: mpsc::Receiver<AfniWriteCommand>,
-    sender: mpsc::Sender<AfniConnectionEvent>,
+    sender: Sender<AfniConnectionControlEvent>,
     stop: Arc<AtomicBool>,
     verbose: bool,
     recorder: Option<NimlRecorder>,
@@ -737,11 +934,26 @@ fn write_afni_stream(
             AfniWriteCommand::Elements(elements) => {
                 write_afni_elements(&mut stream, &elements, verbose, recorder.as_ref())
             }
-            AfniWriteCommand::SurfaceRegistrationPart { mesh, info, part } => {
-                surface_registration_element(&mesh, &info, part).and_then(|element| {
-                    write_afni_elements(&mut stream, &[element], verbose, recorder.as_ref())
-                })
-            }
+            AfniWriteCommand::SurfaceRegistration { mesh, info } => (|| -> Result<()> {
+                write_afni_processing_instruction(
+                    &mut stream,
+                    AFNI_KEEP_READING_PROCINS,
+                    "keep_reading",
+                    verbose,
+                    recorder.as_ref(),
+                )?;
+                for part in AFNI_SURFACE_REGISTRATION_PARTS {
+                    let element = surface_registration_element(&mesh, &info, part)?;
+                    write_afni_elements(&mut stream, &[element], verbose, recorder.as_ref())?;
+                }
+                write_afni_processing_instruction(
+                    &mut stream,
+                    AFNI_PAUSE_READING_PROCINS,
+                    "pause_reading",
+                    verbose,
+                    recorder.as_ref(),
+                )
+            })(),
             AfniWriteCommand::Flush(completion) => {
                 let _ = completion.send(Ok(()));
                 continue;
@@ -750,8 +962,8 @@ fn write_afni_stream(
         };
 
         if let Err(error) = result {
-            let _ = sender.send(AfniConnectionEvent::Error(format!("{error:#}")));
-            let _ = sender.send(AfniConnectionEvent::Disconnected);
+            let _ = sender.send(AfniConnectionControlEvent::Error(format!("{error:#}")));
+            let _ = sender.send(AfniConnectionControlEvent::Disconnected);
             wake_gui(&wake);
             stop.store(true, Ordering::Relaxed);
             let _ = stream.shutdown(Shutdown::Both);
@@ -780,6 +992,33 @@ fn write_afni_elements(
             "sumaru niml tx-write: bytes={} elements={} elapsed_ms={:.1}",
             payload.len(),
             elements.len(),
+            write_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if let Some(recorder) = recorder {
+        recorder.record_payload(NimlDirection::Tx, payload.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_afni_processing_instruction(
+    stream: &mut TcpStream,
+    payload: &str,
+    label: &str,
+    verbose: bool,
+    recorder: Option<&NimlRecorder>,
+) -> Result<()> {
+    let write_start = Instant::now();
+    stream
+        .write_all(payload.as_bytes())
+        .map_err(|error| afni_write_error(error, payload.len(), 0))?;
+    stream
+        .flush()
+        .map_err(|error| afni_write_error(error, payload.len(), 0))?;
+    if verbose {
+        eprintln!(
+            "sumaru niml tx-procins: {label} bytes={} elapsed_ms={:.1}",
+            payload.len(),
             write_start.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -2075,6 +2314,123 @@ mod tests {
         assert_eq!(
             overlay.attrs.get("threshold_value"),
             Some(&"3.1".to_string())
+        );
+    }
+
+    #[test]
+    fn enqueue_coalesced_afni_messages_keeps_latest_rgba_overlay_per_surface() {
+        let mut queue = VecDeque::new();
+        let first = AfniIncomingMessage::RgbaOverlay(AfniRgbaOverlay {
+            surface_idcode: "surf-1".to_string(),
+            local_domain_parent_id: Some("parent-1".to_string()),
+            node_indices: vec![1, 2],
+            rgba: vec![[255, 0, 0, 255], [0, 255, 0, 255]],
+            threshold: Some("1.0".to_string()),
+            function_idcode: Some("func-1".to_string()),
+            volume_idcode: Some("vol-1".to_string()),
+        });
+        let second = AfniIncomingMessage::RgbaOverlay(AfniRgbaOverlay {
+            surface_idcode: "surf-1".to_string(),
+            local_domain_parent_id: Some("parent-1".to_string()),
+            node_indices: vec![3],
+            rgba: vec![[0, 0, 255, 128]],
+            threshold: Some("2.0".to_string()),
+            function_idcode: Some("func-2".to_string()),
+            volume_idcode: Some("vol-2".to_string()),
+        });
+
+        enqueue_coalesced_afni_messages(&mut queue, [first, second.clone()]);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front(), Some(&second));
+    }
+
+    #[test]
+    fn enqueue_coalesced_afni_messages_merges_partial_overlay_updates() {
+        let mut queue = VecDeque::new();
+
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::OverlayState(AfniOverlayState {
+                visible: Some(false),
+                symmetric_range: None,
+                intensity_range: Some(ValueRange {
+                    min: -5.0,
+                    max: 5.0,
+                }),
+                threshold: None,
+                opacity: None,
+                overlay_path: None,
+            })],
+        );
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::OverlayState(AfniOverlayState {
+                visible: None,
+                symmetric_range: Some(true),
+                intensity_range: None,
+                threshold: Some(OverlayThreshold {
+                    enabled: true,
+                    absolute: false,
+                    value: 3.5,
+                    hide_failed: false,
+                }),
+                opacity: Some(0.4),
+                overlay_path: Some(PathBuf::from("stats.niml.dset")),
+            })],
+        );
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.front(),
+            Some(&AfniIncomingMessage::OverlayState(AfniOverlayState {
+                visible: Some(false),
+                symmetric_range: Some(true),
+                intensity_range: Some(ValueRange {
+                    min: -5.0,
+                    max: 5.0,
+                }),
+                threshold: Some(OverlayThreshold {
+                    enabled: true,
+                    absolute: false,
+                    value: 3.5,
+                    hide_failed: false,
+                }),
+                opacity: Some(0.4),
+                overlay_path: Some(PathBuf::from("stats.niml.dset")),
+            }))
+        );
+    }
+
+    #[test]
+    fn enqueue_coalesced_afni_messages_cancels_paired_toggle_overlay_commands() {
+        let mut queue = VecDeque::new();
+
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::SetBackground(BackgroundMode::White),
+            )],
+        );
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::ToggleOverlay,
+            )],
+        );
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::ToggleOverlay,
+            )],
+        );
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.front(),
+            Some(&AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::SetBackground(BackgroundMode::White),
+            ))
         );
     }
 

@@ -775,8 +775,8 @@ impl<'a> NimlByteParser<'a> {
             if self.is_end() {
                 return Ok(elements);
             }
-            if self.peek(b"<?xml") {
-                self.consume_until(b">")?;
+            if self.peek(b"<?") {
+                self.consume_until(b"?>")?;
                 continue;
             }
             elements.push(self.parse_element()?);

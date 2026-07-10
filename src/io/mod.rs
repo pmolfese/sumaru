@@ -121,6 +121,23 @@ mod tests {
     }
 
     #[test]
+    fn ascii_niml_parser_ignores_processing_instructions() {
+        let elements = parse_niml_str(
+            r#"<?keep_reading ?>
+<SUMARU_viewer_command command="reset_camera"></SUMARU_viewer_command>
+<?pause_reading ?>"#,
+        )
+        .unwrap();
+
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].name, "SUMARU_viewer_command");
+        assert_eq!(
+            elements[0].attrs.get("command").map(String::as_str),
+            Some("reset_camera")
+        );
+    }
+
+    #[test]
     fn dataset_payload_roundtrips_sparse_data_and_attributes() {
         let payload = read_niml_dset_str(super::MINIMAL_DSET_SAMPLE).unwrap();
 
