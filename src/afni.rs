@@ -574,20 +574,43 @@ fn read_afni_stream(
                     expected_binary_len = None;
                 }
                 pending.extend_from_slice(&chunk[..read]);
+                if expected_binary_len.is_none() {
+                    expected_binary_len = expected_binary_niml_message_len(&pending);
+                    if verbose && let Some(expected_len) = expected_binary_len {
+                        eprintln!(
+                            "sumaru niml rx-read: binary message expects {} bytes; remaining_bytes={}",
+                            expected_len,
+                            expected_len.saturating_sub(pending.len())
+                        );
+                    }
+                }
                 while verbose && pending.len() >= next_progress {
+                    let (expected_bytes, remaining_bytes) = expected_binary_len
+                        .map(|expected_len| {
+                            (
+                                format!(" expected_bytes={expected_len}"),
+                                format!(
+                                    " remaining_bytes={}",
+                                    expected_len.saturating_sub(pending.len())
+                                ),
+                            )
+                        })
+                        .unwrap_or_default();
                     eprintln!(
-                        "sumaru niml rx-read: pending_bytes={} elapsed_ms={:.1}",
+                        "sumaru niml rx-read: pending_bytes={}{}{} elapsed_ms={:.1} throughput_mib_s={:.2}",
                         pending.len(),
+                        expected_bytes,
+                        remaining_bytes,
                         message_start
                             .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+                            .unwrap_or(0.0),
+                        message_start
+                            .map(|start| bytes_per_second_mib(pending.len(), start.elapsed()))
                             .unwrap_or(0.0)
                     );
                     next_progress = next_progress.saturating_add(AFNI_VERBOSE_READ_PROGRESS_STEP);
                 }
 
-                if expected_binary_len.is_none() {
-                    expected_binary_len = expected_binary_niml_message_len(&pending);
-                }
                 if let Some(expected_len) = expected_binary_len {
                     if pending.len() < expected_len {
                         binary_waits += 1;
@@ -601,11 +624,18 @@ fn read_afni_stream(
                         if !elements.is_empty() {
                             if verbose {
                                 eprintln!(
-                                    "sumaru niml rx-parse: complete bytes={} elements={} read_elapsed_ms={:.1} parse_ms={:.1} incomplete_parse_attempts={} incomplete_parse_ms={:.1} binary_waits={}",
+                                    "sumaru niml rx-parse: complete bytes={} expected_bytes={} elements={} read_elapsed_ms={:.1} throughput_mib_s={:.2} parse_ms={:.1} incomplete_parse_attempts={} incomplete_parse_ms={:.1} binary_waits={}",
                                     pending.len(),
+                                    expected_binary_len.unwrap_or(pending.len()),
                                     elements.len(),
                                     message_start
                                         .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+                                        .unwrap_or(0.0),
+                                    message_start
+                                        .map(|start| bytes_per_second_mib(
+                                            pending.len(),
+                                            start.elapsed()
+                                        ))
                                         .unwrap_or(0.0),
                                     parse_start.elapsed().as_secs_f64() * 1000.0,
                                     incomplete_parse_attempts,
@@ -676,6 +706,15 @@ fn read_afni_stream(
             }
         }
     }
+}
+
+fn bytes_per_second_mib(bytes: usize, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= f64::EPSILON {
+        return 0.0;
+    }
+
+    bytes as f64 / (1024.0 * 1024.0) / seconds
 }
 
 fn write_afni_stream(

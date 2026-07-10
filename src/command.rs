@@ -166,6 +166,9 @@ pub enum SurfaceRenderStyle {
     Filled,
     Triangles,
     Vertices,
+    VerticesHalf,
+    VerticesQuarter,
+    VerticesEighth,
 }
 
 impl SurfaceRenderStyle {
@@ -173,7 +176,10 @@ impl SurfaceRenderStyle {
         match self {
             Self::Filled => "filled",
             Self::Triangles => "triangles",
-            Self::Vertices => "vertices",
+            Self::Vertices => "points",
+            Self::VerticesHalf => "points/2",
+            Self::VerticesQuarter => "points/4",
+            Self::VerticesEighth => "points/8",
         }
     }
 
@@ -181,7 +187,31 @@ impl SurfaceRenderStyle {
         match self {
             Self::Filled => Self::Triangles,
             Self::Triangles => Self::Vertices,
-            Self::Vertices => Self::Filled,
+            Self::Vertices => Self::VerticesHalf,
+            Self::VerticesHalf => Self::VerticesQuarter,
+            Self::VerticesQuarter => Self::VerticesEighth,
+            Self::VerticesEighth => Self::Filled,
+        }
+    }
+
+    pub fn cycled_backward(self) -> Self {
+        match self {
+            Self::Filled => Self::VerticesEighth,
+            Self::Triangles => Self::Filled,
+            Self::Vertices => Self::Triangles,
+            Self::VerticesHalf => Self::Vertices,
+            Self::VerticesQuarter => Self::VerticesHalf,
+            Self::VerticesEighth => Self::VerticesQuarter,
+        }
+    }
+
+    pub fn point_prefix_groups(self) -> Option<u8> {
+        match self {
+            Self::Filled | Self::Triangles => None,
+            Self::Vertices => Some(8),
+            Self::VerticesHalf => Some(4),
+            Self::VerticesQuarter => Some(2),
+            Self::VerticesEighth => Some(1),
         }
     }
 }
@@ -475,7 +505,9 @@ pub enum ViewerCommand {
     ToggleCameraMode,
     ToggleLightingMode,
     ToggleSurfaceRenderStyle,
+    ReverseSurfaceRenderStyle,
     CycleSurfaceOpacity,
+    RaiseSurfaceOpacity,
     ToggleCameraMomentum,
     ToggleBackground,
     SetAnatomicalShadingVisible(bool),
@@ -583,6 +615,29 @@ mod tests {
         style = style.cycled();
         assert_eq!(style, SurfaceRenderStyle::Vertices);
         style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::VerticesHalf);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::VerticesQuarter);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::VerticesEighth);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::Filled);
+    }
+
+    #[test]
+    fn surface_render_style_cycles_backward_through_all_presets() {
+        let mut style = SurfaceRenderStyle::Filled;
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::VerticesEighth);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::VerticesQuarter);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::VerticesHalf);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::Vertices);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::Triangles);
+        style = style.cycled_backward();
         assert_eq!(style, SurfaceRenderStyle::Filled);
     }
 

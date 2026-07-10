@@ -172,7 +172,7 @@ impl ViewerState {
                             actions.push(ViewerCommand::ToggleSurfaceRenderStyle);
                             ui.close();
                         }
-                        if ui.button("Cycle Surface Opacity").clicked() {
+                        if ui.button("Lower Surface Opacity").clicked() {
                             actions.push(ViewerCommand::CycleSurfaceOpacity);
                             ui.close();
                         }

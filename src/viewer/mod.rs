@@ -104,11 +104,15 @@ impl From<ViewPreset> for PresetOrientation {
     }
 }
 
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
-const VERTEX_STRIDE: wgpu::BufferAddress = 40;
-const PREPARED_VERTEX_BYTES: usize = 10 * std::mem::size_of::<f32>();
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+const COLOR_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Float32x4];
+const VERTEX_STRIDE: wgpu::BufferAddress = 24;
+const COLOR_STRIDE: wgpu::BufferAddress = 16;
+const PREPARED_VERTEX_BYTES: usize = 6 * std::mem::size_of::<f32>();
+const PREPARED_COLOR_BYTES: usize = 4 * std::mem::size_of::<f32>();
 const AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE: usize = 3 * PREPARED_VERTEX_BYTES;
+const AFNI_CELL_COLOR_BYTES_PER_TRIANGLE: usize = 3 * PREPARED_COLOR_BYTES;
 const AFNI_CELL_COLOR_MAX_CHUNK_VERTEX_BYTES: usize = 32 * 1024 * 1024;
 const AFNI_EVENTS_PER_DRAIN: usize = 4;
 const AFNI_ELEMENTS_PER_DRAIN: usize = 4;
@@ -152,6 +156,21 @@ fn afni_cell_color_vertex_bytes(
         .saturating_add(selection_vertex_bytes)
 }
 
+fn afni_cell_color_color_bytes(
+    geometry: &PreparedGeometry,
+    selection: Option<SelectionHighlight>,
+) -> usize {
+    let selection_color_bytes = selection
+        .is_some()
+        .then_some(SELECTION_HIGHLIGHT_VERTEX_COUNT * PREPARED_COLOR_BYTES)
+        .unwrap_or(0);
+    geometry
+        .indices
+        .len()
+        .saturating_mul(PREPARED_COLOR_BYTES)
+        .saturating_add(selection_color_bytes)
+}
+
 fn afni_cell_color_needs_chunking(
     geometry: &PreparedGeometry,
     selection: Option<SelectionHighlight>,
@@ -159,16 +178,20 @@ fn afni_cell_color_needs_chunking(
 ) -> bool {
     let max_buffer_size = usize::try_from(max_buffer_size).unwrap_or(usize::MAX);
     afni_cell_color_vertex_bytes(geometry, selection) > max_buffer_size
+        || afni_cell_color_color_bytes(geometry, selection) > max_buffer_size
 }
 
 fn afni_cell_color_max_triangles_per_chunk(max_buffer_size: u64) -> usize {
     let max_buffer_size = usize::try_from(max_buffer_size).unwrap_or(usize::MAX);
-    let target_vertex_bytes = (max_buffer_size / 2)
+    let target_buffer_bytes = (max_buffer_size / 2)
         .max(AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE)
+        .max(AFNI_CELL_COLOR_BYTES_PER_TRIANGLE)
         .min(max_buffer_size)
         .min(AFNI_CELL_COLOR_MAX_CHUNK_VERTEX_BYTES);
 
-    (target_vertex_bytes / AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE).max(1)
+    (target_buffer_bytes / AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE)
+        .min(target_buffer_bytes / AFNI_CELL_COLOR_BYTES_PER_TRIANGLE)
+        .max(1)
 }
 
 #[derive(Clone, Copy)]
@@ -277,6 +300,7 @@ pub struct LaunchOptions {
     pub verbose: bool,
     pub preload: bool,
     pub big_mem: bool,
+    pub gpu: bool,
     pub afni: AfniViewerOptions,
     pub niml_record_path: Option<PathBuf>,
 }
@@ -354,6 +378,7 @@ struct ViewerApp {
     verbose: bool,
     preload: bool,
     big_mem: bool,
+    gpu: bool,
     afni: AfniViewerOptions,
     niml_record_path: Option<PathBuf>,
     event_proxy: EventLoopProxy<ViewerEvent>,
@@ -379,6 +404,7 @@ impl ViewerApp {
             verbose: options.verbose,
             preload: options.preload,
             big_mem: options.big_mem,
+            gpu: options.gpu,
             afni: options.afni,
             niml_record_path: options.niml_record_path,
             event_proxy,
@@ -456,6 +482,7 @@ impl ViewerApp {
             self.verbose,
             self.preload,
             self.big_mem,
+            self.gpu,
             self.afni.clone(),
             self.niml_record_path.clone(),
             self.event_proxy.clone(),
@@ -1081,6 +1108,7 @@ struct InitialScene {
 
 struct SurfaceRenderPipelines {
     filled: wgpu::RenderPipeline,
+    filled_flat: wgpu::RenderPipeline,
     triangles: wgpu::RenderPipeline,
     vertices: wgpu::RenderPipeline,
 }
@@ -1146,6 +1174,7 @@ struct ViewerState {
     verbose: bool,
     preload_enabled: bool,
     big_mem: bool,
+    gpu_afni_colors_enabled: bool,
     event_proxy: EventLoopProxy<ViewerEvent>,
     afni_options: AfniViewerOptions,
     afni_connection: Option<AfniConnection>,
@@ -1187,6 +1216,7 @@ impl ViewerState {
         verbose: bool,
         preload_enabled: bool,
         big_mem: bool,
+        gpu_afni_colors_enabled: bool,
         afni_options: AfniViewerOptions,
         niml_record_path: Option<PathBuf>,
         event_proxy: EventLoopProxy<ViewerEvent>,
@@ -1364,23 +1394,33 @@ impl ViewerState {
             bind_group_layouts: &[Some(&uniform_bind_group_layout)],
             immediate_size: 0,
         });
-        let make_surface_pipeline = |label: &str, topology: wgpu::PrimitiveTopology| {
+        let make_surface_pipeline = |label: &str,
+                                     topology: wgpu::PrimitiveTopology,
+                                     vertex_entry: &str,
+                                     fragment_entry: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: VERTEX_STRIDE,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &VERTEX_ATTRIBUTES,
-                    }],
+                    entry_point: Some(vertex_entry),
+                    buffers: &[
+                        wgpu::VertexBufferLayout {
+                            array_stride: VERTEX_STRIDE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &VERTEX_ATTRIBUTES,
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: COLOR_STRIDE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &COLOR_ATTRIBUTES,
+                        },
+                    ],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(fragment_entry),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: surface_format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1410,14 +1450,26 @@ impl ViewerState {
             filled: make_surface_pipeline(
                 "surface render pipeline filled",
                 wgpu::PrimitiveTopology::TriangleList,
+                "vs_main",
+                "fs_main",
+            ),
+            filled_flat: make_surface_pipeline(
+                "surface render pipeline filled flat",
+                wgpu::PrimitiveTopology::TriangleList,
+                "flat_vs_main",
+                "flat_fs_main",
             ),
             triangles: make_surface_pipeline(
                 "surface render pipeline triangles",
                 wgpu::PrimitiveTopology::LineList,
+                "vs_main",
+                "fs_main",
             ),
             vertices: make_surface_pipeline(
                 "surface render pipeline vertices",
                 wgpu::PrimitiveTopology::PointList,
+                "vs_main",
+                "fs_main",
             ),
         };
         let depth_buffer = DepthBuffer::new(&device, view_config.width, view_config.height);
@@ -1543,6 +1595,7 @@ impl ViewerState {
             verbose,
             preload_enabled,
             big_mem,
+            gpu_afni_colors_enabled,
             event_proxy,
             afni_options,
             afni_connection: None,
@@ -1891,11 +1944,15 @@ impl ViewerState {
         f32::from(self.controller.display.surface_opacity_percent) / 100.0
     }
 
-    fn active_surface_pipeline(&self) -> &wgpu::RenderPipeline {
+    fn active_surface_pipeline(&self, flat_colors: bool) -> &wgpu::RenderPipeline {
         match self.active_surface_render_style() {
+            SurfaceRenderStyle::Filled if flat_colors => &self.surface_render_pipelines.filled_flat,
             SurfaceRenderStyle::Filled => &self.surface_render_pipelines.filled,
             SurfaceRenderStyle::Triangles => &self.surface_render_pipelines.triangles,
-            SurfaceRenderStyle::Vertices => &self.surface_render_pipelines.vertices,
+            SurfaceRenderStyle::Vertices
+            | SurfaceRenderStyle::VerticesHalf
+            | SurfaceRenderStyle::VerticesQuarter
+            | SurfaceRenderStyle::VerticesEighth => &self.surface_render_pipelines.vertices,
         }
     }
 
@@ -1941,7 +1998,7 @@ impl ViewerState {
         let surface_style = self.active_surface_render_style();
 
         if let Some(render_set) = &self.surface_render_set {
-            render_pass.set_pipeline(self.active_surface_pipeline());
+            render_pass.set_pipeline(self.active_surface_pipeline(false));
             for instance in &render_set.instances {
                 if !self
                     .controller
@@ -1953,6 +2010,7 @@ impl ViewerState {
                 }
                 render_pass.set_bind_group(0, &instance.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
                 render_pass.set_index_buffer(
                     instance.index_buffer(surface_style).slice(..),
                     wgpu::IndexFormat::Uint32,
@@ -1960,9 +2018,10 @@ impl ViewerState {
                 render_pass.draw_indexed(0..instance.index_count(surface_style), 0, 0..1);
             }
         } else if let Some(buffers) = &self.surface_buffers {
-            render_pass.set_pipeline(self.active_surface_pipeline());
+            render_pass.set_pipeline(self.active_surface_pipeline(buffers.flat_colors));
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, buffers.color_buffer.slice(..));
             render_pass.set_index_buffer(
                 buffers.index_buffer(surface_style).slice(..),
                 wgpu::IndexFormat::Uint32,
@@ -1971,9 +2030,10 @@ impl ViewerState {
         }
 
         if let Some(instance) = &self.selection_instance {
-            render_pass.set_pipeline(self.active_surface_pipeline());
+            render_pass.set_pipeline(self.active_surface_pipeline(false));
             render_pass.set_bind_group(0, &instance.bind_group, &[]);
             render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
             render_pass.set_index_buffer(
                 instance.index_buffer(SurfaceRenderStyle::Filled).slice(..),
                 wgpu::IndexFormat::Uint32,
@@ -2325,8 +2385,16 @@ impl ViewerState {
                 ViewerCommand::ToggleSurfaceRenderStyle => {
                     self.cycle_surface_render_style();
                 }
+                ViewerCommand::ReverseSurfaceRenderStyle => {
+                    self.cycle_surface_render_style_backward();
+                }
                 ViewerCommand::CycleSurfaceOpacity => {
-                    self.cycle_surface_opacity();
+                    self.cycle_surface_opacity_down();
+                    let camera = self.camera.clone();
+                    self.update_render_uniforms_for_camera(&camera);
+                }
+                ViewerCommand::RaiseSurfaceOpacity => {
+                    self.cycle_surface_opacity_up();
                     let camera = self.camera.clone();
                     self.update_render_uniforms_for_camera(&camera);
                 }
@@ -3578,6 +3646,7 @@ impl ViewerState {
         labels: SurfaceInstanceBufferLabels,
     ) -> SurfaceRenderInstance {
         let vertex_bytes = prepared_surface.vertex_bytes();
+        let color_bytes = prepared_surface.color_bytes();
         let triangle_index_bytes = prepared_surface.index_bytes();
         let line_index_bytes = prepared_surface.line_index_bytes();
         let point_index_bytes = prepared_surface.point_index_bytes();
@@ -3595,6 +3664,13 @@ impl ViewerState {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(labels.vertex),
                 contents: &vertex_bytes,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let color_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("surface color buffer"),
+                contents: &color_bytes,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
         let triangle_index_buffer =
@@ -3637,7 +3713,8 @@ impl ViewerState {
         SurfaceRenderInstance {
             side,
             vertex_buffer,
-            vertex_bytes_len: vertex_bytes.len(),
+            color_buffer,
+            color_bytes_len: color_bytes.len(),
             triangle_index_buffer,
             triangle_index_count,
             line_index_buffer,
@@ -3778,18 +3855,17 @@ impl ViewerState {
         }
 
         for (instance, range) in render_set.instances.iter().zip(ranges) {
-            let prepared_surface = PreparedSurface::from_geometry_cell_color_range(
+            let color_bytes = PreparedSurface::cell_color_bytes_for_range(
                 geometry,
                 surface_colors,
                 roi_colors,
                 range.clone(),
             );
-            let vertex_bytes = prepared_surface.vertex_bytes();
-            if vertex_bytes.len() != instance.vertex_bytes_len {
+            if color_bytes.len() != instance.color_bytes_len {
                 return false;
             }
             self.queue
-                .write_buffer(&instance.vertex_buffer, 0, &vertex_bytes);
+                .write_buffer(&instance.color_buffer, 0, &color_bytes);
         }
 
         true
@@ -3858,12 +3934,14 @@ impl ViewerState {
             .clone();
         let use_afni_cell_colors =
             self.afni_rgba_colors.is_some() && self.controller.overlay.visible;
+        let use_gpu_afni_colors = use_afni_cell_colors && self.gpu_afni_colors_enabled;
         let surface_color_slice = surface_colors.as_deref().map(Vec::as_slice);
         let roi_colors = self
             .visible_roi_layer()
             .map(|layer| layer.appearance.node_colors.clone());
         let roi_color_slice = roi_colors.as_deref();
         if use_afni_cell_colors
+            && !use_gpu_afni_colors
             && afni_cell_color_needs_chunking(&geometry, None, self.device.limits().max_buffer_size)
         {
             let surface_id = mesh.metadata.id.clone();
@@ -3883,7 +3961,16 @@ impl ViewerState {
             .is_none()
             .then(|| self.visible_overlay())
             .flatten();
-        let prepared_surface = if use_afni_cell_colors {
+        let prepared_surface = if use_gpu_afni_colors {
+            PreparedSurface::from_geometry_color_slices(
+                &geometry,
+                surface_color_slice,
+                None,
+                1.0,
+                roi_color_slice,
+                None,
+            )
+        } else if use_afni_cell_colors {
             PreparedSurface::from_geometry_cell_colors(
                 &geometry,
                 surface_color_slice,
@@ -3901,13 +3988,34 @@ impl ViewerState {
             )
         };
         let vertex_bytes = prepared_surface.vertex_bytes();
-        let triangle_index_bytes = prepared_surface.index_bytes();
+        let color_bytes = prepared_surface.color_bytes();
+        let triangle_index_bytes = if use_gpu_afni_colors {
+            geometry.flat_color_triangle_index_bytes(surface_color_slice, roi_color_slice)
+        } else {
+            prepared_surface.index_bytes()
+        };
         let line_index_bytes = prepared_surface.line_index_bytes();
         let point_index_bytes = prepared_surface.point_index_bytes();
         let surface_id = mesh.metadata.id.clone();
-        let triangle_index_count = prepared_surface.index_count();
+        let triangle_index_count = if use_gpu_afni_colors {
+            geometry.indices.len() as u32
+        } else {
+            prepared_surface.index_count()
+        };
         let line_index_count = prepared_surface.line_index_count();
         let point_index_count = prepared_surface.point_index_count();
+
+        if self.verbose
+            && use_gpu_afni_colors
+            && !self
+                .surface_buffers
+                .as_ref()
+                .is_some_and(|buffers| buffers.flat_colors)
+        {
+            self.log_status(
+                "Experimental --gpu AFNI flat-color path active for this surface.".to_string(),
+            );
+        }
 
         if let Some(buffers) = self.surface_buffers.as_mut() {
             let mut replaced_gpu_resources = dropped_render_set;
@@ -3925,22 +4033,50 @@ impl ViewerState {
                 buffers.vertex_bytes_len = vertex_bytes.len();
                 replaced_gpu_resources = true;
             }
+            if buffers.color_bytes_len == color_bytes.len() {
+                self.queue
+                    .write_buffer(&buffers.color_buffer, 0, &color_bytes);
+            } else {
+                buffers.color_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("surface color buffer"),
+                            contents: &color_bytes,
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        });
+                buffers.color_bytes_len = color_bytes.len();
+                replaced_gpu_resources = true;
+            }
+
+            if use_gpu_afni_colors || buffers.flat_colors || buffers.surface_id != surface_id {
+                if buffers.triangle_index_bytes_len == triangle_index_bytes.len()
+                    && buffers.triangle_index_count == triangle_index_count
+                {
+                    self.queue.write_buffer(
+                        &buffers.triangle_index_buffer,
+                        0,
+                        &triangle_index_bytes,
+                    );
+                } else {
+                    buffers.triangle_index_buffer =
+                        self.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("surface triangle index buffer"),
+                                contents: &triangle_index_bytes,
+                                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                            });
+                    buffers.triangle_index_bytes_len = triangle_index_bytes.len();
+                    buffers.triangle_index_count = triangle_index_count;
+                    replaced_gpu_resources = true;
+                }
+            }
 
             if buffers.surface_id != surface_id
-                || buffers.triangle_index_bytes_len != triangle_index_bytes.len()
-                || buffers.triangle_index_count != triangle_index_count
                 || buffers.line_index_bytes_len != line_index_bytes.len()
                 || buffers.line_index_count != line_index_count
                 || buffers.point_index_bytes_len != point_index_bytes.len()
                 || buffers.point_index_count != point_index_count
             {
-                buffers.triangle_index_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("surface triangle index buffer"),
-                            contents: &triangle_index_bytes,
-                            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                        });
                 buffers.line_index_buffer =
                     self.device
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3955,8 +4091,6 @@ impl ViewerState {
                             contents: &point_index_bytes,
                             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                         });
-                buffers.triangle_index_bytes_len = triangle_index_bytes.len();
-                buffers.triangle_index_count = triangle_index_count;
                 buffers.line_index_bytes_len = line_index_bytes.len();
                 buffers.line_index_count = line_index_count;
                 buffers.point_index_bytes_len = point_index_bytes.len();
@@ -3964,6 +4098,7 @@ impl ViewerState {
                 replaced_gpu_resources = true;
             }
             buffers.surface_id = surface_id;
+            buffers.flat_colors = use_gpu_afni_colors;
             if replaced_gpu_resources {
                 self.poll_device_for_cleanup();
             }
@@ -3976,6 +4111,13 @@ impl ViewerState {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("surface vertex buffer"),
                 contents: &vertex_bytes,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let color_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("surface color buffer"),
+                contents: &color_bytes,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
         let triangle_index_buffer =
@@ -4002,8 +4144,11 @@ impl ViewerState {
 
         self.surface_buffers = Some(SurfaceBuffers {
             surface_id,
+            flat_colors: use_gpu_afni_colors,
             vertex_buffer,
             vertex_bytes_len: vertex_bytes.len(),
+            color_buffer,
+            color_bytes_len: color_bytes.len(),
             triangle_index_buffer,
             triangle_index_bytes_len: triangle_index_bytes.len(),
             triangle_index_count,
@@ -4365,10 +4510,28 @@ impl ViewerState {
         style
     }
 
-    fn cycle_surface_opacity(&mut self) -> u8 {
+    fn cycle_surface_render_style_backward(&mut self) -> SurfaceRenderStyle {
+        let style = self
+            .controller
+            .display
+            .surface_render_style
+            .cycled_backward();
+        self.controller.display.surface_render_style = style;
+        self.show_surface_render_style_label(style);
+        style
+    }
+
+    fn cycle_surface_opacity_down(&mut self) -> u8 {
+        self.step_surface_opacity(-10)
+    }
+
+    fn cycle_surface_opacity_up(&mut self) -> u8 {
+        self.step_surface_opacity(10)
+    }
+
+    fn step_surface_opacity(&mut self, delta_percent: i16) -> u8 {
         let current = i16::from(self.controller.display.surface_opacity_percent);
-        let next = current - 30;
-        let next = if next < 0 { 100 } else { next as u8 };
+        let next = (current + delta_percent).clamp(0, 100) as u8;
         self.controller.display.surface_opacity_percent = next;
         self.show_surface_opacity_label(next);
         next

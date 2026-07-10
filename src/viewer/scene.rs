@@ -9,8 +9,11 @@ use super::*;
 
 pub(super) struct SurfaceBuffers {
     pub(super) surface_id: SurfaceId,
+    pub(super) flat_colors: bool,
     pub(super) vertex_buffer: wgpu::Buffer,
     pub(super) vertex_bytes_len: usize,
+    pub(super) color_buffer: wgpu::Buffer,
+    pub(super) color_bytes_len: usize,
     pub(super) triangle_index_buffer: wgpu::Buffer,
     pub(super) triangle_index_bytes_len: usize,
     pub(super) triangle_index_count: u32,
@@ -32,7 +35,8 @@ pub(super) struct SurfaceRenderSet {
 pub(super) struct SurfaceRenderInstance {
     pub(super) side: SurfaceSide,
     pub(super) vertex_buffer: wgpu::Buffer,
-    pub(super) vertex_bytes_len: usize,
+    pub(super) color_buffer: wgpu::Buffer,
+    pub(super) color_bytes_len: usize,
     pub(super) triangle_index_buffer: wgpu::Buffer,
     pub(super) triangle_index_count: u32,
     pub(super) line_index_buffer: wgpu::Buffer,
@@ -49,7 +53,10 @@ impl SurfaceBuffers {
         match style {
             SurfaceRenderStyle::Filled => &self.triangle_index_buffer,
             SurfaceRenderStyle::Triangles => &self.line_index_buffer,
-            SurfaceRenderStyle::Vertices => &self.point_index_buffer,
+            SurfaceRenderStyle::Vertices
+            | SurfaceRenderStyle::VerticesHalf
+            | SurfaceRenderStyle::VerticesQuarter
+            | SurfaceRenderStyle::VerticesEighth => &self.point_index_buffer,
         }
     }
 
@@ -57,7 +64,12 @@ impl SurfaceBuffers {
         match style {
             SurfaceRenderStyle::Filled => self.triangle_index_count,
             SurfaceRenderStyle::Triangles => self.line_index_count,
-            SurfaceRenderStyle::Vertices => self.point_index_count,
+            SurfaceRenderStyle::Vertices
+            | SurfaceRenderStyle::VerticesHalf
+            | SurfaceRenderStyle::VerticesQuarter
+            | SurfaceRenderStyle::VerticesEighth => {
+                progressive_point_prefix_count(self.point_index_count, style)
+            }
         }
     }
 }
@@ -67,7 +79,10 @@ impl SurfaceRenderInstance {
         match style {
             SurfaceRenderStyle::Filled => &self.triangle_index_buffer,
             SurfaceRenderStyle::Triangles => &self.line_index_buffer,
-            SurfaceRenderStyle::Vertices => &self.point_index_buffer,
+            SurfaceRenderStyle::Vertices
+            | SurfaceRenderStyle::VerticesHalf
+            | SurfaceRenderStyle::VerticesQuarter
+            | SurfaceRenderStyle::VerticesEighth => &self.point_index_buffer,
         }
     }
 
@@ -75,9 +90,33 @@ impl SurfaceRenderInstance {
         match style {
             SurfaceRenderStyle::Filled => self.triangle_index_count,
             SurfaceRenderStyle::Triangles => self.line_index_count,
-            SurfaceRenderStyle::Vertices => self.point_index_count,
+            SurfaceRenderStyle::Vertices
+            | SurfaceRenderStyle::VerticesHalf
+            | SurfaceRenderStyle::VerticesQuarter
+            | SurfaceRenderStyle::VerticesEighth => {
+                progressive_point_prefix_count(self.point_index_count, style)
+            }
         }
     }
+}
+
+fn progressive_point_prefix_count(total_points: u32, style: SurfaceRenderStyle) -> u32 {
+    let Some(groups) = style.point_prefix_groups() else {
+        return total_points;
+    };
+
+    const RESIDUE_ORDER: [u32; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+    RESIDUE_ORDER
+        .into_iter()
+        .take(groups as usize)
+        .map(|residue| {
+            if total_points <= residue {
+                0
+            } else {
+                1 + (total_points - 1 - residue) / 8
+            }
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

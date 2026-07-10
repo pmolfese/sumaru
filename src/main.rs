@@ -97,6 +97,10 @@ struct Cli {
     #[arg(long = "big-mem")]
     big_mem: bool,
 
+    /// Enable the experimental GPU AFNI color path for `SUMA_irgba` overlays.
+    #[arg(long = "gpu")]
+    gpu: bool,
+
     /// Deprecated: on-demand spec loading is now the default.
     #[arg(long = "no-preload", hide = true, conflicts_with = "preload")]
     no_preload: bool,
@@ -206,6 +210,7 @@ fn main() -> Result<()> {
     let verbose = cli.verbose;
     let preload = cli.preload && !cli.no_preload;
     let big_mem = cli.big_mem;
+    let gpu = cli.gpu;
     let subs = cli.subs.map(|subs| subs.0);
     let p_value = cli.p_value;
     let niml_record_path = cli.niml_record;
@@ -267,6 +272,7 @@ fn main() -> Result<()> {
                 verbose,
                 preload,
                 big_mem,
+                gpu,
                 afni,
                 niml_record_path,
             })?;
@@ -286,6 +292,7 @@ fn main() -> Result<()> {
                 &niml_record_path,
                 onestate,
                 big_mem,
+                gpu,
             )?;
             if afni_requested {
                 bail!("AFNI connection flags only apply to viewer launches and `niml send`");
@@ -308,6 +315,7 @@ fn main() -> Result<()> {
                 &niml_record_path,
                 onestate,
                 big_mem,
+                gpu,
             )?;
             run_niml_command(command, &afni.port_config, verbose)?;
         }
@@ -418,6 +426,7 @@ fn validate_no_viewer_launch_options(
     niml_record_path: &Option<PathBuf>,
     onestate: bool,
     big_mem: bool,
+    gpu: bool,
 ) -> Result<()> {
     if !surface_paths.is_empty()
         || spec.is_some()
@@ -432,6 +441,7 @@ fn validate_no_viewer_launch_options(
         || niml_record_path.is_some()
         || onestate
         || big_mem
+        || gpu
     {
         bail!("viewer launch options and subcommands cannot be mixed");
     }
@@ -1088,6 +1098,7 @@ mod tests {
                 &Some(PathBuf::from("session.nimlrec")),
                 false,
                 false,
+                false,
             )
             .is_err()
         );
@@ -1111,6 +1122,33 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
+                true,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gpu_is_a_viewer_only_opt_in() {
+        let cli = Cli::parse_from(["sumaru", "--surface", "surface.gii", "--gpu"]);
+        assert!(cli.gpu);
+
+        assert!(
+            validate_no_viewer_launch_options(
+                &[],
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                false,
                 false,
                 true,
             )

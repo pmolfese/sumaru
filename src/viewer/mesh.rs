@@ -253,15 +253,36 @@ impl PreparedSurface {
     }
 
     pub(super) fn vertex_bytes(&self) -> Vec<u8> {
-        let mut floats = Vec::with_capacity(self.vertices.len() * 10);
+        let mut floats = Vec::with_capacity(self.vertices.len() * 6);
 
         for vertex in &self.vertices {
             floats.extend_from_slice(&vertex.position);
             floats.extend_from_slice(&vertex.normal);
-            floats.extend_from_slice(&vertex.color);
         }
 
         super::f32_bytes(&floats)
+    }
+
+    pub(super) fn color_bytes(&self) -> Vec<u8> {
+        prepared_vertex_color_bytes(self.vertices.iter().map(|vertex| vertex.color))
+    }
+
+    pub(super) fn cell_color_bytes_for_range(
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        triangle_range: Range<usize>,
+    ) -> Vec<u8> {
+        let triangle_count = geometry.triangle_count();
+        let start_triangle = triangle_range.start.min(triangle_count);
+        let end_triangle = triangle_range.end.min(triangle_count).max(start_triangle);
+        let triangle_indices = &geometry.indices[start_triangle * 3..end_triangle * 3];
+        let colors = triangle_indices.chunks_exact(3).flat_map(|triangle| {
+            let face_color = cell_color_for_triangle(triangle, surface_colors, roi_colors);
+            [face_color; 3]
+        });
+
+        prepared_vertex_color_bytes(colors)
     }
 
     pub(super) fn index_bytes(&self) -> Vec<u8> {
@@ -287,7 +308,7 @@ impl PreparedSurface {
     }
 
     pub(super) fn point_index_bytes(&self) -> Vec<u8> {
-        let indices = (0..self.vertices.len() as u32).collect::<Vec<_>>();
+        let indices = progressive_point_indices(self.vertices.len() as u32);
         indices_to_bytes(&indices)
     }
 
@@ -314,6 +335,15 @@ impl PreparedSurface {
     pub(super) fn is_empty(&self) -> bool {
         self.vertices.is_empty() || self.indices.is_empty()
     }
+}
+
+fn prepared_vertex_color_bytes(colors: impl Iterator<Item = [f32; 4]>) -> Vec<u8> {
+    let mut floats = Vec::new();
+    for color in colors {
+        floats.extend_from_slice(&color);
+    }
+
+    super::f32_bytes(&floats)
 }
 
 impl RoiAppearance {
@@ -464,6 +494,27 @@ impl PreparedGeometry {
         self.indices.len() / 3
     }
 
+    pub(super) fn flat_color_triangle_index_bytes(
+        &self,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+    ) -> Vec<u8> {
+        let mut indices = Vec::with_capacity(self.indices.len());
+        for triangle in self.indices.chunks_exact(3) {
+            match cell_color_source_slot_for_triangle(triangle, surface_colors, roi_colors) {
+                // WGSL flat interpolation sources the first vertex of the
+                // primitive, so rotate each triangle to put the chosen AFNI
+                // face-color source first while preserving winding.
+                0 => indices.extend_from_slice(triangle),
+                1 => indices.extend_from_slice(&[triangle[1], triangle[2], triangle[0]]),
+                2 => indices.extend_from_slice(&[triangle[2], triangle[0], triangle[1]]),
+                _ => unreachable!("triangle color source slot must be 0..=2"),
+            }
+        }
+
+        indices_to_bytes(&indices)
+    }
+
     pub(super) fn from_surface(surface: &SurfaceMesh) -> Self {
         let normals = surface.vertex_normals();
         let center = Vec3::from_array(surface.bounds.center);
@@ -601,6 +652,20 @@ fn indices_to_bytes(indices: &[u32]) -> Vec<u8> {
     bytes
 }
 
+fn progressive_point_indices(total: u32) -> Vec<u32> {
+    const RESIDUE_ORDER: [u32; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+    let mut indices = Vec::with_capacity(total as usize);
+    for residue in RESIDUE_ORDER {
+        let mut index = residue;
+        while index < total {
+            indices.push(index);
+            index += 8;
+        }
+    }
+
+    indices
+}
+
 fn normalized_edge(a: u32, b: u32) -> (u32, u32) {
     if a <= b { (a, b) } else { (b, a) }
 }
@@ -649,6 +714,22 @@ fn cell_color_for_triangle(
     surface_colors: Option<&[[f32; 4]]>,
     roi_colors: Option<&[Option<[f32; 4]>]>,
 ) -> [f32; 4] {
+    cell_color_source_for_triangle(triangle, surface_colors, roi_colors).1
+}
+
+fn cell_color_source_slot_for_triangle(
+    triangle: &[u32],
+    surface_colors: Option<&[[f32; 4]]>,
+    roi_colors: Option<&[Option<[f32; 4]>]>,
+) -> usize {
+    cell_color_source_for_triangle(triangle, surface_colors, roi_colors).0
+}
+
+fn cell_color_source_for_triangle(
+    triangle: &[u32],
+    surface_colors: Option<&[[f32; 4]]>,
+    roi_colors: Option<&[Option<[f32; 4]>]>,
+) -> (usize, [f32; 4]) {
     let color = |index: u32| {
         let index = index as usize;
         compose_vertex_color(
@@ -668,7 +749,11 @@ fn cell_color_for_triangle(
     let v0 = color(triangle[0]);
     let v1 = color(triangle[1]);
     let v2 = color(triangle[2]);
-    if colors_match(v1, v2) { v1 } else { v0 }
+    if colors_match(v1, v2) {
+        (1, v1)
+    } else {
+        (0, v0)
+    }
 }
 
 fn colors_match(left: [f32; 4], right: [f32; 4]) -> bool {
@@ -788,6 +873,25 @@ mod tests {
         for vertex in prepared.vertices {
             assert_eq!(vertex.color, [0.0, 0.0, 1.0, 1.0]);
         }
+    }
+
+    #[test]
+    fn flat_color_triangle_indices_rotate_to_the_chosen_face_color_vertex() {
+        let mesh = triangle_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let colors = vec![
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ];
+
+        let bytes = geometry.flat_color_triangle_index_bytes(Some(&colors), None);
+        let indices = bytes
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(indices, vec![1, 2, 0]);
     }
 
     #[test]
@@ -944,9 +1048,28 @@ mod tests {
 
         assert_eq!(
             prepared.vertex_bytes().len(),
-            prepared.vertices.len() * 10 * 4
+            prepared.vertices.len() * 6 * 4
+        );
+        assert_eq!(
+            prepared.color_bytes().len(),
+            prepared.vertices.len() * 4 * 4
         );
         assert_eq!(prepared.index_bytes().len(), prepared.indices.len() * 4);
+    }
+
+    #[test]
+    fn point_indices_are_progressively_spread_for_sparse_prefix_draws() {
+        let mesh = octagon_strip_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let prepared =
+            PreparedSurface::from_geometry_with_selection(&geometry, None, None, 1.0, None, None);
+        let indices = prepared
+            .point_index_bytes()
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(indices, vec![0, 4, 2, 6, 1, 5, 3, 7]);
     }
 
     fn triangle_mesh() -> SurfaceMesh {
@@ -964,6 +1087,17 @@ mod tests {
         ];
 
         SurfaceMesh::new(vertices, vec![[0, 1, 2], [0, 2, 3]]).unwrap()
+    }
+
+    fn octagon_strip_mesh() -> SurfaceMesh {
+        let vertices = (0..8)
+            .map(|index| [index as f32, 0.0, 0.0])
+            .collect::<Vec<_>>();
+        let triangles = (1..7)
+            .map(|index| [0, index as u32, index as u32 + 1])
+            .collect::<Vec<_>>();
+
+        SurfaceMesh::new(vertices, triangles).unwrap()
     }
 
     fn scalar_overlay(mesh: &SurfaceMesh, values: Vec<f32>) -> (Dataset, Overlay) {
