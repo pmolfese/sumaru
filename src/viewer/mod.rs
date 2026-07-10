@@ -1189,7 +1189,7 @@ struct ViewerState {
     pending_cell_color_upload: Option<PendingCellColorUpload>,
     deferred_afni_rgba_overlays: Vec<AfniRgbaOverlay>,
     afni_work_scheduled: Arc<AtomicBool>,
-    afni_rgba_colors: Option<Vec<[f32; 4]>>,
+    afni_live_overlay_active: bool,
     /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
     /// resends identical colorizations on every redraw; this lets us skip the
     /// recolor + re-upload when nothing changed.
@@ -1612,7 +1612,7 @@ impl ViewerState {
             pending_cell_color_upload: None,
             deferred_afni_rgba_overlays: Vec::new(),
             afni_work_scheduled: Arc::new(AtomicBool::new(false)),
-            afni_rgba_colors: None,
+            afni_live_overlay_active: false,
             afni_rgba_signatures: HashMap::new(),
             sent_crosshair_node: None,
             afni_crosshair_node: None,
@@ -2718,7 +2718,7 @@ impl ViewerState {
     fn reset_scene_state(&mut self) {
         self.overlay.clear();
         self.controller.overlay.visible = true;
-        self.afni_rgba_colors = None;
+        self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
         self.deferred_afni_rgba_overlays.clear();
         self.controller.surface.current_overlay_path = None;
@@ -3506,6 +3506,13 @@ impl ViewerState {
             .filter(|_| self.controller.overlay.visible)
     }
 
+    fn afni_live_overlay_colors(&self) -> Option<&[[f32; 4]]> {
+        self.afni_live_overlay_active
+            .then(|| self.overlay.render.render_model.as_ref())
+            .flatten()
+            .map(|overlay| overlay.color_cache.colors.as_slice())
+    }
+
     fn visible_roi_layer(&self) -> Option<&RoiLayer> {
         self.roi_layer
             .as_ref()
@@ -3879,20 +3886,23 @@ impl ViewerState {
 
     fn upload_surface_buffers(&mut self) {
         self.pending_cell_color_upload = None;
-        let afni_surface_colors = (self.controller.overlay.visible)
-            .then(|| self.afni_rgba_colors.clone())
+        let underlay = self.visible_anatomical_shading_colors();
+        let afni_surface_colors = self
+            .controller
+            .overlay
+            .visible
+            .then(|| self.afni_live_overlay_colors())
             .flatten();
         let surface_colors = if let Some(afni) = afni_surface_colors {
             // AFNI colors replace the surface color, so resolve their alpha
             // against the anatomical underlay now: sub-threshold nodes show the
             // underlay instead of painting the surface black.
-            let underlay = self.visible_anatomical_shading_colors();
             Some(Arc::new(afni_colors_over_underlay(
                 &afni,
                 underlay.as_deref().map(Vec::as_slice),
             )))
         } else {
-            self.visible_anatomical_shading_colors()
+            underlay
         };
         if self.mesh.is_none() {
             let dropped_gpu_resources =
@@ -3938,8 +3948,7 @@ impl ViewerState {
             .expect("prepared geometry cache is populated above")
             .geometry
             .clone();
-        let use_afni_cell_colors =
-            self.afni_rgba_colors.is_some() && self.controller.overlay.visible;
+        let use_afni_cell_colors = self.afni_live_overlay_active && self.controller.overlay.visible;
         let use_gpu_afni_colors = use_afni_cell_colors && self.gpu_afni_colors_enabled;
         let surface_color_slice = surface_colors.as_deref().map(Vec::as_slice);
         let roi_colors = self
@@ -3962,9 +3971,7 @@ impl ViewerState {
         }
 
         self.surface_render_set = None;
-        let visible_overlay = self
-            .afni_rgba_colors
-            .is_none()
+        let visible_overlay = (!self.afni_live_overlay_active)
             .then(|| self.visible_overlay())
             .flatten();
         let prepared_surface = if use_gpu_afni_colors {
@@ -4222,13 +4229,10 @@ impl ViewerState {
             return false;
         }
 
-        let visible_overlay = self
-            .afni_rgba_colors
-            .is_none()
+        let visible_overlay = (!self.afni_live_overlay_active)
             .then(|| self.visible_overlay())
             .flatten();
-        let use_afni_cell_colors =
-            self.afni_rgba_colors.is_some() && self.controller.overlay.visible;
+        let use_afni_cell_colors = self.afni_live_overlay_active && self.controller.overlay.visible;
         let overlay_colors = visible_overlay.map(|overlay| overlay.color_cache.colors.clone());
         let roi_colors = self
             .visible_roi_layer()

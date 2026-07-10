@@ -572,7 +572,7 @@ impl ViewerState {
             .afni_rgba_signatures
             .get(&overlay.surface_idcode)
             .copied();
-        if self.afni_rgba_colors.is_some() && previous_signature == Some(signature) {
+        if self.afni_live_overlay_active && previous_signature == Some(signature) {
             if self.verbose {
                 self.log_status(format!(
                     "Skipped unchanged AFNI/SUMA RGBA overlay for {}.",
@@ -587,8 +587,17 @@ impl ViewerState {
             return Ok(false);
         }
 
+        let existing_colors = if self.afni_live_overlay_active {
+            self.overlay
+                .render
+                .render_model
+                .take()
+                .map(|overlay| overlay.color_cache.colors)
+        } else {
+            None
+        };
         let (colors, applied, skipped) =
-            apply_afni_rgba_to_color_cache(self.afni_rgba_colors.take(), mesh, target, &overlay);
+            apply_afni_rgba_to_color_cache(existing_colors, mesh, target, &overlay);
         if self.verbose {
             self.log_status(format!(
                 "AFNI RGBA color cache updated in {:.1} ms for {} nodes ({} skipped).",
@@ -602,8 +611,8 @@ impl ViewerState {
             .function_idcode
             .clone()
             .or_else(|| Some("AFNI SUMA_irgba".to_string()));
-        let overlay_model = Overlay::from_color_cache(&mesh.domain, colors.clone(), dataset_id)?;
-        self.afni_rgba_colors = Some(colors);
+        let overlay_model = Overlay::from_color_cache(&mesh.domain, colors, dataset_id)?;
+        self.afni_live_overlay_active = true;
         self.overlay.render.render_model = Some(overlay_model);
         self.overlay.data = DatasetOverlayState::None;
         self.overlay.source.path = None;

@@ -69,7 +69,7 @@ impl ViewerState {
         let range = overlay_values.range;
 
         self.overlay.clear();
-        self.afni_rgba_colors = None;
+        self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
         self.overlay.data = DatasetOverlayState::Loaded {
             canonical_dataset: loaded_overlay.dataset,
@@ -122,7 +122,7 @@ impl ViewerState {
         let range = overlay_values.range;
 
         self.overlay.clear();
-        self.afni_rgba_colors = None;
+        self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
         self.overlay.data = DatasetOverlayState::Loaded {
             canonical_dataset: loaded_overlay.dataset,
