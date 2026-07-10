@@ -1108,6 +1108,7 @@ struct ViewerState {
     /// node offsets, and picking, while drawing uses these instances with tiny
     /// model-matrix uniform updates.
     surface_render_set: Option<SurfaceRenderSet>,
+    selection_instance: Option<SurfaceRenderInstance>,
     depth_buffer: DepthBuffer,
     mesh: Option<SurfaceMesh>,
     prepared_geometry_cache: Option<PreparedGeometryCache>,
@@ -1154,6 +1155,7 @@ struct ViewerState {
     pending_afni_redraw_after_registrations: bool,
     pending_afni_elements: VecDeque<NimlElement>,
     pending_cell_color_upload: Option<PendingCellColorUpload>,
+    deferred_afni_rgba_overlays: Vec<AfniRgbaOverlay>,
     afni_rgba_colors: Option<Vec<[f32; 4]>>,
     /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
     /// resends identical colorizations on every redraw; this lets us skip the
@@ -1515,6 +1517,7 @@ impl ViewerState {
             uniform_bind_group,
             uniform_bind_group_layout,
             surface_render_set: None,
+            selection_instance: None,
             depth_buffer,
             mesh: None,
             prepared_geometry_cache: None,
@@ -1549,6 +1552,7 @@ impl ViewerState {
             pending_afni_redraw_after_registrations: false,
             pending_afni_elements: VecDeque::new(),
             pending_cell_color_upload: None,
+            deferred_afni_rgba_overlays: Vec::new(),
             afni_rgba_colors: None,
             afni_rgba_signatures: HashMap::new(),
             sent_crosshair_node: None,
@@ -1716,7 +1720,20 @@ impl ViewerState {
                     ),
                 );
             }
-        } else {
+        }
+        if let Some(instance) = self.selection_instance.as_ref() {
+            self.queue.write_buffer(
+                &instance.uniform_buffer,
+                0,
+                &camera.uniform_bytes_with_model(
+                    aspect,
+                    instance.model_matrix,
+                    lighting_mode,
+                    surface_opacity,
+                ),
+            );
+        }
+        if self.surface_render_set.is_none() {
             self.queue.write_buffer(
                 &self.uniform_buffer,
                 0,
@@ -1951,6 +1968,17 @@ impl ViewerState {
                 wgpu::IndexFormat::Uint32,
             );
             render_pass.draw_indexed(0..buffers.index_count(surface_style), 0, 0..1);
+        }
+
+        if let Some(instance) = &self.selection_instance {
+            render_pass.set_pipeline(self.active_surface_pipeline());
+            render_pass.set_bind_group(0, &instance.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(
+                instance.index_buffer(SurfaceRenderStyle::Filled).slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            render_pass.draw_indexed(0..instance.index_count(SurfaceRenderStyle::Filled), 0, 0..1);
         }
 
         if let Some(volume_view) = &self.volume_view {
@@ -2618,6 +2646,7 @@ impl ViewerState {
         self.controller.overlay.visible = true;
         self.afni_rgba_colors = None;
         self.afni_rgba_signatures.clear();
+        self.deferred_afni_rgba_overlays.clear();
         self.controller.surface.current_overlay_path = None;
         self.roi_path = None;
         self.controller.surface.current_roi_path = None;
@@ -2629,6 +2658,7 @@ impl ViewerState {
         self.controller.interaction.set_pick(None);
         self.controller.display.pair_visibility = PairVisibility::both();
         self.surface_render_set = None;
+        self.selection_instance = None;
     }
 
     fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
@@ -3221,6 +3251,7 @@ impl ViewerState {
     ) {
         self.surface_buffers = None;
         self.surface_render_set = None;
+        self.selection_instance = None;
         self.prepared_geometry_cache = prepared_geometry.map(|geometry| PreparedGeometryCache {
             surface_id: mesh.metadata.id.clone(),
             vertex_count: mesh.vertices.len(),
@@ -3415,11 +3446,19 @@ impl ViewerState {
                 if let Err(error) = self.send_afni_crosshair_for_pick(pick) {
                     self.set_error(error);
                 }
-                self.upload_surface_buffers();
+                if self.has_both_scene() {
+                    self.upload_surface_buffers();
+                } else {
+                    self.upload_selection_highlight_buffer();
+                }
             }
             None => {
                 self.controller.interaction.set_pick(None);
-                self.upload_surface_buffers();
+                if self.has_both_scene() {
+                    self.upload_surface_buffers();
+                } else {
+                    self.upload_selection_highlight_buffer();
+                }
                 self.log_status("No surface under the cursor.");
             }
         }
@@ -3598,6 +3637,7 @@ impl ViewerState {
         SurfaceRenderInstance {
             side,
             vertex_buffer,
+            vertex_bytes_len: vertex_bytes.len(),
             triangle_index_buffer,
             triangle_index_count,
             line_index_buffer,
@@ -3665,13 +3705,31 @@ impl ViewerState {
         geometry: Arc<PreparedGeometry>,
         surface_colors: Option<Arc<Vec<[f32; 4]>>>,
         roi_colors: Option<Vec<Option<[f32; 4]>>>,
-        selection: Option<SelectionHighlight>,
         dropped_render_set: bool,
     ) {
         let max_triangles =
             afni_cell_color_max_triangles_per_chunk(self.device.limits().max_buffer_size);
         let ranges = cell_color_chunk_ranges(geometry.triangle_count(), max_triangles);
         let mesh_chunk_count = ranges.len();
+        let resident_update_start = Instant::now();
+        if self.try_update_chunked_cell_color_vertices(
+            &geometry,
+            surface_colors.as_deref().map(Vec::as_slice),
+            roi_colors.as_deref(),
+            &ranges,
+        ) {
+            self.upload_selection_highlight_buffer();
+            if self.verbose {
+                self.log_status(format!(
+                    "Updated AFNI colorized surface {} across {} resident GPU chunks in {:.1} ms.",
+                    surface_id.as_str(),
+                    mesh_chunk_count,
+                    resident_update_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
+            return;
+        }
+
         let dropped_gpu_resources = dropped_render_set || self.surface_buffers.is_some();
         self.surface_buffers = None;
         self.surface_render_set = Some(SurfaceRenderSet {
@@ -3682,7 +3740,6 @@ impl ViewerState {
             geometry,
             surface_colors,
             roi_colors,
-            selection,
             ranges: ranges.into_iter().collect(),
             mesh_chunk_count,
             chunks_uploaded: 0,
@@ -3703,6 +3760,39 @@ impl ViewerState {
             self.poll_device_for_cleanup();
         }
         self.process_pending_cell_color_upload();
+        self.upload_selection_highlight_buffer();
+    }
+
+    fn try_update_chunked_cell_color_vertices(
+        &self,
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        ranges: &[Range<usize>],
+    ) -> bool {
+        let Some(render_set) = self.surface_render_set.as_ref() else {
+            return false;
+        };
+        if render_set.instances.len() != ranges.len() {
+            return false;
+        }
+
+        for (instance, range) in render_set.instances.iter().zip(ranges) {
+            let prepared_surface = PreparedSurface::from_geometry_cell_color_range(
+                geometry,
+                surface_colors,
+                roi_colors,
+                range.clone(),
+            );
+            let vertex_bytes = prepared_surface.vertex_bytes();
+            if vertex_bytes.len() != instance.vertex_bytes_len {
+                return false;
+            }
+            self.queue
+                .write_buffer(&instance.vertex_buffer, 0, &vertex_bytes);
+        }
+
+        true
     }
 
     fn upload_surface_buffers(&mut self) {
@@ -3727,6 +3817,7 @@ impl ViewerState {
                 self.surface_buffers.is_some() || self.surface_render_set.is_some();
             self.surface_buffers = None;
             self.surface_render_set = None;
+            self.selection_instance = None;
             self.prepared_geometry_cache = None;
             self.anatomical_shading_cache = None;
             if dropped_gpu_resources {
@@ -3742,7 +3833,6 @@ impl ViewerState {
         }
 
         let dropped_render_set = self.surface_render_set.is_some();
-        self.surface_render_set = None;
         let mesh = self
             .mesh
             .as_ref()
@@ -3766,7 +3856,6 @@ impl ViewerState {
             .expect("prepared geometry cache is populated above")
             .geometry
             .clone();
-        let selection = self.selection_highlight();
         let use_afni_cell_colors =
             self.afni_rgba_colors.is_some() && self.controller.overlay.visible;
         let surface_color_slice = surface_colors.as_deref().map(Vec::as_slice);
@@ -3775,11 +3864,7 @@ impl ViewerState {
             .map(|layer| layer.appearance.node_colors.clone());
         let roi_color_slice = roi_colors.as_deref();
         if use_afni_cell_colors
-            && afni_cell_color_needs_chunking(
-                &geometry,
-                selection,
-                self.device.limits().max_buffer_size,
-            )
+            && afni_cell_color_needs_chunking(&geometry, None, self.device.limits().max_buffer_size)
         {
             let surface_id = mesh.metadata.id.clone();
             self.upload_chunked_cell_color_surface_render_set(
@@ -3787,12 +3872,12 @@ impl ViewerState {
                 geometry.clone(),
                 surface_colors.clone(),
                 roi_colors.clone(),
-                selection,
                 dropped_render_set,
             );
             return;
         }
 
+        self.surface_render_set = None;
         let visible_overlay = self
             .afni_rgba_colors
             .is_none()
@@ -3803,7 +3888,7 @@ impl ViewerState {
                 &geometry,
                 surface_color_slice,
                 roi_color_slice,
-                selection,
+                None,
             )
         } else {
             PreparedSurface::from_geometry_color_slices(
@@ -3812,7 +3897,7 @@ impl ViewerState {
                 visible_overlay.map(|overlay| overlay.color_cache.colors.as_slice()),
                 self.overlay.render.appearance.dim,
                 roi_color_slice,
-                selection,
+                None,
             )
         };
         let vertex_bytes = prepared_surface.vertex_bytes();
@@ -3882,6 +3967,7 @@ impl ViewerState {
             if replaced_gpu_resources {
                 self.poll_device_for_cleanup();
             }
+            self.upload_selection_highlight_buffer();
             return;
         }
 
@@ -3931,6 +4017,7 @@ impl ViewerState {
         if dropped_render_set {
             self.poll_device_for_cleanup();
         }
+        self.upload_selection_highlight_buffer();
     }
 
     fn upload_paired_surface_render_set(&mut self, surface_colors: Option<&[[f32; 4]]>) -> bool {
@@ -4090,6 +4177,7 @@ impl ViewerState {
         let dropped_gpu_resources =
             self.surface_buffers.is_some() || self.surface_render_set.is_some();
         self.surface_buffers = None;
+        self.selection_instance = None;
         self.surface_render_set = Some(SurfaceRenderSet { instances });
         if dropped_gpu_resources {
             self.poll_device_for_cleanup();
@@ -4144,6 +4232,52 @@ impl ViewerState {
             pick.face_index,
             pick.normalized_position,
         ))
+    }
+
+    fn upload_selection_highlight_buffer(&mut self) {
+        if self.has_both_scene() {
+            self.selection_instance = None;
+            return;
+        }
+
+        let Some(selection) = self.selection_highlight() else {
+            self.selection_instance = None;
+            return;
+        };
+        let Some(mesh) = self.mesh.as_ref() else {
+            self.selection_instance = None;
+            return;
+        };
+        if !self
+            .prepared_geometry_cache
+            .as_ref()
+            .is_some_and(|cache| cache.matches(mesh))
+        {
+            self.prepared_geometry_cache = Some(PreparedGeometryCache {
+                surface_id: mesh.metadata.id.clone(),
+                vertex_count: mesh.vertices.len(),
+                face_count: mesh.triangles.len(),
+                geometry: Arc::new(PreparedGeometry::from_surface(mesh)),
+            });
+        }
+        let geometry = self
+            .prepared_geometry_cache
+            .as_ref()
+            .expect("prepared geometry cache is populated above")
+            .geometry
+            .clone();
+        let prepared_surface = PreparedSurface::selection_highlight(&geometry, selection);
+        if prepared_surface.is_empty() {
+            self.selection_instance = None;
+            return;
+        }
+
+        self.selection_instance = Some(self.surface_render_instance_from_prepared(
+            &prepared_surface,
+            SurfaceSide::Unknown,
+            Mat4::IDENTITY,
+            CHUNKED_SURFACE_BUFFER_LABELS,
+        ));
     }
 
     fn update_scene_stats(&mut self) {
@@ -4578,7 +4712,6 @@ struct PendingCellColorUpload {
     geometry: Arc<PreparedGeometry>,
     surface_colors: Option<Arc<Vec<[f32; 4]>>>,
     roi_colors: Option<Vec<Option<[f32; 4]>>>,
-    selection: Option<SelectionHighlight>,
     ranges: VecDeque<Range<usize>>,
     mesh_chunk_count: usize,
     chunks_uploaded: usize,

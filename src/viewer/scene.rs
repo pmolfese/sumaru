@@ -32,6 +32,7 @@ pub(super) struct SurfaceRenderSet {
 pub(super) struct SurfaceRenderInstance {
     pub(super) side: SurfaceSide,
     pub(super) vertex_buffer: wgpu::Buffer,
+    pub(super) vertex_bytes_len: usize,
     pub(super) triangle_index_buffer: wgpu::Buffer,
     pub(super) triangle_index_count: u32,
     pub(super) line_index_buffer: wgpu::Buffer,

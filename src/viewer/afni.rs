@@ -56,6 +56,7 @@ impl ViewerState {
             self.pending_afni_redraw_after_registrations = false;
             self.pending_afni_elements.clear();
             self.pending_cell_color_upload = None;
+            self.deferred_afni_rgba_overlays.clear();
             self.log_status("Disconnected AFNI/SUMA NIML talk.");
         }
     }
@@ -188,8 +189,10 @@ impl ViewerState {
 
     /// Pull and dispatch any NIML messages waiting on the connection.
     pub(super) fn drain_afni_events(&mut self) -> bool {
+        let drain_start = Instant::now();
         let mut changed = false;
         let mut event_count = 0usize;
+        let queued_before = self.pending_afni_elements.len();
         while event_count < AFNI_EVENTS_PER_DRAIN {
             let event = self
                 .afni_connection
@@ -200,6 +203,20 @@ impl ViewerState {
             };
             match event {
                 AfniConnectionEvent::Elements(elements) => {
+                    if self.verbose {
+                        let names = elements
+                            .iter()
+                            .map(|element| element.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        self.log_status(format!(
+                            "AFNI drain queued {} element{} [{}]; pending before={}.",
+                            elements.len(),
+                            if elements.len() == 1 { "" } else { "s" },
+                            names,
+                            self.pending_afni_elements.len()
+                        ));
+                    }
                     self.pending_afni_elements.extend(elements);
                 }
                 AfniConnectionEvent::Error(message) => {
@@ -212,12 +229,21 @@ impl ViewerState {
                     self.pending_afni_redraw_after_registrations = false;
                     self.pending_afni_elements.clear();
                     self.pending_cell_color_upload = None;
+                    self.deferred_afni_rgba_overlays.clear();
                     self.log_status("AFNI/SUMA NIML talk disconnected.");
                     changed = true;
                     break;
                 }
             }
             event_count += 1;
+        }
+        if self.verbose && (event_count > 0 || queued_before > 0) {
+            self.log_status(format!(
+                "AFNI drain pulled {event_count} connection event{} in {:.1} ms; pending elements={}.",
+                if event_count == 1 { "" } else { "s" },
+                drain_start.elapsed().as_secs_f64() * 1000.0,
+                self.pending_afni_elements.len()
+            ));
         }
 
         let mut elements = Vec::new();
@@ -228,22 +254,73 @@ impl ViewerState {
             elements.push(element);
         }
         if !elements.is_empty() {
+            let handle_start = Instant::now();
+            if self.verbose {
+                let names = elements
+                    .iter()
+                    .map(|element| element.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.log_status(format!(
+                    "AFNI handling {} element{} [{}]; pending after pop={}.",
+                    elements.len(),
+                    if elements.len() == 1 { "" } else { "s" },
+                    names,
+                    self.pending_afni_elements.len()
+                ));
+            }
             match self.handle_afni_elements(elements) {
                 Ok(event_changed) => changed |= event_changed,
                 Err(error) => self.set_error(error),
             }
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI handled element batch in {:.1} ms.",
+                    handle_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
         }
 
+        let registration_start = Instant::now();
         match self.process_pending_afni_surface_registrations() {
-            Ok(sent) => changed |= sent,
+            Ok(sent) => {
+                if self.verbose && sent {
+                    self.log_status(format!(
+                        "AFNI surface registration tick took {:.1} ms.",
+                        registration_start.elapsed().as_secs_f64() * 1000.0
+                    ));
+                }
+                changed |= sent;
+            }
             Err(error) => self.set_error(error),
         }
+        let upload_start = Instant::now();
         changed |= self.process_pending_cell_color_upload();
+        if self.verbose && self.pending_cell_color_upload.is_some() {
+            self.log_status(format!(
+                "AFNI color chunk upload tick took {:.1} ms; chunks remain.",
+                upload_start.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
+        let deferred_start = Instant::now();
+        match self.apply_deferred_afni_rgba_overlays() {
+            Ok(applied) => {
+                if self.verbose && applied {
+                    self.log_status(format!(
+                        "AFNI applied deferred RGBA overlays in {:.1} ms.",
+                        deferred_start.elapsed().as_secs_f64() * 1000.0
+                    ));
+                }
+                changed |= applied;
+            }
+            Err(error) => self.set_error(error),
+        }
 
         if event_count == AFNI_EVENTS_PER_DRAIN
             || !self.pending_afni_surface_registrations.is_empty()
             || !self.pending_afni_elements.is_empty()
             || self.pending_cell_color_upload.is_some()
+            || !self.deferred_afni_rgba_overlays.is_empty()
         {
             self.request_afni_work();
         }
@@ -284,7 +361,15 @@ impl ViewerState {
         }
 
         for action in actions {
+            let label = afni_route_action_label(&action);
+            let apply_start = Instant::now();
             changed |= self.apply_afni_route_action(action)?;
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI action {label} applied in {:.1} ms.",
+                    apply_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
         }
 
         Ok(changed)
@@ -348,6 +433,7 @@ impl ViewerState {
 
     /// Apply a sparse SUMA_irgba node-color overlay sent from AFNI.
     pub(super) fn apply_afni_rgba_overlay(&mut self, overlay: AfniRgbaOverlay) -> Result<bool> {
+        let apply_start = Instant::now();
         let mesh = self
             .mesh
             .as_ref()
@@ -387,8 +473,21 @@ impl ViewerState {
             return Ok(false);
         }
 
+        if self.pending_cell_color_upload.is_some() {
+            self.defer_afni_rgba_overlay(overlay);
+            return Ok(false);
+        }
+
         let (colors, applied, skipped) =
             apply_afni_rgba_to_color_cache(self.afni_rgba_colors.take(), mesh, target, &overlay);
+        if self.verbose {
+            self.log_status(format!(
+                "AFNI RGBA color cache updated in {:.1} ms for {} nodes ({} skipped).",
+                apply_start.elapsed().as_secs_f64() * 1000.0,
+                applied,
+                skipped
+            ));
+        }
 
         let dataset_id = overlay
             .function_idcode
@@ -419,7 +518,14 @@ impl ViewerState {
         // are simply absent from the sparse list), so we do not re-apply a
         // scalar threshold to this already-resolved color cache.
         self.refresh_pick_overlay_value();
+        let upload_start = Instant::now();
         self.upload_surface_buffers();
+        if self.verbose {
+            self.log_status(format!(
+                "AFNI RGBA surface buffer update requested in {:.1} ms.",
+                upload_start.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
         self.update_scene_stats();
         self.afni_rgba_signatures
             .insert(overlay.surface_idcode.clone(), signature);
@@ -445,6 +551,39 @@ impl ViewerState {
         }
 
         Ok(true)
+    }
+
+    fn defer_afni_rgba_overlay(&mut self, overlay: AfniRgbaOverlay) {
+        let key = (
+            overlay.surface_idcode.clone(),
+            overlay.local_domain_parent_id.clone(),
+        );
+        self.deferred_afni_rgba_overlays.retain(|candidate| {
+            (
+                candidate.surface_idcode.clone(),
+                candidate.local_domain_parent_id.clone(),
+            ) != key
+        });
+        self.deferred_afni_rgba_overlays.push(overlay);
+        if self.verbose {
+            self.log_status(format!(
+                "Deferred AFNI/SUMA RGBA overlay while GPU chunks are still uploading; deferred={}.",
+                self.deferred_afni_rgba_overlays.len()
+            ));
+        }
+    }
+
+    pub(super) fn apply_deferred_afni_rgba_overlays(&mut self) -> Result<bool> {
+        if self.pending_cell_color_upload.is_some() || self.deferred_afni_rgba_overlays.is_empty() {
+            return Ok(false);
+        }
+
+        let overlays = std::mem::take(&mut self.deferred_afni_rgba_overlays);
+        let mut changed = false;
+        for overlay in overlays {
+            changed |= self.apply_afni_rgba_overlay(overlay)?;
+        }
+        Ok(changed)
     }
 
     /// Move the local crosshair/pick to AFNI's reported surface node.
@@ -481,7 +620,11 @@ impl ViewerState {
         self.afni_crosshair_node = Some(node_index);
         self.refresh_pick_overlay_value();
         self.refresh_graph_snapshot_if_open();
-        self.upload_surface_buffers();
+        if self.has_both_scene() {
+            self.upload_surface_buffers();
+        } else {
+            self.upload_selection_highlight_buffer();
+        }
         self.control.window.request_redraw();
         if self.controller.panels.roi_controller_open {
             self.roi_control.window.request_redraw();
@@ -761,11 +904,13 @@ impl ViewerState {
         let roi_color_slice = upload.roi_colors.as_deref();
         let mut instances = Vec::new();
         let mut processed_chunks = 0usize;
+        let tick_start = Instant::now();
 
         while processed_chunks < AFNI_CELL_COLOR_UPLOAD_CHUNKS_PER_TICK {
             let Some(range) = upload.ranges.pop_front() else {
                 break;
             };
+            let chunk_start = Instant::now();
             let prepared_surface = PreparedSurface::from_geometry_cell_color_range(
                 &upload.geometry,
                 surface_color_slice,
@@ -782,19 +927,13 @@ impl ViewerState {
                     upload.labels,
                 ));
             }
-        }
-
-        if upload.ranges.is_empty()
-            && let Some(selection) = upload.selection.take()
-        {
-            let prepared_surface =
-                PreparedSurface::selection_highlight(&upload.geometry, selection);
-            if !prepared_surface.is_empty() {
-                instances.push(self.surface_render_instance_from_prepared(
-                    &prepared_surface,
-                    upload.side.clone(),
-                    upload.model_matrix,
-                    upload.labels,
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI colorized surface {} prepared/uploaded chunk {}/{} in {:.1} ms.",
+                    upload.surface_id.as_str(),
+                    upload.chunks_uploaded,
+                    upload.mesh_chunk_count,
+                    chunk_start.elapsed().as_secs_f64() * 1000.0
                 ));
             }
         }
@@ -804,15 +943,17 @@ impl ViewerState {
             render_set.instances.extend(instances);
         }
 
-        if upload.ranges.is_empty() && upload.selection.is_none() {
+        if upload.ranges.is_empty() {
             if self.verbose {
                 self.log_status(format!(
                     "Finished AFNI colorized surface {} progressive upload \
-                     ({} chunks).",
+                     ({} chunks) in this tick after {:.1} ms.",
                     upload.surface_id.as_str(),
-                    upload.mesh_chunk_count
+                    upload.mesh_chunk_count,
+                    tick_start.elapsed().as_secs_f64() * 1000.0
                 ));
             }
+            self.upload_selection_highlight_buffer();
         } else {
             if self.verbose {
                 self.log_status(format!(
@@ -827,6 +968,17 @@ impl ViewerState {
         }
 
         changed
+    }
+}
+
+fn afni_route_action_label(action: &AfniRouteAction) -> &'static str {
+    match action {
+        AfniRouteAction::ViewerCommand(_) => "viewer_command",
+        AfniRouteAction::LoadDataset(_) => "load_dataset",
+        AfniRouteAction::RgbaOverlay(_) => "rgba_overlay",
+        AfniRouteAction::OverlayState(_) => "overlay_state",
+        AfniRouteAction::SurfaceCrosshair(_) => "surface_crosshair",
+        AfniRouteAction::RoiUpdate(_) => "roi_update",
     }
 }
 

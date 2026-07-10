@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail, ensure};
 
@@ -14,7 +14,8 @@ use crate::command::{
     BackgroundMode, ControllerState, CrosshairState, OverlayThreshold, ViewerCommand,
 };
 use crate::io::{
-    NimlData, NimlElement, NimlNumericMatrix, NimlValueType, parse_niml_bytes, serialize_niml_ascii,
+    NimlData, NimlElement, NimlNumericMatrix, NimlValueType, binary_payload_len, element_is_binary,
+    parse_attrs, parse_niml_bytes, serialize_niml_ascii,
 };
 use crate::niml_debug::{NimlDirection, NimlRecorder};
 use crate::surface::{SurfaceMesh, ValueRange};
@@ -28,6 +29,7 @@ const AFNI_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const AFNI_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const AFNI_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const AFNI_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+const AFNI_VERBOSE_READ_PROGRESS_STEP: usize = 8 * 1024 * 1024;
 
 const AFNI_PORT_NAMES: &[&str] = &[
     "AFNI_SUMA_NIML",
@@ -409,6 +411,29 @@ fn log_niml_elements(verbose: bool, direction: &str, elements: &[NimlElement], b
     }
 }
 
+fn log_niml_elements_timing(
+    verbose: bool,
+    direction: &str,
+    elements: &[NimlElement],
+    byte_count: usize,
+    elapsed: Duration,
+) {
+    if !verbose {
+        return;
+    }
+
+    for element in elements {
+        eprintln!(
+            "sumaru niml {direction}: {} bytes={} elapsed_ms={:.1} {} attrs={}",
+            element.name,
+            byte_count,
+            elapsed.as_secs_f64() * 1000.0,
+            niml_data_summary(&element.data),
+            niml_attr_summary(&element.attrs)
+        );
+    }
+}
+
 fn niml_attr_summary(attrs: &BTreeMap<String, String>) -> String {
     if attrs.is_empty() {
         return "{}".to_string();
@@ -461,6 +486,57 @@ fn truncate_log_value(value: &str) -> String {
     }
 }
 
+fn expected_binary_niml_message_len(bytes: &[u8]) -> Option<usize> {
+    let mut start = 0usize;
+    while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+        start += 1;
+    }
+    if bytes.get(start) != Some(&b'<') {
+        return None;
+    }
+
+    let mut pos = start + 1;
+    if bytes.get(pos) == Some(&b'/') {
+        return None;
+    }
+    let name_start = pos;
+    while let Some(byte) = bytes.get(pos) {
+        if byte.is_ascii_whitespace() || *byte == b'>' || *byte == b'/' {
+            break;
+        }
+        pos += 1;
+    }
+    if pos == name_start {
+        return None;
+    }
+    let name = std::str::from_utf8(&bytes[name_start..pos]).ok()?;
+
+    let header_start = pos;
+    let mut in_quote = false;
+    while let Some(byte) = bytes.get(pos) {
+        if *byte == b'"' {
+            in_quote = !in_quote;
+        } else if *byte == b'>' && !in_quote {
+            let raw_header = std::str::from_utf8(&bytes[header_start..pos]).ok()?;
+            let header_end = pos + 1;
+            let header = raw_header.trim();
+            if header.ends_with('/') {
+                return Some(header_end);
+            }
+            let attrs = parse_attrs(header).ok()?;
+            if !element_is_binary(&attrs) {
+                return None;
+            }
+            let payload_len = binary_payload_len(&attrs).ok()?;
+            let end_marker_len = name.len() + "</>".len();
+            return Some(header_end + payload_len + end_marker_len);
+        }
+        pos += 1;
+    }
+
+    None
+}
+
 fn read_afni_stream(
     mut stream: TcpStream,
     sender: mpsc::Sender<AfniConnectionEvent>,
@@ -471,6 +547,12 @@ fn read_afni_stream(
 ) {
     let mut pending = Vec::new();
     let mut chunk = [0_u8; 65_536];
+    let mut message_start: Option<Instant> = None;
+    let mut next_progress = AFNI_VERBOSE_READ_PROGRESS_STEP;
+    let mut incomplete_parse_attempts = 0usize;
+    let mut incomplete_parse_elapsed = Duration::ZERO;
+    let mut binary_waits = 0usize;
+    let mut expected_binary_len: Option<usize> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match stream.read(&mut chunk) {
@@ -480,11 +562,66 @@ fn read_afni_stream(
                 return;
             }
             Ok(read) => {
+                if message_start.is_none() {
+                    message_start = Some(Instant::now());
+                    next_progress = AFNI_VERBOSE_READ_PROGRESS_STEP;
+                    if verbose {
+                        eprintln!("sumaru niml rx-read: first bytes read={read}");
+                    }
+                    incomplete_parse_attempts = 0;
+                    incomplete_parse_elapsed = Duration::ZERO;
+                    binary_waits = 0;
+                    expected_binary_len = None;
+                }
                 pending.extend_from_slice(&chunk[..read]);
+                while verbose && pending.len() >= next_progress {
+                    eprintln!(
+                        "sumaru niml rx-read: pending_bytes={} elapsed_ms={:.1}",
+                        pending.len(),
+                        message_start
+                            .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+                            .unwrap_or(0.0)
+                    );
+                    next_progress = next_progress.saturating_add(AFNI_VERBOSE_READ_PROGRESS_STEP);
+                }
+
+                if expected_binary_len.is_none() {
+                    expected_binary_len = expected_binary_niml_message_len(&pending);
+                }
+                if let Some(expected_len) = expected_binary_len {
+                    if pending.len() < expected_len {
+                        binary_waits += 1;
+                        continue;
+                    }
+                }
+
+                let parse_start = Instant::now();
                 match parse_niml_bytes(&pending) {
                     Ok(elements) => {
                         if !elements.is_empty() {
-                            log_niml_elements(verbose, "rx", &elements, pending.len());
+                            if verbose {
+                                eprintln!(
+                                    "sumaru niml rx-parse: complete bytes={} elements={} read_elapsed_ms={:.1} parse_ms={:.1} incomplete_parse_attempts={} incomplete_parse_ms={:.1} binary_waits={}",
+                                    pending.len(),
+                                    elements.len(),
+                                    message_start
+                                        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+                                        .unwrap_or(0.0),
+                                    parse_start.elapsed().as_secs_f64() * 1000.0,
+                                    incomplete_parse_attempts,
+                                    incomplete_parse_elapsed.as_secs_f64() * 1000.0,
+                                    binary_waits
+                                );
+                            }
+                            log_niml_elements_timing(
+                                verbose,
+                                "rx",
+                                &elements,
+                                pending.len(),
+                                message_start
+                                    .map(|start| start.elapsed())
+                                    .unwrap_or_default(),
+                            );
                             if let Some(recorder) = recorder.as_ref()
                                 && let Err(error) =
                                     recorder.record_payload(NimlDirection::Rx, &pending)
@@ -498,6 +635,8 @@ fn read_afni_stream(
                             wake_gui(&wake);
                         }
                         pending.clear();
+                        message_start = None;
+                        expected_binary_len = None;
                     }
                     Err(error) if pending.len() > AFNI_MAX_PENDING_BYTES => {
                         let _ = sender.send(AfniConnectionEvent::Error(format!(
@@ -506,8 +645,12 @@ fn read_afni_stream(
                         )));
                         wake_gui(&wake);
                         pending.clear();
+                        message_start = None;
+                        expected_binary_len = None;
                     }
                     Err(_) => {
+                        incomplete_parse_attempts += 1;
+                        incomplete_parse_elapsed += parse_start.elapsed();
                         // A TCP read can split a NIML element anywhere, including
                         // inside binary payload bytes. Keep the bytes until the
                         // next read gives the parser a complete element.
@@ -586,12 +729,21 @@ fn write_afni_elements(
 ) -> Result<()> {
     let payload = serialize_niml_ascii(elements);
     log_niml_elements(verbose, "tx", elements, payload.len());
+    let write_start = Instant::now();
     stream
         .write_all(payload.as_bytes())
         .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
     stream
         .flush()
         .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
+    if verbose {
+        eprintln!(
+            "sumaru niml tx-write: bytes={} elements={} elapsed_ms={:.1}",
+            payload.len(),
+            elements.len(),
+            write_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     if let Some(recorder) = recorder {
         recorder.record_payload(NimlDirection::Tx, payload.as_bytes())?;
     }
