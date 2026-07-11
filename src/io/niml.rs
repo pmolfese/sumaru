@@ -120,6 +120,72 @@ pub fn serialize_niml_ascii(elements: &[NimlElement]) -> String {
     out
 }
 
+/// Serialize numeric NIML elements with native-endian binary payloads.
+/// Elements that cannot use NIML's fixed-width binary representation retain
+/// their normal ASCII representation, allowing command and geometry elements
+/// to share the same writer.
+pub fn serialize_niml_binary(elements: &[NimlElement]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for element in elements {
+        serialize_element_binary(element, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn serialize_element_binary(element: &NimlElement, out: &mut Vec<u8>) -> Result<()> {
+    let NimlData::Numeric(matrix) = &element.data else {
+        let mut ascii = String::new();
+        serialize_element(element, &mut ascii);
+        out.extend_from_slice(ascii.as_bytes());
+        return Ok(());
+    };
+    ensure!(
+        matrix.column_types.iter().all(NimlValueType::is_numeric),
+        "binary NIML requires fixed-width numeric columns"
+    );
+
+    let mut attrs = element.attrs.clone();
+    attrs.insert("ni_type".to_string(), ni_type_string(&matrix.column_types));
+    attrs.insert("ni_dimen".to_string(), matrix.rows.to_string());
+    attrs.insert(
+        "ni_form".to_string(),
+        if cfg!(target_endian = "little") {
+            "binary.lsbfirst"
+        } else {
+            "binary.msbfirst"
+        }
+        .to_string(),
+    );
+
+    out.push(b'<');
+    out.extend_from_slice(element.name.as_bytes());
+    for (key, value) in attrs {
+        out.extend_from_slice(b"\n  ");
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(b"=\"");
+        out.extend_from_slice(escape_niml(&value).as_bytes());
+        out.push(b'"');
+    }
+    out.extend_from_slice(b" >");
+    for row in 0..matrix.rows {
+        for (column, value_type) in matrix.column_types.iter().enumerate() {
+            let value = matrix.get(row, column).unwrap_or(0.0);
+            match value_type {
+                NimlValueType::UInt8 => out.push(value as u8),
+                NimlValueType::Int16 => out.extend_from_slice(&(value as i16).to_ne_bytes()),
+                NimlValueType::Int32 => out.extend_from_slice(&(value as i32).to_ne_bytes()),
+                NimlValueType::Float32 => out.extend_from_slice(&(value as f32).to_ne_bytes()),
+                NimlValueType::Float64 => out.extend_from_slice(&value.to_ne_bytes()),
+                other => bail!("cannot serialize {other:?} in binary NIML"),
+            }
+        }
+    }
+    out.extend_from_slice(b"</");
+    out.extend_from_slice(element.name.as_bytes());
+    out.extend_from_slice(b">\n");
+    Ok(())
+}
+
 pub fn expand_niml_type(ni_type: &str) -> Result<Vec<NimlValueType>> {
     let mut types = Vec::new();
 

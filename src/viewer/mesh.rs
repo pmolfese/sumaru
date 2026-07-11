@@ -346,6 +346,10 @@ fn prepared_vertex_color_bytes(colors: impl Iterator<Item = [f32; 4]>) -> Vec<u8
     super::f32_bytes(&floats)
 }
 
+pub(super) fn color_bytes(colors: impl Iterator<Item = [f32; 4]>) -> Vec<u8> {
+    prepared_vertex_color_bytes(colors)
+}
+
 impl RoiAppearance {
     pub(super) fn empty(node_count: usize) -> Self {
         Self {
@@ -494,6 +498,7 @@ impl PreparedGeometry {
         self.indices.len() / 3
     }
 
+    #[cfg(test)]
     pub(super) fn flat_color_triangle_index_bytes(
         &self,
         surface_colors: Option<&[[f32; 4]]>,
@@ -717,6 +722,7 @@ fn cell_color_for_triangle(
     cell_color_source_for_triangle(triangle, surface_colors, roi_colors).1
 }
 
+#[cfg(test)]
 fn cell_color_source_slot_for_triangle(
     triangle: &[u32],
     surface_colors: Option<&[[f32; 4]]>,

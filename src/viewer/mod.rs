@@ -4127,19 +4127,11 @@ impl ViewerState {
         };
         let vertex_bytes = prepared_surface.vertex_bytes();
         let color_bytes = prepared_surface.color_bytes();
-        let triangle_index_bytes = if use_gpu_afni_colors {
-            geometry.flat_color_triangle_index_bytes(surface_color_slice, roi_color_slice)
-        } else {
-            prepared_surface.index_bytes()
-        };
+        let triangle_index_bytes = prepared_surface.index_bytes();
         let line_index_bytes = prepared_surface.line_index_bytes();
         let point_index_bytes = prepared_surface.point_index_bytes();
         let surface_id = mesh.metadata.id.clone();
-        let triangle_index_count = if use_gpu_afni_colors {
-            geometry.indices.len() as u32
-        } else {
-            prepared_surface.index_count()
-        };
+        let triangle_index_count = prepared_surface.index_count();
         let line_index_count = prepared_surface.line_index_count();
         let point_index_count = prepared_surface.point_index_count();
 
@@ -4236,7 +4228,14 @@ impl ViewerState {
                 replaced_gpu_resources = true;
             }
             buffers.surface_id = surface_id;
-            buffers.flat_colors = use_gpu_afni_colors;
+            buffers.flat_colors = false;
+            buffers.afni_node_colors = use_gpu_afni_colors.then(|| {
+                prepared_surface
+                    .vertices
+                    .iter()
+                    .map(|vertex| vertex.color)
+                    .collect()
+            });
             if replaced_gpu_resources {
                 self.poll_device_for_cleanup();
             }
@@ -4282,7 +4281,14 @@ impl ViewerState {
 
         self.surface_buffers = Some(SurfaceBuffers {
             surface_id,
-            flat_colors: use_gpu_afni_colors,
+            flat_colors: false,
+            afni_node_colors: use_gpu_afni_colors.then(|| {
+                prepared_surface
+                    .vertices
+                    .iter()
+                    .map(|vertex| vertex.color)
+                    .collect()
+            }),
             vertex_buffer,
             vertex_bytes_len: vertex_bytes.len(),
             color_buffer,

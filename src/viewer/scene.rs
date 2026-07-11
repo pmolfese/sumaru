@@ -10,6 +10,9 @@ use super::*;
 pub(super) struct SurfaceBuffers {
     pub(super) surface_id: SurfaceId,
     pub(super) flat_colors: bool,
+    /// CPU mirror of the persistent per-node AFNI color buffer. Present only
+    /// for the experimental `--gpu` path and used to issue partial writes.
+    pub(super) afni_node_colors: Option<Vec<[f32; 4]>>,
     pub(super) vertex_buffer: wgpu::Buffer,
     pub(super) vertex_bytes_len: usize,
     pub(super) color_buffer: wgpu::Buffer,

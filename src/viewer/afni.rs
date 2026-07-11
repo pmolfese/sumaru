@@ -637,7 +637,9 @@ impl ViewerState {
         // scalar threshold to this already-resolved color cache.
         self.refresh_pick_overlay_value();
         let upload_start = Instant::now();
-        self.upload_surface_buffers();
+        if !self.try_update_afni_gpu_node_colors() {
+            self.upload_surface_buffers();
+        }
         if self.verbose {
             self.log_status(format!(
                 "AFNI RGBA surface buffer update requested in {:.1} ms.",
@@ -669,6 +671,74 @@ impl ViewerState {
         }
 
         Ok(true)
+    }
+
+    /// Patch the resident per-node color buffer for the experimental GPU AFNI
+    /// path. Geometry and index buffers remain untouched. Adjacent changed
+    /// nodes are combined into one queue write.
+    fn try_update_afni_gpu_node_colors(&mut self) -> bool {
+        if !self.gpu_afni_colors_enabled || self.has_both_scene() {
+            return false;
+        }
+        let Some(afni) = self.afni_live_overlay_colors().map(<[_]>::to_vec) else {
+            return false;
+        };
+        let underlay = self.visible_anatomical_shading_colors();
+        let mut colors = afni_colors_over_underlay(
+            &afni,
+            underlay.as_deref().map(Vec::as_slice),
+            self.controller.display.afni_uncolored_nodes_transparent,
+        );
+        if let Some(roi) = self.visible_roi_layer() {
+            for (index, color) in colors.iter_mut().enumerate() {
+                *color = mesh::compose_vertex_color(
+                    *color,
+                    None,
+                    1.0,
+                    roi.appearance.node_colors.get(index).copied().flatten(),
+                );
+            }
+        }
+
+        let Some(buffers) = self.surface_buffers.as_mut() else {
+            return false;
+        };
+        let Some(previous) = buffers.afni_node_colors.as_mut() else {
+            return false;
+        };
+        if previous.len() != colors.len()
+            || buffers.color_bytes_len != colors.len() * PREPARED_COLOR_BYTES
+        {
+            return false;
+        }
+
+        let mut start = None;
+        let mut writes = 0usize;
+        for index in 0..=colors.len() {
+            let changed = index < colors.len() && previous[index] != colors[index];
+            match (start, changed) {
+                (None, true) => start = Some(index),
+                (Some(range_start), false) => {
+                    let bytes = mesh::color_bytes(colors[range_start..index].iter().copied());
+                    self.queue.write_buffer(
+                        &buffers.color_buffer,
+                        (range_start * PREPARED_COLOR_BYTES) as wgpu::BufferAddress,
+                        &bytes,
+                    );
+                    previous[range_start..index].copy_from_slice(&colors[range_start..index]);
+                    start = None;
+                    writes += 1;
+                }
+                _ => {}
+            }
+        }
+        if self.verbose {
+            self.log_status(format!(
+                "Patched persistent AFNI GPU node colors with {writes} buffer write{}.",
+                if writes == 1 { "" } else { "s" }
+            ));
+        }
+        true
     }
 
     fn defer_afni_rgba_overlay(&mut self, overlay: AfniRgbaOverlay) {

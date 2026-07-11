@@ -15,7 +15,7 @@ use crate::command::{
 };
 use crate::io::{
     NimlData, NimlElement, NimlNumericMatrix, NimlValueType, binary_payload_len, element_is_binary,
-    parse_attrs, parse_niml_bytes, serialize_niml_ascii,
+    parse_attrs, parse_niml_bytes, serialize_niml_binary,
 };
 use crate::niml_debug::{NimlDirection, NimlRecorder};
 use crate::surface::{SurfaceMesh, ValueRange};
@@ -978,11 +978,11 @@ fn write_afni_elements(
     verbose: bool,
     recorder: Option<&NimlRecorder>,
 ) -> Result<()> {
-    let payload = serialize_niml_ascii(elements);
+    let payload = serialize_niml_binary(elements)?;
     log_niml_elements(verbose, "tx", elements, payload.len());
     let write_start = Instant::now();
     stream
-        .write_all(payload.as_bytes())
+        .write_all(&payload)
         .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
     stream
         .flush()
@@ -996,7 +996,7 @@ fn write_afni_elements(
         );
     }
     if let Some(recorder) = recorder {
-        recorder.record_payload(NimlDirection::Tx, payload.as_bytes())?;
+        recorder.record_payload(NimlDirection::Tx, &payload)?;
     }
     Ok(())
 }

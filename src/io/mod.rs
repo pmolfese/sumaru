@@ -77,7 +77,7 @@ mod tests {
     use super::{
         NimlData, NimlDatasetPayload, NimlElement, NimlMixedTable, NimlNumericMatrix, NimlValue,
         NimlValueType, expand_niml_type, niml_reference_checks, parse_niml_bytes, parse_niml_str,
-        read_niml_dset_str, read_niml_roi_str, serialize_niml_ascii,
+        read_niml_dset_str, read_niml_roi_str, serialize_niml_ascii, serialize_niml_binary,
     };
     use crate::color::Rgba;
     use crate::dataset::{ColumnData, ColumnRole, DatasetKind};
@@ -571,5 +571,39 @@ mod tests {
 
         assert!(text.contains("ni_form=\"ni_group\""));
         assert!(text.contains("ni_type=\"int\""));
+    }
+
+    #[test]
+    fn numeric_element_roundtrips_through_binary_niml() {
+        let matrix = NimlNumericMatrix::from_rows(
+            vec![
+                NimlValueType::Int32,
+                NimlValueType::Float32,
+                NimlValueType::UInt8,
+            ],
+            vec![vec![7.0, 1.25, 255.0], vec![-2.0, -3.5, 4.0]],
+        )
+        .unwrap();
+        let element = NimlElement::numeric("SUMA_test", Default::default(), matrix);
+
+        let bytes = serialize_niml_binary(std::slice::from_ref(&element)).unwrap();
+        let parsed = parse_niml_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, element.name);
+        assert_eq!(parsed[0].data, element.data);
+        assert!(bytes.windows(6).any(|window| window == b"binary"));
+    }
+
+    #[test]
+    fn binary_serializer_leaves_text_elements_ascii() {
+        let element = NimlElement::text("ni_do", Default::default(), "REDRAW");
+        let bytes = serialize_niml_binary(std::slice::from_ref(&element)).unwrap();
+
+        let parsed = parse_niml_bytes(&bytes).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, element.name);
+        assert_eq!(parsed[0].data, element.data);
+        assert!(!bytes.windows(6).any(|window| window == b"binary"));
     }
 }
