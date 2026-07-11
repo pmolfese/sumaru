@@ -4,6 +4,59 @@
 
 use super::*;
 
+const AFNI_GPU_PATCH_MERGE_GAP_NODES: usize = 64;
+const AFNI_GPU_PATCH_MAX_WRITES: usize = 1024;
+const AFNI_GPU_PATCH_MAX_FRACTION: usize = 2;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum AfniGpuColorUploadPlan {
+    None,
+    Ranges(Vec<std::ops::Range<usize>>),
+    Full,
+}
+
+pub(super) fn afni_gpu_color_upload_plan(
+    previous: &[[f32; 4]],
+    colors: &[[f32; 4]],
+) -> AfniGpuColorUploadPlan {
+    if previous.len() != colors.len() {
+        return AfniGpuColorUploadPlan::Full;
+    }
+
+    let mut ranges = Vec::<std::ops::Range<usize>>::new();
+    let mut start = None;
+    for index in 0..=colors.len() {
+        let changed = index < colors.len() && previous[index] != colors[index];
+        match (start, changed) {
+            (None, true) => start = Some(index),
+            (Some(range_start), false) => {
+                let next = range_start..index;
+                if let Some(last) = ranges.last_mut()
+                    && next.start.saturating_sub(last.end) <= AFNI_GPU_PATCH_MERGE_GAP_NODES
+                {
+                    last.end = next.end;
+                } else {
+                    ranges.push(next);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if ranges.is_empty() {
+        return AfniGpuColorUploadPlan::None;
+    }
+
+    let upload_nodes = ranges.iter().map(|range| range.len()).sum::<usize>();
+    if ranges.len() > AFNI_GPU_PATCH_MAX_WRITES
+        || upload_nodes.saturating_mul(AFNI_GPU_PATCH_MAX_FRACTION) >= colors.len()
+    {
+        AfniGpuColorUploadPlan::Full
+    } else {
+        AfniGpuColorUploadPlan::Ranges(ranges)
+    }
+}
+
 impl ViewerState {
     fn reset_afni_surface_registration_state(&mut self) {
         self.afni_session = AfniNimlSession::new();
@@ -712,29 +765,34 @@ impl ViewerState {
             return false;
         }
 
-        let mut start = None;
-        let mut writes = 0usize;
-        for index in 0..=colors.len() {
-            let changed = index < colors.len() && previous[index] != colors[index];
-            match (start, changed) {
-                (None, true) => start = Some(index),
-                (Some(range_start), false) => {
-                    let bytes = mesh::color_bytes(colors[range_start..index].iter().copied());
+        let plan = afni_gpu_color_upload_plan(previous, &colors);
+        let (writes, uploaded_nodes, mode) = match plan {
+            AfniGpuColorUploadPlan::None => (0, 0, "unchanged"),
+            AfniGpuColorUploadPlan::Full => {
+                let bytes = mesh::color_bytes(colors.iter().copied());
+                self.queue.write_buffer(&buffers.color_buffer, 0, &bytes);
+                previous.copy_from_slice(&colors);
+                (1, colors.len(), "bulk")
+            }
+            AfniGpuColorUploadPlan::Ranges(ranges) => {
+                let writes = ranges.len();
+                let uploaded_nodes = ranges.iter().map(|range| range.len()).sum();
+                for range in ranges {
+                    let bytes = mesh::color_bytes(colors[range.clone()].iter().copied());
                     self.queue.write_buffer(
                         &buffers.color_buffer,
-                        (range_start * PREPARED_COLOR_BYTES) as wgpu::BufferAddress,
+                        (range.start * PREPARED_COLOR_BYTES) as wgpu::BufferAddress,
                         &bytes,
                     );
-                    previous[range_start..index].copy_from_slice(&colors[range_start..index]);
-                    start = None;
-                    writes += 1;
+                    previous[range.clone()].copy_from_slice(&colors[range]);
                 }
-                _ => {}
+                (writes, uploaded_nodes, "sparse")
             }
-        }
+        };
         if self.verbose {
             self.log_status(format!(
-                "Patched persistent AFNI GPU node colors with {writes} buffer write{}.",
+                "Patched persistent AFNI GPU node colors in {mode} mode: \
+                 {writes} buffer write{}, {uploaded_nodes} uploaded nodes.",
                 if writes == 1 { "" } else { "s" }
             ));
         }

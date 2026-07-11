@@ -8140,6 +8140,43 @@ mod tests {
     }
 
     #[test]
+    fn afni_gpu_color_upload_planner_skips_unchanged_colors() {
+        let colors = vec![[0.0, 0.0, 0.0, 1.0]; 128];
+        assert_eq!(
+            super::afni::afni_gpu_color_upload_plan(&colors, &colors),
+            super::afni::AfniGpuColorUploadPlan::None
+        );
+    }
+
+    #[test]
+    fn afni_gpu_color_upload_planner_keeps_small_sparse_patches() {
+        let previous = vec![[0.0, 0.0, 0.0, 1.0]; 1024];
+        let mut colors = previous.clone();
+        colors[10] = [1.0, 0.0, 0.0, 1.0];
+        colors[20] = [0.0, 1.0, 0.0, 1.0];
+        colors[500] = [0.0, 0.0, 1.0, 1.0];
+
+        assert_eq!(
+            super::afni::afni_gpu_color_upload_plan(&previous, &colors),
+            super::afni::AfniGpuColorUploadPlan::Ranges(vec![10..21, 500..501])
+        );
+    }
+
+    #[test]
+    fn afni_gpu_color_upload_planner_uses_bulk_for_fragmented_changes() {
+        let previous = vec![[0.0, 0.0, 0.0, 1.0]; 4096];
+        let mut colors = previous.clone();
+        for index in (0..colors.len()).step_by(2) {
+            colors[index] = [1.0, 0.0, 0.0, 1.0];
+        }
+
+        assert_eq!(
+            super::afni::afni_gpu_color_upload_plan(&previous, &colors),
+            super::afni::AfniGpuColorUploadPlan::Full
+        );
+    }
+
+    #[test]
     fn afni_route_coalescing_keeps_latest_rgba_per_surface() {
         fn rgba(surface: &str, parent: Option<&str>, red: u8) -> AfniRouteAction {
             AfniRouteAction::RgbaOverlay(AfniRgbaOverlay {
