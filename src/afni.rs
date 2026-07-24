@@ -34,7 +34,6 @@ const AFNI_VERBOSE_READ_PROGRESS_STEP: usize = 8 * 1024 * 1024;
 const AFNI_MESSAGE_EVENT_CAPACITY: usize = 1;
 const AFNI_KEEP_READING_PROCINS: &str = "<?keep_reading ?>\n";
 const AFNI_PAUSE_READING_PROCINS: &str = "<?pause_reading ?>\n";
-const AFNI_REDISPLAY_PROCINS: &str = "<?drive_afni cmd='REDISPLAY' ?>\n";
 
 const AFNI_PORT_NAMES: &[&str] = &[
     "AFNI_SUMA_NIML",
@@ -216,10 +215,6 @@ enum AfniConnectionControlEvent {
 #[derive(Debug)]
 enum AfniWriteCommand {
     Elements(Vec<NimlElement>),
-    ProcessingInstruction {
-        payload: String,
-        label: String,
-    },
     SurfaceRegistration {
         mesh: Arc<SurfaceMesh>,
         info: AfniSurfaceInfo,
@@ -333,30 +328,6 @@ impl AfniConnection {
     pub fn send_elements(&mut self, elements: &[NimlElement]) -> Result<()> {
         self.writer_sender
             .send(AfniWriteCommand::Elements(elements.to_vec()))
-            .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
-    }
-
-    pub fn send_elements_after(&mut self, elements: &[NimlElement], delay: Duration) -> Result<()> {
-        let writer_sender = self.writer_sender.clone();
-        let elements = elements.to_vec();
-        thread::Builder::new()
-            .name("afni-delayed-write".to_string())
-            .spawn(move || {
-                thread::sleep(delay);
-                let _ = writer_sender.send(AfniWriteCommand::Elements(elements));
-            })
-            .map(|_| ())
-            .map_err(|error| {
-                anyhow::anyhow!("could not schedule delayed AFNI/SUMA NIML write: {error}")
-            })
-    }
-
-    pub fn send_redisplay_request(&mut self) -> Result<()> {
-        self.writer_sender
-            .send(AfniWriteCommand::ProcessingInstruction {
-                payload: AFNI_REDISPLAY_PROCINS.to_string(),
-                label: "drive_afni REDISPLAY".to_string(),
-            })
             .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
     }
 
@@ -969,15 +940,6 @@ fn write_afni_stream(
         let result = match command {
             AfniWriteCommand::Elements(elements) => {
                 write_afni_elements(&mut stream, &elements, verbose, recorder.as_ref())
-            }
-            AfniWriteCommand::ProcessingInstruction { payload, label } => {
-                write_afni_processing_instruction(
-                    &mut stream,
-                    &payload,
-                    &label,
-                    verbose,
-                    recorder.as_ref(),
-                )
             }
             AfniWriteCommand::SurfaceRegistration { mesh, info } => (|| -> Result<()> {
                 write_afni_processing_instruction(

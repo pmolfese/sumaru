@@ -8,17 +8,6 @@ use crate::afni::switch_underlay_command_for_surface;
 const AFNI_GPU_PATCH_MERGE_GAP_NODES: usize = 64;
 const AFNI_GPU_PATCH_MAX_WRITES: usize = 1024;
 const AFNI_GPU_PATCH_MAX_FRACTION: usize = 2;
-const AFNI_REDRAW_RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_secs(2),
-    Duration::from_secs(6),
-    Duration::from_secs(15),
-];
-
-struct AfniRedrawCrosshairNudge {
-    pick: SurfacePick,
-    source: &'static str,
-    surface_nodes: usize,
-}
 
 fn afni_optional_label(value: Option<&str>) -> &str {
     value.filter(|value| !value.is_empty()).unwrap_or("<none>")
@@ -99,7 +88,7 @@ impl ViewerState {
         self.afni_session = AfniNimlSession::new();
         self.pending_afni_surface_registrations.clear();
         self.registered_afni_scene_components.clear();
-        self.pending_afni_redraw_after_registrations = false;
+        self.pending_afni_post_registration_underlay = false;
     }
 
     /// Connect if disconnected, disconnect if connected.
@@ -223,7 +212,7 @@ impl ViewerState {
                 "Queued {queued_count} surface registration{} for AFNI/SUMA.",
                 if queued_count == 1 { "" } else { "s" }
             ));
-            self.pending_afni_redraw_after_registrations = true;
+            self.pending_afni_post_registration_underlay = true;
             self.process_pending_afni_surface_registrations()?;
         } else if force {
             self.log_status("No new surface geometry needed to be sent to AFNI/SUMA.");
@@ -394,72 +383,6 @@ impl ViewerState {
         Ok(queued_count)
     }
 
-    /// Send a `SUMA_crosshair_xyz` to prompt AFNI to resend its colorization for
-    /// the active surfaces. Targets, in order: the current selection, the last
-    /// crosshair we sent, AFNI's most recently reported crosshair, and finally
-    /// the node nearest the brain's center to trigger an initial draw when none
-    /// of those exist yet.
-    pub(super) fn send_afni_redraw_crosshair(&mut self) {
-        if self.afni_connection.is_none() {
-            if self.verbose {
-                self.log_status("AFNI verbose: redraw nudge skipped; no AFNI connection.");
-            }
-            return;
-        }
-        let Some(nudge) = self.afni_redraw_crosshair_nudge() else {
-            return;
-        };
-        self.log_afni_redraw_crosshair_nudge("sending redraw nudge", &nudge);
-        if let Err(error) = self.send_afni_crosshair_for_pick(nudge.pick) {
-            self.set_error(error);
-        }
-    }
-
-    fn send_afni_redraw_crosshair_after_registrations(&mut self) {
-        self.send_afni_redisplay_request_after_registrations();
-        self.send_afni_redraw_crosshair();
-
-        let Some(nudge) = self.afni_redraw_crosshair_nudge() else {
-            return;
-        };
-        let element = match self.afni_crosshair_element_for_pick(nudge.pick) {
-            Ok(Some(element)) => element,
-            Ok(None) => {
-                if self.verbose {
-                    self.log_status(format!(
-                        "AFNI verbose: delayed redraw retries skipped; could not map node {} to an AFNI/SUMA surface crosshair.",
-                        nudge.pick.node_index
-                    ));
-                }
-                return;
-            }
-            Err(error) => {
-                self.set_error(error);
-                return;
-            }
-        };
-        for delay in AFNI_REDRAW_RETRY_DELAYS {
-            let result = self.afni_connection.as_mut().map(|connection| {
-                connection.send_elements_after(std::slice::from_ref(&element), delay)
-            });
-            let Some(result) = result else {
-                return;
-            };
-            if let Err(error) = result {
-                self.set_error(error);
-                return;
-            }
-            if self.verbose {
-                self.log_status(format!(
-                    "AFNI verbose: queued delayed redraw nudge in {:.1}s for node {} from {}.",
-                    delay.as_secs_f32(),
-                    nudge.pick.node_index,
-                    nudge.source
-                ));
-            }
-        }
-    }
-
     fn send_afni_switch_underlay_after_registrations(&mut self, info: &AfniSurfaceInfo) {
         let Some(command) = switch_underlay_command_for_surface(info) else {
             if self.verbose {
@@ -483,82 +406,6 @@ impl ViewerState {
         };
         if let Err(error) = connection.send_drive_afni_command(command) {
             self.set_error(error);
-        }
-    }
-
-    fn send_afni_redisplay_request_after_registrations(&mut self) {
-        if self.afni_connection.is_none() {
-            if self.verbose {
-                self.log_status("AFNI verbose: redisplay request skipped; no AFNI connection.");
-            }
-            return;
-        }
-        if self.verbose {
-            self.log_status(
-                "AFNI verbose: sending drive_afni REDISPLAY after surface registrations.",
-            );
-        }
-        let Some(connection) = self.afni_connection.as_mut() else {
-            return;
-        };
-        if let Err(error) = connection.send_redisplay_request() {
-            self.set_error(error);
-        }
-    }
-
-    fn afni_redraw_crosshair_nudge(&mut self) -> Option<AfniRedrawCrosshairNudge> {
-        let Some(mesh) = self.mesh.as_ref() else {
-            if self.verbose {
-                self.log_status("AFNI verbose: redraw nudge skipped; no active mesh.");
-            }
-            return None;
-        };
-        if mesh.vertices.is_empty() {
-            if self.verbose {
-                self.log_status("AFNI verbose: redraw nudge skipped; active mesh has no vertices.");
-            }
-            return None;
-        }
-        let pick_node = self.controller.interaction.pick.map(|pick| pick.node_index);
-        let center_node = node_nearest_bounds_center(mesh);
-        let (node, source) = if let Some(node) = pick_node {
-            (node, "current pick")
-        } else if let Some(node) = self.sent_crosshair_node {
-            (node, "last sent crosshair")
-        } else if let Some(node) = self.afni_crosshair_node {
-            (node, "last AFNI crosshair")
-        } else if let Some(node) = center_node {
-            (node, "bounds center")
-        } else {
-            (0, "fallback zero")
-        };
-        let Some(pick) = surface_pick_for_mesh_node(mesh, self.overlay.data.node_values(), node)
-        else {
-            if self.verbose {
-                self.log_status(format!(
-                    "AFNI verbose: redraw nudge skipped; node {node} from {source} has no containing face."
-                ));
-            }
-            return None;
-        };
-        Some(AfniRedrawCrosshairNudge {
-            pick,
-            source,
-            surface_nodes: mesh.vertices.len(),
-        })
-    }
-
-    fn log_afni_redraw_crosshair_nudge(&mut self, action: &str, nudge: &AfniRedrawCrosshairNudge) {
-        if self.verbose {
-            self.log_status(format!(
-                "AFNI verbose: {action} from {} node={} xyz=[{:.3}, {:.3}, {:.3}] surface_nodes={}.",
-                nudge.source,
-                nudge.pick.node_index,
-                nudge.pick.surface_position[0],
-                nudge.pick.surface_position[1],
-                nudge.pick.surface_position[2],
-                nudge.surface_nodes
-            ));
         }
     }
 
@@ -1379,15 +1226,11 @@ impl ViewerState {
         }
 
         if self.pending_afni_surface_registrations.is_empty() {
-            if self.pending_afni_redraw_after_registrations {
-                self.pending_afni_redraw_after_registrations = false;
-                // Nudge AFNI to redraw the overlay for the freshly registered
-                // surfaces so the connection is visibly live without waiting
-                // for the user to click.
+            if self.pending_afni_post_registration_underlay {
+                self.pending_afni_post_registration_underlay = false;
                 if let Some(info) = last_completed_surface_info.as_ref() {
                     self.send_afni_switch_underlay_after_registrations(info);
                 }
-                self.send_afni_redraw_crosshair_after_registrations();
             }
         } else {
             self.request_afni_work();

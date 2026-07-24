@@ -1252,7 +1252,7 @@ struct ViewerState {
     afni_recorder: Option<NimlRecorder>,
     pending_afni_surface_registrations: VecDeque<PendingAfniSurfaceRegistration>,
     registered_afni_scene_components: HashSet<(usize, usize)>,
-    pending_afni_redraw_after_registrations: bool,
+    pending_afni_post_registration_underlay: bool,
     pending_afni_messages: VecDeque<AfniIncomingMessage>,
     pending_cell_color_upload: Option<PendingCellColorUpload>,
     deferred_afni_rgba_overlays: Vec<AfniRgbaOverlay>,
@@ -1675,7 +1675,7 @@ impl ViewerState {
             afni_recorder,
             pending_afni_surface_registrations: VecDeque::new(),
             registered_afni_scene_components: HashSet::new(),
-            pending_afni_redraw_after_registrations: false,
+            pending_afni_post_registration_underlay: false,
             pending_afni_messages: VecDeque::new(),
             pending_cell_color_upload: None,
             deferred_afni_rgba_overlays: Vec::new(),
@@ -4836,21 +4836,6 @@ fn paired_component_for_node<'a>(
     let right_nodes = right.mesh.as_ref()?.vertices.len() as u32;
     let right_limit = left_nodes.checked_add(right_nodes)?;
     (node_index < right_limit).then_some(right)
-}
-
-/// Node closest to the surface's bounding-box center (½ x, ½ y, ½ z), used as
-/// the default crosshair target when nothing has been picked yet.
-fn node_nearest_bounds_center(mesh: &SurfaceMesh) -> Option<u32> {
-    let center = Vec3::from_array(mesh.bounds.center);
-    mesh.vertices
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| {
-            let left = Vec3::from_array(**left).distance_squared(center);
-            let right = Vec3::from_array(**right).distance_squared(center);
-            left.total_cmp(&right)
-        })
-        .and_then(|(index, _)| u32::try_from(index).ok())
 }
 
 fn surface_pick_for_mesh_node(
