@@ -33,6 +33,7 @@ const AFNI_VERBOSE_READ_PROGRESS_STEP: usize = 8 * 1024 * 1024;
 const AFNI_MESSAGE_EVENT_CAPACITY: usize = 1;
 const AFNI_KEEP_READING_PROCINS: &str = "<?keep_reading ?>\n";
 const AFNI_PAUSE_READING_PROCINS: &str = "<?pause_reading ?>\n";
+const AFNI_REDISPLAY_PROCINS: &str = "<?drive_afni cmd='REDISPLAY' ?>\n";
 
 const AFNI_PORT_NAMES: &[&str] = &[
     "AFNI_SUMA_NIML",
@@ -213,6 +214,10 @@ enum AfniConnectionControlEvent {
 #[derive(Debug)]
 enum AfniWriteCommand {
     Elements(Vec<NimlElement>),
+    ProcessingInstruction {
+        payload: String,
+        label: String,
+    },
     SurfaceRegistration {
         mesh: Arc<SurfaceMesh>,
         info: AfniSurfaceInfo,
@@ -327,6 +332,34 @@ impl AfniConnection {
         self.writer_sender
             .send(AfniWriteCommand::Elements(elements.to_vec()))
             .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
+    }
+
+    pub fn send_elements_after(&mut self, elements: &[NimlElement], delay: Duration) -> Result<()> {
+        let writer_sender = self.writer_sender.clone();
+        let elements = elements.to_vec();
+        thread::Builder::new()
+            .name("afni-delayed-write".to_string())
+            .spawn(move || {
+                thread::sleep(delay);
+                let _ = writer_sender.send(AfniWriteCommand::Elements(elements));
+            })
+            .map(|_| ())
+            .map_err(|error| {
+                anyhow::anyhow!("could not schedule delayed AFNI/SUMA NIML write: {error}")
+            })
+    }
+
+    pub fn send_redisplay_request(&mut self) -> Result<()> {
+        self.writer_sender
+            .send(AfniWriteCommand::ProcessingInstruction {
+                payload: AFNI_REDISPLAY_PROCINS.to_string(),
+                label: "drive_afni REDISPLAY".to_string(),
+            })
+            .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
+    }
+
+    pub fn send_drive_afni_command(&mut self, command: impl Into<String>) -> Result<()> {
+        self.send_elements(&[drive_afni_command_element(command)])
     }
 
     pub fn send_surface_registration(
@@ -934,6 +967,15 @@ fn write_afni_stream(
             AfniWriteCommand::Elements(elements) => {
                 write_afni_elements(&mut stream, &elements, verbose, recorder.as_ref())
             }
+            AfniWriteCommand::ProcessingInstruction { payload, label } => {
+                write_afni_processing_instruction(
+                    &mut stream,
+                    &payload,
+                    &label,
+                    verbose,
+                    recorder.as_ref(),
+                )
+            }
             AfniWriteCommand::SurfaceRegistration { mesh, info } => (|| -> Result<()> {
                 write_afni_processing_instruction(
                     &mut stream,
@@ -1137,6 +1179,15 @@ pub fn surface_crosshair_element(
         "domain_parent_idcode".to_string(),
         info.local_domain_parent_id.clone(),
     );
+    attrs.insert("Parent_ID".to_string(), info.local_domain_parent_id.clone());
+    attrs.insert(
+        "local_domain_parent_ID".to_string(),
+        info.local_domain_parent_id.clone(),
+    );
+    attrs.insert(
+        "local_domain_parent".to_string(),
+        info.local_domain_parent.clone(),
+    );
     attrs.insert("surface_label".to_string(), info.surface_label.clone());
     push_opt_attr(&mut attrs, "volume_idcode", info.volume_idcode.as_deref());
 
@@ -1150,6 +1201,40 @@ pub fn surface_crosshair_element(
         ],
     )
     .map(|matrix| NimlElement::numeric("SUMA_crosshair_xyz", attrs, matrix))
+}
+
+pub fn switch_underlay_command_for_surface(info: &AfniSurfaceInfo) -> Option<String> {
+    afni_surface_volume_driver_target(info).map(|target| format!("SWITCH_UNDERLAY A.{target}"))
+}
+
+fn drive_afni_command_element(command: impl Into<String>) -> NimlElement {
+    let mut attrs = BTreeMap::new();
+    attrs.insert("ni_verb".to_string(), "DRIVE_AFNI".to_string());
+    attrs.insert("ni_object".to_string(), command.into());
+    NimlElement {
+        name: "ni_do".to_string(),
+        attrs,
+        data: NimlData::None,
+    }
+}
+
+fn afni_surface_volume_driver_target(info: &AfniSurfaceInfo) -> Option<String> {
+    info.volume_idcode
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            info.volume_headname
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            info.volume_filecode
+                .as_deref()
+                .and_then(|path| Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .filter(|value| !value.is_empty())
+        })
+        .map(ToString::to_string)
 }
 
 pub fn parse_incoming_message(element: &NimlElement) -> Result<Option<AfniIncomingMessage>> {
@@ -1388,27 +1473,31 @@ impl AfniRgbaOverlay {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("SUMA_irgba is missing surface_idcode"))?
             .to_string();
-        let NimlData::Numeric(matrix) = &element.data else {
-            bail!("SUMA_irgba must carry a numeric matrix");
-        };
-        ensure!(
-            matrix.column_count() >= 5,
-            "SUMA_irgba needs at least node,r,g,b,a columns"
-        );
+        let (node_indices, rgba) = match &element.data {
+            NimlData::None => (Vec::new(), Vec::new()),
+            NimlData::Numeric(matrix) => {
+                ensure!(
+                    matrix.column_count() >= 5,
+                    "SUMA_irgba needs at least node,r,g,b,a columns"
+                );
 
-        let mut node_indices = Vec::with_capacity(matrix.rows);
-        let mut rgba = Vec::with_capacity(matrix.rows);
-        for row in 0..matrix.rows {
-            let node = matrix.get(row, 0).unwrap_or(0.0).round() as i64;
-            ensure!(node >= 0, "SUMA_irgba node index must be non-negative");
-            node_indices.push(node as u32);
-            rgba.push([
-                clamp_u8(matrix.get(row, 1).unwrap_or(0.0)),
-                clamp_u8(matrix.get(row, 2).unwrap_or(0.0)),
-                clamp_u8(matrix.get(row, 3).unwrap_or(0.0)),
-                clamp_u8(matrix.get(row, 4).unwrap_or(0.0)),
-            ]);
-        }
+                let mut node_indices = Vec::with_capacity(matrix.rows);
+                let mut rgba = Vec::with_capacity(matrix.rows);
+                for row in 0..matrix.rows {
+                    let node = matrix.get(row, 0).unwrap_or(0.0).round() as i64;
+                    ensure!(node >= 0, "SUMA_irgba node index must be non-negative");
+                    node_indices.push(node as u32);
+                    rgba.push([
+                        clamp_u8(matrix.get(row, 1).unwrap_or(0.0)),
+                        clamp_u8(matrix.get(row, 2).unwrap_or(0.0)),
+                        clamp_u8(matrix.get(row, 3).unwrap_or(0.0)),
+                        clamp_u8(matrix.get(row, 4).unwrap_or(0.0)),
+                    ]);
+                }
+                (node_indices, rgba)
+            }
+            _ => bail!("SUMA_irgba must carry a numeric matrix or be empty"),
+        };
 
         Ok(Self {
             surface_idcode,
@@ -2076,6 +2165,33 @@ mod tests {
     }
 
     #[test]
+    fn switch_underlay_command_prefers_volume_idcode() {
+        let mesh = SurfaceMesh::new(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0, 1, 2]],
+        )
+        .unwrap();
+        let mut info = AfniSurfaceInfo::from_mesh(&mesh);
+        info.volume_idcode = Some("AFN_volume_id".to_string());
+        info.volume_headname = Some("anat.nii.gz".to_string());
+
+        let command = switch_underlay_command_for_surface(&info).unwrap();
+        let element = drive_afni_command_element(command.clone());
+
+        assert_eq!(command, "SWITCH_UNDERLAY A.AFN_volume_id");
+        assert_eq!(element.name, "ni_do");
+        assert_eq!(
+            element.attrs.get("ni_verb").map(String::as_str),
+            Some("DRIVE_AFNI")
+        );
+        assert_eq!(
+            element.attrs.get("ni_object").map(String::as_str),
+            Some("SWITCH_UNDERLAY A.AFN_volume_id")
+        );
+        assert_eq!(element.data, NimlData::None);
+    }
+
+    #[test]
     fn gifti_surface_registration_flips_lpi_xy_for_afni() {
         let mut mesh = SurfaceMesh::new(
             vec![[0.0, 0.0, 0.0], [10.0, 20.0, 0.0], [0.0, 1.0, 0.0]],
@@ -2152,6 +2268,46 @@ mod tests {
             outcome.actions.as_slice(),
             [AfniRouteAction::RgbaOverlay(AfniRgbaOverlay { surface_idcode, threshold, .. })]
                 if surface_idcode == "surf-1" && threshold.as_deref() == Some("2.5")
+        ));
+    }
+
+    #[test]
+    fn empty_suma_irgba_routes_as_empty_overlay_action() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("surface_idcode".to_string(), "surf-1".to_string());
+        attrs.insert("local_domain_parent_ID".to_string(), "domain-1".to_string());
+        attrs.insert("function_idcode".to_string(), "func".to_string());
+        attrs.insert("threshold".to_string(), "0".to_string());
+        attrs.insert("volume_idcode".to_string(), "vol".to_string());
+        let element = NimlElement {
+            name: "SUMA_irgba".to_string(),
+            attrs,
+            data: NimlData::None,
+        };
+        let message = parse_incoming_message(&element).unwrap().unwrap();
+
+        let mut controller = ControllerState::default();
+        let outcome = route_incoming_message(&mut controller, message);
+
+        assert!(outcome.applied_state);
+        assert!(controller.overlay.visible);
+        assert!(matches!(
+            outcome.actions.as_slice(),
+            [AfniRouteAction::RgbaOverlay(AfniRgbaOverlay {
+                surface_idcode,
+                local_domain_parent_id,
+                node_indices,
+                rgba,
+                threshold,
+                function_idcode,
+                volume_idcode,
+            })] if surface_idcode == "surf-1"
+                && local_domain_parent_id.as_deref() == Some("domain-1")
+                && node_indices.is_empty()
+                && rgba.is_empty()
+                && threshold.as_deref() == Some("0")
+                && function_idcode.as_deref() == Some("func")
+                && volume_idcode.as_deref() == Some("vol")
         ));
     }
 
@@ -2252,6 +2408,22 @@ mod tests {
         assert_eq!(
             element.attrs.get("surface_idcode"),
             Some(&info.surface_idcode)
+        );
+        assert_eq!(
+            element.attrs.get("domain_parent_idcode"),
+            Some(&info.local_domain_parent_id)
+        );
+        assert_eq!(
+            element.attrs.get("Parent_ID"),
+            Some(&info.local_domain_parent_id)
+        );
+        assert_eq!(
+            element.attrs.get("local_domain_parent_ID"),
+            Some(&info.local_domain_parent_id)
+        );
+        assert_eq!(
+            element.attrs.get("local_domain_parent"),
+            Some(&info.local_domain_parent)
         );
         assert_eq!(
             element.attrs.get("volume_idcode"),
