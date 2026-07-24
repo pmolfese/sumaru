@@ -59,22 +59,14 @@ struct Cli {
     #[arg(long = "overlay", value_name = "PATH")]
     overlay: Option<PathBuf>,
 
-    /// Explicit left-hemisphere overlay for both-hemisphere spec launches.
-    #[arg(
-        long = "overlay-lh",
-        value_name = "PATH",
-        conflicts_with = "overlay",
-        requires = "overlay_rh"
-    )]
+    /// Explicit left-hemisphere overlay for a both-hemisphere launch. May be
+    /// used without `--overlay-rh` to leave the right hemisphere uncolored.
+    #[arg(long = "overlay-lh", value_name = "PATH", conflicts_with = "overlay")]
     overlay_lh: Option<PathBuf>,
 
-    /// Explicit right-hemisphere overlay for both-hemisphere spec launches.
-    #[arg(
-        long = "overlay-rh",
-        value_name = "PATH",
-        conflicts_with = "overlay",
-        requires = "overlay_lh"
-    )]
+    /// Explicit right-hemisphere overlay for a both-hemisphere launch. May be
+    /// used without `--overlay-lh` to leave the left hemisphere uncolored.
+    #[arg(long = "overlay-rh", value_name = "PATH", conflicts_with = "overlay")]
     overlay_rh: Option<PathBuf>,
 
     /// Load this SUMA .niml.roi annotation over the active surface.
@@ -99,6 +91,15 @@ struct Cli {
     /// switching between surfaces is instant (slower startup).
     #[arg(long = "preload")]
     preload: bool,
+
+    /// Request the GPU adapter's native maximum buffer size for very large
+    /// surfaces. Off by default to keep portable wgpu limits.
+    #[arg(long = "big-mem")]
+    big_mem: bool,
+
+    /// Enable the experimental GPU AFNI color path for `SUMA_irgba` overlays.
+    #[arg(long = "gpu")]
+    gpu: bool,
 
     /// Deprecated: on-demand spec loading is now the default.
     #[arg(long = "no-preload", hide = true, conflicts_with = "preload")]
@@ -208,6 +209,8 @@ fn main() -> Result<()> {
     validate_onestate_order(&args)?;
     let verbose = cli.verbose;
     let preload = cli.preload && !cli.no_preload;
+    let big_mem = cli.big_mem;
+    let gpu = cli.gpu;
     let subs = cli.subs.map(|subs| subs.0);
     let p_value = cli.p_value;
     let niml_record_path = cli.niml_record;
@@ -268,6 +271,8 @@ fn main() -> Result<()> {
                 overlay_p_value: p_value,
                 verbose,
                 preload,
+                big_mem,
+                gpu,
                 afni,
                 niml_record_path,
             })?;
@@ -286,6 +291,8 @@ fn main() -> Result<()> {
                 &p_value,
                 &niml_record_path,
                 onestate,
+                big_mem,
+                gpu,
             )?;
             if afni_requested {
                 bail!("AFNI connection flags only apply to viewer launches and `niml send`");
@@ -307,6 +314,8 @@ fn main() -> Result<()> {
                 &p_value,
                 &niml_record_path,
                 onestate,
+                big_mem,
+                gpu,
             )?;
             run_niml_command(command, &afni.port_config, verbose)?;
         }
@@ -416,6 +425,8 @@ fn validate_no_viewer_launch_options(
     p_value: &Option<f64>,
     niml_record_path: &Option<PathBuf>,
     onestate: bool,
+    big_mem: bool,
+    gpu: bool,
 ) -> Result<()> {
     if !surface_paths.is_empty()
         || spec.is_some()
@@ -429,6 +440,8 @@ fn validate_no_viewer_launch_options(
         || p_value.is_some()
         || niml_record_path.is_some()
         || onestate
+        || big_mem
+        || gpu
     {
         bail!("viewer launch options and subcommands cannot be mixed");
     }
@@ -441,11 +454,11 @@ fn explicit_overlay_pair(
     right_path: Option<PathBuf>,
 ) -> Option<ExplicitOverlayPair> {
     match (left_path, right_path) {
-        (Some(left_path), Some(right_path)) => Some(ExplicitOverlayPair {
+        (None, None) => None,
+        (left_path, right_path) => Some(ExplicitOverlayPair {
             left_path,
             right_path,
         }),
-        _ => None,
     }
 }
 
@@ -853,11 +866,11 @@ mod tests {
         let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
         assert_eq!(
             overlay_pair.as_ref().map(|pair| &pair.left_path),
-            Some(&PathBuf::from("left.weird.name.niml.dset"))
+            Some(&Some(PathBuf::from("left.weird.name.niml.dset")))
         );
         assert_eq!(
             overlay_pair.as_ref().map(|pair| &pair.right_path),
-            Some(&PathBuf::from("right.other.name.niml.dset"))
+            Some(&Some(PathBuf::from("right.other.name.niml.dset")))
         );
         assert!(
             validate_viewer_launch(
@@ -875,7 +888,57 @@ mod tests {
             .is_ok()
         );
 
-        assert!(Cli::try_parse_from(["sumaru", "--overlay-lh", "left.niml.dset"]).is_err());
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--spec",
+            "scene_both.spec",
+            "--sv",
+            "SurfVol.nii",
+            "--overlay-lh",
+            "left.only.niml.dset",
+        ]);
+        let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
+        assert_eq!(
+            overlay_pair.as_ref().map(|pair| &pair.left_path),
+            Some(&Some(PathBuf::from("left.only.niml.dset")))
+        );
+        assert_eq!(
+            overlay_pair.as_ref().map(|pair| &pair.right_path),
+            Some(&None)
+        );
+        assert!(
+            validate_viewer_launch(
+                &cli.surface_paths,
+                &cli.spec,
+                &None,
+                &None,
+                &cli.surface_volume,
+                &cli.overlay,
+                &overlay_pair,
+                &cli.roi,
+                &cli.subs.map(|subs| subs.0),
+                &cli.p_value,
+            )
+            .is_ok()
+        );
+
+        let cli = Cli::parse_from(["sumaru", "--overlay-lh", "left.niml.dset"]);
+        let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
+        assert!(
+            validate_viewer_launch(
+                &cli.surface_paths,
+                &cli.spec,
+                &None,
+                &None,
+                &cli.surface_volume,
+                &cli.overlay,
+                &overlay_pair,
+                &cli.roi,
+                &cli.subs.map(|subs| subs.0),
+                &cli.p_value,
+            )
+            .is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "sumaru",
@@ -1034,6 +1097,60 @@ mod tests {
                 &None,
                 &Some(PathBuf::from("session.nimlrec")),
                 false,
+                false,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn big_mem_is_a_viewer_only_opt_in() {
+        let cli = Cli::parse_from(["sumaru", "--surface", "surface.gii", "--big-mem"]);
+        assert!(cli.big_mem);
+
+        assert!(
+            validate_no_viewer_launch_options(
+                &[],
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                false,
+                true,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gpu_is_a_viewer_only_opt_in() {
+        let cli = Cli::parse_from(["sumaru", "--surface", "surface.gii", "--gpu"]);
+        assert!(cli.gpu);
+
+        assert!(
+            validate_no_viewer_launch_options(
+                &[],
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                false,
+                false,
+                true,
             )
             .is_err()
         );

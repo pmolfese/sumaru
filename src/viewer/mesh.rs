@@ -1,7 +1,11 @@
+use std::collections::BTreeSet;
+use std::ops::Range;
+
 use glam::Vec3;
 
-use crate::color::ColorMap;
+use crate::color::{ColorMap, stable_label_color};
 use crate::command::OverlayThreshold;
+#[cfg(test)]
 use crate::overlay::Overlay;
 use crate::surface::{SurfaceMesh, ValueRange};
 
@@ -93,6 +97,7 @@ pub(super) struct OverlayAppearance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OverlayColorMap {
+    DiscreteLabels,
     SpectrumRedToBlue,
     SpectrumRedToBlueGap,
     SpectrumYellowToRed,
@@ -119,6 +124,7 @@ impl PreparedSurface {
         Self::from_geometry_with_selection(&geometry, None, overlay, overlay_dim, None, None)
     }
 
+    #[cfg(test)]
     pub(super) fn from_geometry_with_selection(
         geometry: &PreparedGeometry,
         surface_colors: Option<&[[f32; 4]]>,
@@ -180,10 +186,38 @@ impl PreparedSurface {
         roi_colors: Option<&[Option<[f32; 4]>]>,
         selection: Option<SelectionHighlight>,
     ) -> Self {
-        let mut vertices = Vec::with_capacity(geometry.indices.len());
-        let mut indices = Vec::with_capacity(geometry.indices.len());
+        let mut prepared = Self::from_geometry_cell_color_range(
+            geometry,
+            surface_colors,
+            roi_colors,
+            0..geometry.triangle_count(),
+        );
+        if let Some(selection) = selection {
+            append_selection_highlight(
+                &mut prepared.vertices,
+                &mut prepared.indices,
+                geometry,
+                selection,
+            );
+        }
 
-        for triangle in geometry.indices.chunks_exact(3) {
+        prepared
+    }
+
+    pub(super) fn from_geometry_cell_color_range(
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        triangle_range: Range<usize>,
+    ) -> Self {
+        let triangle_count = geometry.triangle_count();
+        let start_triangle = triangle_range.start.min(triangle_count);
+        let end_triangle = triangle_range.end.min(triangle_count).max(start_triangle);
+        let triangle_indices = &geometry.indices[start_triangle * 3..end_triangle * 3];
+        let mut vertices = Vec::with_capacity(triangle_indices.len());
+        let mut indices = Vec::with_capacity(triangle_indices.len());
+
+        for triangle in triangle_indices.chunks_exact(3) {
             let face_color = cell_color_for_triangle(triangle, surface_colors, roi_colors);
             let start = vertices.len() as u32;
             for index in triangle {
@@ -200,9 +234,16 @@ impl PreparedSurface {
             }
         }
 
-        if let Some(selection) = selection {
-            append_selection_highlight(&mut vertices, &mut indices, geometry, selection);
-        }
+        Self { vertices, indices }
+    }
+
+    pub(super) fn selection_highlight(
+        geometry: &PreparedGeometry,
+        selection: SelectionHighlight,
+    ) -> Self {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        append_selection_highlight(&mut vertices, &mut indices, geometry, selection);
 
         Self { vertices, indices }
     }
@@ -212,15 +253,36 @@ impl PreparedSurface {
     }
 
     pub(super) fn vertex_bytes(&self) -> Vec<u8> {
-        let mut floats = Vec::with_capacity(self.vertices.len() * 10);
+        let mut floats = Vec::with_capacity(self.vertices.len() * 6);
 
         for vertex in &self.vertices {
             floats.extend_from_slice(&vertex.position);
             floats.extend_from_slice(&vertex.normal);
-            floats.extend_from_slice(&vertex.color);
         }
 
         super::f32_bytes(&floats)
+    }
+
+    pub(super) fn color_bytes(&self) -> Vec<u8> {
+        prepared_vertex_color_bytes(self.vertices.iter().map(|vertex| vertex.color))
+    }
+
+    pub(super) fn cell_color_bytes_for_range(
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        triangle_range: Range<usize>,
+    ) -> Vec<u8> {
+        let triangle_count = geometry.triangle_count();
+        let start_triangle = triangle_range.start.min(triangle_count);
+        let end_triangle = triangle_range.end.min(triangle_count).max(start_triangle);
+        let triangle_indices = &geometry.indices[start_triangle * 3..end_triangle * 3];
+        let colors = triangle_indices.chunks_exact(3).flat_map(|triangle| {
+            let face_color = cell_color_for_triangle(triangle, surface_colors, roi_colors);
+            [face_color; 3]
+        });
+
+        prepared_vertex_color_bytes(colors)
     }
 
     pub(super) fn index_bytes(&self) -> Vec<u8> {
@@ -232,6 +294,60 @@ impl PreparedSurface {
 
         bytes
     }
+
+    pub(super) fn line_index_count(&self) -> u32 {
+        self.line_indices().len() as u32
+    }
+
+    pub(super) fn line_index_bytes(&self) -> Vec<u8> {
+        indices_to_bytes(&self.line_indices())
+    }
+
+    pub(super) fn point_index_count(&self) -> u32 {
+        self.vertices.len() as u32
+    }
+
+    pub(super) fn point_index_bytes(&self) -> Vec<u8> {
+        let indices = progressive_point_indices(self.vertices.len() as u32);
+        indices_to_bytes(&indices)
+    }
+
+    fn line_indices(&self) -> Vec<u32> {
+        let mut seen = BTreeSet::new();
+        let mut indices = Vec::new();
+
+        for triangle in self.indices.chunks_exact(3) {
+            for &(a, b) in &[
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ] {
+                let edge = normalized_edge(a, b);
+                if seen.insert(edge) {
+                    indices.extend_from_slice(&[a, b]);
+                }
+            }
+        }
+
+        indices
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.vertices.is_empty() || self.indices.is_empty()
+    }
+}
+
+fn prepared_vertex_color_bytes(colors: impl Iterator<Item = [f32; 4]>) -> Vec<u8> {
+    let mut floats = Vec::new();
+    for color in colors {
+        floats.extend_from_slice(&color);
+    }
+
+    super::f32_bytes(&floats)
+}
+
+pub(super) fn color_bytes(colors: impl Iterator<Item = [f32; 4]>) -> Vec<u8> {
+    prepared_vertex_color_bytes(colors)
 }
 
 impl RoiAppearance {
@@ -378,6 +494,32 @@ fn append_crosshair_marker(
 }
 
 impl PreparedGeometry {
+    pub(super) fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+
+    #[cfg(test)]
+    pub(super) fn flat_color_triangle_index_bytes(
+        &self,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+    ) -> Vec<u8> {
+        let mut indices = Vec::with_capacity(self.indices.len());
+        for triangle in self.indices.chunks_exact(3) {
+            match cell_color_source_slot_for_triangle(triangle, surface_colors, roi_colors) {
+                // WGSL flat interpolation sources the first vertex of the
+                // primitive, so rotate each triangle to put the chosen AFNI
+                // face-color source first while preserving winding.
+                0 => indices.extend_from_slice(triangle),
+                1 => indices.extend_from_slice(&[triangle[1], triangle[2], triangle[0]]),
+                2 => indices.extend_from_slice(&[triangle[2], triangle[0], triangle[1]]),
+                _ => unreachable!("triangle color source slot must be 0..=2"),
+            }
+        }
+
+        indices_to_bytes(&indices)
+    }
+
     pub(super) fn from_surface(surface: &SurfaceMesh) -> Self {
         let normals = surface.vertex_normals();
         let center = Vec3::from_array(surface.bounds.center);
@@ -406,6 +548,28 @@ impl PreparedGeometry {
     }
 }
 
+pub(super) fn cell_color_chunk_ranges(
+    triangle_count: usize,
+    max_triangles_per_chunk: usize,
+) -> Vec<Range<usize>> {
+    if triangle_count == 0 {
+        return Vec::new();
+    }
+
+    let max_triangles_per_chunk = max_triangles_per_chunk.max(1);
+    let mut ranges = Vec::with_capacity(triangle_count.div_ceil(max_triangles_per_chunk));
+    let mut start = 0;
+    while start < triangle_count {
+        let end = start
+            .saturating_add(max_triangles_per_chunk)
+            .min(triangle_count);
+        ranges.push(start..end);
+        start = end;
+    }
+
+    ranges
+}
+
 impl OverlayAppearance {
     pub(super) fn from_range(range: ValueRange) -> Self {
         Self {
@@ -425,7 +589,8 @@ impl OverlayAppearance {
 }
 
 impl OverlayColorMap {
-    pub(super) const ALL: [Self; 13] = [
+    pub(super) const ALL: [Self; 14] = [
+        Self::DiscreteLabels,
         Self::SpectrumRedToBlue,
         Self::SpectrumRedToBlueGap,
         Self::SpectrumYellowToRed,
@@ -443,6 +608,7 @@ impl OverlayColorMap {
 
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::DiscreteLabels => "discrete labels",
             Self::SpectrumRedToBlue => "Spectrum:red_to_blue",
             Self::SpectrumRedToBlueGap => "Spectrum:red_to_blue+gap",
             Self::SpectrumYellowToRed => "Spectrum:yellow_to_red",
@@ -459,23 +625,54 @@ impl OverlayColorMap {
         }
     }
 
-    pub(super) fn to_color_map(self) -> ColorMap {
+    pub(super) fn continuous_color_map(self) -> Option<ColorMap> {
         match self {
-            Self::SpectrumRedToBlue => ColorMap::spectrum_red_to_blue(),
-            Self::SpectrumRedToBlueGap => ColorMap::spectrum_red_to_blue_gap(),
-            Self::SpectrumYellowToRed => ColorMap::spectrum_yellow_to_red(),
-            Self::SpectrumYellowToCyan => ColorMap::spectrum_yellow_to_cyan(),
-            Self::SpectrumYellowToCyanGap => ColorMap::spectrum_yellow_to_cyan_gap(),
-            Self::ColorCircleAjj => ColorMap::color_circle_ajj(),
-            Self::ColorCircleZss => ColorMap::color_circle_zss(),
-            Self::RedsAndBlues => ColorMap::reds_and_blues(),
-            Self::RedsAndBluesWithGreen => ColorMap::reds_and_blues_with_green(),
-            Self::AfniP2Spanned => ColorMap::afni_p2_spanned(),
-            Self::BlueWhiteRed => ColorMap::blue_white_red(),
-            Self::Fire => ColorMap::fire(),
-            Self::Grayscale => ColorMap::grayscale(),
+            Self::DiscreteLabels => None,
+            Self::SpectrumRedToBlue => Some(ColorMap::spectrum_red_to_blue()),
+            Self::SpectrumRedToBlueGap => Some(ColorMap::spectrum_red_to_blue_gap()),
+            Self::SpectrumYellowToRed => Some(ColorMap::spectrum_yellow_to_red()),
+            Self::SpectrumYellowToCyan => Some(ColorMap::spectrum_yellow_to_cyan()),
+            Self::SpectrumYellowToCyanGap => Some(ColorMap::spectrum_yellow_to_cyan_gap()),
+            Self::ColorCircleAjj => Some(ColorMap::color_circle_ajj()),
+            Self::ColorCircleZss => Some(ColorMap::color_circle_zss()),
+            Self::RedsAndBlues => Some(ColorMap::reds_and_blues()),
+            Self::RedsAndBluesWithGreen => Some(ColorMap::reds_and_blues_with_green()),
+            Self::AfniP2Spanned => Some(ColorMap::afni_p2_spanned()),
+            Self::BlueWhiteRed => Some(ColorMap::blue_white_red()),
+            Self::Fire => Some(ColorMap::fire()),
+            Self::Grayscale => Some(ColorMap::grayscale()),
         }
     }
+
+    pub(super) fn uses_continuous_range(self) -> bool {
+        !matches!(self, Self::DiscreteLabels)
+    }
+}
+
+fn indices_to_bytes(indices: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(indices));
+    for index in indices {
+        bytes.extend_from_slice(&index.to_ne_bytes());
+    }
+    bytes
+}
+
+fn progressive_point_indices(total: u32) -> Vec<u32> {
+    const RESIDUE_ORDER: [u32; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+    let mut indices = Vec::with_capacity(total as usize);
+    for residue in RESIDUE_ORDER {
+        let mut index = residue;
+        while index < total {
+            indices.push(index);
+            index += 8;
+        }
+    }
+
+    indices
+}
+
+fn normalized_edge(a: u32, b: u32) -> (u32, u32) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 pub(super) fn compose_vertex_color(
@@ -522,6 +719,23 @@ fn cell_color_for_triangle(
     surface_colors: Option<&[[f32; 4]]>,
     roi_colors: Option<&[Option<[f32; 4]>]>,
 ) -> [f32; 4] {
+    cell_color_source_for_triangle(triangle, surface_colors, roi_colors).1
+}
+
+#[cfg(test)]
+fn cell_color_source_slot_for_triangle(
+    triangle: &[u32],
+    surface_colors: Option<&[[f32; 4]]>,
+    roi_colors: Option<&[Option<[f32; 4]>]>,
+) -> usize {
+    cell_color_source_for_triangle(triangle, surface_colors, roi_colors).0
+}
+
+fn cell_color_source_for_triangle(
+    triangle: &[u32],
+    surface_colors: Option<&[[f32; 4]]>,
+    roi_colors: Option<&[Option<[f32; 4]>]>,
+) -> (usize, [f32; 4]) {
     let color = |index: u32| {
         let index = index as usize;
         compose_vertex_color(
@@ -541,7 +755,11 @@ fn cell_color_for_triangle(
     let v0 = color(triangle[0]);
     let v1 = color(triangle[1]);
     let v2 = color(triangle[2]);
-    if colors_match(v1, v2) { v1 } else { v0 }
+    if colors_match(v1, v2) {
+        (1, v1)
+    } else {
+        (0, v0)
+    }
 }
 
 fn colors_match(left: [f32; 4], right: [f32; 4]) -> bool {
@@ -551,12 +769,16 @@ fn colors_match(left: [f32; 4], right: [f32; 4]) -> bool {
 }
 
 pub(super) fn sample_colormap(colormap: OverlayColorMap, t: f32) -> [f32; 4] {
-    colormap
-        .to_color_map()
-        .as_continuous()
-        .expect("viewer color maps are continuous")
-        .sample(t)
-        .to_array()
+    if let Some(colormap) = colormap.continuous_color_map() {
+        return colormap
+            .as_continuous()
+            .expect("viewer color maps are continuous")
+            .sample(t)
+            .to_array();
+    }
+
+    let index = (t.clamp(0.0, 1.0) * 9.0).round() as i32 + 1;
+    stable_label_color(index, 255).to_array()
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
@@ -566,7 +788,8 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SURFACE_COLOR, PreparedGeometry, PreparedSurface, RoiAppearance, SelectionHighlight,
+        DEFAULT_SURFACE_COLOR, PreparedGeometry, PreparedSurface, RoiAppearance,
+        SelectionHighlight, cell_color_chunk_ranges,
     };
     use crate::color::ColorMap;
     use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
@@ -656,6 +879,79 @@ mod tests {
         for vertex in prepared.vertices {
             assert_eq!(vertex.color, [0.0, 0.0, 1.0, 1.0]);
         }
+    }
+
+    #[test]
+    fn flat_color_triangle_indices_rotate_to_the_chosen_face_color_vertex() {
+        let mesh = triangle_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let colors = vec![
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ];
+
+        let bytes = geometry.flat_color_triangle_index_bytes(Some(&colors), None);
+        let indices = bytes
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(indices, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn cell_color_chunk_ranges_cover_all_triangles() {
+        assert_eq!(
+            cell_color_chunk_ranges(0, 3),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        assert_eq!(cell_color_chunk_ranges(5, 2), vec![0..2, 2..4, 4..5]);
+        assert_eq!(cell_color_chunk_ranges(3, 0), vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn prepared_surface_cell_color_chunks_use_local_indices() {
+        let mesh = square_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let colors = vec![
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+        ];
+        let chunks = cell_color_chunk_ranges(geometry.triangle_count(), 1)
+            .into_iter()
+            .map(|range| {
+                PreparedSurface::from_geometry_cell_color_range(
+                    &geometry,
+                    Some(&colors),
+                    None,
+                    range,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), 2);
+        for chunk in &chunks {
+            assert_eq!(chunk.indices, vec![0, 1, 2]);
+            assert_eq!(chunk.vertices.len(), 3);
+            assert_eq!(chunk.index_count(), 3);
+        }
+    }
+
+    #[test]
+    fn prepared_surface_selection_highlight_can_be_its_own_chunk() {
+        let mesh = triangle_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let chunk = PreparedSurface::selection_highlight(
+            &geometry,
+            SelectionHighlight::normalized(2, 0, [0.0, 0.0, 0.0]),
+        );
+
+        assert_eq!(chunk.vertices.len(), 15);
+        assert_eq!(chunk.indices.len(), 51);
+        assert!(!chunk.is_empty());
     }
 
     #[test]
@@ -758,15 +1054,56 @@ mod tests {
 
         assert_eq!(
             prepared.vertex_bytes().len(),
-            prepared.vertices.len() * 10 * 4
+            prepared.vertices.len() * 6 * 4
+        );
+        assert_eq!(
+            prepared.color_bytes().len(),
+            prepared.vertices.len() * 4 * 4
         );
         assert_eq!(prepared.index_bytes().len(), prepared.indices.len() * 4);
+    }
+
+    #[test]
+    fn point_indices_are_progressively_spread_for_sparse_prefix_draws() {
+        let mesh = octagon_strip_mesh();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+        let prepared =
+            PreparedSurface::from_geometry_with_selection(&geometry, None, None, 1.0, None, None);
+        let indices = prepared
+            .point_index_bytes()
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(indices, vec![0, 4, 2, 6, 1, 5, 3, 7]);
     }
 
     fn triangle_mesh() -> SurfaceMesh {
         let vertices = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
 
         SurfaceMesh::new(vertices, vec![[0, 1, 2]]).unwrap()
+    }
+
+    fn square_mesh() -> SurfaceMesh {
+        let vertices = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+
+        SurfaceMesh::new(vertices, vec![[0, 1, 2], [0, 2, 3]]).unwrap()
+    }
+
+    fn octagon_strip_mesh() -> SurfaceMesh {
+        let vertices = (0..8)
+            .map(|index| [index as f32, 0.0, 0.0])
+            .collect::<Vec<_>>();
+        let triangles = (1..7)
+            .map(|index| [0, index as u32, index as u32 + 1])
+            .collect::<Vec<_>>();
+
+        SurfaceMesh::new(vertices, triangles).unwrap()
     }
 
     fn scalar_overlay(mesh: &SurfaceMesh, values: Vec<f32>) -> (Dataset, Overlay) {

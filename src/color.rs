@@ -1,5 +1,19 @@
 use anyhow::{Result, ensure};
 
+const STABLE_LABEL_RGB_PALETTE: [[u8; 3]; 10] = [
+    [0, 194, 255],
+    [255, 242, 0],
+    [57, 255, 20],
+    [255, 117, 24],
+    [255, 0, 255],
+    [0, 255, 255],
+    [255, 49, 49],
+    [157, 0, 255],
+    [180, 255, 0],
+    [255, 0, 170],
+];
+const ZERO_LABEL_RGB: [u8; 3] = [128, 128, 128];
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColorMap {
     Continuous(ContinuousColorMap),
@@ -127,6 +141,25 @@ impl ColorMap {
             Self::Labels(label_table) => Some(label_table),
         }
     }
+}
+
+pub fn stable_label_rgb(key: i32) -> [u8; 3] {
+    if key == 0 {
+        return ZERO_LABEL_RGB;
+    }
+
+    let normalized = if key > 0 {
+        key - 1
+    } else {
+        key.saturating_abs() - 1
+    };
+    let index = normalized.rem_euclid(STABLE_LABEL_RGB_PALETTE.len() as i32) as usize;
+    STABLE_LABEL_RGB_PALETTE[index]
+}
+
+pub fn stable_label_color(key: i32, alpha: u8) -> Rgba {
+    let [red, green, blue] = stable_label_rgb(key);
+    Rgba::from_u8(red, green, blue, alpha)
 }
 
 impl ContinuousColorMap {
@@ -742,7 +775,7 @@ fn finite_or_zero(value: f32) -> f32 {
 mod tests {
     use super::{
         ColorMap, ColorStop, ContinuousColorMap, FreeSurferLabelEntry, LabelEntry, LabelTable,
-        LabelTableSource, Rgba,
+        LabelTableSource, Rgba, stable_label_rgb,
     };
 
     #[test]
@@ -957,5 +990,13 @@ mod tests {
         assert_eq!(table.source, LabelTableSource::FreeSurfer);
         assert_eq!(table.label(17).unwrap().label, "bankssts");
         assert_eq!(table.color_for_key(17), Rgba::from_u8(10, 20, 30, 255));
+    }
+
+    #[test]
+    fn stable_label_palette_matches_expected_first_four_labels() {
+        assert_eq!(stable_label_rgb(1), [0, 194, 255]);
+        assert_eq!(stable_label_rgb(2), [255, 242, 0]);
+        assert_eq!(stable_label_rgb(3), [57, 255, 20]);
+        assert_eq!(stable_label_rgb(4), [255, 117, 24]);
     }
 }

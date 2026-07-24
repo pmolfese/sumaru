@@ -69,7 +69,7 @@ impl ViewerState {
         let range = overlay_values.range;
 
         self.overlay.clear();
-        self.afni_rgba_colors = None;
+        self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
         self.overlay.data = DatasetOverlayState::Loaded {
             canonical_dataset: loaded_overlay.dataset,
@@ -79,6 +79,7 @@ impl ViewerState {
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         self.overlay.source.path = Some(path.clone());
         self.overlay.source.pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
         self.controller.surface.current_overlay_path = Some(path.clone());
@@ -88,26 +89,30 @@ impl ViewerState {
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.log_status(format!(
-            "Loaded overlay range {}. {column_summary}",
-            value_range_label(range)
+            "Loaded overlay range {}. {column_summary}{}",
+            value_range_label(range),
+            if auto_discrete_labels {
+                " Using discrete integer label colors."
+            } else {
+                ""
+            }
         ));
 
         Ok(())
     }
 
-    /// Load an explicit left/right overlay pair onto a paired scene.
+    /// Load an explicit hemisphere overlay selection onto a paired scene.
     pub(super) fn load_overlay_pair_paths(&mut self, pair: ExplicitOverlayPair) -> Result<()> {
         let mesh = self
             .mesh
             .as_ref()
-            .context("load a both-hemisphere spec before loading explicit paired overlays")?;
+            .context("load a both-hemisphere scene before loading hemisphere overlays")?;
         let loaded_selection = self
             .load_explicit_paired_overlay_selection(&pair, mesh)
             .with_context(|| {
                 format!(
-                    "failed to load paired overlays {} and {}",
-                    pair.left_path.display(),
-                    pair.right_path.display()
+                    "failed to load hemisphere overlays {}",
+                    explicit_overlay_pair_display_name(&pair)
                 )
             })?;
         let loaded_overlay = loaded_selection.overlay;
@@ -117,7 +122,7 @@ impl ViewerState {
         let range = overlay_values.range;
 
         self.overlay.clear();
-        self.afni_rgba_colors = None;
+        self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
         self.overlay.data = DatasetOverlayState::Loaded {
             canonical_dataset: loaded_overlay.dataset,
@@ -127,17 +132,27 @@ impl ViewerState {
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
-        self.overlay.source.path = Some(pair.left_path.clone());
+        let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
+        let primary_path = pair
+            .primary_path()
+            .context("explicit hemisphere overlay selection is empty")?
+            .to_path_buf();
+        self.overlay.source.path = Some(primary_path.clone());
         self.overlay.source.pair_paths = Some(pair.clone());
-        self.controller.surface.current_overlay_path = Some(pair.left_path.clone());
+        self.controller.surface.current_overlay_path = Some(primary_path);
         self.overlay.source.display_name = Some(loaded_selection.display_name);
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
         self.log_status(format!(
-            "Loaded paired overlays range {}. {column_summary}",
-            value_range_label(range)
+            "Loaded hemisphere overlay range {}. {column_summary}{}",
+            value_range_label(range),
+            if auto_discrete_labels {
+                " Using discrete integer label colors."
+            } else {
+                ""
+            }
         ));
 
         Ok(())
@@ -275,7 +290,7 @@ impl ViewerState {
         })
     }
 
-    /// Build the overlay model for an explicit paired-hemisphere selection.
+    /// Build the overlay model for an explicit hemisphere selection.
     pub(super) fn load_explicit_paired_overlay_selection(
         &self,
         pair: &ExplicitOverlayPair,
@@ -292,28 +307,58 @@ impl ViewerState {
             .mesh
             .as_ref()
             .context("right hemisphere surface is still loading")?;
-        ensure!(
-            pair.left_path.exists(),
-            "left hemisphere overlay {} does not exist",
-            pair.left_path.display()
-        );
-        ensure!(
-            pair.right_path.exists(),
-            "right hemisphere overlay {} does not exist",
-            pair.right_path.display()
-        );
+        let dataset = match (&pair.left_path, &pair.right_path) {
+            (Some(left_path), Some(right_path)) => {
+                ensure!(
+                    left_path.exists(),
+                    "left hemisphere overlay {} does not exist",
+                    left_path.display()
+                );
+                ensure!(
+                    right_path.exists(),
+                    "right hemisphere overlay {} does not exist",
+                    right_path.display()
+                );
 
-        let left_dataset = load_dataset_from_path(&pair.left_path, left_mesh)
-            .with_context(|| format!("failed to load {}", pair.left_path.display()))?;
-        let right_dataset = load_dataset_from_path(&pair.right_path, right_mesh)
-            .with_context(|| format!("failed to load {}", pair.right_path.display()))?;
-        let dataset = paired_overlay_dataset(
-            left_dataset,
-            right_dataset,
-            &mesh.domain,
-            left_mesh.vertices.len() as u32,
-        )?;
-        let overlay = loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "paired NIML")?;
+                let left_dataset = load_dataset_from_path(left_path, left_mesh)
+                    .with_context(|| format!("failed to load {}", left_path.display()))?;
+                let right_dataset = load_dataset_from_path(right_path, right_mesh)
+                    .with_context(|| format!("failed to load {}", right_path.display()))?;
+                paired_overlay_dataset(
+                    left_dataset,
+                    right_dataset,
+                    &mesh.domain,
+                    left_mesh.vertices.len() as u32,
+                )?
+            }
+            (Some(left_path), None) => {
+                ensure!(
+                    left_path.exists(),
+                    "left hemisphere overlay {} does not exist",
+                    left_path.display()
+                );
+                let left_dataset = load_dataset_from_path(left_path, left_mesh)
+                    .with_context(|| format!("failed to load {}", left_path.display()))?;
+                single_hemisphere_overlay_dataset(left_dataset, &mesh.domain, 0)?
+            }
+            (None, Some(right_path)) => {
+                ensure!(
+                    right_path.exists(),
+                    "right hemisphere overlay {} does not exist",
+                    right_path.display()
+                );
+                let right_dataset = load_dataset_from_path(right_path, right_mesh)
+                    .with_context(|| format!("failed to load {}", right_path.display()))?;
+                single_hemisphere_overlay_dataset(
+                    right_dataset,
+                    &mesh.domain,
+                    left_mesh.vertices.len() as u32,
+                )?
+            }
+            (None, None) => bail!("no hemisphere overlay path was provided"),
+        };
+        let overlay =
+            loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "hemisphere overlay")?;
 
         Ok(LoadedOverlaySelection {
             overlay,
@@ -329,8 +374,8 @@ impl ViewerState {
         self.active_paired_components()?;
         let paths = paired_overlay_paths(path)?;
         Some(ExplicitOverlayPair {
-            left_path: paths.left_path,
-            right_path: paths.right_path,
+            left_path: Some(paths.left_path),
+            right_path: Some(paths.right_path),
         })
     }
 
@@ -359,14 +404,39 @@ impl ViewerState {
         } else {
             range
         };
+        let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         self.sanitize_overlay_appearance();
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
         self.update_scene_stats();
-        self.log_status(format!("Overlay columns: {column_summary}"));
+        self.log_status(format!(
+            "Overlay columns: {column_summary}{}",
+            if auto_discrete_labels {
+                " Using discrete integer label colors."
+            } else {
+                ""
+            }
+        ));
 
         Ok(())
+    }
+
+    fn maybe_apply_discrete_overlay_palette(&mut self) -> bool {
+        let Some(dataset) = self.overlay.data.dataset() else {
+            return false;
+        };
+        let intensity_index = self.overlay.data.columns().intensity;
+        if auto_overlay_label_table(dataset, intensity_index).is_some() {
+            self.overlay.render.appearance.colormap = OverlayColorMap::DiscreteLabels;
+            self.overlay.render.appearance.symmetric_range = false;
+            true
+        } else {
+            if self.overlay.render.appearance.colormap == OverlayColorMap::DiscreteLabels {
+                self.overlay.render.appearance.colormap = OverlayColorMap::SpectrumRedToBlue;
+            }
+            false
+        }
     }
 
     /// Recompute overlay appearance defaults from the selected columns.
@@ -400,13 +470,18 @@ impl ViewerState {
             self.overlay.data.columns(),
             self.overlay.render.appearance.threshold.enabled,
         );
+        let intensity_index = columns.intensity.index;
         let (threshold, mask_mode) =
             threshold_and_mask_from_appearance(self.overlay.render.appearance);
         // Build with an empty cache, apply the real display settings, then
         // compute the color cache exactly once (from_dataset would compute it a
         // first time with default settings and throw that away).
         let mut overlay = Overlay::without_color_cache(dataset, domain, columns)?
-            .with_colormap(self.overlay.render.appearance.colormap.to_color_map())
+            .with_colormap(resolved_overlay_color_map(
+                dataset,
+                intensity_index,
+                self.overlay.render.appearance.colormap,
+            ))
             .with_intensity_range(RangeSelection::Manual(overlay_range_from_value_range(
                 self.overlay.render.appearance.range,
             )))

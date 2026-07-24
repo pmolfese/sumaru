@@ -1,20 +1,22 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail, ensure};
 
 use crate::command::{
-    BackgroundMode, ControllerState, CrosshairState, OverlayThreshold, ViewerCommand,
+    BackgroundMode, ControllerState, CrosshairState, OverlayThreshold, ViewNudge, ViewPreset,
+    ViewerCommand,
 };
 use crate::io::{
-    NimlData, NimlElement, NimlNumericMatrix, NimlValueType, parse_niml_bytes, serialize_niml_ascii,
+    NimlData, NimlElement, NimlNumericMatrix, NimlValueType, binary_payload_len, element_is_binary,
+    parse_attrs, parse_niml_bytes, serialize_niml_binary,
 };
 use crate::niml_debug::{NimlDirection, NimlRecorder};
 use crate::surface::{SurfaceMesh, ValueRange};
@@ -28,6 +30,10 @@ const AFNI_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const AFNI_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const AFNI_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const AFNI_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+const AFNI_VERBOSE_READ_PROGRESS_STEP: usize = 8 * 1024 * 1024;
+const AFNI_MESSAGE_EVENT_CAPACITY: usize = 1;
+const AFNI_KEEP_READING_PROCINS: &str = "<?keep_reading ?>\n";
+const AFNI_PAUSE_READING_PROCINS: &str = "<?pause_reading ?>\n";
 
 const AFNI_PORT_NAMES: &[&str] = &[
     "AFNI_SUMA_NIML",
@@ -107,6 +113,19 @@ pub struct AfniRgbaOverlay {
     pub volume_idcode: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfniSurfaceRegistrationPart {
+    Coordinates,
+    Normals,
+    Triangles,
+}
+
+pub const AFNI_SURFACE_REGISTRATION_PARTS: [AfniSurfaceRegistrationPart; 3] = [
+    AfniSurfaceRegistrationPart::Coordinates,
+    AfniSurfaceRegistrationPart::Normals,
+    AfniSurfaceRegistrationPart::Triangles,
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AfniIncomingMessage {
     RgbaOverlay(AfniRgbaOverlay),
@@ -116,6 +135,7 @@ pub enum AfniIncomingMessage {
     DatasetLoad(PathBuf),
     OverlayState(AfniOverlayState),
     ControllerCommand(AfniControllerCommand),
+    ViewerCommands(Vec<ViewerCommand>),
     RoiUpdate(AfniRoiUpdate),
 }
 
@@ -158,7 +178,7 @@ pub struct AfniRoiUpdate {
     pub visible: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AfniRouteAction {
     ViewerCommand(ViewerCommand),
     LoadDataset(PathBuf),
@@ -181,19 +201,39 @@ pub struct AfniNimlSession {
 
 #[derive(Debug)]
 pub enum AfniConnectionEvent {
-    Elements(Vec<NimlElement>),
+    Messages(Vec<AfniIncomingMessage>),
     Error(String),
     Disconnected,
 }
 
 #[derive(Debug)]
+enum AfniConnectionControlEvent {
+    Error(String),
+    Disconnected,
+}
+
+#[derive(Debug)]
+enum AfniWriteCommand {
+    Elements(Vec<NimlElement>),
+    SurfaceRegistration {
+        mesh: Arc<SurfaceMesh>,
+        info: AfniSurfaceInfo,
+    },
+    Flush(Sender<std::result::Result<(), String>>),
+    Disconnect,
+}
+
+type WakeCallback = Arc<Mutex<Box<dyn Fn() + Send>>>;
+
+#[derive(Debug)]
 pub struct AfniConnection {
     stream: TcpStream,
-    receiver: Receiver<AfniConnectionEvent>,
+    control_receiver: Receiver<AfniConnectionControlEvent>,
+    message_receiver: Receiver<Vec<AfniIncomingMessage>>,
+    writer_sender: Sender<AfniWriteCommand>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
-    recorder: Option<NimlRecorder>,
-    verbose: bool,
+    writer: Option<JoinHandle<()>>,
 }
 
 impl AfniConnection {
@@ -237,55 +277,109 @@ impl AfniConnection {
 
         let reader_stream = stream.try_clone()?;
         reader_stream.set_read_timeout(Some(AFNI_READ_TIMEOUT))?;
-        let (sender, receiver) = mpsc::channel();
+        let writer_stream = stream.try_clone()?;
+        writer_stream.set_write_timeout(Some(AFNI_WRITE_TIMEOUT))?;
+        let (control_sender, control_receiver) = mpsc::channel();
+        let (message_sender, message_receiver) = mpsc::sync_channel(AFNI_MESSAGE_EVENT_CAPACITY);
+        let (writer_sender, writer_receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = stop.clone();
+        let writer_stop = stop.clone();
         let reader_recorder = recorder.clone();
+        let writer_recorder = recorder;
+        let wake: WakeCallback = Arc::new(Mutex::new(Box::new(wake)));
+        let reader_wake = wake.clone();
+        let writer_wake = wake;
+        let writer_control_sender = control_sender.clone();
         let reader = thread::spawn(move || {
             read_afni_stream(
                 reader_stream,
-                sender,
+                control_sender,
+                message_sender,
                 reader_stop,
                 verbose,
                 reader_recorder,
-                wake,
+                reader_wake,
+            );
+        });
+        let writer = thread::spawn(move || {
+            write_afni_stream(
+                writer_stream,
+                writer_receiver,
+                writer_control_sender,
+                writer_stop,
+                verbose,
+                writer_recorder,
+                writer_wake,
             );
         });
 
         Ok(Self {
             stream,
-            receiver,
+            control_receiver,
+            message_receiver,
+            writer_sender,
             stop,
             reader: Some(reader),
-            recorder,
-            verbose,
+            writer: Some(writer),
         })
     }
 
     pub fn send_elements(&mut self, elements: &[NimlElement]) -> Result<()> {
-        let payload = serialize_niml_ascii(elements);
-        log_niml_elements(self.verbose, "tx", elements, payload.len());
-        self.stream
-            .write_all(payload.as_bytes())
-            .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
-        self.stream
-            .flush()
-            .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
-        if let Some(recorder) = self.recorder.as_ref() {
-            recorder.record_payload(NimlDirection::Tx, payload.as_bytes())?;
+        self.writer_sender
+            .send(AfniWriteCommand::Elements(elements.to_vec()))
+            .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
+    }
+
+    pub fn send_drive_afni_command(&mut self, command: impl Into<String>) -> Result<()> {
+        self.send_elements(&[drive_afni_command_element(command)])
+    }
+
+    pub fn send_surface_registration(
+        &mut self,
+        mesh: Arc<SurfaceMesh>,
+        info: AfniSurfaceInfo,
+    ) -> Result<()> {
+        self.writer_sender
+            .send(AfniWriteCommand::SurfaceRegistration { mesh, info })
+            .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.writer_sender
+            .send(AfniWriteCommand::Flush(sender))
+            .map_err(|_| anyhow::anyhow!("AFNI/SUMA NIML writer is not running"))?;
+        match receiver.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => bail!("{message}"),
+            Err(_) => bail!("AFNI/SUMA NIML writer stopped before flushing"),
         }
-        Ok(())
     }
 
     pub fn try_recv(&self) -> Option<AfniConnectionEvent> {
-        self.receiver.try_recv().ok()
+        if let Ok(event) = self.control_receiver.try_recv() {
+            return Some(match event {
+                AfniConnectionControlEvent::Error(message) => AfniConnectionEvent::Error(message),
+                AfniConnectionControlEvent::Disconnected => AfniConnectionEvent::Disconnected,
+            });
+        }
+
+        self.message_receiver
+            .try_recv()
+            .ok()
+            .map(AfniConnectionEvent::Messages)
     }
 
     pub fn disconnect(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        let _ = self.writer_sender.send(AfniWriteCommand::Disconnect);
         let _ = self.stream.shutdown(Shutdown::Both);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
         }
     }
 }
@@ -344,6 +438,29 @@ fn log_niml_elements(verbose: bool, direction: &str, elements: &[NimlElement], b
     }
 }
 
+fn log_niml_elements_timing(
+    verbose: bool,
+    direction: &str,
+    elements: &[NimlElement],
+    byte_count: usize,
+    elapsed: Duration,
+) {
+    if !verbose {
+        return;
+    }
+
+    for element in elements {
+        eprintln!(
+            "sumaru niml {direction}: {} bytes={} elapsed_ms={:.1} {} attrs={}",
+            element.name,
+            byte_count,
+            elapsed.as_secs_f64() * 1000.0,
+            niml_data_summary(&element.data),
+            niml_attr_summary(&element.attrs)
+        );
+    }
+}
+
 fn niml_attr_summary(attrs: &BTreeMap<String, String>) -> String {
     if attrs.is_empty() {
         return "{}".to_string();
@@ -396,53 +513,372 @@ fn truncate_log_value(value: &str) -> String {
     }
 }
 
+fn expected_binary_niml_message_len(bytes: &[u8]) -> Option<usize> {
+    let mut start = 0usize;
+    while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+        start += 1;
+    }
+    if bytes.get(start) != Some(&b'<') {
+        return None;
+    }
+
+    let mut pos = start + 1;
+    if bytes.get(pos) == Some(&b'/') {
+        return None;
+    }
+    let name_start = pos;
+    while let Some(byte) = bytes.get(pos) {
+        if byte.is_ascii_whitespace() || *byte == b'>' || *byte == b'/' {
+            break;
+        }
+        pos += 1;
+    }
+    if pos == name_start {
+        return None;
+    }
+    let name = std::str::from_utf8(&bytes[name_start..pos]).ok()?;
+
+    let header_start = pos;
+    let mut in_quote = false;
+    while let Some(byte) = bytes.get(pos) {
+        if *byte == b'"' {
+            in_quote = !in_quote;
+        } else if *byte == b'>' && !in_quote {
+            let raw_header = std::str::from_utf8(&bytes[header_start..pos]).ok()?;
+            let header_end = pos + 1;
+            let header = raw_header.trim();
+            if header.ends_with('/') {
+                return Some(header_end);
+            }
+            let attrs = parse_attrs(header).ok()?;
+            if !element_is_binary(&attrs) {
+                return None;
+            }
+            let payload_len = binary_payload_len(&attrs).ok()?;
+            let end_marker_len = name.len() + "</>".len();
+            return Some(header_end + payload_len + end_marker_len);
+        }
+        pos += 1;
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AfniIncomingMessageKey {
+    RgbaOverlay(String, Option<String>),
+    SurfaceSelection,
+    Crosshair,
+    SurfaceCrosshair,
+    DatasetLoad,
+    OverlayState,
+    RoiUpdate,
+    ResetCamera,
+    SetBackground,
+    OpenSurfaceController,
+    OpenRoiController,
+}
+
+fn afni_incoming_message_key(message: &AfniIncomingMessage) -> Option<AfniIncomingMessageKey> {
+    match message {
+        AfniIncomingMessage::RgbaOverlay(overlay) => Some(AfniIncomingMessageKey::RgbaOverlay(
+            overlay.surface_idcode.clone(),
+            overlay.local_domain_parent_id.clone(),
+        )),
+        AfniIncomingMessage::SurfaceSelection(_) => Some(AfniIncomingMessageKey::SurfaceSelection),
+        AfniIncomingMessage::Crosshair(_) => Some(AfniIncomingMessageKey::Crosshair),
+        AfniIncomingMessage::SurfaceCrosshair(_) => Some(AfniIncomingMessageKey::SurfaceCrosshair),
+        AfniIncomingMessage::DatasetLoad(_) => Some(AfniIncomingMessageKey::DatasetLoad),
+        AfniIncomingMessage::OverlayState(_) => Some(AfniIncomingMessageKey::OverlayState),
+        AfniIncomingMessage::RoiUpdate(_) => Some(AfniIncomingMessageKey::RoiUpdate),
+        AfniIncomingMessage::ViewerCommands(_) => None,
+        AfniIncomingMessage::ControllerCommand(command) => match command {
+            AfniControllerCommand::ResetCamera => Some(AfniIncomingMessageKey::ResetCamera),
+            AfniControllerCommand::ToggleOverlay => None,
+            AfniControllerCommand::SetBackground(_) => Some(AfniIncomingMessageKey::SetBackground),
+            AfniControllerCommand::OpenSurfaceController(_) => {
+                Some(AfniIncomingMessageKey::OpenSurfaceController)
+            }
+            AfniControllerCommand::OpenRoiController(_) => {
+                Some(AfniIncomingMessageKey::OpenRoiController)
+            }
+        },
+    }
+}
+
+fn merge_afni_overlay_state(existing: &mut AfniOverlayState, incoming: AfniOverlayState) {
+    if incoming.visible.is_some() {
+        existing.visible = incoming.visible;
+    }
+    if incoming.symmetric_range.is_some() {
+        existing.symmetric_range = incoming.symmetric_range;
+    }
+    if incoming.intensity_range.is_some() {
+        existing.intensity_range = incoming.intensity_range;
+    }
+    if incoming.threshold.is_some() {
+        existing.threshold = incoming.threshold;
+    }
+    if incoming.opacity.is_some() {
+        existing.opacity = incoming.opacity;
+    }
+    if incoming.overlay_path.is_some() {
+        existing.overlay_path = incoming.overlay_path;
+    }
+}
+
+fn merge_afni_roi_update(existing: &mut AfniRoiUpdate, incoming: AfniRoiUpdate) {
+    if incoming.path.is_some() {
+        existing.path = incoming.path;
+    }
+    if incoming.visible.is_some() {
+        existing.visible = incoming.visible;
+    }
+}
+
+fn merge_afni_incoming_message(existing: &mut AfniIncomingMessage, incoming: AfniIncomingMessage) {
+    match (existing, incoming) {
+        (
+            AfniIncomingMessage::OverlayState(existing),
+            AfniIncomingMessage::OverlayState(incoming),
+        ) => {
+            merge_afni_overlay_state(existing, incoming);
+        }
+        (AfniIncomingMessage::RoiUpdate(existing), AfniIncomingMessage::RoiUpdate(incoming)) => {
+            merge_afni_roi_update(existing, incoming);
+        }
+        (slot, incoming) => *slot = incoming,
+    }
+}
+
+pub(crate) fn enqueue_coalesced_afni_messages(
+    queue: &mut VecDeque<AfniIncomingMessage>,
+    messages: impl IntoIterator<Item = AfniIncomingMessage>,
+) {
+    for message in messages {
+        if matches!(
+            message,
+            AfniIncomingMessage::ControllerCommand(AfniControllerCommand::ToggleOverlay)
+        ) {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(
+                    queued,
+                    AfniIncomingMessage::ControllerCommand(AfniControllerCommand::ToggleOverlay)
+                )
+            }) {
+                queue.remove(index);
+                continue;
+            }
+        }
+
+        let Some(key) = afni_incoming_message_key(&message) else {
+            queue.push_back(message);
+            continue;
+        };
+
+        if let Some(existing) = queue
+            .iter_mut()
+            .find(|queued| afni_incoming_message_key(queued).as_ref() == Some(&key))
+        {
+            merge_afni_incoming_message(existing, message);
+        } else {
+            queue.push_back(message);
+        }
+    }
+}
+
+fn flush_deferred_afni_messages(
+    sender: &SyncSender<Vec<AfniIncomingMessage>>,
+    deferred: &mut VecDeque<AfniIncomingMessage>,
+) -> std::result::Result<bool, TrySendError<Vec<AfniIncomingMessage>>> {
+    if deferred.is_empty() {
+        return Ok(false);
+    }
+
+    let batch = deferred.iter().cloned().collect::<Vec<_>>();
+    match sender.try_send(batch) {
+        Ok(()) => {
+            deferred.clear();
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn read_afni_stream(
     mut stream: TcpStream,
-    sender: mpsc::Sender<AfniConnectionEvent>,
+    control_sender: Sender<AfniConnectionControlEvent>,
+    message_sender: SyncSender<Vec<AfniIncomingMessage>>,
     stop: Arc<AtomicBool>,
     verbose: bool,
     recorder: Option<NimlRecorder>,
-    wake: impl Fn() + Send + 'static,
+    wake: WakeCallback,
 ) {
     let mut pending = Vec::new();
+    let mut deferred_messages = VecDeque::new();
     let mut chunk = [0_u8; 65_536];
+    let mut message_start: Option<Instant> = None;
+    let mut next_progress = AFNI_VERBOSE_READ_PROGRESS_STEP;
+    let mut incomplete_parse_attempts = 0usize;
+    let mut incomplete_parse_elapsed = Duration::ZERO;
+    let mut binary_waits = 0usize;
+    let mut expected_binary_len: Option<usize> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match stream.read(&mut chunk) {
             Ok(0) => {
-                let _ = sender.send(AfniConnectionEvent::Disconnected);
-                wake();
+                let _ = control_sender.send(AfniConnectionControlEvent::Disconnected);
+                wake_gui(&wake);
                 return;
             }
             Ok(read) => {
+                if message_start.is_none() {
+                    message_start = Some(Instant::now());
+                    next_progress = AFNI_VERBOSE_READ_PROGRESS_STEP;
+                    if verbose {
+                        eprintln!("sumaru niml rx-read: first bytes read={read}");
+                    }
+                    incomplete_parse_attempts = 0;
+                    incomplete_parse_elapsed = Duration::ZERO;
+                    binary_waits = 0;
+                    expected_binary_len = None;
+                }
                 pending.extend_from_slice(&chunk[..read]);
+                if expected_binary_len.is_none() {
+                    expected_binary_len = expected_binary_niml_message_len(&pending);
+                    if verbose && let Some(expected_len) = expected_binary_len {
+                        eprintln!(
+                            "sumaru niml rx-read: binary message expects {} bytes; remaining_bytes={}",
+                            expected_len,
+                            expected_len.saturating_sub(pending.len())
+                        );
+                    }
+                }
+                while verbose && pending.len() >= next_progress {
+                    let (expected_bytes, remaining_bytes) = expected_binary_len
+                        .map(|expected_len| {
+                            (
+                                format!(" expected_bytes={expected_len}"),
+                                format!(
+                                    " remaining_bytes={}",
+                                    expected_len.saturating_sub(pending.len())
+                                ),
+                            )
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "sumaru niml rx-read: pending_bytes={}{}{} elapsed_ms={:.1} throughput_mib_s={:.2}",
+                        pending.len(),
+                        expected_bytes,
+                        remaining_bytes,
+                        message_start
+                            .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+                            .unwrap_or(0.0),
+                        message_start
+                            .map(|start| bytes_per_second_mib(pending.len(), start.elapsed()))
+                            .unwrap_or(0.0)
+                    );
+                    next_progress = next_progress.saturating_add(AFNI_VERBOSE_READ_PROGRESS_STEP);
+                }
+
+                if let Some(expected_len) = expected_binary_len {
+                    if pending.len() < expected_len {
+                        binary_waits += 1;
+                        continue;
+                    }
+                }
+
+                let parse_start = Instant::now();
                 match parse_niml_bytes(&pending) {
                     Ok(elements) => {
                         if !elements.is_empty() {
-                            log_niml_elements(verbose, "rx", &elements, pending.len());
+                            if verbose {
+                                eprintln!(
+                                    "sumaru niml rx-parse: complete bytes={} expected_bytes={} elements={} read_elapsed_ms={:.1} throughput_mib_s={:.2} parse_ms={:.1} incomplete_parse_attempts={} incomplete_parse_ms={:.1} binary_waits={}",
+                                    pending.len(),
+                                    expected_binary_len.unwrap_or(pending.len()),
+                                    elements.len(),
+                                    message_start
+                                        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+                                        .unwrap_or(0.0),
+                                    message_start
+                                        .map(|start| bytes_per_second_mib(
+                                            pending.len(),
+                                            start.elapsed()
+                                        ))
+                                        .unwrap_or(0.0),
+                                    parse_start.elapsed().as_secs_f64() * 1000.0,
+                                    incomplete_parse_attempts,
+                                    incomplete_parse_elapsed.as_secs_f64() * 1000.0,
+                                    binary_waits
+                                );
+                            }
+                            log_niml_elements_timing(
+                                verbose,
+                                "rx",
+                                &elements,
+                                pending.len(),
+                                message_start
+                                    .map(|start| start.elapsed())
+                                    .unwrap_or_default(),
+                            );
                             if let Some(recorder) = recorder.as_ref()
                                 && let Err(error) =
                                     recorder.record_payload(NimlDirection::Rx, &pending)
                             {
-                                let _ = sender.send(AfniConnectionEvent::Error(format!(
-                                    "failed to record AFNI NIML message: {error:#}"
-                                )));
-                                wake();
+                                let _ = control_sender.send(AfniConnectionControlEvent::Error(
+                                    format!("failed to record AFNI NIML message: {error:#}"),
+                                ));
+                                wake_gui(&wake);
                             }
-                            let _ = sender.send(AfniConnectionEvent::Elements(elements));
-                            wake();
+                            let mut messages = Vec::new();
+                            for element in elements {
+                                match parse_incoming_message(&element) {
+                                    Ok(Some(message)) => messages.push(message),
+                                    Ok(None) => {
+                                        if verbose {
+                                            eprintln!("sumaru niml rx-ignore: {}", element.name);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = control_sender.send(
+                                            AfniConnectionControlEvent::Error(format!(
+                                                "failed to route AFNI/SUMA NIML element {}: {error:#}",
+                                                element.name
+                                            )),
+                                        );
+                                        wake_gui(&wake);
+                                    }
+                                }
+                            }
+                            enqueue_coalesced_afni_messages(&mut deferred_messages, messages);
+                            match flush_deferred_afni_messages(
+                                &message_sender,
+                                &mut deferred_messages,
+                            ) {
+                                Ok(true) => wake_gui(&wake),
+                                Ok(false) => {}
+                                Err(TrySendError::Full(_)) => {}
+                                Err(TrySendError::Disconnected(_)) => return,
+                            }
                         }
                         pending.clear();
+                        message_start = None;
+                        expected_binary_len = None;
                     }
                     Err(error) if pending.len() > AFNI_MAX_PENDING_BYTES => {
-                        let _ = sender.send(AfniConnectionEvent::Error(format!(
+                        let _ = control_sender.send(AfniConnectionControlEvent::Error(format!(
                             "AFNI NIML stream exceeded {} pending bytes before parsing: {error:#}",
                             AFNI_MAX_PENDING_BYTES
                         )));
-                        wake();
+                        wake_gui(&wake);
                         pending.clear();
+                        message_start = None;
+                        expected_binary_len = None;
                     }
                     Err(_) => {
+                        incomplete_parse_attempts += 1;
+                        incomplete_parse_elapsed += parse_start.elapsed();
                         // A TCP read can split a NIML element anywhere, including
                         // inside binary payload bytes. Keep the bytes until the
                         // next read gives the parser a complete element.
@@ -455,18 +891,153 @@ fn read_afni_stream(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                match flush_deferred_afni_messages(&message_sender, &mut deferred_messages) {
+                    Ok(true) => wake_gui(&wake),
+                    Ok(false) => {}
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
                 continue;
             }
             Err(error) => {
                 if !stop.load(Ordering::Relaxed) {
-                    let _ = sender.send(AfniConnectionEvent::Error(format!(
+                    let _ = control_sender.send(AfniConnectionControlEvent::Error(format!(
                         "AFNI NIML read failed: {error}"
                     )));
-                    wake();
+                    wake_gui(&wake);
                 }
                 return;
             }
         }
+    }
+}
+
+fn bytes_per_second_mib(bytes: usize, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= f64::EPSILON {
+        return 0.0;
+    }
+
+    bytes as f64 / (1024.0 * 1024.0) / seconds
+}
+
+fn write_afni_stream(
+    mut stream: TcpStream,
+    receiver: mpsc::Receiver<AfniWriteCommand>,
+    sender: Sender<AfniConnectionControlEvent>,
+    stop: Arc<AtomicBool>,
+    verbose: bool,
+    recorder: Option<NimlRecorder>,
+    wake: WakeCallback,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let command = match receiver.recv_timeout(AFNI_READ_TIMEOUT) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let result = match command {
+            AfniWriteCommand::Elements(elements) => {
+                write_afni_elements(&mut stream, &elements, verbose, recorder.as_ref())
+            }
+            AfniWriteCommand::SurfaceRegistration { mesh, info } => (|| -> Result<()> {
+                write_afni_processing_instruction(
+                    &mut stream,
+                    AFNI_KEEP_READING_PROCINS,
+                    "keep_reading",
+                    verbose,
+                    recorder.as_ref(),
+                )?;
+                for part in AFNI_SURFACE_REGISTRATION_PARTS {
+                    let element = surface_registration_element(&mesh, &info, part)?;
+                    write_afni_elements(&mut stream, &[element], verbose, recorder.as_ref())?;
+                }
+                write_afni_processing_instruction(
+                    &mut stream,
+                    AFNI_PAUSE_READING_PROCINS,
+                    "pause_reading",
+                    verbose,
+                    recorder.as_ref(),
+                )
+            })(),
+            AfniWriteCommand::Flush(completion) => {
+                let _ = completion.send(Ok(()));
+                continue;
+            }
+            AfniWriteCommand::Disconnect => break,
+        };
+
+        if let Err(error) = result {
+            let _ = sender.send(AfniConnectionControlEvent::Error(format!("{error:#}")));
+            let _ = sender.send(AfniConnectionControlEvent::Disconnected);
+            wake_gui(&wake);
+            stop.store(true, Ordering::Relaxed);
+            let _ = stream.shutdown(Shutdown::Both);
+            break;
+        }
+    }
+}
+
+fn write_afni_elements(
+    stream: &mut TcpStream,
+    elements: &[NimlElement],
+    verbose: bool,
+    recorder: Option<&NimlRecorder>,
+) -> Result<()> {
+    let payload = serialize_niml_binary(elements)?;
+    log_niml_elements(verbose, "tx", elements, payload.len());
+    let write_start = Instant::now();
+    stream
+        .write_all(&payload)
+        .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
+    stream
+        .flush()
+        .map_err(|error| afni_write_error(error, payload.len(), elements.len()))?;
+    if verbose {
+        eprintln!(
+            "sumaru niml tx-write: bytes={} elements={} elapsed_ms={:.1}",
+            payload.len(),
+            elements.len(),
+            write_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if let Some(recorder) = recorder {
+        recorder.record_payload(NimlDirection::Tx, &payload)?;
+    }
+    Ok(())
+}
+
+fn write_afni_processing_instruction(
+    stream: &mut TcpStream,
+    payload: &str,
+    label: &str,
+    verbose: bool,
+    recorder: Option<&NimlRecorder>,
+) -> Result<()> {
+    let write_start = Instant::now();
+    stream
+        .write_all(payload.as_bytes())
+        .map_err(|error| afni_write_error(error, payload.len(), 0))?;
+    stream
+        .flush()
+        .map_err(|error| afni_write_error(error, payload.len(), 0))?;
+    if verbose {
+        eprintln!(
+            "sumaru niml tx-procins: {label} bytes={} elapsed_ms={:.1}",
+            payload.len(),
+            write_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if let Some(recorder) = recorder {
+        recorder.record_payload(NimlDirection::Tx, payload.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn wake_gui(wake: &WakeCallback) {
+    if let Ok(wake) = wake.lock() {
+        (*wake)();
     }
 }
 
@@ -526,11 +1097,22 @@ pub fn surface_registration_elements(
     mesh: &SurfaceMesh,
     info: &AfniSurfaceInfo,
 ) -> Result<Vec<NimlElement>> {
-    Ok(vec![
-        surface_ixyz_element(mesh, info)?,
-        surface_normals_element(mesh, info)?,
-        surface_ijk_element(mesh, info)?,
-    ])
+    AFNI_SURFACE_REGISTRATION_PARTS
+        .into_iter()
+        .map(|part| surface_registration_element(mesh, info, part))
+        .collect()
+}
+
+pub fn surface_registration_element(
+    mesh: &SurfaceMesh,
+    info: &AfniSurfaceInfo,
+    part: AfniSurfaceRegistrationPart,
+) -> Result<NimlElement> {
+    match part {
+        AfniSurfaceRegistrationPart::Coordinates => surface_ixyz_element(mesh, info),
+        AfniSurfaceRegistrationPart::Normals => surface_normals_element(mesh, info),
+        AfniSurfaceRegistrationPart::Triangles => surface_ijk_element(mesh, info),
+    }
 }
 
 pub fn outgoing_state_elements(
@@ -562,6 +1144,15 @@ pub fn surface_crosshair_element(
         "domain_parent_idcode".to_string(),
         info.local_domain_parent_id.clone(),
     );
+    attrs.insert("Parent_ID".to_string(), info.local_domain_parent_id.clone());
+    attrs.insert(
+        "local_domain_parent_ID".to_string(),
+        info.local_domain_parent_id.clone(),
+    );
+    attrs.insert(
+        "local_domain_parent".to_string(),
+        info.local_domain_parent.clone(),
+    );
     attrs.insert("surface_label".to_string(), info.surface_label.clone());
     push_opt_attr(&mut attrs, "volume_idcode", info.volume_idcode.as_deref());
 
@@ -575,6 +1166,40 @@ pub fn surface_crosshair_element(
         ],
     )
     .map(|matrix| NimlElement::numeric("SUMA_crosshair_xyz", attrs, matrix))
+}
+
+pub fn switch_underlay_command_for_surface(info: &AfniSurfaceInfo) -> Option<String> {
+    afni_surface_volume_driver_target(info).map(|target| format!("SWITCH_UNDERLAY A.{target}"))
+}
+
+fn drive_afni_command_element(command: impl Into<String>) -> NimlElement {
+    let mut attrs = BTreeMap::new();
+    attrs.insert("ni_verb".to_string(), "DRIVE_AFNI".to_string());
+    attrs.insert("ni_object".to_string(), command.into());
+    NimlElement {
+        name: "ni_do".to_string(),
+        attrs,
+        data: NimlData::None,
+    }
+}
+
+fn afni_surface_volume_driver_target(info: &AfniSurfaceInfo) -> Option<String> {
+    info.volume_idcode
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            info.volume_headname
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            info.volume_filecode
+                .as_deref()
+                .and_then(|path| Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .filter(|value| !value.is_empty())
+        })
+        .map(ToString::to_string)
 }
 
 pub fn parse_incoming_message(element: &NimlElement) -> Result<Option<AfniIncomingMessage>> {
@@ -603,9 +1228,7 @@ pub fn parse_incoming_message(element: &NimlElement) -> Result<Option<AfniIncomi
         "SUMARU_roi_state" => Ok(Some(AfniIncomingMessage::RoiUpdate(
             roi_update_from_element(element),
         ))),
-        "EngineCommand" => {
-            Ok(engine_command_from_element(element).map(AfniIncomingMessage::ControllerCommand))
-        }
+        "EngineCommand" => Ok(engine_command_from_element(element)),
         _ => Ok(None),
     }
 }
@@ -710,6 +1333,14 @@ pub fn route_incoming_message(
             }
             outcome.applied_state = true;
         }
+        AfniIncomingMessage::ViewerCommands(commands) => {
+            for command in commands {
+                outcome
+                    .actions
+                    .push(AfniRouteAction::ViewerCommand(command));
+            }
+            outcome.applied_state = true;
+        }
         AfniIncomingMessage::RoiUpdate(update) => {
             if let Some(visible) = update.visible {
                 controller.roi.visible = visible;
@@ -746,6 +1377,11 @@ impl AfniNimlSession {
             return Ok(None);
         }
         surface_registration_elements(mesh, info).map(Some)
+    }
+
+    pub fn reserve_surface_registration(&mut self, info: &AfniSurfaceInfo) -> bool {
+        self.registered_surface_ids
+            .insert(info.surface_idcode.clone())
     }
 
     pub fn receive_element(
@@ -808,27 +1444,31 @@ impl AfniRgbaOverlay {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("SUMA_irgba is missing surface_idcode"))?
             .to_string();
-        let NimlData::Numeric(matrix) = &element.data else {
-            bail!("SUMA_irgba must carry a numeric matrix");
-        };
-        ensure!(
-            matrix.column_count() >= 5,
-            "SUMA_irgba needs at least node,r,g,b,a columns"
-        );
+        let (node_indices, rgba) = match &element.data {
+            NimlData::None => (Vec::new(), Vec::new()),
+            NimlData::Numeric(matrix) => {
+                ensure!(
+                    matrix.column_count() >= 5,
+                    "SUMA_irgba needs at least node,r,g,b,a columns"
+                );
 
-        let mut node_indices = Vec::with_capacity(matrix.rows);
-        let mut rgba = Vec::with_capacity(matrix.rows);
-        for row in 0..matrix.rows {
-            let node = matrix.get(row, 0).unwrap_or(0.0).round() as i64;
-            ensure!(node >= 0, "SUMA_irgba node index must be non-negative");
-            node_indices.push(node as u32);
-            rgba.push([
-                clamp_u8(matrix.get(row, 1).unwrap_or(0.0)),
-                clamp_u8(matrix.get(row, 2).unwrap_or(0.0)),
-                clamp_u8(matrix.get(row, 3).unwrap_or(0.0)),
-                clamp_u8(matrix.get(row, 4).unwrap_or(0.0)),
-            ]);
-        }
+                let mut node_indices = Vec::with_capacity(matrix.rows);
+                let mut rgba = Vec::with_capacity(matrix.rows);
+                for row in 0..matrix.rows {
+                    let node = matrix.get(row, 0).unwrap_or(0.0).round() as i64;
+                    ensure!(node >= 0, "SUMA_irgba node index must be non-negative");
+                    node_indices.push(node as u32);
+                    rgba.push([
+                        clamp_u8(matrix.get(row, 1).unwrap_or(0.0)),
+                        clamp_u8(matrix.get(row, 2).unwrap_or(0.0)),
+                        clamp_u8(matrix.get(row, 3).unwrap_or(0.0)),
+                        clamp_u8(matrix.get(row, 4).unwrap_or(0.0)),
+                    ]);
+                }
+                (node_indices, rgba)
+            }
+            _ => bail!("SUMA_irgba must carry a numeric matrix or be empty"),
+        };
 
         Ok(Self {
             surface_idcode,
@@ -1320,9 +1960,13 @@ fn controller_command_from_element(element: &NimlElement) -> Option<AfniControll
     }
 }
 
-fn engine_command_from_element(element: &NimlElement) -> Option<AfniControllerCommand> {
+fn engine_command_from_element(element: &NimlElement) -> Option<AfniIncomingMessage> {
     match attr(element, "Command")? {
         "viewer_cont" => {
+            let viewer_commands = drivesuma_viewer_commands_from_element(element);
+            if !viewer_commands.is_empty() {
+                return Some(AfniIncomingMessage::ViewerCommands(viewer_commands));
+            }
             if let Some(value) = attr(element, "bkg_col") {
                 let is_white = value
                     .split_whitespace()
@@ -1330,23 +1974,141 @@ fn engine_command_from_element(element: &NimlElement) -> Option<AfniControllerCo
                     .take(3)
                     .sum::<f32>()
                     > 1.5;
-                return Some(AfniControllerCommand::SetBackground(if is_white {
-                    BackgroundMode::White
-                } else {
-                    BackgroundMode::Black
-                }));
+                return Some(AfniIncomingMessage::ControllerCommand(
+                    AfniControllerCommand::SetBackground(if is_white {
+                        BackgroundMode::White
+                    } else {
+                        BackgroundMode::Black
+                    }),
+                ));
             }
             None
         }
         "surf_cont" => {
             if parse_attr::<bool>(element, "view_dset") == Some(false) {
-                Some(AfniControllerCommand::ToggleOverlay)
+                Some(AfniIncomingMessage::ControllerCommand(
+                    AfniControllerCommand::ToggleOverlay,
+                ))
             } else {
                 None
             }
         }
         _ => None,
     }
+}
+
+fn drivesuma_viewer_commands_from_element(element: &NimlElement) -> Vec<ViewerCommand> {
+    let key_count = parse_attr::<usize>(element, "N_Key").unwrap_or(0);
+    let mut commands = Vec::new();
+    for index in 0..key_count {
+        let Some(key) = attr(element, &format!("Key_{index}")) else {
+            continue;
+        };
+        let repeat = parse_attr::<usize>(element, &format!("Key_rep_{index}"))
+            .unwrap_or(1)
+            .max(1);
+        let key_value = attr(element, &format!("Key_strval_{index}"));
+        if let Some(command) = drivesuma_key_viewer_command(key, key_value) {
+            commands.extend(std::iter::repeat_n(command, repeat));
+        }
+    }
+    commands
+}
+
+fn drivesuma_key_viewer_command(key: &str, value: Option<&str>) -> Option<ViewerCommand> {
+    if value.is_some() {
+        return None;
+    }
+
+    match key {
+        "R" | "space" | "Space" => Some(ViewerCommand::ResetCamera),
+        "up" | "Up" => Some(ViewerCommand::NudgeCamera(ViewNudge::Up)),
+        "down" | "Down" => Some(ViewerCommand::NudgeCamera(ViewNudge::Down)),
+        "left" | "Left" => Some(ViewerCommand::NudgeCamera(ViewNudge::Left)),
+        "right" | "Right" => Some(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+        "ctrl+left" | "ctrl+Left" => Some(ViewerCommand::Preset(ViewPreset::Left)),
+        "ctrl+right" | "ctrl+Right" => Some(ViewerCommand::Preset(ViewPreset::Right)),
+        "ctrl+up" | "ctrl+Up" => Some(ViewerCommand::Preset(ViewPreset::Top)),
+        "ctrl+down" | "ctrl+Down" => Some(ViewerCommand::Preset(ViewPreset::Bottom)),
+        "F5" | "b" => Some(ViewerCommand::ToggleBackground),
+        "p" => Some(ViewerCommand::ToggleSurfaceRenderStyle),
+        "P" => Some(ViewerCommand::ReverseSurfaceRenderStyle),
+        "o" => Some(ViewerCommand::CycleSurfaceOpacity),
+        "O" => Some(ViewerCommand::RaiseSurfaceOpacity),
+        "m" => Some(ViewerCommand::ToggleCameraMomentum),
+        "r" => Some(ViewerCommand::SaveScreenshot),
+        "ctrl+r" => Some(ViewerCommand::SaveMontage),
+        "G" => Some(ViewerCommand::OpenGraphForPick),
+        "comma" | "," => Some(ViewerCommand::CycleSceneSurface(-1)),
+        "period" | "." => Some(ViewerCommand::CycleSceneSurface(1)),
+        _ => None,
+    }
+}
+
+pub fn drivesuma_unsupported_attributes(element: &NimlElement) -> Vec<String> {
+    if element.name != "EngineCommand" {
+        return Vec::new();
+    }
+
+    match attr(element, "Command") {
+        Some("viewer_cont") => drivesuma_unsupported_viewer_attrs(element),
+        Some("surf_cont") => drivesuma_unsupported_attrs_except(element, &["Command", "view_dset"]),
+        Some(command) => vec![format!("Command={command}")],
+        None => vec!["Command=<missing>".to_string()],
+    }
+}
+
+fn drivesuma_unsupported_viewer_attrs(element: &NimlElement) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    for key in element.attrs.keys() {
+        if key == "Command"
+            || key == "bkg_col"
+            || key == "N_Key"
+            || drivesuma_key_attr_index(key).is_some()
+        {
+            continue;
+        }
+        unsupported.push(key.clone());
+    }
+
+    let key_count = parse_attr::<usize>(element, "N_Key").unwrap_or(0);
+    for index in 0..key_count {
+        let key_attr = format!("Key_{index}");
+        let Some(key) = attr(element, &key_attr) else {
+            unsupported.push(key_attr);
+            continue;
+        };
+        let value = attr(element, &format!("Key_strval_{index}"));
+        if drivesuma_key_viewer_command(key, value).is_none() {
+            if let Some(value) = value {
+                unsupported.push(format!("{key_attr}={key} value={value}"));
+            } else {
+                unsupported.push(format!("{key_attr}={key}"));
+            }
+        }
+    }
+    unsupported.sort();
+    unsupported
+}
+
+fn drivesuma_unsupported_attrs_except(element: &NimlElement, supported: &[&str]) -> Vec<String> {
+    let mut unsupported = element
+        .attrs
+        .keys()
+        .filter(|key| !supported.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unsupported.sort();
+    unsupported
+}
+
+fn drivesuma_key_attr_index(key: &str) -> Option<usize> {
+    key.strip_prefix("Key_rep_")
+        .or_else(|| key.strip_prefix("Key_pause_"))
+        .or_else(|| key.strip_prefix("Key_redis_"))
+        .or_else(|| key.strip_prefix("Key_strval_"))
+        .or_else(|| key.strip_prefix("Key_"))
+        .and_then(|index| index.parse().ok())
 }
 
 fn roi_update_from_element(element: &NimlElement) -> AfniRoiUpdate {
@@ -1496,6 +2258,33 @@ mod tests {
     }
 
     #[test]
+    fn switch_underlay_command_prefers_volume_idcode() {
+        let mesh = SurfaceMesh::new(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0, 1, 2]],
+        )
+        .unwrap();
+        let mut info = AfniSurfaceInfo::from_mesh(&mesh);
+        info.volume_idcode = Some("AFN_volume_id".to_string());
+        info.volume_headname = Some("anat.nii.gz".to_string());
+
+        let command = switch_underlay_command_for_surface(&info).unwrap();
+        let element = drive_afni_command_element(command.clone());
+
+        assert_eq!(command, "SWITCH_UNDERLAY A.AFN_volume_id");
+        assert_eq!(element.name, "ni_do");
+        assert_eq!(
+            element.attrs.get("ni_verb").map(String::as_str),
+            Some("DRIVE_AFNI")
+        );
+        assert_eq!(
+            element.attrs.get("ni_object").map(String::as_str),
+            Some("SWITCH_UNDERLAY A.AFN_volume_id")
+        );
+        assert_eq!(element.data, NimlData::None);
+    }
+
+    #[test]
     fn gifti_surface_registration_flips_lpi_xy_for_afni() {
         let mut mesh = SurfaceMesh::new(
             vec![[0.0, 0.0, 0.0], [10.0, 20.0, 0.0], [0.0, 1.0, 0.0]],
@@ -1572,6 +2361,46 @@ mod tests {
             outcome.actions.as_slice(),
             [AfniRouteAction::RgbaOverlay(AfniRgbaOverlay { surface_idcode, threshold, .. })]
                 if surface_idcode == "surf-1" && threshold.as_deref() == Some("2.5")
+        ));
+    }
+
+    #[test]
+    fn empty_suma_irgba_routes_as_empty_overlay_action() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("surface_idcode".to_string(), "surf-1".to_string());
+        attrs.insert("local_domain_parent_ID".to_string(), "domain-1".to_string());
+        attrs.insert("function_idcode".to_string(), "func".to_string());
+        attrs.insert("threshold".to_string(), "0".to_string());
+        attrs.insert("volume_idcode".to_string(), "vol".to_string());
+        let element = NimlElement {
+            name: "SUMA_irgba".to_string(),
+            attrs,
+            data: NimlData::None,
+        };
+        let message = parse_incoming_message(&element).unwrap().unwrap();
+
+        let mut controller = ControllerState::default();
+        let outcome = route_incoming_message(&mut controller, message);
+
+        assert!(outcome.applied_state);
+        assert!(controller.overlay.visible);
+        assert!(matches!(
+            outcome.actions.as_slice(),
+            [AfniRouteAction::RgbaOverlay(AfniRgbaOverlay {
+                surface_idcode,
+                local_domain_parent_id,
+                node_indices,
+                rgba,
+                threshold,
+                function_idcode,
+                volume_idcode,
+            })] if surface_idcode == "surf-1"
+                && local_domain_parent_id.as_deref() == Some("domain-1")
+                && node_indices.is_empty()
+                && rgba.is_empty()
+                && threshold.as_deref() == Some("0")
+                && function_idcode.as_deref() == Some("func")
+                && volume_idcode.as_deref() == Some("vol")
         ));
     }
 
@@ -1674,6 +2503,22 @@ mod tests {
             Some(&info.surface_idcode)
         );
         assert_eq!(
+            element.attrs.get("domain_parent_idcode"),
+            Some(&info.local_domain_parent_id)
+        );
+        assert_eq!(
+            element.attrs.get("Parent_ID"),
+            Some(&info.local_domain_parent_id)
+        );
+        assert_eq!(
+            element.attrs.get("local_domain_parent_ID"),
+            Some(&info.local_domain_parent_id)
+        );
+        assert_eq!(
+            element.attrs.get("local_domain_parent"),
+            Some(&info.local_domain_parent)
+        );
+        assert_eq!(
             element.attrs.get("volume_idcode"),
             Some(&"AFN_test".to_string())
         );
@@ -1735,6 +2580,198 @@ mod tests {
             overlay.attrs.get("threshold_value"),
             Some(&"3.1".to_string())
         );
+    }
+
+    #[test]
+    fn enqueue_coalesced_afni_messages_keeps_latest_rgba_overlay_per_surface() {
+        let mut queue = VecDeque::new();
+        let first = AfniIncomingMessage::RgbaOverlay(AfniRgbaOverlay {
+            surface_idcode: "surf-1".to_string(),
+            local_domain_parent_id: Some("parent-1".to_string()),
+            node_indices: vec![1, 2],
+            rgba: vec![[255, 0, 0, 255], [0, 255, 0, 255]],
+            threshold: Some("1.0".to_string()),
+            function_idcode: Some("func-1".to_string()),
+            volume_idcode: Some("vol-1".to_string()),
+        });
+        let second = AfniIncomingMessage::RgbaOverlay(AfniRgbaOverlay {
+            surface_idcode: "surf-1".to_string(),
+            local_domain_parent_id: Some("parent-1".to_string()),
+            node_indices: vec![3],
+            rgba: vec![[0, 0, 255, 128]],
+            threshold: Some("2.0".to_string()),
+            function_idcode: Some("func-2".to_string()),
+            volume_idcode: Some("vol-2".to_string()),
+        });
+
+        enqueue_coalesced_afni_messages(&mut queue, [first, second.clone()]);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front(), Some(&second));
+    }
+
+    #[test]
+    fn enqueue_coalesced_afni_messages_merges_partial_overlay_updates() {
+        let mut queue = VecDeque::new();
+
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::OverlayState(AfniOverlayState {
+                visible: Some(false),
+                symmetric_range: None,
+                intensity_range: Some(ValueRange {
+                    min: -5.0,
+                    max: 5.0,
+                }),
+                threshold: None,
+                opacity: None,
+                overlay_path: None,
+            })],
+        );
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::OverlayState(AfniOverlayState {
+                visible: None,
+                symmetric_range: Some(true),
+                intensity_range: None,
+                threshold: Some(OverlayThreshold {
+                    enabled: true,
+                    absolute: false,
+                    value: 3.5,
+                    hide_failed: false,
+                }),
+                opacity: Some(0.4),
+                overlay_path: Some(PathBuf::from("stats.niml.dset")),
+            })],
+        );
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.front(),
+            Some(&AfniIncomingMessage::OverlayState(AfniOverlayState {
+                visible: Some(false),
+                symmetric_range: Some(true),
+                intensity_range: Some(ValueRange {
+                    min: -5.0,
+                    max: 5.0,
+                }),
+                threshold: Some(OverlayThreshold {
+                    enabled: true,
+                    absolute: false,
+                    value: 3.5,
+                    hide_failed: false,
+                }),
+                opacity: Some(0.4),
+                overlay_path: Some(PathBuf::from("stats.niml.dset")),
+            }))
+        );
+    }
+
+    #[test]
+    fn enqueue_coalesced_afni_messages_cancels_paired_toggle_overlay_commands() {
+        let mut queue = VecDeque::new();
+
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::SetBackground(BackgroundMode::White),
+            )],
+        );
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::ToggleOverlay,
+            )],
+        );
+        enqueue_coalesced_afni_messages(
+            &mut queue,
+            [AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::ToggleOverlay,
+            )],
+        );
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.front(),
+            Some(&AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::SetBackground(BackgroundMode::White),
+            ))
+        );
+    }
+
+    #[test]
+    fn drivesuma_viewer_cont_key_commands_route_to_viewer_actions() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("Command".to_string(), "viewer_cont".to_string());
+        attrs.insert("N_Key".to_string(), "4".to_string());
+        attrs.insert("Key_0".to_string(), "R".to_string());
+        attrs.insert("Key_rep_0".to_string(), "1".to_string());
+        attrs.insert("Key_1".to_string(), "right".to_string());
+        attrs.insert("Key_rep_1".to_string(), "3".to_string());
+        attrs.insert("Key_2".to_string(), "ctrl+left".to_string());
+        attrs.insert("Key_rep_2".to_string(), "1".to_string());
+        attrs.insert("Key_3".to_string(), "comma".to_string());
+        attrs.insert("Key_rep_3".to_string(), "1".to_string());
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        let message = parse_incoming_message(&element).unwrap().unwrap();
+        let mut controller = ControllerState::default();
+        let outcome = route_incoming_message(&mut controller, message);
+
+        assert!(outcome.applied_state);
+        assert_eq!(
+            outcome.actions,
+            vec![
+                AfniRouteAction::ViewerCommand(ViewerCommand::ResetCamera),
+                AfniRouteAction::ViewerCommand(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::Preset(ViewPreset::Left)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::CycleSceneSurface(-1)),
+            ]
+        );
+        assert!(drivesuma_unsupported_attributes(&element).is_empty());
+    }
+
+    #[test]
+    fn drivesuma_unsupported_attributes_report_unimplemented_commands() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("Command".to_string(), "viewer_cont".to_string());
+        attrs.insert("N_Key".to_string(), "1".to_string());
+        attrs.insert("Key_0".to_string(), "j".to_string());
+        attrs.insert("Key_rep_0".to_string(), "1".to_string());
+        attrs.insert("Key_strval_0".to_string(), "54R".to_string());
+        attrs.insert("load_view".to_string(), "saved.vvs".to_string());
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        assert_eq!(
+            drivesuma_unsupported_attributes(&element),
+            vec!["Key_0=j value=54R".to_string(), "load_view".to_string(),]
+        );
+        assert!(parse_incoming_message(&element).unwrap().is_none());
+    }
+
+    #[test]
+    fn drivesuma_surf_cont_view_dset_false_still_toggles_overlay() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("Command".to_string(), "surf_cont".to_string());
+        attrs.insert("view_dset".to_string(), "n".to_string());
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        let message = parse_incoming_message(&element).unwrap().unwrap();
+        let mut controller = ControllerState::default();
+        controller.overlay.visible = true;
+        let outcome = route_incoming_message(&mut controller, message);
+
+        assert!(outcome.applied_state);
+        assert!(!controller.overlay.visible);
+        assert_eq!(
+            outcome.actions,
+            vec![AfniRouteAction::ViewerCommand(
+                ViewerCommand::SetOverlayVisible(false)
+            )]
+        );
+        assert!(drivesuma_unsupported_attributes(&element).is_empty());
     }
 
     #[test]

@@ -61,6 +61,10 @@ impl CameraCommandState {
         self.last_preset = Some(preset);
     }
 
+    pub fn note_manual_motion(&mut self) {
+        self.last_preset = None;
+    }
+
     pub fn note_reset(&mut self) {
         self.reset_generation = self.reset_generation.wrapping_add(1);
         self.last_preset = None;
@@ -100,7 +104,11 @@ pub enum ViewPreset {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayCommandState {
     pub background: BackgroundMode,
+    pub lighting_mode: LightingMode,
+    pub surface_render_style: SurfaceRenderStyle,
+    pub surface_opacity_percent: u8,
     pub anatomical_shading_visible: bool,
+    pub afni_uncolored_nodes_transparent: bool,
     pub pair_layout: HemisphereLayout,
     pub pair_state: HemisphereLayoutState,
     pub pair_visibility: PairVisibility,
@@ -110,10 +118,102 @@ impl Default for DisplayCommandState {
     fn default() -> Self {
         Self {
             background: BackgroundMode::Black,
+            lighting_mode: LightingMode::default(),
+            surface_render_style: SurfaceRenderStyle::default(),
+            surface_opacity_percent: 100,
             anatomical_shading_visible: false,
+            afni_uncolored_nodes_transparent: false,
             pair_layout: HemisphereLayout::Closed,
             pair_state: HemisphereLayoutState::closed(),
             pair_visibility: PairVisibility::both(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LightingMode {
+    Directional,
+    DirectionalSoft,
+    Headlight,
+    #[default]
+    Studio,
+    Flat,
+}
+
+impl LightingMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Directional => "fixed",
+            Self::DirectionalSoft => "fixed soft",
+            Self::Headlight => "headlight",
+            Self::Studio => "studio",
+            Self::Flat => "flat",
+        }
+    }
+
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::Directional => Self::DirectionalSoft,
+            Self::DirectionalSoft => Self::Headlight,
+            Self::Headlight => Self::Studio,
+            Self::Studio => Self::Flat,
+            Self::Flat => Self::Directional,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurfaceRenderStyle {
+    #[default]
+    Filled,
+    Triangles,
+    Vertices,
+    VerticesHalf,
+    VerticesQuarter,
+    VerticesEighth,
+}
+
+impl SurfaceRenderStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::Triangles => "triangles",
+            Self::Vertices => "points",
+            Self::VerticesHalf => "points/2",
+            Self::VerticesQuarter => "points/4",
+            Self::VerticesEighth => "points/8",
+        }
+    }
+
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::Filled => Self::Triangles,
+            Self::Triangles => Self::Vertices,
+            Self::Vertices => Self::VerticesHalf,
+            Self::VerticesHalf => Self::VerticesQuarter,
+            Self::VerticesQuarter => Self::VerticesEighth,
+            Self::VerticesEighth => Self::Filled,
+        }
+    }
+
+    pub fn cycled_backward(self) -> Self {
+        match self {
+            Self::Filled => Self::VerticesEighth,
+            Self::Triangles => Self::Filled,
+            Self::Vertices => Self::Triangles,
+            Self::VerticesHalf => Self::Vertices,
+            Self::VerticesQuarter => Self::VerticesHalf,
+            Self::VerticesEighth => Self::VerticesQuarter,
+        }
+    }
+
+    pub fn point_prefix_groups(self) -> Option<u8> {
+        match self {
+            Self::Filled | Self::Triangles => None,
+            Self::Vertices => Some(8),
+            Self::VerticesHalf => Some(4),
+            Self::VerticesQuarter => Some(2),
+            Self::VerticesEighth => Some(1),
         }
     }
 }
@@ -394,7 +494,15 @@ impl StatusLog {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewNudge {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ViewerCommand {
     PickSurface,
     PickOverlay,
@@ -405,9 +513,15 @@ pub enum ViewerCommand {
     RefreshOverlayAppearance,
     ResetCamera,
     ToggleCameraMode,
+    ToggleLightingMode,
+    ToggleSurfaceRenderStyle,
+    ReverseSurfaceRenderStyle,
+    CycleSurfaceOpacity,
+    RaiseSurfaceOpacity,
     ToggleCameraMomentum,
     ToggleBackground,
     SetAnatomicalShadingVisible(bool),
+    ToggleAfniUncoloredTransparency,
     SetOverlayVisible(bool),
     SetRoiVisible(bool),
     SetRoiSlotVisible(usize, bool),
@@ -426,9 +540,11 @@ pub enum ViewerCommand {
     SetRoiControllerOpen(bool),
     OpenGraphForPick,
     SetGraphWindowOpen(bool),
+    NudgeCamera(ViewNudge),
     Preset(ViewPreset),
     HemisphereLayout(HemisphereLayout),
     SelectSceneSurface(usize),
+    CycleSceneSurface(isize),
     SaveScreenshot,
     SaveMontage,
     /// Spawn a fresh, empty sumaru window — no surface, overlay, or session
@@ -468,7 +584,8 @@ fn value_label(value: Option<f32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundMode, CameraControlMode, ControllerState, PairVisibility, SurfacePick, ViewPreset,
+        BackgroundMode, CameraControlMode, ControllerState, LightingMode, PairVisibility,
+        SurfacePick, SurfaceRenderStyle, ViewPreset,
     };
     use crate::surface::SurfaceSide;
 
@@ -484,12 +601,69 @@ mod tests {
     }
 
     #[test]
+    fn lighting_mode_cycles_through_all_presets() {
+        let mut mode = LightingMode::Directional;
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::DirectionalSoft);
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::Headlight);
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::Studio);
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::Flat);
+        mode = mode.cycled();
+        assert_eq!(mode, LightingMode::Directional);
+    }
+
+    #[test]
+    fn lighting_mode_default_is_studio() {
+        assert_eq!(LightingMode::default(), LightingMode::Studio);
+    }
+
+    #[test]
+    fn surface_render_style_cycles_through_all_presets() {
+        let mut style = SurfaceRenderStyle::Filled;
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::Triangles);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::Vertices);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::VerticesHalf);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::VerticesQuarter);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::VerticesEighth);
+        style = style.cycled();
+        assert_eq!(style, SurfaceRenderStyle::Filled);
+    }
+
+    #[test]
+    fn surface_render_style_cycles_backward_through_all_presets() {
+        let mut style = SurfaceRenderStyle::Filled;
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::VerticesEighth);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::VerticesQuarter);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::VerticesHalf);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::Vertices);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::Triangles);
+        style = style.cycled_backward();
+        assert_eq!(style, SurfaceRenderStyle::Filled);
+    }
+
+    #[test]
     fn camera_command_state_tracks_mode_preset_and_reset() {
         let mut state = ControllerState::default();
 
         assert_eq!(state.camera.toggle_mode(), CameraControlMode::Turntable);
         state.camera.set_preset(ViewPreset::Top);
         assert_eq!(state.camera.last_preset, Some(ViewPreset::Top));
+        state.camera.note_manual_motion();
+        assert_eq!(state.camera.last_preset, None);
+        state.camera.set_preset(ViewPreset::Top);
         state.camera.note_reset();
 
         assert_eq!(state.camera.reset_generation, 1);

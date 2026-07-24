@@ -277,6 +277,7 @@ pub fn send_debug_command(
     let count = elements.len();
     let mut connection = AfniConnection::connect(config, verbose, None, || {})?;
     connection.send_elements(&elements)?;
+    connection.flush()?;
     Ok(count)
 }
 

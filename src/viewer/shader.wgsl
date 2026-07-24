@@ -1,7 +1,11 @@
 struct Uniforms {
     view_projection: mat4x4<f32>,
     model: mat4x4<f32>,
-    light_direction: vec4<f32>,
+    light_direction_primary: vec4<f32>,
+    light_direction_secondary: vec4<f32>,
+    light_direction_tertiary: vec4<f32>,
+    light_weights: vec4<f32>,
+    lighting_params: vec4<f32>,
     surface_color: vec4<f32>,
 }
 
@@ -20,6 +24,12 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
 }
 
+struct FlatVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) @interpolate(flat) color: vec4<f32>,
+}
+
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     let world_position = uniforms.model * vec4<f32>(input.position, 1.0);
@@ -32,14 +42,52 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     return output;
 }
 
+@vertex
+fn flat_vs_main(input: VertexInput) -> FlatVertexOutput {
+    let world_position = uniforms.model * vec4<f32>(input.position, 1.0);
+    let world_normal = normalize((uniforms.model * vec4<f32>(input.normal, 0.0)).xyz);
+
+    var output: FlatVertexOutput;
+    output.clip_position = uniforms.view_projection * world_position;
+    output.normal = world_normal;
+    output.color = input.color;
+    return output;
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if input.color.a <= 0.001 {
+        discard;
+    }
     let normal = normalize(input.normal);
-    let light = normalize(uniforms.light_direction.xyz);
-    let diffuse = abs(dot(normal, light));
-    let lit = 0.28 + diffuse * 0.72;
+    let primary = normalize(uniforms.light_direction_primary.xyz);
+    let secondary = normalize(uniforms.light_direction_secondary.xyz);
+    let tertiary = normalize(uniforms.light_direction_tertiary.xyz);
+    let diffuse =
+        abs(dot(normal, primary)) * uniforms.light_weights.x
+        + abs(dot(normal, secondary)) * uniforms.light_weights.y
+        + abs(dot(normal, tertiary)) * uniforms.light_weights.z;
+    let lit = clamp(uniforms.lighting_params.x + diffuse * uniforms.lighting_params.y, 0.0, 1.0);
 
-    return vec4<f32>(input.color.rgb * lit, input.color.a);
+    return vec4<f32>(input.color.rgb * lit, input.color.a * uniforms.surface_color.a);
+}
+
+@fragment
+fn flat_fs_main(input: FlatVertexOutput) -> @location(0) vec4<f32> {
+    if input.color.a <= 0.001 {
+        discard;
+    }
+    let normal = normalize(input.normal);
+    let primary = normalize(uniforms.light_direction_primary.xyz);
+    let secondary = normalize(uniforms.light_direction_secondary.xyz);
+    let tertiary = normalize(uniforms.light_direction_tertiary.xyz);
+    let diffuse =
+        abs(dot(normal, primary)) * uniforms.light_weights.x
+        + abs(dot(normal, secondary)) * uniforms.light_weights.y
+        + abs(dot(normal, tertiary)) * uniforms.light_weights.z;
+    let lit = clamp(uniforms.lighting_params.x + diffuse * uniforms.lighting_params.y, 0.0, 1.0);
+
+    return vec4<f32>(input.color.rgb * lit, input.color.a * uniforms.surface_color.a);
 }
 
 struct OverlayInput {

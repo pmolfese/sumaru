@@ -3,8 +3,94 @@
 //! as part of the topical-submodule split; all methods stay on `ViewerState`.
 
 use super::*;
+use crate::afni::switch_underlay_command_for_surface;
+
+const AFNI_GPU_PATCH_MERGE_GAP_NODES: usize = 64;
+const AFNI_GPU_PATCH_MAX_WRITES: usize = 1024;
+const AFNI_GPU_PATCH_MAX_FRACTION: usize = 2;
+
+fn afni_optional_label(value: Option<&str>) -> &str {
+    value.filter(|value| !value.is_empty()).unwrap_or("<none>")
+}
+
+fn afni_optional_path_label(value: Option<&PathBuf>) -> String {
+    value
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn afni_surface_info_debug_label(info: &AfniSurfaceInfo) -> String {
+    format!(
+        "surface_id={} label={} domain_parent_id={} domain_parent={} volume_id={} volume_headname={} volume_filecode={} spec_name={} spec_path={}",
+        info.surface_idcode,
+        info.surface_label,
+        info.local_domain_parent_id,
+        info.local_domain_parent,
+        afni_optional_label(info.volume_idcode.as_deref()),
+        afni_optional_label(info.volume_headname.as_deref()),
+        afni_optional_label(info.volume_filecode.as_deref()),
+        afni_optional_label(info.specfile_name.as_deref()),
+        afni_optional_label(info.specfile_path.as_deref())
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum AfniGpuColorUploadPlan {
+    None,
+    Ranges(Vec<std::ops::Range<usize>>),
+    Full,
+}
+
+pub(super) fn afni_gpu_color_upload_plan(
+    previous: &[[f32; 4]],
+    colors: &[[f32; 4]],
+) -> AfniGpuColorUploadPlan {
+    if previous.len() != colors.len() {
+        return AfniGpuColorUploadPlan::Full;
+    }
+
+    let mut ranges = Vec::<std::ops::Range<usize>>::new();
+    let mut start = None;
+    for index in 0..=colors.len() {
+        let changed = index < colors.len() && previous[index] != colors[index];
+        match (start, changed) {
+            (None, true) => start = Some(index),
+            (Some(range_start), false) => {
+                let next = range_start..index;
+                if let Some(last) = ranges.last_mut()
+                    && next.start.saturating_sub(last.end) <= AFNI_GPU_PATCH_MERGE_GAP_NODES
+                {
+                    last.end = next.end;
+                } else {
+                    ranges.push(next);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if ranges.is_empty() {
+        return AfniGpuColorUploadPlan::None;
+    }
+
+    let upload_nodes = ranges.iter().map(|range| range.len()).sum::<usize>();
+    if ranges.len() > AFNI_GPU_PATCH_MAX_WRITES
+        || upload_nodes.saturating_mul(AFNI_GPU_PATCH_MAX_FRACTION) >= colors.len()
+    {
+        AfniGpuColorUploadPlan::Full
+    } else {
+        AfniGpuColorUploadPlan::Ranges(ranges)
+    }
+}
 
 impl ViewerState {
+    fn reset_afni_surface_registration_state(&mut self) {
+        self.afni_session = AfniNimlSession::new();
+        self.pending_afni_surface_registrations.clear();
+        self.registered_afni_scene_components.clear();
+        self.pending_afni_post_registration_underlay = false;
+    }
+
     /// Connect if disconnected, disconnect if connected.
     pub(super) fn toggle_afni_talk(&mut self) -> Result<()> {
         if self.afni_connection.is_some() {
@@ -24,12 +110,13 @@ impl ViewerState {
 
         let config = self.afni_options.port_config.clone();
         let event_proxy = self.event_proxy.clone();
+        let afni_work_scheduled = Arc::clone(&self.afni_work_scheduled);
         let connection = AfniConnection::connect(
             &config,
             self.verbose,
             self.afni_recorder.clone(),
             move || {
-                let _ = event_proxy.send_event(ViewerEvent::AfniMessagesReady);
+                request_afni_event_once(&event_proxy, &afni_work_scheduled);
             },
         )
         .with_context(|| {
@@ -39,11 +126,30 @@ impl ViewerState {
             )
         })?;
         self.afni_connection = Some(connection);
-        self.afni_session = AfniNimlSession::new();
+        self.afni_work_scheduled.store(false, Ordering::Release);
+        self.reset_afni_surface_registration_state();
         self.log_status(format!(
             "Connected AFNI/SUMA NIML talk at {}:{}.",
             config.host, config.port
         ));
+        if self.verbose {
+            self.log_status(format!(
+                "AFNI verbose: session surface_volume_path={} surface_volume_idcode={} scene={}.",
+                afni_optional_path_label(self.surface_volume_path.as_ref()),
+                afni_optional_label(self.surface_volume_idcode.as_deref()),
+                self.surface_scene
+                    .as_ref()
+                    .map(|scene| {
+                        format!(
+                            "{} surface group{} from {}",
+                            scene.surfaces.len(),
+                            if scene.surfaces.len() == 1 { "" } else { "s" },
+                            scene.spec_path.display()
+                        )
+                    })
+                    .unwrap_or_else(|| "direct surface".to_string())
+            ));
+        }
         self.send_afni_surfaces(false)
     }
 
@@ -51,7 +157,12 @@ impl ViewerState {
     pub(super) fn disconnect_afni_talk(&mut self) {
         if let Some(mut connection) = self.afni_connection.take() {
             connection.disconnect();
-            self.afni_session = AfniNimlSession::new();
+            self.reset_afni_surface_registration_state();
+            self.pending_afni_messages.clear();
+            self.pending_cell_color_upload = None;
+            self.deferred_afni_rgba_overlays.clear();
+            self.afni_work_scheduled.store(false, Ordering::Release);
+            self.trim_scene_surface_residency();
             self.log_status("Disconnected AFNI/SUMA NIML talk.");
         }
     }
@@ -63,7 +174,7 @@ impl ViewerState {
             return Ok(());
         }
 
-        self.afni_session = AfniNimlSession::new();
+        self.reset_afni_surface_registration_state();
         self.send_afni_surfaces(true)
     }
 
@@ -78,76 +189,222 @@ impl ViewerState {
         }
 
         if force {
-            self.afni_session = AfniNimlSession::new();
+            self.reset_afni_surface_registration_state();
         }
 
-        self.ensure_scene_surfaces_loaded_for_afni()?;
-        let exports = self.afni_surface_exports()?;
-        let mut sent_count = 0usize;
-        for (mesh, info) in exports {
-            let Some(elements) = self.afni_session.register_surface_once(&mesh, &info)? else {
-                continue;
-            };
-            let connection = self
-                .afni_connection
-                .as_mut()
-                .context("AFNI/SUMA NIML talk is not connected")?;
-            for element in elements {
-                if let Err(error) = connection.send_elements(std::slice::from_ref(&element)) {
-                    self.disconnect_afni_talk();
-                    return Err(error.context("AFNI/SUMA NIML write failed"));
-                }
-            }
-            sent_count += 1;
-        }
-
-        if sent_count > 0 {
+        if self.verbose {
             self.log_status(format!(
-                "Sent {sent_count} surface registration{} to AFNI/SUMA.",
-                if sent_count == 1 { "" } else { "s" }
+                "AFNI verbose: preparing surface registration force={} surface_volume_path={} surface_volume_idcode={}.",
+                force,
+                afni_optional_path_label(self.surface_volume_path.as_ref()),
+                afni_optional_label(self.surface_volume_idcode.as_deref())
             ));
+        }
+
+        let queued_count = if self.surface_scene.is_some() {
+            self.queue_scene_afni_surface_registrations()?
+        } else {
+            self.queue_direct_afni_surface_registration()?
+        };
+
+        if queued_count > 0 {
+            self.log_status(format!(
+                "Queued {queued_count} surface registration{} for AFNI/SUMA.",
+                if queued_count == 1 { "" } else { "s" }
+            ));
+            self.pending_afni_post_registration_underlay = true;
+            self.process_pending_afni_surface_registrations()?;
         } else if force {
             self.log_status("No new surface geometry needed to be sent to AFNI/SUMA.");
         }
 
-        // Nudge AFNI to redraw the overlay for the freshly registered surfaces
-        // so the connection is visibly live without waiting for the user to
-        // click. Prefer the current/last crosshair location to avoid moving
-        // AFNI's focus on a plain surface switch.
-        self.send_afni_redraw_crosshair();
+        self.trim_scene_surface_residency();
 
         Ok(())
     }
 
-    /// Send a `SUMA_crosshair_xyz` to prompt AFNI to resend its colorization for
-    /// the active surfaces. Targets, in order: the current selection, the last
-    /// crosshair we sent, AFNI's most recently reported crosshair, and finally
-    /// the node nearest the brain's center to trigger an initial draw when none
-    /// of those exist yet.
-    pub(super) fn send_afni_redraw_crosshair(&mut self) {
-        if self.afni_connection.is_none() {
-            return;
+    fn queue_direct_afni_surface_registration(&mut self) -> Result<usize> {
+        let mut queued_count = 0usize;
+        for (mesh, info) in self.afni_surface_exports()? {
+            if !self.afni_session.reserve_surface_registration(&info) {
+                if self.verbose {
+                    self.log_status(format!(
+                        "AFNI verbose: skipping already-registered direct surface {}.",
+                        afni_surface_info_debug_label(&info)
+                    ));
+                }
+                continue;
+            }
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI verbose: queued direct surface registration nodes={} faces={} {}.",
+                    mesh.vertices.len(),
+                    mesh.triangles.len(),
+                    afni_surface_info_debug_label(&info)
+                ));
+            }
+            self.pending_afni_surface_registrations
+                .push_back(PendingAfniSurfaceRegistration {
+                    mesh: Arc::new(mesh),
+                    info,
+                });
+            queued_count += 1;
         }
-        let Some(mesh) = self.mesh.as_ref() else {
+
+        Ok(queued_count)
+    }
+
+    fn queue_scene_afni_surface_registrations(&mut self) -> Result<usize> {
+        let Some(scene) = self.surface_scene.as_ref() else {
+            return Ok(0);
+        };
+
+        let mut tasks = Vec::new();
+        for (surface_index, surface) in scene.surfaces.iter().enumerate() {
+            for (component_index, component) in surface.components.iter().enumerate() {
+                if self
+                    .registered_afni_scene_components
+                    .contains(&(surface_index, component_index))
+                {
+                    if self.verbose {
+                        eprintln!(
+                            "AFNI verbose: skipping already-seen scene component surface_index={} component_index={} name={}.",
+                            surface_index, component_index, component.name
+                        );
+                    }
+                    continue;
+                }
+                if !afni_component_is_sendable(component, component.mesh.as_ref()) {
+                    if self.verbose {
+                        eprintln!(
+                            "AFNI verbose: skipping non-sendable scene component surface_index={} component_index={} name={} anatomical={:?}.",
+                            surface_index,
+                            component_index,
+                            component.name,
+                            component.spec_surface.anatomical
+                        );
+                    }
+                    continue;
+                }
+                tasks.push((
+                    surface_index,
+                    component_index,
+                    component.spec_surface.clone(),
+                    component.mesh.clone(),
+                ));
+            }
+        }
+
+        if tasks.is_empty() {
+            return Ok(0);
+        }
+
+        let spec = scene.spec.clone();
+        let surface_volume_idcode = scene.surface_volume_idcode.clone();
+        let load_count = tasks
+            .iter()
+            .filter(|(_, _, _, mesh)| mesh.is_none())
+            .count();
+        if load_count > 0 {
+            self.log_status(format!(
+                "Loading {} spec surface component{} for AFNI/SUMA registration.",
+                load_count,
+                if load_count == 1 { "" } else { "s" }
+            ));
+        }
+
+        let mut queued_count = 0usize;
+        for (surface_index, component_index, spec_surface, existing_mesh) in tasks {
+            let mesh = match existing_mesh {
+                Some(mesh) => mesh,
+                None => {
+                    let mesh = load_spec_component_mesh(
+                        &spec,
+                        &spec_surface,
+                        surface_volume_idcode.as_deref(),
+                    )?;
+                    if let Some(scene) = self.surface_scene.as_mut()
+                        && let Some(component) = scene
+                            .surfaces
+                            .get_mut(surface_index)
+                            .and_then(|surface| surface.components.get_mut(component_index))
+                        && component.mesh.is_none()
+                    {
+                        component.mesh = Some(mesh.clone());
+                    }
+                    mesh
+                }
+            };
+
+            let Some((scene, component)) = self.surface_scene.as_ref().and_then(|scene| {
+                scene.surfaces.get(surface_index).and_then(|surface| {
+                    surface
+                        .components
+                        .get(component_index)
+                        .map(|component| (scene, component))
+                })
+            }) else {
+                continue;
+            };
+
+            let mut info = AfniSurfaceInfo::from_mesh(&mesh);
+            decorate_afni_surface_info(&mut info, Some(scene), Some(component));
+            self.registered_afni_scene_components
+                .insert((surface_index, component_index));
+            if !self.afni_session.reserve_surface_registration(&info) {
+                if self.verbose {
+                    self.log_status(format!(
+                        "AFNI verbose: skipping already-registered scene surface_index={} component_index={} {}.",
+                        surface_index,
+                        component_index,
+                        afni_surface_info_debug_label(&info)
+                    ));
+                }
+                continue;
+            }
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI verbose: queued scene surface registration surface_index={} component_index={} nodes={} faces={} {}.",
+                    surface_index,
+                    component_index,
+                    mesh.vertices.len(),
+                    mesh.triangles.len(),
+                    afni_surface_info_debug_label(&info)
+                ));
+            }
+            self.pending_afni_surface_registrations
+                .push_back(PendingAfniSurfaceRegistration {
+                    mesh: Arc::new(mesh),
+                    info,
+                });
+            queued_count += 1;
+        }
+
+        Ok(queued_count)
+    }
+
+    fn send_afni_switch_underlay_after_registrations(&mut self, info: &AfniSurfaceInfo) {
+        let Some(command) = switch_underlay_command_for_surface(info) else {
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI verbose: SWITCH_UNDERLAY skipped; no surface volume target in {}.",
+                    afni_surface_info_debug_label(info)
+                ));
+            }
             return;
         };
-        if mesh.vertices.is_empty() {
-            return;
+        if self.verbose {
+            self.log_status(format!(
+                "AFNI verbose: sending native post-registration command: {command}."
+            ));
         }
-        let node = self
-            .controller
-            .interaction
-            .pick
-            .map(|pick| pick.node_index)
-            .or(self.sent_crosshair_node)
-            .or(self.afni_crosshair_node)
-            .or_else(|| node_nearest_bounds_center(mesh))
-            .unwrap_or(0);
-        let Some(pick) = surface_pick_for_mesh_node(mesh, self.overlay.data.node_values(), node)
-        else {
+        let Some(connection) = self.afni_connection.as_mut() else {
+            if self.verbose {
+                self.log_status("AFNI verbose: SWITCH_UNDERLAY skipped; no AFNI connection.");
+            }
             return;
         };
-        if let Err(error) = self.send_afni_crosshair_for_pick(pick) {
+        if let Err(error) = connection.send_drive_afni_command(command) {
             self.set_error(error);
         }
     }
@@ -190,57 +447,184 @@ impl ViewerState {
 
     /// Pull and dispatch any NIML messages waiting on the connection.
     pub(super) fn drain_afni_events(&mut self) -> bool {
-        let mut events = Vec::new();
-        if let Some(connection) = self.afni_connection.as_ref() {
-            while let Some(event) = connection.try_recv() {
-                events.push(event);
-            }
-        }
-
+        let drain_start = Instant::now();
         let mut changed = false;
-        for event in events {
+        let mut event_count = 0usize;
+        let queued_before = self.pending_afni_messages.len();
+        while event_count < AFNI_EVENTS_PER_DRAIN {
+            let event = self
+                .afni_connection
+                .as_ref()
+                .and_then(AfniConnection::try_recv);
+            let Some(event) = event else {
+                break;
+            };
             match event {
-                AfniConnectionEvent::Elements(elements) => {
-                    match self.handle_afni_elements(elements) {
-                        Ok(event_changed) => changed |= event_changed,
-                        Err(error) => self.set_error(error),
+                AfniConnectionEvent::Messages(messages) => {
+                    if self.verbose {
+                        let names = messages
+                            .iter()
+                            .map(afni_incoming_message_label)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        self.log_status(format!(
+                            "AFNI drain queued {} message{} [{}]; pending before={}.",
+                            messages.len(),
+                            if messages.len() == 1 { "" } else { "s" },
+                            names,
+                            self.pending_afni_messages.len()
+                        ));
                     }
+                    crate::afni::enqueue_coalesced_afni_messages(
+                        &mut self.pending_afni_messages,
+                        messages,
+                    );
                 }
                 AfniConnectionEvent::Error(message) => {
                     self.log_status(format!("AFNI/SUMA NIML talk error: {message}"));
                 }
                 AfniConnectionEvent::Disconnected => {
                     self.afni_connection = None;
-                    self.afni_session = AfniNimlSession::new();
+                    self.reset_afni_surface_registration_state();
+                    self.pending_afni_messages.clear();
+                    self.pending_cell_color_upload = None;
+                    self.deferred_afni_rgba_overlays.clear();
+                    self.trim_scene_surface_residency();
                     self.log_status("AFNI/SUMA NIML talk disconnected.");
                     changed = true;
+                    break;
                 }
             }
+            event_count += 1;
+        }
+        if self.verbose && (event_count > 0 || queued_before > 0) {
+            self.log_status(format!(
+                "AFNI drain pulled {event_count} connection event{} in {:.1} ms; pending messages={}.",
+                if event_count == 1 { "" } else { "s" },
+                drain_start.elapsed().as_secs_f64() * 1000.0,
+                self.pending_afni_messages.len()
+            ));
+        }
+
+        let mut messages = Vec::new();
+        while messages.len() < AFNI_MESSAGES_PER_DRAIN {
+            let Some(message) = self.pending_afni_messages.pop_front() else {
+                break;
+            };
+            messages.push(message);
+        }
+        if !messages.is_empty() {
+            let handle_start = Instant::now();
+            if self.verbose {
+                let names = messages
+                    .iter()
+                    .map(afni_incoming_message_label)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.log_status(format!(
+                    "AFNI handling {} message{} [{}]; pending after pop={}.",
+                    messages.len(),
+                    if messages.len() == 1 { "" } else { "s" },
+                    names,
+                    self.pending_afni_messages.len()
+                ));
+            }
+            match self.handle_afni_messages(messages) {
+                Ok(event_changed) => changed |= event_changed,
+                Err(error) => self.set_error(error),
+            }
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI handled message batch in {:.1} ms.",
+                    handle_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
+        }
+
+        let registration_start = Instant::now();
+        match self.process_pending_afni_surface_registrations() {
+            Ok(sent) => {
+                if self.verbose && sent {
+                    self.log_status(format!(
+                        "AFNI surface registration tick took {:.1} ms.",
+                        registration_start.elapsed().as_secs_f64() * 1000.0
+                    ));
+                }
+                changed |= sent;
+            }
+            Err(error) => self.set_error(error),
+        }
+        let upload_start = Instant::now();
+        changed |= self.process_pending_cell_color_upload();
+        if self.verbose && self.pending_cell_color_upload.is_some() {
+            self.log_status(format!(
+                "AFNI color chunk upload tick took {:.1} ms; chunks remain.",
+                upload_start.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
+        let deferred_start = Instant::now();
+        match self.apply_deferred_afni_rgba_overlays() {
+            Ok(applied) => {
+                if self.verbose && applied {
+                    self.log_status(format!(
+                        "AFNI applied deferred RGBA overlays in {:.1} ms.",
+                        deferred_start.elapsed().as_secs_f64() * 1000.0
+                    ));
+                }
+                changed |= applied;
+            }
+            Err(error) => self.set_error(error),
+        }
+
+        if event_count == AFNI_EVENTS_PER_DRAIN
+            || !self.pending_afni_surface_registrations.is_empty()
+            || !self.pending_afni_messages.is_empty()
+            || self.pending_cell_color_upload.is_some()
+            || !self.deferred_afni_rgba_overlays.is_empty()
+        {
+            self.request_afni_work();
         }
 
         changed
     }
 
-    /// Route a batch of parsed incoming NIML elements to their handlers.
-    pub(super) fn handle_afni_elements(&mut self, elements: Vec<NimlElement>) -> Result<bool> {
+    /// Route a batch of parsed incoming AFNI messages to their handlers.
+    pub(super) fn handle_afni_messages(
+        &mut self,
+        messages: Vec<AfniIncomingMessage>,
+    ) -> Result<bool> {
         let mut actions = Vec::new();
         let mut changed = false;
-        for element in elements {
-            let Some(outcome) = self
-                .afni_session
-                .receive_element(&mut self.controller, &element)?
-            else {
-                if self.verbose {
-                    self.log_status(format!("Ignored AFNI/SUMA NIML element {}.", element.name));
-                }
-                continue;
-            };
+        for message in messages {
+            let outcome = crate::afni::route_incoming_message(&mut self.controller, message);
             changed |= outcome.applied_state;
             actions.extend(outcome.actions);
         }
 
+        let action_count = actions.len();
+        let actions = coalesce_afni_route_actions(actions);
+        if self.verbose && actions.len() < action_count {
+            self.log_status(format!(
+                "Coalesced {} redundant AFNI/SUMA action{} before applying.",
+                action_count - actions.len(),
+                if action_count - actions.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+
         for action in actions {
+            let label = afni_route_action_label(&action);
+            let apply_start = Instant::now();
             changed |= self.apply_afni_route_action(action)?;
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI action {label} applied in {:.1} ms.",
+                    apply_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
         }
 
         Ok(changed)
@@ -304,6 +688,7 @@ impl ViewerState {
 
     /// Apply a sparse SUMA_irgba node-color overlay sent from AFNI.
     pub(super) fn apply_afni_rgba_overlay(&mut self, overlay: AfniRgbaOverlay) -> Result<bool> {
+        let apply_start = Instant::now();
         let mesh = self
             .mesh
             .as_ref()
@@ -323,6 +708,28 @@ impl ViewerState {
             ));
             return Ok(false);
         };
+        if overlay.node_indices.is_empty() {
+            self.log_status(format!(
+                "AFNI/SUMA sent an empty RGBA overlay for {}{}{}{}; no surface colors were applied.",
+                overlay.surface_idcode,
+                overlay
+                    .local_domain_parent_id
+                    .as_deref()
+                    .map(|parent| format!(" (domain parent {parent})"))
+                    .unwrap_or_default(),
+                overlay
+                    .function_idcode
+                    .as_deref()
+                    .map(|function| format!(", function {function}"))
+                    .unwrap_or_default(),
+                overlay
+                    .threshold
+                    .as_deref()
+                    .map(|threshold| format!(", threshold {threshold}"))
+                    .unwrap_or_default()
+            ));
+            return Ok(false);
+        }
 
         // AFNI resends an identical irgba colorization on every redraw. When the
         // payload for this surface matches the one we last applied, skip the
@@ -333,7 +740,7 @@ impl ViewerState {
             .afni_rgba_signatures
             .get(&overlay.surface_idcode)
             .copied();
-        if self.afni_rgba_colors.is_some() && previous_signature == Some(signature) {
+        if self.afni_live_overlay_active && previous_signature == Some(signature) {
             if self.verbose {
                 self.log_status(format!(
                     "Skipped unchanged AFNI/SUMA RGBA overlay for {}.",
@@ -343,15 +750,37 @@ impl ViewerState {
             return Ok(false);
         }
 
+        if self.pending_cell_color_upload.is_some() {
+            self.defer_afni_rgba_overlay(overlay);
+            return Ok(false);
+        }
+
+        let existing_colors = if self.afni_live_overlay_active {
+            self.overlay
+                .render
+                .render_model
+                .take()
+                .map(|overlay| overlay.color_cache.colors)
+        } else {
+            None
+        };
         let (colors, applied, skipped) =
-            apply_afni_rgba_to_color_cache(self.afni_rgba_colors.take(), mesh, target, &overlay);
+            apply_afni_rgba_to_color_cache(existing_colors, mesh, target, &overlay);
+        if self.verbose {
+            self.log_status(format!(
+                "AFNI RGBA color cache updated in {:.1} ms for {} nodes ({} skipped).",
+                apply_start.elapsed().as_secs_f64() * 1000.0,
+                applied,
+                skipped
+            ));
+        }
 
         let dataset_id = overlay
             .function_idcode
             .clone()
             .or_else(|| Some("AFNI SUMA_irgba".to_string()));
-        let overlay_model = Overlay::from_color_cache(&mesh.domain, colors.clone(), dataset_id)?;
-        self.afni_rgba_colors = Some(colors);
+        let overlay_model = Overlay::from_color_cache(&mesh.domain, colors, dataset_id)?;
+        self.afni_live_overlay_active = true;
         self.overlay.render.render_model = Some(overlay_model);
         self.overlay.data = DatasetOverlayState::None;
         self.overlay.source.path = None;
@@ -375,7 +804,16 @@ impl ViewerState {
         // are simply absent from the sparse list), so we do not re-apply a
         // scalar threshold to this already-resolved color cache.
         self.refresh_pick_overlay_value();
-        self.upload_surface_buffers();
+        let upload_start = Instant::now();
+        if !self.try_update_afni_gpu_node_colors() {
+            self.upload_surface_buffers();
+        }
+        if self.verbose {
+            self.log_status(format!(
+                "AFNI RGBA surface buffer update requested in {:.1} ms.",
+                upload_start.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
         self.update_scene_stats();
         self.afni_rgba_signatures
             .insert(overlay.surface_idcode.clone(), signature);
@@ -401,6 +839,112 @@ impl ViewerState {
         }
 
         Ok(true)
+    }
+
+    /// Patch the resident per-node color buffer for the experimental GPU AFNI
+    /// path. Geometry and index buffers remain untouched. Adjacent changed
+    /// nodes are combined into one queue write.
+    fn try_update_afni_gpu_node_colors(&mut self) -> bool {
+        if !self.gpu_afni_colors_enabled || self.has_both_scene() {
+            return false;
+        }
+        let Some(afni) = self.afni_live_overlay_colors().map(<[_]>::to_vec) else {
+            return false;
+        };
+        let underlay = self.visible_anatomical_shading_colors();
+        let mut colors = afni_colors_over_underlay(
+            &afni,
+            underlay.as_deref().map(Vec::as_slice),
+            self.controller.display.afni_uncolored_nodes_transparent,
+        );
+        if let Some(roi) = self.visible_roi_layer() {
+            for (index, color) in colors.iter_mut().enumerate() {
+                *color = mesh::compose_vertex_color(
+                    *color,
+                    None,
+                    1.0,
+                    roi.appearance.node_colors.get(index).copied().flatten(),
+                );
+            }
+        }
+
+        let Some(buffers) = self.surface_buffers.as_mut() else {
+            return false;
+        };
+        let Some(previous) = buffers.afni_node_colors.as_mut() else {
+            return false;
+        };
+        if previous.len() != colors.len()
+            || buffers.color_bytes_len != colors.len() * PREPARED_COLOR_BYTES
+        {
+            return false;
+        }
+
+        let plan = afni_gpu_color_upload_plan(previous, &colors);
+        let (writes, uploaded_nodes, mode) = match plan {
+            AfniGpuColorUploadPlan::None => (0, 0, "unchanged"),
+            AfniGpuColorUploadPlan::Full => {
+                let bytes = mesh::color_bytes(colors.iter().copied());
+                self.queue.write_buffer(&buffers.color_buffer, 0, &bytes);
+                previous.copy_from_slice(&colors);
+                (1, colors.len(), "bulk")
+            }
+            AfniGpuColorUploadPlan::Ranges(ranges) => {
+                let writes = ranges.len();
+                let uploaded_nodes = ranges.iter().map(|range| range.len()).sum();
+                for range in ranges {
+                    let bytes = mesh::color_bytes(colors[range.clone()].iter().copied());
+                    self.queue.write_buffer(
+                        &buffers.color_buffer,
+                        (range.start * PREPARED_COLOR_BYTES) as wgpu::BufferAddress,
+                        &bytes,
+                    );
+                    previous[range.clone()].copy_from_slice(&colors[range]);
+                }
+                (writes, uploaded_nodes, "sparse")
+            }
+        };
+        if self.verbose {
+            self.log_status(format!(
+                "Patched persistent AFNI GPU node colors in {mode} mode: \
+                 {writes} buffer write{}, {uploaded_nodes} uploaded nodes.",
+                if writes == 1 { "" } else { "s" }
+            ));
+        }
+        true
+    }
+
+    fn defer_afni_rgba_overlay(&mut self, overlay: AfniRgbaOverlay) {
+        let key = (
+            overlay.surface_idcode.clone(),
+            overlay.local_domain_parent_id.clone(),
+        );
+        self.deferred_afni_rgba_overlays.retain(|candidate| {
+            (
+                candidate.surface_idcode.clone(),
+                candidate.local_domain_parent_id.clone(),
+            ) != key
+        });
+        self.deferred_afni_rgba_overlays.push(overlay);
+        if self.verbose {
+            self.log_status(format!(
+                "Deferred AFNI/SUMA RGBA overlay while GPU chunks are still uploading; deferred={}.",
+                self.deferred_afni_rgba_overlays.len()
+            ));
+        }
+    }
+
+    pub(super) fn apply_deferred_afni_rgba_overlays(&mut self) -> Result<bool> {
+        if self.pending_cell_color_upload.is_some() || self.deferred_afni_rgba_overlays.is_empty() {
+            return Ok(false);
+        }
+
+        let overlays = std::mem::take(&mut self.deferred_afni_rgba_overlays);
+        let mut changed = false;
+        for overlay in overlays {
+            changed |= self.apply_afni_rgba_overlay(overlay)?;
+        }
+        Ok(changed)
     }
 
     /// Move the local crosshair/pick to AFNI's reported surface node.
@@ -437,7 +981,11 @@ impl ViewerState {
         self.afni_crosshair_node = Some(node_index);
         self.refresh_pick_overlay_value();
         self.refresh_graph_snapshot_if_open();
-        self.upload_surface_buffers();
+        if self.has_both_scene() {
+            self.upload_surface_buffers();
+        } else {
+            self.upload_selection_highlight_buffer();
+        }
         self.control.window.request_redraw();
         if self.controller.panels.roi_controller_open {
             self.roi_control.window.request_redraw();
@@ -590,51 +1138,251 @@ impl ViewerState {
         None
     }
 
-    /// Lazily load any spec surface meshes needed before AFNI registration.
-    pub(super) fn ensure_scene_surfaces_loaded_for_afni(&mut self) -> Result<()> {
-        let Some(scene) = self.surface_scene.as_ref() else {
-            return Ok(());
+    fn trim_scene_surface_residency(&mut self) {
+        if self.preload_enabled {
+            return;
+        }
+
+        let Some(scene) = self.surface_scene.as_mut() else {
+            return;
         };
-        let mut tasks = Vec::new();
-        for (surface_index, surface) in scene.surfaces.iter().enumerate() {
-            for (component_index, component) in surface.components.iter().enumerate() {
-                if !afni_component_is_sendable(component, component.mesh.as_ref()) {
-                    continue;
-                }
-                if component.mesh.is_none() {
-                    tasks.push((
-                        surface_index,
-                        component_index,
-                        component.spec_surface.clone(),
-                    ));
-                }
+        let active_index = scene.active_index;
+        let mut released_components = 0usize;
+        let mut released_caches = 0usize;
+        for (surface_index, surface) in scene.surfaces.iter_mut().enumerate() {
+            if surface_index == active_index {
+                continue;
+            }
+            if surface.display_cache.take().is_some() {
+                released_caches += 1;
+            }
+            for component in &mut surface.components {
+                released_components += usize::from(component.mesh.take().is_some());
+                component.label_lookup = None;
+                component.normal_cache = None;
             }
         }
-        if tasks.is_empty() {
-            return Ok(());
+        if self.verbose && (released_components > 0 || released_caches > 0) {
+            self.log_status(format!(
+                "Released {} inactive scene component mesh{} and {} display cache{}.",
+                released_components,
+                if released_components == 1 { "" } else { "es" },
+                released_caches,
+                if released_caches == 1 { "" } else { "s" }
+            ));
         }
-
-        let spec = scene.spec.clone();
-        let surface_volume_idcode = scene.surface_volume_idcode.clone();
-        self.log_status(format!(
-            "Loading {} spec surface component{} for AFNI/SUMA registration.",
-            tasks.len(),
-            if tasks.len() == 1 { "" } else { "s" }
-        ));
-
-        for (surface_index, component_index, surface) in tasks {
-            let mesh = load_spec_component_mesh(&spec, &surface, surface_volume_idcode.as_deref())?;
-            if let Some(scene) = self.surface_scene.as_mut()
-                && let Some(component) = scene
-                    .surfaces
-                    .get_mut(surface_index)
-                    .and_then(|surface| surface.components.get_mut(component_index))
-                && component.mesh.is_none()
-            {
-                component.mesh = Some(mesh);
-            }
-        }
-
-        Ok(())
     }
+}
+
+impl ViewerState {
+    pub(super) fn request_afni_work(&self) {
+        request_afni_event_once(&self.event_proxy, &self.afni_work_scheduled);
+    }
+
+    pub(super) fn process_pending_afni_surface_registrations(&mut self) -> Result<bool> {
+        if self.pending_afni_surface_registrations.is_empty() {
+            return Ok(false);
+        }
+
+        let mut sent_any = false;
+        let mut completed_surfaces = 0usize;
+        let mut sent_surfaces = 0usize;
+        let mut last_completed_surface_info = None;
+        while sent_surfaces < AFNI_SURFACE_REGISTRATIONS_PER_TICK {
+            let Some(registration) = self.pending_afni_surface_registrations.pop_front() else {
+                break;
+            };
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI verbose: sending surface registration nodes={} faces={} {}.",
+                    registration.mesh.vertices.len(),
+                    registration.mesh.triangles.len(),
+                    afni_surface_info_debug_label(&registration.info)
+                ));
+            }
+            let connection = self
+                .afni_connection
+                .as_mut()
+                .context("AFNI/SUMA NIML talk is not connected")?;
+            if let Err(error) = connection.send_surface_registration(
+                Arc::clone(&registration.mesh),
+                registration.info.clone(),
+            ) {
+                self.disconnect_afni_talk();
+                return Err(error.context("AFNI/SUMA NIML write failed"));
+            }
+
+            sent_surfaces += 1;
+            sent_any = true;
+            completed_surfaces += 1;
+            last_completed_surface_info = Some(registration.info);
+        }
+
+        if completed_surfaces > 0 && self.verbose {
+            self.log_status(format!(
+                "Sent {completed_surfaces} queued AFNI/SUMA surface registration{}.",
+                if completed_surfaces == 1 { "" } else { "s" }
+            ));
+        }
+
+        if self.pending_afni_surface_registrations.is_empty() {
+            if self.pending_afni_post_registration_underlay {
+                self.pending_afni_post_registration_underlay = false;
+                if let Some(info) = last_completed_surface_info.as_ref() {
+                    self.send_afni_switch_underlay_after_registrations(info);
+                }
+            }
+        } else {
+            self.request_afni_work();
+        }
+
+        Ok(sent_any)
+    }
+
+    pub(super) fn process_pending_cell_color_upload(&mut self) -> bool {
+        let Some(mut upload) = self.pending_cell_color_upload.take() else {
+            return false;
+        };
+
+        let surface_color_slice = upload.surface_colors.as_deref().map(Vec::as_slice);
+        let roi_color_slice = upload.roi_colors.as_deref();
+        let mut instances = Vec::new();
+        let mut processed_chunks = 0usize;
+        let tick_start = Instant::now();
+
+        while processed_chunks < AFNI_CELL_COLOR_UPLOAD_CHUNKS_PER_TICK {
+            let Some(range) = upload.ranges.pop_front() else {
+                break;
+            };
+            let chunk_start = Instant::now();
+            let prepared_surface = PreparedSurface::from_geometry_cell_color_range(
+                &upload.geometry,
+                surface_color_slice,
+                roi_color_slice,
+                range,
+            );
+            upload.chunks_uploaded += 1;
+            processed_chunks += 1;
+            if !prepared_surface.is_empty() {
+                instances.push(self.surface_render_instance_from_prepared(
+                    &prepared_surface,
+                    upload.side.clone(),
+                    upload.model_matrix,
+                    upload.labels,
+                ));
+            }
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI colorized surface {} prepared/uploaded chunk {}/{} in {:.1} ms.",
+                    upload.surface_id.as_str(),
+                    upload.chunks_uploaded,
+                    upload.mesh_chunk_count,
+                    chunk_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
+        }
+
+        let changed = !instances.is_empty();
+        if let Some(render_set) = self.surface_render_set.as_mut() {
+            render_set.instances.extend(instances);
+        }
+
+        if upload.ranges.is_empty() {
+            if self.verbose {
+                self.log_status(format!(
+                    "Finished AFNI colorized surface {} progressive upload \
+                     ({} chunks) in this tick after {:.1} ms.",
+                    upload.surface_id.as_str(),
+                    upload.mesh_chunk_count,
+                    tick_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
+            self.upload_selection_highlight_buffer();
+        } else {
+            if self.verbose {
+                self.log_status(format!(
+                    "AFNI colorized surface {} uploaded {}/{} chunks.",
+                    upload.surface_id.as_str(),
+                    upload.chunks_uploaded,
+                    upload.mesh_chunk_count
+                ));
+            }
+            self.pending_cell_color_upload = Some(upload);
+            self.request_afni_work();
+        }
+
+        changed
+    }
+}
+
+fn request_afni_event_once(
+    event_proxy: &EventLoopProxy<ViewerEvent>,
+    afni_work_scheduled: &AtomicBool,
+) {
+    if afni_work_scheduled
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && event_proxy
+            .send_event(ViewerEvent::AfniMessagesReady)
+            .is_err()
+    {
+        afni_work_scheduled.store(false, Ordering::Release);
+    }
+}
+
+fn afni_incoming_message_label(message: &AfniIncomingMessage) -> &'static str {
+    match message {
+        AfniIncomingMessage::RgbaOverlay(_) => "rgba_overlay",
+        AfniIncomingMessage::SurfaceSelection(_) => "surface_selection",
+        AfniIncomingMessage::Crosshair(_) => "crosshair",
+        AfniIncomingMessage::SurfaceCrosshair(_) => "surface_crosshair",
+        AfniIncomingMessage::DatasetLoad(_) => "dataset_load",
+        AfniIncomingMessage::OverlayState(_) => "overlay_state",
+        AfniIncomingMessage::ControllerCommand(_) => "controller_command",
+        AfniIncomingMessage::ViewerCommands(_) => "viewer_commands",
+        AfniIncomingMessage::RoiUpdate(_) => "roi_update",
+    }
+}
+
+fn afni_route_action_label(action: &AfniRouteAction) -> &'static str {
+    match action {
+        AfniRouteAction::ViewerCommand(_) => "viewer_command",
+        AfniRouteAction::LoadDataset(_) => "load_dataset",
+        AfniRouteAction::RgbaOverlay(_) => "rgba_overlay",
+        AfniRouteAction::OverlayState(_) => "overlay_state",
+        AfniRouteAction::SurfaceCrosshair(_) => "surface_crosshair",
+        AfniRouteAction::RoiUpdate(_) => "roi_update",
+    }
+}
+
+pub(super) fn coalesce_afni_route_actions(actions: Vec<AfniRouteAction>) -> Vec<AfniRouteAction> {
+    let mut latest_rgba = HashMap::<(String, Option<String>), usize>::new();
+    for (index, action) in actions.iter().enumerate() {
+        if let AfniRouteAction::RgbaOverlay(overlay) = action {
+            latest_rgba.insert(
+                (
+                    overlay.surface_idcode.clone(),
+                    overlay.local_domain_parent_id.clone(),
+                ),
+                index,
+            );
+        }
+    }
+
+    actions
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            if let AfniRouteAction::RgbaOverlay(overlay) = &action {
+                let key = (
+                    overlay.surface_idcode.clone(),
+                    overlay.local_domain_parent_id.clone(),
+                );
+                if latest_rgba.get(&key) != Some(&index) {
+                    return None;
+                }
+            }
+            Some(action)
+        })
+        .collect()
 }

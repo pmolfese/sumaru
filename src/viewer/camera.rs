@@ -1,8 +1,10 @@
+use crate::command::LightingMode;
 use glam::{Mat3, Mat4, Quat, Vec3};
 use std::time::Duration;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
 pub(super) const CAMERA_FOV_Y_RADIANS: f32 = std::f32::consts::FRAC_PI_4;
+const KEYBOARD_NUDGE_RADIANS: f32 = std::f32::consts::PI / 36.0;
 const MOMENTUM_MIN_DELTA_PIXELS: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +28,14 @@ pub(super) enum PresetOrientation {
     Right,
     Top,
     Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CameraNudgeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 #[derive(Clone)]
@@ -139,6 +149,16 @@ impl Camera {
         }
     }
 
+    pub(super) fn nudge(&mut self, direction: CameraNudgeDirection) {
+        self.stop_momentum();
+        match direction {
+            CameraNudgeDirection::Left => self.drag_angle(-KEYBOARD_NUDGE_RADIANS, 0.0),
+            CameraNudgeDirection::Right => self.drag_angle(KEYBOARD_NUDGE_RADIANS, 0.0),
+            CameraNudgeDirection::Up => self.drag_angle(0.0, -KEYBOARD_NUDGE_RADIANS),
+            CameraNudgeDirection::Down => self.drag_angle(0.0, KEYBOARD_NUDGE_RADIANS),
+        }
+    }
+
     pub(super) fn momentum_enabled(&self) -> bool {
         self.momentum_enabled
     }
@@ -181,37 +201,47 @@ impl Camera {
 
     fn drag(&mut self, dx: f32, dy: f32) {
         let sensitivity = 0.01;
+        self.drag_angle(dx * sensitivity, dy * sensitivity);
+    }
 
+    fn drag_angle(&mut self, dx_radians: f32, dy_radians: f32) {
         match self.mode {
             CameraMode::Orbit => {
-                let yaw = Quat::from_axis_angle(Vec3::Z, -dx * sensitivity);
+                let yaw = Quat::from_axis_angle(Vec3::Z, -dx_radians);
                 let right = self.orientation * Vec3::X;
-                let pitch = Quat::from_axis_angle(right.normalize(), -dy * sensitivity);
+                let pitch = Quat::from_axis_angle(right.normalize(), -dy_radians);
                 self.orientation = (yaw * pitch * self.orientation).normalize();
                 self.sync_angles_from_orientation();
             }
             CameraMode::Turntable => {
-                self.yaw -= dx * sensitivity;
-                self.pitch = (self.pitch - dy * sensitivity).clamp(-1.45, 1.45);
+                self.yaw -= dx_radians;
+                self.pitch = (self.pitch - dy_radians).clamp(-1.45, 1.45);
                 self.sync_orientation_from_angles();
             }
         }
     }
 
-    pub(super) fn uniform_bytes(&self, aspect: f32) -> Vec<u8> {
-        self.uniform_bytes_with_model(aspect, Mat4::IDENTITY)
-    }
-
-    /// Same as [`Self::uniform_bytes`] but with an explicit model matrix, used
-    /// to draw each acorn hemisphere with its own transform while dragging.
-    pub(super) fn uniform_bytes_with_model(&self, aspect: f32, model: Mat4) -> Vec<u8> {
+    /// Build the camera + lighting uniform block, with an explicit model
+    /// matrix used to draw each acorn hemisphere with its own transform while
+    /// dragging or in paired renders.
+    pub(super) fn uniform_bytes_with_model(
+        &self,
+        aspect: f32,
+        model: Mat4,
+        lighting_mode: LightingMode,
+        surface_opacity: f32,
+    ) -> Vec<u8> {
         let view_projection = self.view_projection(aspect);
-        let light_direction = Vec3::new(0.35, 0.8, 0.45).normalize();
-        let surface_color = [0.76, 0.78, 0.74, 1.0];
+        let lighting = self.lighting_uniforms(lighting_mode);
+        let surface_color = [0.76, 0.78, 0.74, surface_opacity.clamp(0.0, 1.0)];
         let floats = [
             view_projection.to_cols_array().as_slice(),
             model.to_cols_array().as_slice(),
-            &[light_direction.x, light_direction.y, light_direction.z, 0.0],
+            &lighting.primary_direction,
+            &lighting.secondary_direction,
+            &lighting.tertiary_direction,
+            &lighting.weights,
+            &lighting.params,
             &surface_color,
         ]
         .concat();
@@ -270,6 +300,65 @@ impl Camera {
         self.orientation = orientation_for(eye_direction, up);
         self.sync_angles_from_orientation();
     }
+
+    fn lighting_uniforms(&self, lighting_mode: LightingMode) -> LightingUniforms {
+        let world = Vec3::new(0.35, 0.8, 0.45).normalize();
+        let (eye_direction, up) = self.view_axes();
+        let eye = eye_direction.normalize();
+        let up = up.normalize();
+        let right = up.cross(eye).normalize_or_zero();
+        let primary = |direction: Vec3| [direction.x, direction.y, direction.z, 0.0];
+
+        match lighting_mode {
+            LightingMode::Directional => LightingUniforms {
+                primary_direction: primary(world),
+                secondary_direction: primary(world),
+                tertiary_direction: primary(world),
+                weights: [1.0, 0.0, 0.0, 0.0],
+                params: [0.28, 0.72, 0.0, 0.0],
+            },
+            LightingMode::DirectionalSoft => LightingUniforms {
+                primary_direction: primary(world),
+                secondary_direction: primary(world),
+                tertiary_direction: primary(world),
+                weights: [1.0, 0.0, 0.0, 0.0],
+                params: [0.58, 0.42, 0.0, 0.0],
+            },
+            LightingMode::Headlight => LightingUniforms {
+                primary_direction: primary(eye),
+                secondary_direction: primary(eye),
+                tertiary_direction: primary(eye),
+                weights: [1.0, 0.0, 0.0, 0.0],
+                params: [0.40, 0.60, 0.0, 0.0],
+            },
+            LightingMode::Studio => {
+                let fill_a = (eye + right * 0.85 + up * 0.35).normalize_or_zero();
+                let fill_b = (eye - right * 0.65 - up * 0.20).normalize_or_zero();
+                LightingUniforms {
+                    primary_direction: primary(eye),
+                    secondary_direction: primary(fill_a),
+                    tertiary_direction: primary(fill_b),
+                    weights: [0.55, 0.25, 0.20, 0.0],
+                    params: [0.34, 0.66, 0.0, 0.0],
+                }
+            }
+            LightingMode::Flat => LightingUniforms {
+                primary_direction: primary(world),
+                secondary_direction: primary(world),
+                tertiary_direction: primary(world),
+                weights: [0.0, 0.0, 0.0, 0.0],
+                params: [1.0, 0.0, 0.0, 0.0],
+            },
+        }
+    }
+}
+
+struct LightingUniforms {
+    primary_direction: [f32; 4],
+    secondary_direction: [f32; 4],
+    tertiary_direction: [f32; 4],
+    weights: [f32; 4],
+    params: [f32; 4],
 }
 
 fn orientation_for(eye_direction: Vec3, up_hint: Vec3) -> Quat {
@@ -296,8 +385,10 @@ pub(super) fn stable_up_for_direction(eye_direction: Vec3) -> Vec3 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Camera, CameraMode, PresetOrientation};
+    use super::{Camera, CameraMode, CameraNudgeDirection, PresetOrientation};
     use std::time::Duration;
+
+    const FIVE_DEGREES: f32 = std::f32::consts::PI / 36.0;
 
     #[test]
     fn camera_mode_toggles_between_orbit_and_turntable() {
@@ -315,6 +406,26 @@ mod tests {
         let (eye_direction, _) = camera.view_axes();
 
         assert!(eye_direction.z > 0.99);
+    }
+
+    #[test]
+    fn arrow_nudges_rotate_camera_by_five_degrees() {
+        let mut camera = Camera::default();
+        let start_yaw = camera.yaw;
+        let start_pitch = camera.pitch;
+
+        camera.nudge(CameraNudgeDirection::Right);
+        assert!((camera.yaw - (start_yaw + FIVE_DEGREES)).abs() < 0.000_001);
+        assert!((camera.pitch - start_pitch).abs() < 0.000_001);
+
+        camera.nudge(CameraNudgeDirection::Left);
+        assert!((camera.yaw - start_yaw).abs() < 0.000_001);
+
+        camera.nudge(CameraNudgeDirection::Up);
+        assert!((camera.pitch - (start_pitch - FIVE_DEGREES)).abs() < 0.000_001);
+
+        camera.nudge(CameraNudgeDirection::Down);
+        assert!((camera.pitch - start_pitch).abs() < 0.000_001);
     }
 
     #[test]

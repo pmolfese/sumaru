@@ -139,6 +139,14 @@ impl ViewerState {
                         self.show_mode_label(mode);
                         true
                     }
+                    PhysicalKey::Code(KeyCode::KeyL)
+                        if !self.modifiers.shift_key()
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key() =>
+                    {
+                        self.cycle_lighting_mode();
+                        true
+                    }
                     PhysicalKey::Code(KeyCode::KeyM) => {
                         self.toggle_camera_momentum();
                         true
@@ -149,7 +157,7 @@ impl ViewerState {
                         true
                     }
                     PhysicalKey::Code(KeyCode::F5) => {
-                        self.controller.display.background.toggle();
+                        self.apply_commands(vec![ViewerCommand::ToggleBackground]);
                         true
                     }
                     PhysicalKey::Code(KeyCode::KeyR) if self.modifiers.shift_key() => {
@@ -164,7 +172,51 @@ impl ViewerState {
                         }
                         true
                     }
-                    PhysicalKey::Code(KeyCode::KeyO) => {
+                    PhysicalKey::Code(KeyCode::KeyP)
+                        if !self.modifiers.shift_key()
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key() =>
+                    {
+                        self.apply_commands(vec![ViewerCommand::ToggleSurfaceRenderStyle]);
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::KeyP)
+                        if self.modifiers.shift_key()
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key() =>
+                    {
+                        self.apply_commands(vec![ViewerCommand::ReverseSurfaceRenderStyle]);
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::KeyO)
+                        if !self.modifiers.shift_key()
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key() =>
+                    {
+                        self.apply_commands(vec![ViewerCommand::CycleSurfaceOpacity]);
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::KeyO)
+                        if self.modifiers.shift_key()
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key() =>
+                    {
+                        self.apply_commands(vec![ViewerCommand::RaiseSurfaceOpacity]);
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::KeyI)
+                        if !self.modifiers.shift_key()
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key() =>
+                    {
+                        self.apply_commands(vec![ViewerCommand::ToggleAfniUncoloredTransparency]);
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::KeyV)
+                        if self.modifiers.shift_key()
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key() =>
+                    {
                         self.toggle_overlay_visibility();
                         true
                     }
@@ -222,6 +274,26 @@ impl ViewerState {
                     PhysicalKey::Code(KeyCode::ArrowDown) if self.modifiers.alt_key() => {
                         self.camera.set_preset(PresetOrientation::Bottom);
                         self.controller.camera.set_preset(ViewPreset::Bottom);
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                        self.camera.nudge(CameraNudgeDirection::Left);
+                        self.controller.camera.note_manual_motion();
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowRight) => {
+                        self.camera.nudge(CameraNudgeDirection::Right);
+                        self.controller.camera.note_manual_motion();
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowUp) => {
+                        self.camera.nudge(CameraNudgeDirection::Up);
+                        self.controller.camera.note_manual_motion();
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowDown) => {
+                        self.camera.nudge(CameraNudgeDirection::Down);
+                        self.controller.camera.note_manual_motion();
                         true
                     }
                     _ => false,

@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,14 +22,15 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::afni::{
-    AfniConnection, AfniConnectionEvent, AfniNimlSession, AfniOverlayState, AfniPortConfig,
-    AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo, DEFAULT_AFNI_HOST,
-    DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
+    AfniConnection, AfniConnectionEvent, AfniIncomingMessage, AfniNimlSession, AfniOverlayState,
+    AfniPortConfig, AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo,
+    DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
 };
-use crate::color::{LabelTable, Rgba};
+use crate::color::{ColorMap, LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
 use crate::command::{
     BackgroundMode, CameraControlMode, ControllerState, HemisphereLayout, HemisphereLayoutState,
-    OverlayThreshold, PairVisibility, SurfacePick, ViewPreset, ViewerCommand,
+    LightingMode, OverlayThreshold, PairVisibility, SurfacePick, SurfaceRenderStyle, ViewNudge,
+    ViewPreset, ViewerCommand,
 };
 use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
 use crate::io::{
@@ -47,13 +50,13 @@ use crate::surface::{
     AnatomicalCorrectness, NodeMask, NormalDirection, OverlayDataset, SmoothingWeights,
     SurfaceDomain, SurfaceDomainId, SurfaceId, SurfaceKind, SurfaceMesh, SurfaceSide, ValueRange,
 };
-use camera::{Camera, CameraMode, PresetOrientation};
+use camera::{Camera, CameraMode, CameraNudgeDirection, PresetOrientation};
 use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
 };
 use mesh::{
     OverlayAppearance, OverlayColorMap, PreparedGeometry, PreparedGeometryVertex, PreparedSurface,
-    RoiAppearance, SelectionHighlight, sample_colormap,
+    RoiAppearance, SelectionHighlight, cell_color_chunk_ranges, sample_colormap,
 };
 use overlay_load::*;
 use pick::{pick_surface, pick_surface_with_model, screen_ray};
@@ -102,22 +105,124 @@ impl From<ViewPreset> for PresetOrientation {
     }
 }
 
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
-const VERTEX_STRIDE: wgpu::BufferAddress = 40;
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+const COLOR_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Float32x4];
+const VERTEX_STRIDE: wgpu::BufferAddress = 24;
+const COLOR_STRIDE: wgpu::BufferAddress = 16;
+const PREPARED_VERTEX_BYTES: usize = 6 * std::mem::size_of::<f32>();
+const PREPARED_COLOR_BYTES: usize = 4 * std::mem::size_of::<f32>();
+const AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE: usize = 3 * PREPARED_VERTEX_BYTES;
+const AFNI_CELL_COLOR_BYTES_PER_TRIANGLE: usize = 3 * PREPARED_COLOR_BYTES;
+const AFNI_CELL_COLOR_MAX_CHUNK_VERTEX_BYTES: usize = 32 * 1024 * 1024;
+const AFNI_EVENTS_PER_DRAIN: usize = 4;
+const AFNI_MESSAGES_PER_DRAIN: usize = 4;
+const AFNI_CELL_COLOR_UPLOAD_CHUNKS_PER_TICK: usize = 1;
+const AFNI_SURFACE_REGISTRATIONS_PER_TICK: usize = 1;
+const SELECTION_HIGHLIGHT_VERTEX_COUNT: usize = 15;
 const MODE_LABEL_DURATION: Duration = Duration::from_secs(2);
 const MOMENTUM_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const STARTUP_REDRAW_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_REDRAW_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const SUMA_CONVEXITY_SMOOTHING_ITERATIONS: usize = 5;
 /// Overlay color for nodes AFNI did not colorize (absent from the `SUMA_irgba`
-/// node list, or sent with zero alpha). Transparent so the anatomical underlay
-/// shows through, matching SUMA.
+/// node list, or sent with zero alpha). Transparent so those nodes can either
+/// resolve to the anatomical underlay or be discarded for interior
+/// shine-through mode.
 const AFNI_TRANSPARENT_NODE_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 const SUMA_CONVEXITY_OPACITY: f32 = 0.85;
 const CONTROL_CONTENT_WIDTH_POINTS: f32 = 560.0;
 const CONTROL_MIN_INNER_WIDTH: u32 = 620;
 const CONTROL_MIN_INNER_HEIGHT: u32 = 420;
+
+fn viewer_required_wgpu_limits(adapter_limits: &wgpu::Limits, big_mem: bool) -> wgpu::Limits {
+    let mut limits = wgpu::Limits::default();
+    if big_mem {
+        limits.max_buffer_size = adapter_limits.max_buffer_size;
+    }
+    limits
+}
+
+fn afni_cell_color_vertex_bytes(
+    geometry: &PreparedGeometry,
+    selection: Option<SelectionHighlight>,
+) -> usize {
+    let selection_vertex_bytes = selection
+        .is_some()
+        .then_some(SELECTION_HIGHLIGHT_VERTEX_COUNT * PREPARED_VERTEX_BYTES)
+        .unwrap_or(0);
+    geometry
+        .indices
+        .len()
+        .saturating_mul(PREPARED_VERTEX_BYTES)
+        .saturating_add(selection_vertex_bytes)
+}
+
+fn afni_cell_color_color_bytes(
+    geometry: &PreparedGeometry,
+    selection: Option<SelectionHighlight>,
+) -> usize {
+    let selection_color_bytes = selection
+        .is_some()
+        .then_some(SELECTION_HIGHLIGHT_VERTEX_COUNT * PREPARED_COLOR_BYTES)
+        .unwrap_or(0);
+    geometry
+        .indices
+        .len()
+        .saturating_mul(PREPARED_COLOR_BYTES)
+        .saturating_add(selection_color_bytes)
+}
+
+fn afni_cell_color_needs_chunking(
+    geometry: &PreparedGeometry,
+    selection: Option<SelectionHighlight>,
+    max_buffer_size: u64,
+) -> bool {
+    let max_buffer_size = usize::try_from(max_buffer_size).unwrap_or(usize::MAX);
+    afni_cell_color_vertex_bytes(geometry, selection) > max_buffer_size
+        || afni_cell_color_color_bytes(geometry, selection) > max_buffer_size
+}
+
+fn afni_cell_color_max_triangles_per_chunk(max_buffer_size: u64) -> usize {
+    let max_buffer_size = usize::try_from(max_buffer_size).unwrap_or(usize::MAX);
+    let target_buffer_bytes = (max_buffer_size / 2)
+        .max(AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE)
+        .max(AFNI_CELL_COLOR_BYTES_PER_TRIANGLE)
+        .min(max_buffer_size)
+        .min(AFNI_CELL_COLOR_MAX_CHUNK_VERTEX_BYTES);
+
+    (target_buffer_bytes / AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE)
+        .min(target_buffer_bytes / AFNI_CELL_COLOR_BYTES_PER_TRIANGLE)
+        .max(1)
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceInstanceBufferLabels {
+    vertex: &'static str,
+    triangle_index: &'static str,
+    line_index: &'static str,
+    point_index: &'static str,
+    uniform: &'static str,
+    bind_group: &'static str,
+}
+
+const CHUNKED_SURFACE_BUFFER_LABELS: SurfaceInstanceBufferLabels = SurfaceInstanceBufferLabels {
+    vertex: "chunked surface vertex buffer",
+    triangle_index: "chunked surface triangle index buffer",
+    line_index: "chunked surface line index buffer",
+    point_index: "chunked surface point index buffer",
+    uniform: "chunked surface uniform buffer",
+    bind_group: "chunked surface bind group",
+};
+
+const PAIRED_SURFACE_BUFFER_LABELS: SurfaceInstanceBufferLabels = SurfaceInstanceBufferLabels {
+    vertex: "paired surface vertex buffer",
+    triangle_index: "paired surface triangle index buffer",
+    line_index: "paired surface line index buffer",
+    point_index: "paired surface point index buffer",
+    uniform: "paired surface uniform buffer",
+    bind_group: "paired surface bind group",
+};
 const CONTROL_INITIAL_INNER_HEIGHT: u32 = 720;
 const CONTROL_MAX_INNER_WIDTH: u32 = 900;
 const CONTROL_RESIZE_THRESHOLD: u32 = 12;
@@ -196,14 +301,30 @@ pub struct LaunchOptions {
     pub overlay_p_value: Option<f64>,
     pub verbose: bool,
     pub preload: bool,
+    pub big_mem: bool,
+    pub gpu: bool,
     pub afni: AfniViewerOptions,
     pub niml_record_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplicitOverlayPair {
-    pub left_path: PathBuf,
-    pub right_path: PathBuf,
+    pub left_path: Option<PathBuf>,
+    pub right_path: Option<PathBuf>,
+}
+
+impl ExplicitOverlayPair {
+    fn primary_path(&self) -> Option<&Path> {
+        self.left_path.as_deref().or(self.right_path.as_deref())
+    }
+
+    fn path_for_side(&self, side: &SurfaceSide) -> Option<&Path> {
+        match side {
+            SurfaceSide::Left => self.left_path.as_deref(),
+            SurfaceSide::Right => self.right_path.as_deref(),
+            _ => self.primary_path(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +379,8 @@ struct ViewerApp {
     initial_overlay_p_value: Option<f64>,
     verbose: bool,
     preload: bool,
+    big_mem: bool,
+    gpu: bool,
     afni: AfniViewerOptions,
     niml_record_path: Option<PathBuf>,
     event_proxy: EventLoopProxy<ViewerEvent>,
@@ -282,6 +405,8 @@ impl ViewerApp {
             initial_overlay_p_value: options.overlay_p_value,
             verbose: options.verbose,
             preload: options.preload,
+            big_mem: options.big_mem,
+            gpu: options.gpu,
             afni: options.afni,
             niml_record_path: options.niml_record_path,
             event_proxy,
@@ -358,10 +483,17 @@ impl ViewerApp {
             },
             self.verbose,
             self.preload,
+            self.big_mem,
+            self.gpu,
             self.afni.clone(),
             self.niml_record_path.clone(),
             self.event_proxy.clone(),
         ))?);
+        if let Some(state) = self.state.as_ref() {
+            // Keep the render window as the launch focus instead of whichever
+            // auxiliary pane was created most recently.
+            state.view_window().focus_window();
+        }
 
         Ok(())
     }
@@ -407,11 +539,19 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
 
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Occluded(occluded) => {
+                    state.set_view_occluded(occluded);
+                }
                 WindowEvent::Resized(size) => {
                     state.resize_view(size);
-                    state.view_window().request_redraw();
+                    if !state.view.occluded {
+                        state.view_window().request_redraw();
+                    }
                 }
                 WindowEvent::RedrawRequested => {
+                    if state.view.occluded {
+                        return;
+                    }
                     state.update();
 
                     match state.render_view() {
@@ -440,19 +580,29 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             }
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::Control, occluded);
+                }
                 WindowEvent::Resized(size) => {
                     state.resize_control(size);
-                    state.control_window().request_redraw();
-                }
-                WindowEvent::RedrawRequested => match state.render_control() {
-                    RenderStatus::Rendered => state.control.frame_rendered = true,
-                    RenderStatus::Skipped => {}
-                    RenderStatus::Reconfigure => {
-                        state.resize_control(state.control.size);
+                    if !state.control.occluded {
                         state.control_window().request_redraw();
                     }
-                    RenderStatus::ValidationError => eprintln!("control validation error"),
-                },
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.control.occluded {
+                        return;
+                    }
+                    match state.render_control() {
+                        RenderStatus::Rendered => state.control.frame_rendered = true,
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_control(state.control.size);
+                            state.control_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("control validation error"),
+                    }
+                }
                 _ => {}
             }
             return;
@@ -471,19 +621,29 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 WindowEvent::CloseRequested => {
                     state.apply_commands(vec![ViewerCommand::SetRoiControllerOpen(false)]);
                 }
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::RoiControl, occluded);
+                }
                 WindowEvent::Resized(size) => {
                     state.resize_roi_control(size);
-                    state.roi_control_window().request_redraw();
-                }
-                WindowEvent::RedrawRequested => match state.render_roi_control() {
-                    RenderStatus::Rendered => {}
-                    RenderStatus::Skipped => {}
-                    RenderStatus::Reconfigure => {
-                        state.resize_roi_control(state.roi_control.size);
+                    if !state.roi_control.occluded {
                         state.roi_control_window().request_redraw();
                     }
-                    RenderStatus::ValidationError => eprintln!("ROI control validation error"),
-                },
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.roi_control.occluded {
+                        return;
+                    }
+                    match state.render_roi_control() {
+                        RenderStatus::Rendered => {}
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_roi_control(state.roi_control.size);
+                            state.roi_control_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("ROI control validation error"),
+                    }
+                }
                 _ => {}
             }
             return;
@@ -502,19 +662,29 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 WindowEvent::CloseRequested => {
                     state.apply_commands(vec![ViewerCommand::SetGraphWindowOpen(false)]);
                 }
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::Graph, occluded);
+                }
                 WindowEvent::Resized(size) => {
                     state.resize_graph(size);
-                    state.graph_window().request_redraw();
-                }
-                WindowEvent::RedrawRequested => match state.render_graph() {
-                    RenderStatus::Rendered => {}
-                    RenderStatus::Skipped => {}
-                    RenderStatus::Reconfigure => {
-                        state.resize_graph(state.graph.size);
+                    if !state.graph.occluded {
                         state.graph_window().request_redraw();
                     }
-                    RenderStatus::ValidationError => eprintln!("graph validation error"),
-                },
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.graph.occluded {
+                        return;
+                    }
+                    match state.render_graph() {
+                        RenderStatus::Rendered => {}
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_graph(state.graph.size);
+                            state.graph_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("graph validation error"),
+                    }
+                }
                 _ => {}
             }
         }
@@ -527,6 +697,13 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
 
         match event {
             ViewerEvent::AfniMessagesReady => {
+                state.afni_work_scheduled.store(false, Ordering::Release);
+                if state.view.occluded {
+                    if state.verbose {
+                        state.log_status("Deferred AFNI drain while the view window is occluded.");
+                    }
+                    return;
+                }
                 if state.drain_afni_events() {
                     state.control_window().request_redraw();
                     if state.controller.panels.roi_controller_open {
@@ -570,9 +747,16 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             .roi_controller_open
             .then_some(state.roi_control.repaint_at)
             .flatten();
-        let view_due = next_view.is_some_and(|at| at <= now);
-        let control_due = next_control.is_some_and(|at| at <= now);
-        let roi_control_due = next_roi_control.is_some_and(|at| at <= now);
+        let next_graph = state
+            .controller
+            .panels
+            .graph_window_open
+            .then_some(state.graph.repaint_at)
+            .flatten();
+        let view_due = repaint_due(now, next_view, state.view.occluded);
+        let control_due = repaint_due(now, next_control, state.control.occluded);
+        let roi_control_due = repaint_due(now, next_roi_control, state.roi_control.occluded);
+        let graph_due = repaint_due(now, next_graph, state.graph.occluded);
         if view_due {
             state.view_window().request_redraw();
         }
@@ -582,15 +766,22 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         if roi_control_due {
             state.roi_control_window().request_redraw();
         }
+        if graph_due {
+            state.graph_window().request_redraw();
+        }
 
-        let next_wake = [next_view, next_control, next_roi_control]
-            .into_iter()
-            .flatten()
-            .filter(|at| *at > now)
-            .min();
+        let next_wake = next_visible_repaint_wake(
+            now,
+            [
+                (next_view, state.view.occluded),
+                (next_control, state.control.occluded),
+                (next_roi_control, state.roi_control.occluded),
+                (next_graph, state.graph.occluded),
+            ],
+        );
         match next_wake {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None if view_due || control_due || roi_control_due => {
+            None if view_due || control_due || roi_control_due || graph_due => {
                 event_loop.set_control_flow(ControlFlow::Wait)
             }
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -666,7 +857,15 @@ struct WindowPane {
     last_requested_size: Option<PhysicalSize<u32>>,
     repaint_at: Option<Instant>,
     frame_rendered: bool,
+    occluded: bool,
     egui: EguiPane,
+}
+
+#[derive(Clone, Copy)]
+enum AuxWindowPane {
+    Control,
+    RoiControl,
+    Graph,
 }
 
 impl WindowPane {
@@ -685,6 +884,7 @@ impl WindowPane {
             last_requested_size: None,
             repaint_at: None,
             frame_rendered: false,
+            occluded: false,
             egui,
         }
     }
@@ -801,6 +1001,7 @@ impl WindowPane {
 
         command_buffers.push(encoder.finish());
         queue.submit(command_buffers);
+        let _ = device.poll(wgpu::PollType::Poll);
         output.present();
 
         RenderStatus::Rendered
@@ -975,6 +1176,13 @@ struct InitialScene {
     overlay_p_value: Option<f64>,
 }
 
+struct SurfaceRenderPipelines {
+    filled: wgpu::RenderPipeline,
+    filled_flat: wgpu::RenderPipeline,
+    triangles: wgpu::RenderPipeline,
+    vertices: wgpu::RenderPipeline,
+}
+
 struct ViewerState {
     view: WindowPane,
     control: WindowPane,
@@ -988,15 +1196,17 @@ struct ViewerState {
     /// the self-managed resize handle sticks and drives the 3D viewport split.
     graph_dock_height_points: f32,
     startup_redraw_until: Instant,
-    render_pipeline: wgpu::RenderPipeline,
+    surface_render_pipelines: SurfaceRenderPipelines,
     surface_buffers: Option<SurfaceBuffers>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     uniform_bind_group_layout: wgpu::BindGroupLayout,
-    /// Per-hemisphere resident buffers for active both-spec scenes. The logical
-    /// combined mesh still backs overlays, ROI node offsets, and picking, while
-    /// drawing uses these instances with tiny model-matrix uniform updates.
+    /// Multi-draw resident buffers for active both-spec scenes and chunked AFNI
+    /// colorized surfaces. The logical combined mesh still backs overlays, ROI
+    /// node offsets, and picking, while drawing uses these instances with tiny
+    /// model-matrix uniform updates.
     surface_render_set: Option<SurfaceRenderSet>,
+    selection_instance: Option<SurfaceRenderInstance>,
     depth_buffer: DepthBuffer,
     mesh: Option<SurfaceMesh>,
     prepared_geometry_cache: Option<PreparedGeometryCache>,
@@ -1033,12 +1243,21 @@ struct ViewerState {
     pending_scene_stats: HashSet<SurfaceId>,
     verbose: bool,
     preload_enabled: bool,
+    big_mem: bool,
+    gpu_afni_colors_enabled: bool,
     event_proxy: EventLoopProxy<ViewerEvent>,
     afni_options: AfniViewerOptions,
     afni_connection: Option<AfniConnection>,
     afni_session: AfniNimlSession,
     afni_recorder: Option<NimlRecorder>,
-    afni_rgba_colors: Option<Vec<[f32; 4]>>,
+    pending_afni_surface_registrations: VecDeque<PendingAfniSurfaceRegistration>,
+    registered_afni_scene_components: HashSet<(usize, usize)>,
+    pending_afni_post_registration_underlay: bool,
+    pending_afni_messages: VecDeque<AfniIncomingMessage>,
+    pending_cell_color_upload: Option<PendingCellColorUpload>,
+    deferred_afni_rgba_overlays: Vec<AfniRgbaOverlay>,
+    afni_work_scheduled: Arc<AtomicBool>,
+    afni_live_overlay_active: bool,
     /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
     /// resends identical colorizations on every redraw; this lets us skip the
     /// recolor + re-upload when nothing changed.
@@ -1068,6 +1287,8 @@ impl ViewerState {
         scene: InitialScene,
         verbose: bool,
         preload_enabled: bool,
+        big_mem: bool,
+        gpu_afni_colors_enabled: bool,
         afni_options: AfniViewerOptions,
         niml_record_path: Option<PathBuf>,
         event_proxy: EventLoopProxy<ViewerEvent>,
@@ -1109,11 +1330,21 @@ impl ViewerState {
             })
             .await
             .context("failed to find a compatible GPU adapter")?;
+        let adapter_limits = adapter.limits();
+        let required_limits = viewer_required_wgpu_limits(&adapter_limits, big_mem);
+        if verbose && big_mem {
+            eprintln!(
+                "sumaru: --big-mem requesting wgpu max_buffer_size {:.1} MiB \
+                 (adapter supports {:.1} MiB).",
+                required_limits.max_buffer_size as f64 / (1024.0 * 1024.0),
+                adapter_limits.max_buffer_size as f64 / (1024.0 * 1024.0),
+            );
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sumaru device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 ..Default::default()
             })
             .await?;
@@ -1196,7 +1427,12 @@ impl ViewerState {
         let camera = Camera::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera uniform buffer"),
-            contents: &camera.uniform_bytes(view_config.width as f32 / view_config.height as f32),
+            contents: &camera.uniform_bytes_with_model(
+                view_config.width as f32 / view_config.height as f32,
+                Mat4::IDENTITY,
+                LightingMode::default(),
+                1.0,
+            ),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let uniform_bind_group_layout =
@@ -1230,46 +1466,84 @@ impl ViewerState {
             bind_group_layouts: &[Some(&uniform_bind_group_layout)],
             immediate_size: 0,
         });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("surface render pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: VERTEX_STRIDE,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &VERTEX_ATTRIBUTES,
-                }],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_surface_pipeline = |label: &str,
+                                     topology: wgpu::PrimitiveTopology,
+                                     vertex_entry: &str,
+                                     fragment_entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vertex_entry),
+                    buffers: &[
+                        wgpu::VertexBufferLayout {
+                            array_stride: VERTEX_STRIDE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &VERTEX_ATTRIBUTES,
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: COLOR_STRIDE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &COLOR_ATTRIBUTES,
+                        },
+                    ],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fragment_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let surface_render_pipelines = SurfaceRenderPipelines {
+            filled: make_surface_pipeline(
+                "surface render pipeline filled",
+                wgpu::PrimitiveTopology::TriangleList,
+                "vs_main",
+                "fs_main",
+            ),
+            filled_flat: make_surface_pipeline(
+                "surface render pipeline filled flat",
+                wgpu::PrimitiveTopology::TriangleList,
+                "flat_vs_main",
+                "flat_fs_main",
+            ),
+            triangles: make_surface_pipeline(
+                "surface render pipeline triangles",
+                wgpu::PrimitiveTopology::LineList,
+                "vs_main",
+                "fs_main",
+            ),
+            vertices: make_surface_pipeline(
+                "surface render pipeline vertices",
+                wgpu::PrimitiveTopology::PointList,
+                "vs_main",
+                "fs_main",
+            ),
+        };
         let depth_buffer = DepthBuffer::new(&device, view_config.width, view_config.height);
         let view_egui_ctx = egui::Context::default();
         view_egui_ctx.set_visuals(egui::Visuals::dark());
@@ -1361,12 +1635,13 @@ impl ViewerState {
             graph_dock_pre_open_size: None,
             graph_dock_height_points: GRAPH_DOCK_DEFAULT_HEIGHT_POINTS,
             startup_redraw_until: Instant::now(),
-            render_pipeline,
+            surface_render_pipelines,
             surface_buffers: None,
             uniform_buffer,
             uniform_bind_group,
             uniform_bind_group_layout,
             surface_render_set: None,
+            selection_instance: None,
             depth_buffer,
             mesh: None,
             prepared_geometry_cache: None,
@@ -1391,12 +1666,21 @@ impl ViewerState {
             pending_scene_stats: HashSet::new(),
             verbose,
             preload_enabled,
+            big_mem,
+            gpu_afni_colors_enabled,
             event_proxy,
             afni_options,
             afni_connection: None,
             afni_session: AfniNimlSession::new(),
             afni_recorder,
-            afni_rgba_colors: None,
+            pending_afni_surface_registrations: VecDeque::new(),
+            registered_afni_scene_components: HashSet::new(),
+            pending_afni_post_registration_underlay: false,
+            pending_afni_messages: VecDeque::new(),
+            pending_cell_color_upload: None,
+            deferred_afni_rgba_overlays: Vec::new(),
+            afni_work_scheduled: Arc::new(AtomicBool::new(false)),
+            afni_live_overlay_active: false,
             afni_rgba_signatures: HashMap::new(),
             sent_crosshair_node: None,
             afni_crosshair_node: None,
@@ -1486,17 +1770,66 @@ impl ViewerState {
     }
 
     fn request_missing_startup_redraws(&self) {
-        if !self.view.frame_rendered {
+        if !self.view.frame_rendered && !self.view.occluded {
             self.view.window.request_redraw();
         }
-        if !self.control.frame_rendered {
+        if !self.control.frame_rendered && !self.control.occluded {
             self.control.window.request_redraw();
+        }
+    }
+
+    fn set_view_occluded(&mut self, occluded: bool) {
+        if self.view.occluded == occluded {
+            return;
+        }
+
+        self.view.occluded = occluded;
+        if occluded {
+            self.view.repaint_at = None;
+            if self.verbose {
+                self.log_status("View window occluded; deferring AFNI/live redraw work.");
+            }
+            return;
+        }
+
+        self.camera_tick_at = Instant::now();
+        if self.verbose {
+            self.log_status("View window visible again; resuming AFNI/live redraw work.");
+        }
+        if self.afni_connection.is_some() {
+            self.request_afni_work();
+        }
+        self.view.window.request_redraw();
+        self.control.window.request_redraw();
+        if self.controller.panels.roi_controller_open {
+            self.roi_control.window.request_redraw();
+        }
+        if self.controller.panels.graph_window_open {
+            self.graph.window.request_redraw();
+        }
+    }
+
+    fn set_aux_window_occluded(&mut self, pane: AuxWindowPane, occluded: bool) {
+        let window = match pane {
+            AuxWindowPane::Control => &mut self.control,
+            AuxWindowPane::RoiControl => &mut self.roi_control,
+            AuxWindowPane::Graph => &mut self.graph,
+        };
+        if window.occluded == occluded {
+            return;
+        }
+        window.occluded = occluded;
+        if occluded {
+            window.repaint_at = None;
+        } else {
+            window.window.request_redraw();
         }
     }
 
     fn resize_view(&mut self, size: PhysicalSize<u32>) {
         if self.view.resize(&self.device, size) {
             self.depth_buffer = DepthBuffer::new(&self.device, size.width, size.height);
+            self.poll_device_for_cleanup();
         }
     }
 
@@ -1547,17 +1880,45 @@ impl ViewerState {
 
     fn update_render_uniforms_for_camera(&mut self, camera: &Camera) {
         let aspect = self.scene_viewport_aspect();
+        let lighting_mode = self.controller.display.lighting_mode;
+        let surface_opacity = self.surface_opacity();
         if let Some(render_set) = self.surface_render_set.as_ref() {
             for instance in &render_set.instances {
                 self.queue.write_buffer(
                     &instance.uniform_buffer,
                     0,
-                    &camera.uniform_bytes_with_model(aspect, instance.model_matrix),
+                    &camera.uniform_bytes_with_model(
+                        aspect,
+                        instance.model_matrix,
+                        lighting_mode,
+                        surface_opacity,
+                    ),
                 );
             }
-        } else {
-            self.queue
-                .write_buffer(&self.uniform_buffer, 0, &camera.uniform_bytes(aspect));
+        }
+        if let Some(instance) = self.selection_instance.as_ref() {
+            self.queue.write_buffer(
+                &instance.uniform_buffer,
+                0,
+                &camera.uniform_bytes_with_model(
+                    aspect,
+                    instance.model_matrix,
+                    lighting_mode,
+                    surface_opacity,
+                ),
+            );
+        }
+        if self.surface_render_set.is_none() {
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                0,
+                &camera.uniform_bytes_with_model(
+                    aspect,
+                    Mat4::IDENTITY,
+                    lighting_mode,
+                    surface_opacity,
+                ),
+            );
         }
     }
 
@@ -1674,9 +2035,14 @@ impl ViewerState {
 
         command_buffers.push(encoder.finish());
         self.queue.submit(command_buffers);
+        self.poll_device_for_cleanup();
         output.present();
 
         RenderStatus::Rendered
+    }
+
+    fn poll_device_for_cleanup(&self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 
     fn schedule_momentum_repaint(&mut self) {
@@ -1690,6 +2056,26 @@ impl ViewerState {
                 .repaint_at
                 .map_or(next_frame, |existing| existing.min(next_frame)),
         );
+    }
+
+    fn active_surface_render_style(&self) -> SurfaceRenderStyle {
+        self.controller.display.surface_render_style
+    }
+
+    fn surface_opacity(&self) -> f32 {
+        f32::from(self.controller.display.surface_opacity_percent) / 100.0
+    }
+
+    fn active_surface_pipeline(&self, flat_colors: bool) -> &wgpu::RenderPipeline {
+        match self.active_surface_render_style() {
+            SurfaceRenderStyle::Filled if flat_colors => &self.surface_render_pipelines.filled_flat,
+            SurfaceRenderStyle::Filled => &self.surface_render_pipelines.filled,
+            SurfaceRenderStyle::Triangles => &self.surface_render_pipelines.triangles,
+            SurfaceRenderStyle::Vertices
+            | SurfaceRenderStyle::VerticesHalf
+            | SurfaceRenderStyle::VerticesQuarter
+            | SurfaceRenderStyle::VerticesEighth => &self.surface_render_pipelines.vertices,
+        }
     }
 
     fn encode_surface_render_pass(
@@ -1731,9 +2117,10 @@ impl ViewerState {
             1.0,
         );
         render_pass.set_scissor_rect(0, 0, viewport_size.width, viewport_size.height);
+        let surface_style = self.active_surface_render_style();
 
         if let Some(render_set) = &self.surface_render_set {
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(self.active_surface_pipeline(false));
             for instance in &render_set.instances {
                 if !self
                     .controller
@@ -1745,16 +2132,35 @@ impl ViewerState {
                 }
                 render_pass.set_bind_group(0, &instance.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(instance.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..instance.index_count, 0, 0..1);
+                render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    instance.index_buffer(surface_style).slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..instance.index_count(surface_style), 0, 0..1);
             }
         } else if let Some(buffers) = &self.surface_buffers {
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(self.active_surface_pipeline(buffers.flat_colors));
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(buffers.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..buffers.index_count, 0, 0..1);
+            render_pass.set_vertex_buffer(1, buffers.color_buffer.slice(..));
+            render_pass.set_index_buffer(
+                buffers.index_buffer(surface_style).slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            render_pass.draw_indexed(0..buffers.index_count(surface_style), 0, 0..1);
+        }
+
+        if let Some(instance) = &self.selection_instance {
+            render_pass.set_pipeline(self.active_surface_pipeline(false));
+            render_pass.set_bind_group(0, &instance.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
+            render_pass.set_index_buffer(
+                instance.index_buffer(SurfaceRenderStyle::Filled).slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            render_pass.draw_indexed(0..instance.index_count(SurfaceRenderStyle::Filled), 0, 0..1);
         }
 
         if let Some(volume_view) = &self.volume_view {
@@ -2095,6 +2501,25 @@ impl ViewerState {
                     self.controller.camera.mode = mode.into();
                     self.show_mode_label(mode);
                 }
+                ViewerCommand::ToggleLightingMode => {
+                    self.cycle_lighting_mode();
+                }
+                ViewerCommand::ToggleSurfaceRenderStyle => {
+                    self.cycle_surface_render_style();
+                }
+                ViewerCommand::ReverseSurfaceRenderStyle => {
+                    self.cycle_surface_render_style_backward();
+                }
+                ViewerCommand::CycleSurfaceOpacity => {
+                    self.cycle_surface_opacity_down();
+                    let camera = self.camera.clone();
+                    self.update_render_uniforms_for_camera(&camera);
+                }
+                ViewerCommand::RaiseSurfaceOpacity => {
+                    self.cycle_surface_opacity_up();
+                    let camera = self.camera.clone();
+                    self.update_render_uniforms_for_camera(&camera);
+                }
                 ViewerCommand::ToggleCameraMomentum => self.toggle_camera_momentum(),
                 ViewerCommand::ToggleBackground => self.controller.display.background.toggle(),
                 ViewerCommand::SetAnatomicalShadingVisible(visible) => {
@@ -2106,6 +2531,14 @@ impl ViewerState {
                     } else {
                         "Anatomical shading hidden."
                     });
+                }
+                ViewerCommand::ToggleAfniUncoloredTransparency => {
+                    let enabled = !self.controller.display.afni_uncolored_nodes_transparent;
+                    self.controller.display.afni_uncolored_nodes_transparent = enabled;
+                    self.show_afni_interior_color_label(enabled);
+                    if self.afni_live_overlay_active && self.controller.overlay.visible {
+                        self.upload_surface_buffers();
+                    }
                 }
                 ViewerCommand::SetOverlayVisible(visible) => {
                     if self.overlay.is_loaded() {
@@ -2296,6 +2729,16 @@ impl ViewerState {
                 ViewerCommand::SetGraphWindowOpen(open) => {
                     self.set_graph_window_open(open);
                 }
+                ViewerCommand::NudgeCamera(direction) => {
+                    let direction = match direction {
+                        ViewNudge::Left => CameraNudgeDirection::Left,
+                        ViewNudge::Right => CameraNudgeDirection::Right,
+                        ViewNudge::Up => CameraNudgeDirection::Up,
+                        ViewNudge::Down => CameraNudgeDirection::Down,
+                    };
+                    self.camera.nudge(direction);
+                    self.controller.camera.note_manual_motion();
+                }
                 ViewerCommand::Preset(preset) => {
                     self.controller.camera.set_preset(preset);
                     self.camera.set_preset(preset.into());
@@ -2310,6 +2753,10 @@ impl ViewerState {
                         self.set_error(error);
                     }
                 }
+                ViewerCommand::CycleSceneSurface(delta) => match self.cycle_scene_surface(delta) {
+                    Ok(_) => {}
+                    Err(error) => self.set_error(error),
+                },
                 ViewerCommand::SaveScreenshot => {
                     if let Err(error) = self.save_current_view_screenshot() {
                         self.set_error(error);
@@ -2385,7 +2832,10 @@ impl ViewerState {
 
     /// Launch another sumaru process from this executable, detached so it
     /// outlives the launcher. `label` only flavors the status/error message.
-    fn spawn_sumaru_instance(&mut self, args: Vec<OsString>, label: &str) {
+    fn spawn_sumaru_instance(&mut self, mut args: Vec<OsString>, label: &str) {
+        if self.big_mem {
+            args.push("--big-mem".into());
+        }
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(error) => {
@@ -2406,8 +2856,9 @@ impl ViewerState {
     fn reset_scene_state(&mut self) {
         self.overlay.clear();
         self.controller.overlay.visible = true;
-        self.afni_rgba_colors = None;
+        self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
+        self.deferred_afni_rgba_overlays.clear();
         self.controller.surface.current_overlay_path = None;
         self.roi_path = None;
         self.controller.surface.current_roi_path = None;
@@ -2419,6 +2870,7 @@ impl ViewerState {
         self.controller.interaction.set_pick(None);
         self.controller.display.pair_visibility = PairVisibility::both();
         self.surface_render_set = None;
+        self.selection_instance = None;
     }
 
     fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
@@ -3011,6 +3463,7 @@ impl ViewerState {
     ) {
         self.surface_buffers = None;
         self.surface_render_set = None;
+        self.selection_instance = None;
         self.prepared_geometry_cache = prepared_geometry.map(|geometry| PreparedGeometryCache {
             surface_id: mesh.metadata.id.clone(),
             vertex_count: mesh.vertices.len(),
@@ -3072,11 +3525,10 @@ impl ViewerState {
             && let Some(component) = self.picked_paired_component(pick)
             && let Some(pair) = self.overlay.source.pair_paths.as_ref()
         {
-            return match component.side {
-                SurfaceSide::Left => file_name_display(&pair.left_path),
-                SurfaceSide::Right => file_name_display(&pair.right_path),
-                _ => file_name_display(path),
-            };
+            return pair
+                .path_for_side(&component.side)
+                .map(file_name_display)
+                .unwrap_or_else(|| "none".to_string());
         }
 
         if let Some(pick) = self.controller.interaction.pick
@@ -3192,6 +3644,13 @@ impl ViewerState {
             .filter(|_| self.controller.overlay.visible)
     }
 
+    fn afni_live_overlay_colors(&self) -> Option<&[[f32; 4]]> {
+        self.afni_live_overlay_active
+            .then(|| self.overlay.render.render_model.as_ref())
+            .flatten()
+            .map(|overlay| overlay.color_cache.colors.as_slice())
+    }
+
     fn visible_roi_layer(&self) -> Option<&RoiLayer> {
         self.roi_layer
             .as_ref()
@@ -3206,11 +3665,19 @@ impl ViewerState {
                 if let Err(error) = self.send_afni_crosshair_for_pick(pick) {
                     self.set_error(error);
                 }
-                self.upload_surface_buffers();
+                if self.has_both_scene() {
+                    self.upload_surface_buffers();
+                } else {
+                    self.upload_selection_highlight_buffer();
+                }
             }
             None => {
                 self.controller.interaction.set_pick(None);
-                self.upload_surface_buffers();
+                if self.has_both_scene() {
+                    self.upload_surface_buffers();
+                } else {
+                    self.upload_selection_highlight_buffer();
+                }
                 self.log_status("No surface under the cursor.");
             }
         }
@@ -3322,27 +3789,271 @@ impl ViewerState {
         }
     }
 
+    fn surface_render_instance_from_prepared(
+        &self,
+        prepared_surface: &PreparedSurface,
+        side: SurfaceSide,
+        model_matrix: Mat4,
+        labels: SurfaceInstanceBufferLabels,
+    ) -> SurfaceRenderInstance {
+        let vertex_bytes = prepared_surface.vertex_bytes();
+        let color_bytes = prepared_surface.color_bytes();
+        let triangle_index_bytes = prepared_surface.index_bytes();
+        let line_index_bytes = prepared_surface.line_index_bytes();
+        let point_index_bytes = prepared_surface.point_index_bytes();
+        let triangle_index_count = prepared_surface.index_count();
+        let line_index_count = prepared_surface.line_index_count();
+        let point_index_count = prepared_surface.point_index_count();
+        let uniform_bytes = self.camera.uniform_bytes_with_model(
+            self.scene_viewport_aspect(),
+            model_matrix,
+            self.controller.display.lighting_mode,
+            self.surface_opacity(),
+        );
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(labels.vertex),
+                contents: &vertex_bytes,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let color_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("surface color buffer"),
+                contents: &color_bytes,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let triangle_index_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(labels.triangle_index),
+                    contents: &triangle_index_bytes,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                });
+        let line_index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(labels.line_index),
+                contents: &line_index_bytes,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let point_index_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(labels.point_index),
+                    contents: &point_index_bytes,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                });
+        let uniform_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(labels.uniform),
+                contents: &uniform_bytes,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(labels.bind_group),
+            layout: &self.uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        SurfaceRenderInstance {
+            side,
+            vertex_buffer,
+            color_buffer,
+            color_bytes_len: color_bytes.len(),
+            triangle_index_buffer,
+            triangle_index_count,
+            line_index_buffer,
+            line_index_count,
+            point_index_buffer,
+            point_index_count,
+            uniform_buffer,
+            bind_group,
+            model_matrix,
+        }
+    }
+
+    fn push_cell_color_surface_instances(
+        &self,
+        instances: &mut Vec<SurfaceRenderInstance>,
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        selection: Option<SelectionHighlight>,
+        side: SurfaceSide,
+        model_matrix: Mat4,
+        labels: SurfaceInstanceBufferLabels,
+    ) -> usize {
+        let max_triangles =
+            afni_cell_color_max_triangles_per_chunk(self.device.limits().max_buffer_size);
+        let ranges = cell_color_chunk_ranges(geometry.triangle_count(), max_triangles);
+        let mesh_chunk_count = ranges.len();
+        instances.reserve(mesh_chunk_count + usize::from(selection.is_some()));
+
+        for range in ranges {
+            let prepared_surface = PreparedSurface::from_geometry_cell_color_range(
+                geometry,
+                surface_colors,
+                roi_colors,
+                range,
+            );
+            if !prepared_surface.is_empty() {
+                instances.push(self.surface_render_instance_from_prepared(
+                    &prepared_surface,
+                    side.clone(),
+                    model_matrix,
+                    labels,
+                ));
+            }
+        }
+
+        if let Some(selection) = selection {
+            let prepared_surface = PreparedSurface::selection_highlight(geometry, selection);
+            if !prepared_surface.is_empty() {
+                instances.push(self.surface_render_instance_from_prepared(
+                    &prepared_surface,
+                    side,
+                    model_matrix,
+                    labels,
+                ));
+            }
+        }
+
+        mesh_chunk_count
+    }
+
+    fn upload_chunked_cell_color_surface_render_set(
+        &mut self,
+        surface_id: SurfaceId,
+        geometry: Arc<PreparedGeometry>,
+        surface_colors: Option<Arc<Vec<[f32; 4]>>>,
+        roi_colors: Option<Vec<Option<[f32; 4]>>>,
+        dropped_render_set: bool,
+    ) {
+        let max_triangles =
+            afni_cell_color_max_triangles_per_chunk(self.device.limits().max_buffer_size);
+        let ranges = cell_color_chunk_ranges(geometry.triangle_count(), max_triangles);
+        let mesh_chunk_count = ranges.len();
+        let resident_update_start = Instant::now();
+        if self.try_update_chunked_cell_color_vertices(
+            &geometry,
+            surface_colors.as_deref().map(Vec::as_slice),
+            roi_colors.as_deref(),
+            &ranges,
+        ) {
+            self.upload_selection_highlight_buffer();
+            if self.verbose {
+                self.log_status(format!(
+                    "Updated AFNI colorized surface {} across {} resident GPU chunks in {:.1} ms.",
+                    surface_id.as_str(),
+                    mesh_chunk_count,
+                    resident_update_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
+            return;
+        }
+
+        let dropped_gpu_resources = dropped_render_set || self.surface_buffers.is_some();
+        self.surface_buffers = None;
+        self.surface_render_set = Some(SurfaceRenderSet {
+            instances: Vec::new(),
+        });
+        self.pending_cell_color_upload = Some(PendingCellColorUpload {
+            surface_id: surface_id.clone(),
+            geometry,
+            surface_colors,
+            roi_colors,
+            ranges: ranges.into_iter().collect(),
+            mesh_chunk_count,
+            chunks_uploaded: 0,
+            side: SurfaceSide::Unknown,
+            model_matrix: Mat4::IDENTITY,
+            labels: CHUNKED_SURFACE_BUFFER_LABELS,
+        });
+        if self.verbose {
+            self.log_status(format!(
+                "AFNI colorized surface {} split into {} GPU chunks \
+                 (up to {} triangles each); uploading progressively.",
+                surface_id.as_str(),
+                mesh_chunk_count,
+                max_triangles
+            ));
+        }
+        if dropped_gpu_resources {
+            self.poll_device_for_cleanup();
+        }
+        self.process_pending_cell_color_upload();
+        self.upload_selection_highlight_buffer();
+    }
+
+    fn try_update_chunked_cell_color_vertices(
+        &self,
+        geometry: &PreparedGeometry,
+        surface_colors: Option<&[[f32; 4]]>,
+        roi_colors: Option<&[Option<[f32; 4]>]>,
+        ranges: &[Range<usize>],
+    ) -> bool {
+        let Some(render_set) = self.surface_render_set.as_ref() else {
+            return false;
+        };
+        if render_set.instances.len() != ranges.len() {
+            return false;
+        }
+
+        for (instance, range) in render_set.instances.iter().zip(ranges) {
+            let color_bytes = PreparedSurface::cell_color_bytes_for_range(
+                geometry,
+                surface_colors,
+                roi_colors,
+                range.clone(),
+            );
+            if color_bytes.len() != instance.color_bytes_len {
+                return false;
+            }
+            self.queue
+                .write_buffer(&instance.color_buffer, 0, &color_bytes);
+        }
+
+        true
+    }
+
     fn upload_surface_buffers(&mut self) {
-        let afni_surface_colors = (self.controller.overlay.visible)
-            .then(|| self.afni_rgba_colors.clone())
+        self.pending_cell_color_upload = None;
+        let underlay = self.visible_anatomical_shading_colors();
+        let afni_surface_colors = self
+            .controller
+            .overlay
+            .visible
+            .then(|| self.afni_live_overlay_colors())
             .flatten();
         let surface_colors = if let Some(afni) = afni_surface_colors {
             // AFNI colors replace the surface color, so resolve their alpha
             // against the anatomical underlay now: sub-threshold nodes show the
             // underlay instead of painting the surface black.
-            let underlay = self.visible_anatomical_shading_colors();
             Some(Arc::new(afni_colors_over_underlay(
                 &afni,
                 underlay.as_deref().map(Vec::as_slice),
+                self.controller.display.afni_uncolored_nodes_transparent,
             )))
         } else {
-            self.visible_anatomical_shading_colors()
+            underlay
         };
         if self.mesh.is_none() {
+            let dropped_gpu_resources =
+                self.surface_buffers.is_some() || self.surface_render_set.is_some();
             self.surface_buffers = None;
             self.surface_render_set = None;
+            self.selection_instance = None;
             self.prepared_geometry_cache = None;
             self.anatomical_shading_cache = None;
+            if dropped_gpu_resources {
+                self.poll_device_for_cleanup();
+            }
             return;
         }
 
@@ -3352,7 +4063,7 @@ impl ViewerState {
             return;
         }
 
-        self.surface_render_set = None;
+        let dropped_render_set = self.surface_render_set.is_some();
         let mesh = self
             .mesh
             .as_ref()
@@ -3376,39 +4087,82 @@ impl ViewerState {
             .expect("prepared geometry cache is populated above")
             .geometry
             .clone();
-        let selection = self.selection_highlight();
-        let use_afni_cell_colors =
-            self.afni_rgba_colors.is_some() && self.controller.overlay.visible;
-        let visible_overlay = self
-            .afni_rgba_colors
-            .is_none()
+        let use_afni_cell_colors = self.afni_live_overlay_active && self.controller.overlay.visible;
+        let use_gpu_afni_colors = use_afni_cell_colors && self.gpu_afni_colors_enabled;
+        let surface_color_slice = surface_colors.as_deref().map(Vec::as_slice);
+        let roi_colors = self
+            .visible_roi_layer()
+            .map(|layer| layer.appearance.node_colors.clone());
+        let roi_color_slice = roi_colors.as_deref();
+        if use_afni_cell_colors
+            && !use_gpu_afni_colors
+            && afni_cell_color_needs_chunking(&geometry, None, self.device.limits().max_buffer_size)
+        {
+            let surface_id = mesh.metadata.id.clone();
+            self.upload_chunked_cell_color_surface_render_set(
+                surface_id,
+                geometry.clone(),
+                surface_colors.clone(),
+                roi_colors.clone(),
+                dropped_render_set,
+            );
+            return;
+        }
+
+        self.surface_render_set = None;
+        let visible_overlay = (!self.afni_live_overlay_active)
             .then(|| self.visible_overlay())
             .flatten();
-        let surface_color_slice = surface_colors.as_deref().map(Vec::as_slice);
-        let roi = self.visible_roi_layer().map(|layer| &layer.appearance);
-        let prepared_surface = if use_afni_cell_colors {
+        let prepared_surface = if use_gpu_afni_colors {
+            PreparedSurface::from_geometry_color_slices(
+                &geometry,
+                surface_color_slice,
+                None,
+                1.0,
+                roi_color_slice,
+                None,
+            )
+        } else if use_afni_cell_colors {
             PreparedSurface::from_geometry_cell_colors(
                 &geometry,
                 surface_color_slice,
-                roi.map(|roi| roi.node_colors.as_slice()),
-                selection,
+                roi_color_slice,
+                None,
             )
         } else {
-            PreparedSurface::from_geometry_with_selection(
+            PreparedSurface::from_geometry_color_slices(
                 &geometry,
                 surface_color_slice,
-                visible_overlay,
+                visible_overlay.map(|overlay| overlay.color_cache.colors.as_slice()),
                 self.overlay.render.appearance.dim,
-                roi,
-                selection,
+                roi_color_slice,
+                None,
             )
         };
         let vertex_bytes = prepared_surface.vertex_bytes();
-        let index_bytes = prepared_surface.index_bytes();
+        let color_bytes = prepared_surface.color_bytes();
+        let triangle_index_bytes = prepared_surface.index_bytes();
+        let line_index_bytes = prepared_surface.line_index_bytes();
+        let point_index_bytes = prepared_surface.point_index_bytes();
         let surface_id = mesh.metadata.id.clone();
-        let index_count = prepared_surface.index_count();
+        let triangle_index_count = prepared_surface.index_count();
+        let line_index_count = prepared_surface.line_index_count();
+        let point_index_count = prepared_surface.point_index_count();
+
+        if self.verbose
+            && use_gpu_afni_colors
+            && !self
+                .surface_buffers
+                .as_ref()
+                .is_some_and(|buffers| buffers.flat_colors)
+        {
+            self.log_status(
+                "Experimental --gpu AFNI flat-color path active for this surface.".to_string(),
+            );
+        }
 
         if let Some(buffers) = self.surface_buffers.as_mut() {
+            let mut replaced_gpu_resources = dropped_render_set;
             if buffers.vertex_bytes_len == vertex_bytes.len() {
                 self.queue
                     .write_buffer(&buffers.vertex_buffer, 0, &vertex_bytes);
@@ -3421,23 +4175,85 @@ impl ViewerState {
                             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                         });
                 buffers.vertex_bytes_len = vertex_bytes.len();
+                replaced_gpu_resources = true;
+            }
+            if buffers.color_bytes_len == color_bytes.len() {
+                self.queue
+                    .write_buffer(&buffers.color_buffer, 0, &color_bytes);
+            } else {
+                buffers.color_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("surface color buffer"),
+                            contents: &color_bytes,
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        });
+                buffers.color_bytes_len = color_bytes.len();
+                replaced_gpu_resources = true;
+            }
+
+            if use_gpu_afni_colors || buffers.flat_colors || buffers.surface_id != surface_id {
+                if buffers.triangle_index_bytes_len == triangle_index_bytes.len()
+                    && buffers.triangle_index_count == triangle_index_count
+                {
+                    self.queue.write_buffer(
+                        &buffers.triangle_index_buffer,
+                        0,
+                        &triangle_index_bytes,
+                    );
+                } else {
+                    buffers.triangle_index_buffer =
+                        self.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("surface triangle index buffer"),
+                                contents: &triangle_index_bytes,
+                                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                            });
+                    buffers.triangle_index_bytes_len = triangle_index_bytes.len();
+                    buffers.triangle_index_count = triangle_index_count;
+                    replaced_gpu_resources = true;
+                }
             }
 
             if buffers.surface_id != surface_id
-                || buffers.index_bytes_len != index_bytes.len()
-                || buffers.index_count != index_count
+                || buffers.line_index_bytes_len != line_index_bytes.len()
+                || buffers.line_index_count != line_index_count
+                || buffers.point_index_bytes_len != point_index_bytes.len()
+                || buffers.point_index_count != point_index_count
             {
-                buffers.index_buffer =
+                buffers.line_index_buffer =
                     self.device
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("surface index buffer"),
-                            contents: &index_bytes,
+                            label: Some("surface line index buffer"),
+                            contents: &line_index_bytes,
                             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                         });
-                buffers.index_bytes_len = index_bytes.len();
-                buffers.index_count = index_count;
+                buffers.point_index_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("surface point index buffer"),
+                            contents: &point_index_bytes,
+                            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        });
+                buffers.line_index_bytes_len = line_index_bytes.len();
+                buffers.line_index_count = line_index_count;
+                buffers.point_index_bytes_len = point_index_bytes.len();
+                buffers.point_index_count = point_index_count;
+                replaced_gpu_resources = true;
             }
             buffers.surface_id = surface_id;
+            buffers.flat_colors = false;
+            buffers.afni_node_colors = use_gpu_afni_colors.then(|| {
+                prepared_surface
+                    .vertices
+                    .iter()
+                    .map(|vertex| vertex.color)
+                    .collect()
+            });
+            if replaced_gpu_resources {
+                self.poll_device_for_cleanup();
+            }
+            self.upload_selection_highlight_buffer();
             return;
         }
 
@@ -3448,22 +4264,63 @@ impl ViewerState {
                 contents: &vertex_bytes,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
-        let index_buffer = self
+        let color_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("surface index buffer"),
-                contents: &index_bytes,
+                label: Some("surface color buffer"),
+                contents: &color_bytes,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let triangle_index_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("surface triangle index buffer"),
+                    contents: &triangle_index_bytes,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                });
+        let line_index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("surface line index buffer"),
+                contents: &line_index_bytes,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             });
+        let point_index_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("surface point index buffer"),
+                    contents: &point_index_bytes,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                });
 
         self.surface_buffers = Some(SurfaceBuffers {
             surface_id,
+            flat_colors: false,
+            afni_node_colors: use_gpu_afni_colors.then(|| {
+                prepared_surface
+                    .vertices
+                    .iter()
+                    .map(|vertex| vertex.color)
+                    .collect()
+            }),
             vertex_buffer,
             vertex_bytes_len: vertex_bytes.len(),
-            index_buffer,
-            index_bytes_len: index_bytes.len(),
-            index_count,
+            color_buffer,
+            color_bytes_len: color_bytes.len(),
+            triangle_index_buffer,
+            triangle_index_bytes_len: triangle_index_bytes.len(),
+            triangle_index_count,
+            line_index_buffer,
+            line_index_bytes_len: line_index_bytes.len(),
+            line_index_count,
+            point_index_buffer,
+            point_index_bytes_len: point_index_bytes.len(),
+            point_index_count,
         });
+        if dropped_render_set {
+            self.poll_device_for_cleanup();
+        }
+        self.upload_selection_highlight_buffer();
     }
 
     fn upload_paired_surface_render_set(&mut self, surface_colors: Option<&[[f32; 4]]>) -> bool {
@@ -3517,13 +4374,10 @@ impl ViewerState {
             return false;
         }
 
-        let visible_overlay = self
-            .afni_rgba_colors
-            .is_none()
+        let visible_overlay = (!self.afni_live_overlay_active)
             .then(|| self.visible_overlay())
             .flatten();
-        let use_afni_cell_colors =
-            self.afni_rgba_colors.is_some() && self.controller.overlay.visible;
+        let use_afni_cell_colors = self.afni_live_overlay_active && self.controller.overlay.visible;
         let overlay_colors = visible_overlay.map(|overlay| overlay.color_cache.colors.clone());
         let roi_colors = self
             .visible_roi_layer()
@@ -3534,7 +4388,6 @@ impl ViewerState {
         let visibility = self.controller.display.pair_visibility;
         let matrices = self.active_pair_matrices_for_layout(layout, visibility);
         let selection_scale = selection_scale_from_model_matrices(&matrices);
-        let aspect = self.scene_viewport_aspect();
 
         let mut instances = Vec::with_capacity(raw.len());
         for component in raw {
@@ -3560,73 +4413,75 @@ impl ViewerState {
                 &component.normals,
                 &component.triangles,
             );
-            let prepared_surface = if use_afni_cell_colors {
-                PreparedSurface::from_geometry_cell_colors(
-                    &geometry,
-                    surface_color_slice,
-                    roi_color_slice,
-                    selection,
-                )
-            } else {
-                PreparedSurface::from_geometry_color_slices(
-                    &geometry,
-                    surface_color_slice,
-                    overlay_color_slice,
-                    dim,
-                    roi_color_slice,
-                    selection,
-                )
-            };
-            let vertex_bytes = prepared_surface.vertex_bytes();
-            let index_bytes = prepared_surface.index_bytes();
             let model_matrix = matrices
                 .iter()
                 .find(|(side, _)| *side == component.side)
                 .map(|(_, matrix)| *matrix)
                 .unwrap_or(Mat4::IDENTITY);
-            let uniform_bytes = self.camera.uniform_bytes_with_model(aspect, model_matrix);
-            let vertex_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("paired surface vertex buffer"),
-                    contents: &vertex_bytes,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                });
-            let index_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("paired surface index buffer"),
-                    contents: &index_bytes,
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                });
-            let uniform_buffer =
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("paired surface uniform buffer"),
-                        contents: &uniform_bytes,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    });
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("paired surface bind group"),
-                layout: &self.uniform_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                }],
-            });
-            instances.push(SurfaceRenderInstance {
-                side: component.side,
-                vertex_buffer,
-                index_buffer,
-                index_count: prepared_surface.index_count(),
-                uniform_buffer,
-                bind_group,
-                model_matrix,
-            });
+            if use_afni_cell_colors
+                && afni_cell_color_needs_chunking(
+                    &geometry,
+                    selection,
+                    self.device.limits().max_buffer_size,
+                )
+            {
+                let mesh_chunk_count = self.push_cell_color_surface_instances(
+                    &mut instances,
+                    &geometry,
+                    surface_color_slice,
+                    roi_color_slice,
+                    selection,
+                    component.side.clone(),
+                    model_matrix,
+                    PAIRED_SURFACE_BUFFER_LABELS,
+                );
+                if self.verbose {
+                    let max_triangles = afni_cell_color_max_triangles_per_chunk(
+                        self.device.limits().max_buffer_size,
+                    );
+                    self.log_status(format!(
+                        "AFNI colorized {} surface split into {} GPU chunks \
+                         (up to {} triangles each).",
+                        surface_side_label(&component.side),
+                        mesh_chunk_count,
+                        max_triangles
+                    ));
+                }
+            } else {
+                let prepared_surface = if use_afni_cell_colors {
+                    PreparedSurface::from_geometry_cell_colors(
+                        &geometry,
+                        surface_color_slice,
+                        roi_color_slice,
+                        selection,
+                    )
+                } else {
+                    PreparedSurface::from_geometry_color_slices(
+                        &geometry,
+                        surface_color_slice,
+                        overlay_color_slice,
+                        dim,
+                        roi_color_slice,
+                        selection,
+                    )
+                };
+                instances.push(self.surface_render_instance_from_prepared(
+                    &prepared_surface,
+                    component.side,
+                    model_matrix,
+                    PAIRED_SURFACE_BUFFER_LABELS,
+                ));
+            }
         }
 
+        let dropped_gpu_resources =
+            self.surface_buffers.is_some() || self.surface_render_set.is_some();
         self.surface_buffers = None;
+        self.selection_instance = None;
         self.surface_render_set = Some(SurfaceRenderSet { instances });
+        if dropped_gpu_resources {
+            self.poll_device_for_cleanup();
+        }
         true
     }
 
@@ -3677,6 +4532,52 @@ impl ViewerState {
             pick.face_index,
             pick.normalized_position,
         ))
+    }
+
+    fn upload_selection_highlight_buffer(&mut self) {
+        if self.has_both_scene() {
+            self.selection_instance = None;
+            return;
+        }
+
+        let Some(selection) = self.selection_highlight() else {
+            self.selection_instance = None;
+            return;
+        };
+        let Some(mesh) = self.mesh.as_ref() else {
+            self.selection_instance = None;
+            return;
+        };
+        if !self
+            .prepared_geometry_cache
+            .as_ref()
+            .is_some_and(|cache| cache.matches(mesh))
+        {
+            self.prepared_geometry_cache = Some(PreparedGeometryCache {
+                surface_id: mesh.metadata.id.clone(),
+                vertex_count: mesh.vertices.len(),
+                face_count: mesh.triangles.len(),
+                geometry: Arc::new(PreparedGeometry::from_surface(mesh)),
+            });
+        }
+        let geometry = self
+            .prepared_geometry_cache
+            .as_ref()
+            .expect("prepared geometry cache is populated above")
+            .geometry
+            .clone();
+        let prepared_surface = PreparedSurface::selection_highlight(&geometry, selection);
+        if prepared_surface.is_empty() {
+            self.selection_instance = None;
+            return;
+        }
+
+        self.selection_instance = Some(self.surface_render_instance_from_prepared(
+            &prepared_surface,
+            SurfaceSide::Unknown,
+            Mat4::IDENTITY,
+            CHUNKED_SURFACE_BUFFER_LABELS,
+        ));
     }
 
     fn update_scene_stats(&mut self) {
@@ -3736,6 +4637,70 @@ impl ViewerState {
 
     fn show_mode_label(&mut self, mode: CameraMode) {
         self.show_transient_label(mode.label());
+    }
+
+    fn show_lighting_mode_label(&mut self, mode: LightingMode) {
+        self.show_transient_label(format!("lighting: {}", mode.label()));
+    }
+
+    fn show_surface_render_style_label(&mut self, style: SurfaceRenderStyle) {
+        self.show_transient_label(format!("surface: {}", style.label()));
+    }
+
+    fn show_surface_opacity_label(&mut self, percent: u8) {
+        self.show_transient_label(format!("opacity: {percent}%"));
+    }
+
+    fn show_afni_interior_color_label(&mut self, enabled: bool) {
+        self.show_transient_label(if enabled {
+            "interior shine-through on"
+        } else {
+            "interior shine-through off"
+        });
+    }
+
+    fn cycle_lighting_mode(&mut self) -> LightingMode {
+        let mode = self.controller.display.lighting_mode.cycled();
+        self.controller.display.lighting_mode = mode;
+        self.show_lighting_mode_label(mode);
+        mode
+    }
+
+    fn cycle_surface_render_style(&mut self) -> SurfaceRenderStyle {
+        let style = self.controller.display.surface_render_style.cycled();
+        self.controller.display.surface_render_style = style;
+        self.show_surface_render_style_label(style);
+        style
+    }
+
+    fn cycle_surface_render_style_backward(&mut self) -> SurfaceRenderStyle {
+        let style = self
+            .controller
+            .display
+            .surface_render_style
+            .cycled_backward();
+        self.controller.display.surface_render_style = style;
+        self.show_surface_render_style_label(style);
+        style
+    }
+
+    fn cycle_surface_opacity_down(&mut self) -> u8 {
+        self.step_surface_opacity(-10)
+    }
+
+    fn cycle_surface_opacity_up(&mut self) -> u8 {
+        self.step_surface_opacity(10)
+    }
+
+    fn step_surface_opacity(&mut self, delta_percent: i16) -> u8 {
+        let current = i16::from(self.controller.display.surface_opacity_percent);
+        // Wrap around the 0..=100 range so stepping past an end cycles to the
+        // other: pressing "o" at 0% jumps back to 100%.
+        let next = current + delta_percent;
+        let next = next.rem_euclid(110).clamp(0, 100) as u8;
+        self.controller.display.surface_opacity_percent = next;
+        self.show_surface_opacity_label(next);
+        next
     }
 
     fn toggle_camera_momentum(&mut self) {
@@ -3871,21 +4836,6 @@ fn paired_component_for_node<'a>(
     let right_nodes = right.mesh.as_ref()?.vertices.len() as u32;
     let right_limit = left_nodes.checked_add(right_nodes)?;
     (node_index < right_limit).then_some(right)
-}
-
-/// Node closest to the surface's bounding-box center (½ x, ½ y, ½ z), used as
-/// the default crosshair target when nothing has been picked yet.
-fn node_nearest_bounds_center(mesh: &SurfaceMesh) -> Option<u32> {
-    let center = Vec3::from_array(mesh.bounds.center);
-    mesh.vertices
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| {
-            let left = Vec3::from_array(**left).distance_squared(center);
-            let right = Vec3::from_array(**right).distance_squared(center);
-            left.total_cmp(&right)
-        })
-        .and_then(|(index, _)| u32::try_from(index).ok())
 }
 
 fn surface_pick_for_mesh_node(
@@ -4069,6 +5019,24 @@ struct ControlUiOutput {
 enum ViewerEvent {
     AfniMessagesReady,
     SceneStatsReady,
+}
+
+struct PendingCellColorUpload {
+    surface_id: SurfaceId,
+    geometry: Arc<PreparedGeometry>,
+    surface_colors: Option<Arc<Vec<[f32; 4]>>>,
+    roi_colors: Option<Vec<Option<[f32; 4]>>>,
+    ranges: VecDeque<Range<usize>>,
+    mesh_chunk_count: usize,
+    chunks_uploaded: usize,
+    side: SurfaceSide,
+    model_matrix: Mat4,
+    labels: SurfaceInstanceBufferLabels,
+}
+
+struct PendingAfniSurfaceRegistration {
+    mesh: Arc<SurfaceMesh>,
+    info: AfniSurfaceInfo,
 }
 
 struct PreloadTask {
@@ -4496,6 +5464,65 @@ fn finite_integer_label_value(value: f64) -> Option<i32> {
         .and_then(|value| i32::try_from(value).ok())
 }
 
+fn auto_overlay_label_table(dataset: &Dataset, intensity_index: usize) -> Option<LabelTable> {
+    const MAX_AUTO_DISCRETE_LABELS: usize = 64;
+
+    let column = dataset.columns.get(intensity_index)?;
+    let keys = discrete_integer_column_keys(column)?
+        .into_iter()
+        .filter(|key| *key != 0)
+        .collect::<Vec<_>>();
+    if keys.is_empty() || keys.len() > MAX_AUTO_DISCRETE_LABELS {
+        return None;
+    }
+
+    let labels = keys
+        .into_iter()
+        .map(|key| LabelEntry::new(key, key.to_string(), stable_label_color(key, 255)))
+        .collect::<Result<Vec<_>>>()
+        .ok()?;
+
+    LabelTable::with_name(
+        Some(format!("{} discrete labels", column.label)),
+        LabelTableSource::Manual,
+        labels,
+    )
+    .ok()
+}
+
+fn discrete_integer_column_keys(column: &DataColumn) -> Option<BTreeSet<i32>> {
+    let mut keys = BTreeSet::new();
+    match &column.values {
+        ColumnData::UInt32(values) => {
+            for value in values {
+                keys.insert(i32::try_from(*value).ok()?);
+            }
+        }
+        ColumnData::Int32(values) => {
+            keys.extend(values.iter().copied());
+        }
+        ColumnData::Float32(values) => {
+            for value in values {
+                if !value.is_finite() {
+                    continue;
+                }
+                keys.insert(finite_integer_label_value(*value as f64)?);
+            }
+        }
+        ColumnData::Float64(values) => {
+            for value in values {
+                if !value.is_finite() {
+                    continue;
+                }
+                keys.insert(finite_integer_label_value(*value)?);
+            }
+        }
+        ColumnData::Text(_) => return None,
+    }
+
+    Some(keys)
+}
+
 fn afni_component_is_sendable(
     component: &SceneSurfaceComponent,
     mesh: Option<&SurfaceMesh>,
@@ -4611,9 +5638,13 @@ fn afni_rgba_to_suma_node_color(rgba: [u8; 4]) -> [f32; 4] {
 /// Flatten AFNI's per-node RGBA color cache into opaque surface colors by
 /// blending each node over the anatomical underlay using its alpha. AFNI colors
 /// are rendered as the surface itself (not a separate overlay plane), so a
-/// sub-threshold node (alpha 0) must resolve to the underlay here or it would
-/// paint the surface black.
-fn afni_colors_over_underlay(afni: &[[f32; 4]], underlay: Option<&[[f32; 4]]>) -> Vec<[f32; 4]> {
+/// sub-threshold node (alpha 0) either resolves to the underlay or becomes a
+/// discarded fragment for interior shine-through mode.
+fn afni_colors_over_underlay(
+    afni: &[[f32; 4]],
+    underlay: Option<&[[f32; 4]]>,
+    transparent_uncolored_nodes: bool,
+) -> Vec<[f32; 4]> {
     afni.iter()
         .enumerate()
         .map(|(index, color)| {
@@ -4622,6 +5653,9 @@ fn afni_colors_over_underlay(afni: &[[f32; 4]], underlay: Option<&[[f32; 4]]>) -
                 .copied()
                 .unwrap_or(mesh::DEFAULT_SURFACE_COLOR);
             let alpha = color[3].clamp(0.0, 1.0);
+            if transparent_uncolored_nodes && alpha <= f32::EPSILON {
+                return [base[0], base[1], base[2], 0.0];
+            }
             [
                 base[0] * (1.0 - alpha) + color[0] * alpha,
                 base[1] * (1.0 - alpha) + color[1] * alpha,
@@ -5013,11 +6047,41 @@ fn paired_overlay_path_for_side(path: &Path, side: &SurfaceSide) -> Option<PathB
 }
 
 fn explicit_overlay_pair_display_name(pair: &ExplicitOverlayPair) -> String {
-    format!(
-        "LH {} / RH {}",
-        file_name_display(&pair.left_path),
-        file_name_display(&pair.right_path)
-    )
+    match (&pair.left_path, &pair.right_path) {
+        (Some(left_path), Some(right_path)) => format!(
+            "LH {} / RH {}",
+            file_name_display(left_path),
+            file_name_display(right_path)
+        ),
+        (Some(left_path), None) => format!("LH {}", file_name_display(left_path)),
+        (None, Some(right_path)) => format!("RH {}", file_name_display(right_path)),
+        (None, None) => "none".to_string(),
+    }
+}
+
+fn single_hemisphere_overlay_dataset(
+    dataset: Dataset,
+    domain: &SurfaceDomain,
+    node_offset: u32,
+) -> Result<Dataset> {
+    let kind = dataset.kind.clone();
+    let columns = dataset.columns;
+    let parent_ids = dataset.parent_ids;
+    let row_count = dataset.row_count;
+    let node_indices = if let Some(indices) = dataset.node_indices {
+        indices
+            .into_iter()
+            .map(|node| node + node_offset)
+            .collect::<Vec<_>>()
+    } else {
+        (0..row_count as u32)
+            .map(|node| node + node_offset)
+            .collect::<Vec<_>>()
+    };
+
+    Dataset::sparse(kind, domain, node_indices, columns)
+        .map(|dataset| dataset.with_parent_ids(parent_ids))
+        .context("failed to remap hemisphere overlay into the active paired surface")
 }
 
 fn paired_overlay_paths_for_pattern(
@@ -5698,23 +6762,7 @@ fn robust_finite_range(values: &[f32]) -> Option<(f32, f32)> {
 }
 
 fn roi_fill_color_for_label(integer_label: i32) -> Rgba {
-    const PALETTE: [[u8; 3]; 10] = [
-        [239, 58, 49],
-        [48, 166, 86],
-        [48, 116, 230],
-        [239, 181, 42],
-        [205, 82, 206],
-        [28, 175, 190],
-        [241, 126, 40],
-        [139, 93, 224],
-        [142, 196, 58],
-        [228, 77, 126],
-    ];
-    let label = integer_label.max(1);
-    let index = (label - 1).rem_euclid(PALETTE.len() as i32) as usize;
-    let [red, green, blue] = PALETTE[index];
-
-    Rgba::from_u8(red, green, blue, 205)
+    stable_label_color(integer_label, 205)
 }
 
 fn roi_edge_color_for_label(integer_label: i32) -> Rgba {
@@ -5819,6 +6867,21 @@ fn overlay_range_from_value_range(range: ValueRange) -> ColumnRange {
     ColumnRange {
         min: range.min as f64,
         max: range.max as f64,
+    }
+}
+
+fn resolved_overlay_color_map(
+    dataset: &Dataset,
+    intensity_index: usize,
+    colormap: OverlayColorMap,
+) -> ColorMap {
+    match colormap {
+        OverlayColorMap::DiscreteLabels => auto_overlay_label_table(dataset, intensity_index)
+            .map(ColorMap::labels)
+            .unwrap_or_else(ColorMap::spectrum_red_to_blue),
+        _ => colormap
+            .continuous_color_map()
+            .expect("non-discrete overlay color maps are continuous"),
     }
 }
 
@@ -6638,6 +7701,21 @@ fn repaint_delay_to_instant(full_output: &egui::FullOutput) -> Option<Instant> {
     }
 }
 
+fn repaint_due(now: Instant, repaint_at: Option<Instant>, occluded: bool) -> bool {
+    !occluded && repaint_at.is_some_and(|at| at <= now)
+}
+
+fn next_visible_repaint_wake<const N: usize>(
+    now: Instant,
+    panes: [(Option<Instant>, bool); N],
+) -> Option<Instant> {
+    panes
+        .into_iter()
+        .filter_map(|(repaint_at, occluded)| (!occluded).then_some(repaint_at).flatten())
+        .filter(|at| *at > now)
+        .min()
+}
+
 fn graph_initial_inner_size(view_size: PhysicalSize<u32>) -> PhysicalSize<u32> {
     let max_width = graph_max_inner_width(view_size);
     let max_height = graph_max_inner_height(view_size);
@@ -6827,20 +7905,24 @@ mod tests {
     use super::{
         AfniSurfaceTarget, BackgroundMode, HemisphereLayout, HemisphereLayoutState, MontageCamera,
         OverlayAppearance, OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR,
-        PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PresetOrientation,
-        RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
-        SceneSurfaceLayout, SurfacePick, afni_component_is_sendable, afni_rgba_overlay_signature,
-        apply_afni_rgba_to_color_cache, canonical_overlay_columns, component_transforms,
-        load_spec_component_label_lookup, load_spec_component_mesh, pair_hemisphere_matrices,
-        paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
-        paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
-        roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
-        scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
-        selection_scale_from_model_matrices, spec_label_dataset_for_surface,
-        standard_montage_shots, surface_pick_for_mesh_node, threshold_and_mask_from_appearance,
-        timestamped_png_name_from_unix_seconds,
+        PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PreparedGeometry,
+        PresetOrientation, RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface,
+        SceneSurfaceComponent, SceneSurfaceLayout, SurfacePick, ViewerCommand,
+        afni_cell_color_max_triangles_per_chunk, afni_cell_color_needs_chunking,
+        afni_component_is_sendable, afni_rgba_overlay_signature, apply_afni_rgba_to_color_cache,
+        auto_overlay_label_table, canonical_overlay_columns, component_transforms,
+        explicit_overlay_pair_display_name, load_spec_component_label_lookup,
+        load_spec_component_mesh, pair_hemisphere_matrices, paired_component_for_node,
+        paired_overlay_dataset, paired_overlay_path_for_side, paired_overlay_paths,
+        paired_spec_montage_shots, resolve_overlay_subs, roi_appearance_for_mesh,
+        roi_fill_nodes_from_seed, scene_surface_display_label, scene_surfaces_from_components,
+        scene_surfaces_grouped_by_state, selection_for_component,
+        selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
+        spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
+        threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
+        viewer_required_wgpu_limits,
     };
-    use crate::afni::AfniRgbaOverlay;
+    use crate::afni::{AfniRgbaOverlay, AfniRouteAction};
     use crate::color::Rgba;
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{MaskMode, Threshold};
@@ -6853,6 +7935,44 @@ mod tests {
     use glam::{Mat4, Vec3};
     use std::path::{Path, PathBuf};
 
+    use super::ExplicitOverlayPair;
+
+    #[test]
+    fn big_mem_requests_adapter_buffer_limit() {
+        let mut adapter_limits = wgpu::Limits::default();
+        adapter_limits.max_buffer_size = 2 * 1024 * 1024 * 1024;
+
+        assert_eq!(
+            viewer_required_wgpu_limits(&adapter_limits, false).max_buffer_size,
+            wgpu::Limits::default().max_buffer_size
+        );
+        assert_eq!(
+            viewer_required_wgpu_limits(&adapter_limits, true).max_buffer_size,
+            adapter_limits.max_buffer_size
+        );
+    }
+
+    #[test]
+    fn afni_cell_color_chunk_policy_stays_under_buffer_limit() {
+        let max_buffer_size = 256 * 1024 * 1024;
+        let max_triangles = afni_cell_color_max_triangles_per_chunk(max_buffer_size);
+        let chunk_vertex_bytes = max_triangles * super::AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE;
+
+        assert!(chunk_vertex_bytes <= max_buffer_size as usize);
+        assert!(chunk_vertex_bytes <= super::AFNI_CELL_COLOR_MAX_CHUNK_VERTEX_BYTES);
+
+        let oversized_vertex_count = max_buffer_size as usize / super::PREPARED_VERTEX_BYTES + 1;
+        let geometry = PreparedGeometry {
+            vertices: vec![],
+            indices: vec![0; oversized_vertex_count],
+        };
+        assert!(afni_cell_color_needs_chunking(
+            &geometry,
+            None,
+            max_buffer_size
+        ));
+    }
+
     #[test]
     fn background_toggles_between_black_and_white() {
         let mut background = BackgroundMode::Black;
@@ -6862,6 +7982,97 @@ mod tests {
 
         background.toggle();
         assert_eq!(background, BackgroundMode::Black);
+    }
+
+    #[test]
+    fn auto_overlay_label_table_detects_small_integer_palettes() {
+        let domain = SurfaceDomain::from_triangles(4, vec![[0, 1, 2], [1, 2, 3]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "labels",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Int32(vec![1, 2, 3, 4]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let table = auto_overlay_label_table(&dataset, 0).expect("should build label table");
+
+        assert_eq!(
+            table.label(1).unwrap().color,
+            Rgba::from_u8(0, 194, 255, 255)
+        );
+        assert_eq!(
+            table.label(2).unwrap().color,
+            Rgba::from_u8(255, 242, 0, 255)
+        );
+        assert_eq!(
+            table.label(3).unwrap().color,
+            Rgba::from_u8(57, 255, 20, 255)
+        );
+        assert_eq!(
+            table.label(4).unwrap().color,
+            Rgba::from_u8(255, 117, 24, 255)
+        );
+    }
+
+    #[test]
+    fn auto_overlay_label_table_treats_zero_as_unlabeled_background() {
+        let domain = SurfaceDomain::from_triangles(4, vec![[0, 1, 2], [1, 2, 3]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "labels",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Int32(vec![0, 1, 0, 2]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let table = auto_overlay_label_table(&dataset, 0).expect("should build label table");
+
+        assert!(table.label(0).is_none());
+        assert_eq!(table.color_for_key(0), Rgba::TRANSPARENT);
+        assert_eq!(
+            table.label(1).unwrap().color,
+            Rgba::from_u8(0, 194, 255, 255)
+        );
+        assert_eq!(
+            table.label(2).unwrap().color,
+            Rgba::from_u8(255, 242, 0, 255)
+        );
+    }
+
+    #[test]
+    fn auto_overlay_label_table_rejects_non_integer_columns() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "effect",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![1.0, 2.5, 3.0]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert!(auto_overlay_label_table(&dataset, 0).is_none());
     }
 
     #[test]
@@ -6925,6 +8136,87 @@ mod tests {
             afni_rgba_overlay_signature(&base),
             afni_rgba_overlay_signature(&renamed)
         );
+    }
+
+    #[test]
+    fn afni_gpu_color_upload_planner_skips_unchanged_colors() {
+        let colors = vec![[0.0, 0.0, 0.0, 1.0]; 128];
+        assert_eq!(
+            super::afni::afni_gpu_color_upload_plan(&colors, &colors),
+            super::afni::AfniGpuColorUploadPlan::None
+        );
+    }
+
+    #[test]
+    fn afni_gpu_color_upload_planner_keeps_small_sparse_patches() {
+        let previous = vec![[0.0, 0.0, 0.0, 1.0]; 1024];
+        let mut colors = previous.clone();
+        colors[10] = [1.0, 0.0, 0.0, 1.0];
+        colors[20] = [0.0, 1.0, 0.0, 1.0];
+        colors[500] = [0.0, 0.0, 1.0, 1.0];
+
+        assert_eq!(
+            super::afni::afni_gpu_color_upload_plan(&previous, &colors),
+            super::afni::AfniGpuColorUploadPlan::Ranges(vec![10..21, 500..501])
+        );
+    }
+
+    #[test]
+    fn afni_gpu_color_upload_planner_uses_bulk_for_fragmented_changes() {
+        let previous = vec![[0.0, 0.0, 0.0, 1.0]; 4096];
+        let mut colors = previous.clone();
+        for index in (0..colors.len()).step_by(2) {
+            colors[index] = [1.0, 0.0, 0.0, 1.0];
+        }
+
+        assert_eq!(
+            super::afni::afni_gpu_color_upload_plan(&previous, &colors),
+            super::afni::AfniGpuColorUploadPlan::Full
+        );
+    }
+
+    #[test]
+    fn afni_route_coalescing_keeps_latest_rgba_per_surface() {
+        fn rgba(surface: &str, parent: Option<&str>, red: u8) -> AfniRouteAction {
+            AfniRouteAction::RgbaOverlay(AfniRgbaOverlay {
+                surface_idcode: surface.to_string(),
+                local_domain_parent_id: parent.map(str::to_string),
+                node_indices: vec![1],
+                rgba: vec![[red, 0, 0, 255]],
+                threshold: None,
+                function_idcode: None,
+                volume_idcode: None,
+            })
+        }
+
+        let actions = vec![
+            rgba("lh", Some("smoothwm"), 1),
+            AfniRouteAction::ViewerCommand(ViewerCommand::ResetCamera),
+            rgba("rh", Some("smoothwm"), 2),
+            rgba("lh", Some("smoothwm"), 3),
+        ];
+
+        let coalesced = super::afni::coalesce_afni_route_actions(actions);
+
+        assert_eq!(coalesced.len(), 3);
+        assert!(matches!(
+            coalesced[0],
+            AfniRouteAction::ViewerCommand(ViewerCommand::ResetCamera)
+        ));
+        match &coalesced[1] {
+            AfniRouteAction::RgbaOverlay(overlay) => {
+                assert_eq!(overlay.surface_idcode, "rh");
+                assert_eq!(overlay.rgba[0][0], 2);
+            }
+            _ => panic!("expected right hemisphere RGBA update"),
+        }
+        match &coalesced[2] {
+            AfniRouteAction::RgbaOverlay(overlay) => {
+                assert_eq!(overlay.surface_idcode, "lh");
+                assert_eq!(overlay.rgba[0][0], 3);
+            }
+            _ => panic!("expected latest left hemisphere RGBA update"),
+        }
     }
 
     #[test]
@@ -7032,17 +8324,33 @@ mod tests {
             [0.6, 0.6, 0.6, 1.0],
         ];
 
-        let composed = super::afni_colors_over_underlay(&afni, Some(&underlay));
+        let composed = super::afni_colors_over_underlay(&afni, Some(&underlay), false);
 
         assert_eq!(composed[0], [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(composed[1], [0.4, 0.4, 0.4, 1.0]);
         assert_eq!(composed[2], [0.3, 0.3, 0.8, 1.0]);
 
+        let shine_through = super::afni_colors_over_underlay(&afni, Some(&underlay), true);
+        assert_eq!(shine_through[0], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(shine_through[1], [0.4, 0.4, 0.4, 0.0]);
+        assert_eq!(shine_through[2], [0.3, 0.3, 0.8, 1.0]);
+
         // With no underlay, transparent nodes resolve to the default surface so
         // the surface is never painted black.
-        let without = super::afni_colors_over_underlay(&afni, None);
+        let without = super::afni_colors_over_underlay(&afni, None, false);
         assert_eq!(without[1], super::mesh::DEFAULT_SURFACE_COLOR);
         assert_eq!(without[0], [1.0, 0.0, 0.0, 1.0]);
+
+        let without_underlay_shine = super::afni_colors_over_underlay(&afni, None, true);
+        assert_eq!(
+            without_underlay_shine[1],
+            [
+                super::mesh::DEFAULT_SURFACE_COLOR[0],
+                super::mesh::DEFAULT_SURFACE_COLOR[1],
+                super::mesh::DEFAULT_SURFACE_COLOR[2],
+                0.0,
+            ]
+        );
     }
 
     #[test]
@@ -8026,6 +9334,44 @@ mod tests {
             panic!("expected float values");
         };
         assert_eq!(values, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn single_hemisphere_overlay_dataset_offsets_right_hemisphere_nodes() {
+        let right_domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let composite_domain =
+            SurfaceDomain::from_triangles(6, vec![[0, 1, 2], [3, 4, 5]]).unwrap();
+        let right = scalar_dataset(&right_domain, vec![4.0, 5.0, 6.0]);
+
+        let remapped = single_hemisphere_overlay_dataset(right, &composite_domain, 3).unwrap();
+
+        assert_eq!(remapped.row_count, 3);
+        assert_eq!(remapped.node_indices.as_deref(), Some(&[3, 4, 5][..]));
+        let ColumnData::Float32(values) = &remapped.columns[0].values else {
+            panic!("expected float values");
+        };
+        assert_eq!(values, &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn explicit_overlay_pair_display_name_handles_single_hemisphere() {
+        let left_only = ExplicitOverlayPair {
+            left_path: Some(PathBuf::from("left.niml.dset")),
+            right_path: None,
+        };
+        let right_only = ExplicitOverlayPair {
+            left_path: None,
+            right_path: Some(PathBuf::from("right.niml.dset")),
+        };
+
+        assert_eq!(
+            explicit_overlay_pair_display_name(&left_only),
+            "LH left.niml.dset"
+        );
+        assert_eq!(
+            explicit_overlay_pair_display_name(&right_only),
+            "RH right.niml.dset"
+        );
     }
 
     #[test]
