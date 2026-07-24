@@ -29,8 +29,8 @@ use crate::afni::{
 use crate::color::{ColorMap, LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
 use crate::command::{
     BackgroundMode, CameraControlMode, ControllerState, HemisphereLayout, HemisphereLayoutState,
-    LightingMode, OverlayThreshold, PairVisibility, SurfacePick, SurfaceRenderStyle, ViewPreset,
-    ViewerCommand,
+    LightingMode, OverlayThreshold, PairVisibility, SurfacePick, SurfaceRenderStyle, ViewNudge,
+    ViewPreset, ViewerCommand,
 };
 use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
 use crate::io::{
@@ -2729,6 +2729,16 @@ impl ViewerState {
                 ViewerCommand::SetGraphWindowOpen(open) => {
                     self.set_graph_window_open(open);
                 }
+                ViewerCommand::NudgeCamera(direction) => {
+                    let direction = match direction {
+                        ViewNudge::Left => CameraNudgeDirection::Left,
+                        ViewNudge::Right => CameraNudgeDirection::Right,
+                        ViewNudge::Up => CameraNudgeDirection::Up,
+                        ViewNudge::Down => CameraNudgeDirection::Down,
+                    };
+                    self.camera.nudge(direction);
+                    self.controller.camera.note_manual_motion();
+                }
                 ViewerCommand::Preset(preset) => {
                     self.controller.camera.set_preset(preset);
                     self.camera.set_preset(preset.into());
@@ -2743,6 +2753,10 @@ impl ViewerState {
                         self.set_error(error);
                     }
                 }
+                ViewerCommand::CycleSceneSurface(delta) => match self.cycle_scene_surface(delta) {
+                    Ok(_) => {}
+                    Err(error) => self.set_error(error),
+                },
                 ViewerCommand::SaveScreenshot => {
                     if let Err(error) = self.save_current_view_screenshot() {
                         self.set_error(error);

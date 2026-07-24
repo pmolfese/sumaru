@@ -1496,6 +1496,7 @@ fn afni_incoming_message_label(message: &AfniIncomingMessage) -> &'static str {
         AfniIncomingMessage::DatasetLoad(_) => "dataset_load",
         AfniIncomingMessage::OverlayState(_) => "overlay_state",
         AfniIncomingMessage::ControllerCommand(_) => "controller_command",
+        AfniIncomingMessage::ViewerCommands(_) => "viewer_commands",
         AfniIncomingMessage::RoiUpdate(_) => "roi_update",
     }
 }

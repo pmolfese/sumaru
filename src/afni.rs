@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail, ensure};
 
 use crate::command::{
-    BackgroundMode, ControllerState, CrosshairState, OverlayThreshold, ViewerCommand,
+    BackgroundMode, ControllerState, CrosshairState, OverlayThreshold, ViewNudge, ViewPreset,
+    ViewerCommand,
 };
 use crate::io::{
     NimlData, NimlElement, NimlNumericMatrix, NimlValueType, binary_payload_len, element_is_binary,
@@ -135,6 +136,7 @@ pub enum AfniIncomingMessage {
     DatasetLoad(PathBuf),
     OverlayState(AfniOverlayState),
     ControllerCommand(AfniControllerCommand),
+    ViewerCommands(Vec<ViewerCommand>),
     RoiUpdate(AfniRoiUpdate),
 }
 
@@ -177,7 +179,7 @@ pub struct AfniRoiUpdate {
     pub visible: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AfniRouteAction {
     ViewerCommand(ViewerCommand),
     LoadDataset(PathBuf),
@@ -618,6 +620,7 @@ fn afni_incoming_message_key(message: &AfniIncomingMessage) -> Option<AfniIncomi
         AfniIncomingMessage::DatasetLoad(_) => Some(AfniIncomingMessageKey::DatasetLoad),
         AfniIncomingMessage::OverlayState(_) => Some(AfniIncomingMessageKey::OverlayState),
         AfniIncomingMessage::RoiUpdate(_) => Some(AfniIncomingMessageKey::RoiUpdate),
+        AfniIncomingMessage::ViewerCommands(_) => None,
         AfniIncomingMessage::ControllerCommand(command) => match command {
             AfniControllerCommand::ResetCamera => Some(AfniIncomingMessageKey::ResetCamera),
             AfniControllerCommand::ToggleOverlay => None,
@@ -1263,9 +1266,7 @@ pub fn parse_incoming_message(element: &NimlElement) -> Result<Option<AfniIncomi
         "SUMARU_roi_state" => Ok(Some(AfniIncomingMessage::RoiUpdate(
             roi_update_from_element(element),
         ))),
-        "EngineCommand" => {
-            Ok(engine_command_from_element(element).map(AfniIncomingMessage::ControllerCommand))
-        }
+        "EngineCommand" => Ok(engine_command_from_element(element)),
         _ => Ok(None),
     }
 }
@@ -1364,6 +1365,14 @@ pub fn route_incoming_message(
                 }
             };
             if let Some(command) = viewer_command {
+                outcome
+                    .actions
+                    .push(AfniRouteAction::ViewerCommand(command));
+            }
+            outcome.applied_state = true;
+        }
+        AfniIncomingMessage::ViewerCommands(commands) => {
+            for command in commands {
                 outcome
                     .actions
                     .push(AfniRouteAction::ViewerCommand(command));
@@ -1989,9 +1998,13 @@ fn controller_command_from_element(element: &NimlElement) -> Option<AfniControll
     }
 }
 
-fn engine_command_from_element(element: &NimlElement) -> Option<AfniControllerCommand> {
+fn engine_command_from_element(element: &NimlElement) -> Option<AfniIncomingMessage> {
     match attr(element, "Command")? {
         "viewer_cont" => {
+            let viewer_commands = drivesuma_viewer_commands_from_element(element);
+            if !viewer_commands.is_empty() {
+                return Some(AfniIncomingMessage::ViewerCommands(viewer_commands));
+            }
             if let Some(value) = attr(element, "bkg_col") {
                 let is_white = value
                     .split_whitespace()
@@ -1999,23 +2012,141 @@ fn engine_command_from_element(element: &NimlElement) -> Option<AfniControllerCo
                     .take(3)
                     .sum::<f32>()
                     > 1.5;
-                return Some(AfniControllerCommand::SetBackground(if is_white {
-                    BackgroundMode::White
-                } else {
-                    BackgroundMode::Black
-                }));
+                return Some(AfniIncomingMessage::ControllerCommand(
+                    AfniControllerCommand::SetBackground(if is_white {
+                        BackgroundMode::White
+                    } else {
+                        BackgroundMode::Black
+                    }),
+                ));
             }
             None
         }
         "surf_cont" => {
             if parse_attr::<bool>(element, "view_dset") == Some(false) {
-                Some(AfniControllerCommand::ToggleOverlay)
+                Some(AfniIncomingMessage::ControllerCommand(
+                    AfniControllerCommand::ToggleOverlay,
+                ))
             } else {
                 None
             }
         }
         _ => None,
     }
+}
+
+fn drivesuma_viewer_commands_from_element(element: &NimlElement) -> Vec<ViewerCommand> {
+    let key_count = parse_attr::<usize>(element, "N_Key").unwrap_or(0);
+    let mut commands = Vec::new();
+    for index in 0..key_count {
+        let Some(key) = attr(element, &format!("Key_{index}")) else {
+            continue;
+        };
+        let repeat = parse_attr::<usize>(element, &format!("Key_rep_{index}"))
+            .unwrap_or(1)
+            .max(1);
+        let key_value = attr(element, &format!("Key_strval_{index}"));
+        if let Some(command) = drivesuma_key_viewer_command(key, key_value) {
+            commands.extend(std::iter::repeat_n(command, repeat));
+        }
+    }
+    commands
+}
+
+fn drivesuma_key_viewer_command(key: &str, value: Option<&str>) -> Option<ViewerCommand> {
+    if value.is_some() {
+        return None;
+    }
+
+    match key {
+        "R" | "space" | "Space" => Some(ViewerCommand::ResetCamera),
+        "up" | "Up" => Some(ViewerCommand::NudgeCamera(ViewNudge::Up)),
+        "down" | "Down" => Some(ViewerCommand::NudgeCamera(ViewNudge::Down)),
+        "left" | "Left" => Some(ViewerCommand::NudgeCamera(ViewNudge::Left)),
+        "right" | "Right" => Some(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+        "ctrl+left" | "ctrl+Left" => Some(ViewerCommand::Preset(ViewPreset::Left)),
+        "ctrl+right" | "ctrl+Right" => Some(ViewerCommand::Preset(ViewPreset::Right)),
+        "ctrl+up" | "ctrl+Up" => Some(ViewerCommand::Preset(ViewPreset::Top)),
+        "ctrl+down" | "ctrl+Down" => Some(ViewerCommand::Preset(ViewPreset::Bottom)),
+        "F5" | "b" => Some(ViewerCommand::ToggleBackground),
+        "p" => Some(ViewerCommand::ToggleSurfaceRenderStyle),
+        "P" => Some(ViewerCommand::ReverseSurfaceRenderStyle),
+        "o" => Some(ViewerCommand::CycleSurfaceOpacity),
+        "O" => Some(ViewerCommand::RaiseSurfaceOpacity),
+        "m" => Some(ViewerCommand::ToggleCameraMomentum),
+        "r" => Some(ViewerCommand::SaveScreenshot),
+        "ctrl+r" => Some(ViewerCommand::SaveMontage),
+        "G" => Some(ViewerCommand::OpenGraphForPick),
+        "comma" | "," => Some(ViewerCommand::CycleSceneSurface(-1)),
+        "period" | "." => Some(ViewerCommand::CycleSceneSurface(1)),
+        _ => None,
+    }
+}
+
+pub fn drivesuma_unsupported_attributes(element: &NimlElement) -> Vec<String> {
+    if element.name != "EngineCommand" {
+        return Vec::new();
+    }
+
+    match attr(element, "Command") {
+        Some("viewer_cont") => drivesuma_unsupported_viewer_attrs(element),
+        Some("surf_cont") => drivesuma_unsupported_attrs_except(element, &["Command", "view_dset"]),
+        Some(command) => vec![format!("Command={command}")],
+        None => vec!["Command=<missing>".to_string()],
+    }
+}
+
+fn drivesuma_unsupported_viewer_attrs(element: &NimlElement) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    for key in element.attrs.keys() {
+        if key == "Command"
+            || key == "bkg_col"
+            || key == "N_Key"
+            || drivesuma_key_attr_index(key).is_some()
+        {
+            continue;
+        }
+        unsupported.push(key.clone());
+    }
+
+    let key_count = parse_attr::<usize>(element, "N_Key").unwrap_or(0);
+    for index in 0..key_count {
+        let key_attr = format!("Key_{index}");
+        let Some(key) = attr(element, &key_attr) else {
+            unsupported.push(key_attr);
+            continue;
+        };
+        let value = attr(element, &format!("Key_strval_{index}"));
+        if drivesuma_key_viewer_command(key, value).is_none() {
+            if let Some(value) = value {
+                unsupported.push(format!("{key_attr}={key} value={value}"));
+            } else {
+                unsupported.push(format!("{key_attr}={key}"));
+            }
+        }
+    }
+    unsupported.sort();
+    unsupported
+}
+
+fn drivesuma_unsupported_attrs_except(element: &NimlElement, supported: &[&str]) -> Vec<String> {
+    let mut unsupported = element
+        .attrs
+        .keys()
+        .filter(|key| !supported.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unsupported.sort();
+    unsupported
+}
+
+fn drivesuma_key_attr_index(key: &str) -> Option<usize> {
+    key.strip_prefix("Key_rep_")
+        .or_else(|| key.strip_prefix("Key_pause_"))
+        .or_else(|| key.strip_prefix("Key_redis_"))
+        .or_else(|| key.strip_prefix("Key_strval_"))
+        .or_else(|| key.strip_prefix("Key_"))
+        .and_then(|index| index.parse().ok())
 }
 
 fn roi_update_from_element(element: &NimlElement) -> AfniRoiUpdate {
@@ -2604,6 +2735,81 @@ mod tests {
                 AfniControllerCommand::SetBackground(BackgroundMode::White),
             ))
         );
+    }
+
+    #[test]
+    fn drivesuma_viewer_cont_key_commands_route_to_viewer_actions() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("Command".to_string(), "viewer_cont".to_string());
+        attrs.insert("N_Key".to_string(), "4".to_string());
+        attrs.insert("Key_0".to_string(), "R".to_string());
+        attrs.insert("Key_rep_0".to_string(), "1".to_string());
+        attrs.insert("Key_1".to_string(), "right".to_string());
+        attrs.insert("Key_rep_1".to_string(), "3".to_string());
+        attrs.insert("Key_2".to_string(), "ctrl+left".to_string());
+        attrs.insert("Key_rep_2".to_string(), "1".to_string());
+        attrs.insert("Key_3".to_string(), "comma".to_string());
+        attrs.insert("Key_rep_3".to_string(), "1".to_string());
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        let message = parse_incoming_message(&element).unwrap().unwrap();
+        let mut controller = ControllerState::default();
+        let outcome = route_incoming_message(&mut controller, message);
+
+        assert!(outcome.applied_state);
+        assert_eq!(
+            outcome.actions,
+            vec![
+                AfniRouteAction::ViewerCommand(ViewerCommand::ResetCamera),
+                AfniRouteAction::ViewerCommand(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::Preset(ViewPreset::Left)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::CycleSceneSurface(-1)),
+            ]
+        );
+        assert!(drivesuma_unsupported_attributes(&element).is_empty());
+    }
+
+    #[test]
+    fn drivesuma_unsupported_attributes_report_unimplemented_commands() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("Command".to_string(), "viewer_cont".to_string());
+        attrs.insert("N_Key".to_string(), "1".to_string());
+        attrs.insert("Key_0".to_string(), "j".to_string());
+        attrs.insert("Key_rep_0".to_string(), "1".to_string());
+        attrs.insert("Key_strval_0".to_string(), "54R".to_string());
+        attrs.insert("load_view".to_string(), "saved.vvs".to_string());
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        assert_eq!(
+            drivesuma_unsupported_attributes(&element),
+            vec!["Key_0=j value=54R".to_string(), "load_view".to_string(),]
+        );
+        assert!(parse_incoming_message(&element).unwrap().is_none());
+    }
+
+    #[test]
+    fn drivesuma_surf_cont_view_dset_false_still_toggles_overlay() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("Command".to_string(), "surf_cont".to_string());
+        attrs.insert("view_dset".to_string(), "n".to_string());
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        let message = parse_incoming_message(&element).unwrap().unwrap();
+        let mut controller = ControllerState::default();
+        controller.overlay.visible = true;
+        let outcome = route_incoming_message(&mut controller, message);
+
+        assert!(outcome.applied_state);
+        assert!(!controller.overlay.visible);
+        assert_eq!(
+            outcome.actions,
+            vec![AfniRouteAction::ViewerCommand(
+                ViewerCommand::SetOverlayVisible(false)
+            )]
+        );
+        assert!(drivesuma_unsupported_attributes(&element).is_empty());
     }
 
     #[test]

@@ -494,7 +494,15 @@ impl StatusLog {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewNudge {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ViewerCommand {
     PickSurface,
     PickOverlay,
@@ -532,9 +540,11 @@ pub enum ViewerCommand {
     SetRoiControllerOpen(bool),
     OpenGraphForPick,
     SetGraphWindowOpen(bool),
+    NudgeCamera(ViewNudge),
     Preset(ViewPreset),
     HemisphereLayout(HemisphereLayout),
     SelectSceneSurface(usize),
+    CycleSceneSurface(isize),
     SaveScreenshot,
     SaveMontage,
     /// Spawn a fresh, empty sumaru window — no surface, overlay, or session
