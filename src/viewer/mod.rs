@@ -4148,6 +4148,7 @@ impl ViewerState {
         let triangle_index_count = prepared_surface.index_count();
         let line_index_count = prepared_surface.line_index_count();
         let point_index_count = prepared_surface.point_index_count();
+        let flat_colors = use_afni_cell_colors;
 
         if self.verbose
             && use_gpu_afni_colors
@@ -4192,7 +4193,10 @@ impl ViewerState {
                 replaced_gpu_resources = true;
             }
 
-            if use_gpu_afni_colors || buffers.flat_colors || buffers.surface_id != surface_id {
+            if use_gpu_afni_colors
+                || buffers.flat_colors != flat_colors
+                || buffers.surface_id != surface_id
+            {
                 if buffers.triangle_index_bytes_len == triangle_index_bytes.len()
                     && buffers.triangle_index_count == triangle_index_count
                 {
@@ -4242,7 +4246,7 @@ impl ViewerState {
                 replaced_gpu_resources = true;
             }
             buffers.surface_id = surface_id;
-            buffers.flat_colors = false;
+            buffers.flat_colors = flat_colors;
             buffers.afni_node_colors = use_gpu_afni_colors.then(|| {
                 prepared_surface
                     .vertices
@@ -4295,7 +4299,7 @@ impl ViewerState {
 
         self.surface_buffers = Some(SurfaceBuffers {
             surface_id,
-            flat_colors: false,
+            flat_colors,
             afni_node_colors: use_gpu_afni_colors.then(|| {
                 prepared_surface
                     .vertices
