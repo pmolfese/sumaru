@@ -69,6 +69,7 @@ impl ViewerState {
         let range = overlay_values.range;
 
         self.overlay.clear();
+        self.auto_niml_overlay_active = false;
         self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
         self.overlay.data = DatasetOverlayState::Loaded {
@@ -82,6 +83,7 @@ impl ViewerState {
         let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         self.overlay.source.path = Some(path.clone());
         self.overlay.source.pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
+        self.overlay.source.label_table = None;
         self.controller.surface.current_overlay_path = Some(path.clone());
         self.overlay.source.display_name = Some(loaded_selection.display_name);
         self.rebuild_overlay_model()?;
@@ -122,6 +124,7 @@ impl ViewerState {
         let range = overlay_values.range;
 
         self.overlay.clear();
+        self.auto_niml_overlay_active = false;
         self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
         self.overlay.data = DatasetOverlayState::Loaded {
@@ -139,6 +142,7 @@ impl ViewerState {
             .to_path_buf();
         self.overlay.source.path = Some(primary_path.clone());
         self.overlay.source.pair_paths = Some(pair.clone());
+        self.overlay.source.label_table = None;
         self.controller.surface.current_overlay_path = Some(primary_path);
         self.overlay.source.display_name = Some(loaded_selection.display_name);
         self.rebuild_overlay_model()?;
@@ -366,6 +370,170 @@ impl ViewerState {
         })
     }
 
+    /// Load same-stem `.niml.dset` files beside the active surface components.
+    pub(super) fn load_auto_niml_overlay_for_active_surface(&mut self) -> Result<bool> {
+        if !self.auto_color_niml {
+            return Ok(false);
+        }
+
+        let Some(mesh) = self.mesh.as_ref() else {
+            return Ok(false);
+        };
+        let domain = mesh.domain.clone();
+        let node_count = mesh.vertices.len();
+        let components = self.active_auto_niml_components()?;
+        if components.is_empty() {
+            return Ok(false);
+        }
+
+        let mut datasets = Vec::new();
+        let mut display_paths = Vec::new();
+        let mut label_table = None;
+        let mut node_offset = 0u32;
+        let mut missing = 0usize;
+        for (surface_path, component_mesh) in components {
+            let Some(overlay_path) = matching_niml_dset_path(&surface_path) else {
+                node_offset = node_offset.saturating_add(component_mesh.vertices.len() as u32);
+                missing += 1;
+                continue;
+            };
+            let (dataset, component_label_table) =
+                read_niml_dataset_with_label_table(&overlay_path, &component_mesh.domain)
+                    .with_context(|| format!("failed to load {}", overlay_path.display()))?;
+            if label_table.is_none() {
+                label_table = component_label_table;
+            }
+            datasets.push(single_hemisphere_overlay_dataset(
+                dataset,
+                &domain,
+                node_offset,
+            )?);
+            display_paths.push(overlay_path);
+            node_offset = node_offset.saturating_add(component_mesh.vertices.len() as u32);
+        }
+
+        if datasets.is_empty() {
+            if self.auto_niml_overlay_active {
+                self.clear_auto_niml_overlay();
+            }
+            self.log_status("No matching same-stem .niml.dset overlays found.");
+            return Ok(false);
+        }
+
+        let dataset = combine_auto_niml_datasets(datasets, &domain)?;
+        let loaded_overlay = loaded_overlay_from_dataset(dataset, node_count, "auto NIML")?;
+        self.install_auto_niml_overlay(loaded_overlay, display_paths, label_table, missing)?;
+
+        Ok(true)
+    }
+
+    fn active_auto_niml_components(&self) -> Result<Vec<(PathBuf, SurfaceMesh)>> {
+        if let Some(scene) = self.surface_scene.as_ref() {
+            let surface = scene
+                .surfaces
+                .get(scene.active_index)
+                .context("active scene surface is outside loaded scene")?;
+            return surface
+                .components
+                .iter()
+                .map(|component| {
+                    Ok((
+                        component.path.clone(),
+                        component.mesh.clone().with_context(|| {
+                            format!("surface {} is still loading", component.name)
+                        })?,
+                    ))
+                })
+                .collect();
+        }
+
+        let path = self
+            .surface_path
+            .clone()
+            .context("no active surface path is loaded")?;
+        let mesh = self
+            .mesh
+            .clone()
+            .context("no active surface mesh is loaded")?;
+
+        Ok(vec![(path, mesh)])
+    }
+
+    fn install_auto_niml_overlay(
+        &mut self,
+        loaded_overlay: LoadedOverlay,
+        display_paths: Vec<PathBuf>,
+        label_table: Option<LabelTable>,
+        missing: usize,
+    ) -> Result<()> {
+        let column_summary =
+            overlay_column_summary(&loaded_overlay.dataset, loaded_overlay.columns);
+        let overlay_values = loaded_overlay.overlay_values;
+        let range = overlay_values.range;
+        let primary_path = display_paths.first().cloned();
+        let display_name = auto_niml_display_name(&display_paths);
+
+        self.overlay.clear();
+        self.auto_niml_overlay_active = true;
+        self.afni_live_overlay_active = false;
+        self.afni_rgba_signatures.clear();
+        self.overlay.data = DatasetOverlayState::Loaded {
+            canonical_dataset: loaded_overlay.dataset,
+            columns: loaded_overlay.columns,
+            node_values: overlay_values,
+        };
+        self.controller.overlay.visible = true;
+        self.overlay.render.appearance = OverlayAppearance::from_range(range);
+        self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
+        self.overlay.source.path = primary_path.clone();
+        self.overlay.source.pair_paths = None;
+        self.overlay.source.label_table = label_table;
+        self.controller.surface.current_overlay_path = primary_path;
+        self.overlay.source.display_name = Some(display_name);
+        let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
+        self.rebuild_overlay_model()?;
+        self.apply_initial_overlay_options(
+            self.auto_niml_overlay_subs.clone().as_deref(),
+            self.auto_niml_overlay_p_value,
+        )?;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+        self.log_status(format!(
+            "Auto-loaded {} matching .niml.dset overlay{} range {}. {column_summary}{}{}",
+            display_paths.len(),
+            if display_paths.len() == 1 { "" } else { "s" },
+            value_range_label(range),
+            if auto_discrete_labels {
+                " Using discrete integer label colors."
+            } else {
+                ""
+            },
+            if missing > 0 {
+                format!(
+                    " ({missing} surface{} had no match.)",
+                    if missing == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            }
+        ));
+
+        Ok(())
+    }
+
+    fn clear_auto_niml_overlay(&mut self) {
+        self.overlay.clear();
+        self.auto_niml_overlay_active = false;
+        self.afni_live_overlay_active = false;
+        self.afni_rgba_signatures.clear();
+        self.controller.surface.current_overlay_path = None;
+        self.controller.overlay.visible = false;
+        self.refresh_pick_overlay_value();
+        self.upload_surface_buffers();
+        self.update_scene_stats();
+    }
+
     /// Infer the opposite-hemisphere overlay file for a loaded path.
     pub(super) fn explicit_overlay_pair_for_loaded_path(
         &self,
@@ -427,7 +595,13 @@ impl ViewerState {
             return false;
         };
         let intensity_index = self.overlay.data.columns().intensity;
-        if auto_overlay_label_table(dataset, intensity_index).is_some() {
+        if resolved_overlay_label_table(
+            dataset,
+            intensity_index,
+            self.overlay.source.label_table.as_ref(),
+        )
+        .is_some()
+        {
             self.overlay.render.appearance.colormap = OverlayColorMap::DiscreteLabels;
             self.overlay.render.appearance.symmetric_range = false;
             true
@@ -481,6 +655,7 @@ impl ViewerState {
                 dataset,
                 intensity_index,
                 self.overlay.render.appearance.colormap,
+                self.overlay.source.label_table.as_ref(),
             ))
             .with_intensity_range(RangeSelection::Manual(overlay_range_from_value_range(
                 self.overlay.render.appearance.range,
@@ -510,5 +685,162 @@ impl ViewerState {
         } else {
             "Overlay hidden."
         });
+    }
+}
+
+fn matching_niml_dset_path(surface_path: &Path) -> Option<PathBuf> {
+    if !is_gifti_path(surface_path) {
+        return None;
+    }
+    let candidate = surface_path.with_extension("niml.dset");
+    candidate.exists().then_some(candidate)
+}
+
+fn combine_auto_niml_datasets(
+    mut datasets: Vec<Dataset>,
+    domain: &SurfaceDomain,
+) -> Result<Dataset> {
+    let mut combined = datasets
+        .drain(..1)
+        .next()
+        .context("no auto NIML datasets were loaded")?;
+    for dataset in datasets {
+        combined = append_sparse_overlay_dataset(combined, dataset, domain)?;
+    }
+
+    Ok(combined)
+}
+
+fn append_sparse_overlay_dataset(
+    left: Dataset,
+    right: Dataset,
+    domain: &SurfaceDomain,
+) -> Result<Dataset> {
+    ensure!(
+        left.columns.len() == right.columns.len(),
+        "auto NIML overlays have different column counts: {} vs {}",
+        left.columns.len(),
+        right.columns.len()
+    );
+    let kind = if left.kind == right.kind {
+        left.kind.clone()
+    } else {
+        DatasetKind::Unknown
+    };
+    let parent_ids = if left.parent_ids == right.parent_ids {
+        left.parent_ids.clone()
+    } else {
+        DatasetParentIds::default()
+    };
+    let left_row_count = left.row_count;
+    let right_row_count = right.row_count;
+    let left_node_indices = left.node_indices.clone();
+    let right_node_indices = right.node_indices.clone();
+    let columns = left
+        .columns
+        .into_iter()
+        .zip(right.columns)
+        .map(|(left, right)| paired_data_column(left, right))
+        .collect::<Result<Vec<_>>>()?;
+    let mut node_indices = Vec::with_capacity(left_row_count + right_row_count);
+    if let Some(indices) = left_node_indices {
+        node_indices.extend(indices);
+    } else {
+        node_indices.extend(0..left_row_count as u32);
+    }
+    if let Some(indices) = right_node_indices {
+        node_indices.extend(indices);
+    } else {
+        node_indices.extend(0..right_row_count as u32);
+    }
+
+    Dataset::sparse(kind, domain, node_indices, columns)
+        .map(|dataset| dataset.with_parent_ids(parent_ids))
+        .context("failed to combine auto NIML overlay datasets")
+}
+
+fn auto_niml_display_name(paths: &[PathBuf]) -> String {
+    match paths {
+        [] => "auto .niml.dset".to_string(),
+        [path] => file_name_display(path),
+        paths => format!("{} auto .niml.dset overlays", paths.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_niml_dset_path_finds_same_stem_gifti_match() {
+        let dir =
+            std::env::temp_dir().join(format!("sumaru_auto_niml_match_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let surface = dir.join("region.k9.gii");
+        let overlay = dir.join("region.k9.niml.dset");
+        std::fs::write(&surface, b"").unwrap();
+        std::fs::write(&overlay, b"").unwrap();
+
+        assert_eq!(matching_niml_dset_path(&surface), Some(overlay.clone()));
+        assert_eq!(matching_niml_dset_path(&dir.join("region.k9.txt")), None);
+
+        let _ = std::fs::remove_file(surface);
+        let _ = std::fs::remove_file(overlay);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn combine_auto_niml_datasets_preserves_component_node_offsets() {
+        let mesh = SurfaceMesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+            ],
+            vec![[0, 1, 2], [2, 3, 4]],
+        )
+        .unwrap();
+        let left = Dataset::sparse(
+            DatasetKind::SurfaceLabel,
+            &mesh.domain,
+            vec![0, 1],
+            vec![
+                DataColumn::new(
+                    "label",
+                    ColumnRole::Label,
+                    None,
+                    ColumnData::Int32(vec![9, 9]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let right = Dataset::sparse(
+            DatasetKind::SurfaceLabel,
+            &mesh.domain,
+            vec![3, 4],
+            vec![
+                DataColumn::new(
+                    "label",
+                    ColumnRole::Label,
+                    None,
+                    ColumnData::Int32(vec![10, 10]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let combined = combine_auto_niml_datasets(vec![left, right], &mesh.domain).unwrap();
+
+        assert_eq!(combined.node_indices.as_deref(), Some(&[0, 1, 3, 4][..]));
+        assert_eq!(combined.row_count, 4);
+        assert_eq!(combined.columns.len(), 1);
+        assert_eq!(
+            combined.columns[0].values,
+            ColumnData::Int32(vec![9, 9, 10, 10])
+        );
     }
 }

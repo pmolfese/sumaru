@@ -32,7 +32,9 @@ use crate::command::{
     LightingMode, OverlayThreshold, PairVisibility, SurfacePick, SurfaceRenderStyle, ViewNudge,
     ViewPreset, ViewerCommand,
 };
-use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
+use crate::dataset::{
+    ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds,
+};
 use crate::io::{
     NimlElement, read_gifti_dataset, read_gifti_image, read_niml_dataset,
     read_niml_dataset_with_label_table, read_niml_roi, write_niml_roi,
@@ -297,6 +299,7 @@ pub struct LaunchOptions {
     pub overlay_path: Option<PathBuf>,
     pub overlay_pair_paths: Option<ExplicitOverlayPair>,
     pub roi_path: Option<PathBuf>,
+    pub auto_color_niml: bool,
     pub overlay_subs: Option<Vec<String>>,
     pub overlay_p_value: Option<f64>,
     pub verbose: bool,
@@ -375,6 +378,7 @@ struct ViewerApp {
     initial_overlay_path: Option<PathBuf>,
     initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
     initial_roi_path: Option<PathBuf>,
+    initial_auto_color_niml: bool,
     initial_overlay_subs: Option<Vec<String>>,
     initial_overlay_p_value: Option<f64>,
     verbose: bool,
@@ -401,6 +405,7 @@ impl ViewerApp {
             initial_overlay_path: options.overlay_path,
             initial_overlay_pair_paths: options.overlay_pair_paths,
             initial_roi_path: options.roi_path,
+            initial_auto_color_niml: options.auto_color_niml,
             initial_overlay_subs: options.overlay_subs,
             initial_overlay_p_value: options.overlay_p_value,
             verbose: options.verbose,
@@ -478,6 +483,7 @@ impl ViewerApp {
                 overlay_path: self.initial_overlay_path.take(),
                 overlay_pair_paths: self.initial_overlay_pair_paths.take(),
                 roi_path: self.initial_roi_path.take(),
+                auto_color_niml: self.initial_auto_color_niml,
                 overlay_subs: self.initial_overlay_subs.take(),
                 overlay_p_value: self.initial_overlay_p_value.take(),
             },
@@ -1016,6 +1022,8 @@ struct OverlaySourceInfo {
     path: Option<PathBuf>,
     /// Explicit left/right file pair, when loaded as a paired overlay.
     pair_paths: Option<ExplicitOverlayPair>,
+    /// Label colors supplied by the source dataset.
+    label_table: Option<LabelTable>,
     /// Friendly label that overrides the file name in the UI when set.
     display_name: Option<String>,
 }
@@ -1172,6 +1180,7 @@ struct InitialScene {
     overlay_path: Option<PathBuf>,
     overlay_pair_paths: Option<ExplicitOverlayPair>,
     roi_path: Option<PathBuf>,
+    auto_color_niml: bool,
     overlay_subs: Option<Vec<String>>,
     overlay_p_value: Option<f64>,
 }
@@ -1215,6 +1224,10 @@ struct ViewerState {
     scene_generation: u64,
     controller: ControllerState,
     overlay: ViewerOverlayState,
+    auto_color_niml: bool,
+    auto_niml_overlay_active: bool,
+    auto_niml_overlay_subs: Option<Vec<String>>,
+    auto_niml_overlay_p_value: Option<f64>,
     surface_path: Option<PathBuf>,
     roi_path: Option<PathBuf>,
     roi_layer: Option<RoiLayer>,
@@ -1310,6 +1323,7 @@ impl ViewerState {
             overlay_path: initial_overlay_path,
             overlay_pair_paths: initial_overlay_pair_paths,
             roi_path: initial_roi_path,
+            auto_color_niml: initial_auto_color_niml,
             overlay_subs: initial_overlay_subs,
             overlay_p_value: initial_overlay_p_value,
         } = scene;
@@ -1650,6 +1664,10 @@ impl ViewerState {
             scene_generation: 0,
             controller: ControllerState::default(),
             overlay: ViewerOverlayState::default(),
+            auto_color_niml: initial_auto_color_niml,
+            auto_niml_overlay_active: false,
+            auto_niml_overlay_subs: initial_overlay_subs.clone(),
+            auto_niml_overlay_p_value: initial_overlay_p_value,
             surface_path: None,
             roi_path: None,
             roi_layer: None,
@@ -1725,6 +1743,8 @@ impl ViewerState {
                 initial_overlay_subs.as_deref(),
                 initial_overlay_p_value,
             )?;
+        } else if initial_auto_color_niml {
+            state.load_auto_niml_overlay_for_active_surface()?;
         }
         if let Some(path) = initial_roi_path {
             state.load_roi_path(path)?;
@@ -2889,8 +2909,12 @@ impl ViewerState {
             self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone());
         self.controller.surface.current_surface_path = Some(path.clone());
         self.controller.surface.current_scene_surface_index = None;
-        self.upload_surface_buffers();
-        self.update_scene_stats();
+        if self.auto_color_niml {
+            self.load_auto_niml_overlay_for_active_surface()?;
+        } else {
+            self.upload_surface_buffers();
+            self.update_scene_stats();
+        }
         self.camera.reset();
         self.controller.camera.note_reset();
         self.view
@@ -3400,7 +3424,10 @@ impl ViewerState {
         {
             self.refresh_active_pair_render_geometry()?;
         }
-        if self.overlay.data.is_loaded() {
+        if self.auto_color_niml && (self.auto_niml_overlay_active || !self.overlay.data.is_loaded())
+        {
+            self.load_auto_niml_overlay_for_active_surface()?;
+        } else if self.overlay.data.is_loaded() {
             self.refresh_overlay_columns()?;
         } else {
             self.upload_surface_buffers();
@@ -6878,15 +6905,46 @@ fn resolved_overlay_color_map(
     dataset: &Dataset,
     intensity_index: usize,
     colormap: OverlayColorMap,
+    label_table: Option<&LabelTable>,
 ) -> ColorMap {
     match colormap {
-        OverlayColorMap::DiscreteLabels => auto_overlay_label_table(dataset, intensity_index)
-            .map(ColorMap::labels)
-            .unwrap_or_else(ColorMap::spectrum_red_to_blue),
+        OverlayColorMap::DiscreteLabels => {
+            resolved_overlay_label_table(dataset, intensity_index, label_table)
+                .map(ColorMap::labels)
+                .unwrap_or_else(ColorMap::spectrum_red_to_blue)
+        }
         _ => colormap
             .continuous_color_map()
             .expect("non-discrete overlay color maps are continuous"),
     }
+}
+
+fn resolved_overlay_label_table(
+    dataset: &Dataset,
+    intensity_index: usize,
+    label_table: Option<&LabelTable>,
+) -> Option<LabelTable> {
+    label_table
+        .filter(|table| label_table_matches_overlay_values(dataset, intensity_index, table))
+        .cloned()
+        .or_else(|| auto_overlay_label_table(dataset, intensity_index))
+}
+
+fn label_table_matches_overlay_values(
+    dataset: &Dataset,
+    intensity_index: usize,
+    label_table: &LabelTable,
+) -> bool {
+    let Some(column) = dataset.columns.get(intensity_index) else {
+        return false;
+    };
+    let Some(keys) = discrete_integer_column_keys(column) else {
+        return false;
+    };
+
+    keys.into_iter()
+        .filter(|key| *key != 0)
+        .all(|key| label_table.label(key).is_some())
 }
 
 fn overlay_dataset_from_canonical_dataset(
@@ -7908,7 +7966,7 @@ fn size_is_close(current: PhysicalSize<u32>, desired: PhysicalSize<u32>) -> bool
 mod tests {
     use super::{
         AfniSurfaceTarget, BackgroundMode, HemisphereLayout, HemisphereLayoutState, MontageCamera,
-        OverlayAppearance, OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR,
+        OverlayAppearance, OverlayColorMap, OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR,
         PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PreparedGeometry,
         PresetOrientation, RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface,
         SceneSurfaceComponent, SceneSurfaceLayout, SurfacePick, ViewerCommand,
@@ -7918,16 +7976,16 @@ mod tests {
         explicit_overlay_pair_display_name, load_spec_component_label_lookup,
         load_spec_component_mesh, pair_hemisphere_matrices, paired_component_for_node,
         paired_overlay_dataset, paired_overlay_path_for_side, paired_overlay_paths,
-        paired_spec_montage_shots, resolve_overlay_subs, roi_appearance_for_mesh,
-        roi_fill_nodes_from_seed, scene_surface_display_label, scene_surfaces_from_components,
-        scene_surfaces_grouped_by_state, selection_for_component,
+        paired_spec_montage_shots, resolve_overlay_subs, resolved_overlay_color_map,
+        roi_appearance_for_mesh, roi_fill_nodes_from_seed, scene_surface_display_label,
+        scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
         selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
         spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
         threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
         viewer_required_wgpu_limits,
     };
     use crate::afni::{AfniRgbaOverlay, AfniRouteAction};
-    use crate::color::Rgba;
+    use crate::color::{LabelEntry, LabelTable, LabelTableSource, Rgba};
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{MaskMode, Threshold};
     use crate::roi::Roi;
@@ -8056,6 +8114,41 @@ mod tests {
             table.label(2).unwrap().color,
             Rgba::from_u8(255, 242, 0, 255)
         );
+    }
+
+    #[test]
+    fn discrete_overlay_colormap_prefers_embedded_label_table() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceLabel,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "labels",
+                    ColumnRole::Label,
+                    None,
+                    ColumnData::Int32(vec![9, 40, 9]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let table = LabelTable::with_name(
+            Some("Haskins".to_string()),
+            LabelTableSource::Unknown,
+            vec![
+                LabelEntry::new(9, "3rd-Ventricle", Rgba::from_u8(253, 82, 250, 255)).unwrap(),
+                LabelEntry::new(40, "ctx-lh-bankssts", Rgba::from_u8(68, 7, 242, 255)).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let colormap =
+            resolved_overlay_color_map(&dataset, 0, OverlayColorMap::DiscreteLabels, Some(&table));
+        let resolved = colormap.label_table().expect("expected label colormap");
+
+        assert_eq!(resolved.color_for_key(9), Rgba::from_u8(253, 82, 250, 255));
+        assert_eq!(resolved.color_for_key(40), Rgba::from_u8(68, 7, 242, 255));
     }
 
     #[test]
