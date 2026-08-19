@@ -4813,7 +4813,7 @@ fn paint_launch_button(
     } else {
         ui.visuals().text_color()
     };
-    let stroke = egui::Stroke::new(1.5, stroke_color);
+    let stroke = egui::Stroke::new(1.5_f32, stroke_color);
     let painter = ui.painter();
 
     if enabled && response.hovered() {
@@ -7287,7 +7287,10 @@ fn controller_section(
     .show_unindented(ui, |ui| {
         egui::Frame::new()
             .fill(egui::Color32::from_rgb(28, 32, 39))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 62, 74)))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgb(55, 62, 74),
+            ))
             .corner_radius(egui::CornerRadius::same(6))
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, add_contents);
@@ -7393,7 +7396,7 @@ fn draw_graph_snapshot(
     painter.rect_stroke(
         rect,
         egui::CornerRadius::same(6),
-        egui::Stroke::new(1.0, border_color()),
+        egui::Stroke::new(1.0_f32, border_color()),
         egui::StrokeKind::Outside,
     );
 
@@ -7405,7 +7408,7 @@ fn draw_graph_snapshot(
                 egui::pos2(plot_rect.left(), y),
                 egui::pos2(plot_rect.right(), y),
             ],
-            egui::Stroke::new(1.0, grid_color),
+            egui::Stroke::new(1.0_f32, grid_color),
         );
     }
     painter.line_segment(
@@ -7413,14 +7416,14 @@ fn draw_graph_snapshot(
             egui::pos2(plot_rect.left(), plot_rect.top()),
             egui::pos2(plot_rect.left(), plot_rect.bottom()),
         ],
-        egui::Stroke::new(1.0, axis_color),
+        egui::Stroke::new(1.0_f32, axis_color),
     );
     painter.line_segment(
         [
             egui::pos2(plot_rect.left(), plot_rect.bottom()),
             egui::pos2(plot_rect.right(), plot_rect.bottom()),
         ],
-        egui::Stroke::new(1.0, axis_color),
+        egui::Stroke::new(1.0_f32, axis_color),
     );
 
     let y_min = snapshot.y_range.min;
@@ -7442,7 +7445,10 @@ fn draw_graph_snapshot(
 
     let points = graph_plot_positions(snapshot, plot_rect);
     for pair in points.windows(2) {
-        painter.line_segment([pair[0].1, pair[1].1], egui::Stroke::new(2.0, line_color));
+        painter.line_segment(
+            [pair[0].1, pair[1].1],
+            egui::Stroke::new(2.0_f32, line_color),
+        );
     }
 
     for (index, position) in &points {
@@ -7452,7 +7458,7 @@ fn draw_graph_snapshot(
         painter.circle_stroke(
             *position,
             radius,
-            egui::Stroke::new(1.0, egui::Color32::BLACK),
+            egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
         );
     }
 
@@ -7626,7 +7632,7 @@ fn vertical_threshold_bar(
     painter.rect_stroke(
         bar_rect,
         egui::CornerRadius::same(4),
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(95, 104, 121)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(95, 104, 121)),
         egui::StrokeKind::Outside,
     );
 
@@ -7649,13 +7655,13 @@ fn vertical_threshold_bar(
     };
     painter.line_segment(
         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-        egui::Stroke::new(2.0, marker_color),
+        egui::Stroke::new(2.0_f32, marker_color),
     );
     painter.circle_filled(egui::pos2(rect.center().x, y), 3.5, egui::Color32::BLACK);
     painter.circle_stroke(
         egui::pos2(rect.center().x, y),
         3.5,
-        egui::Stroke::new(1.0, marker_color),
+        egui::Stroke::new(1.0_f32, marker_color),
     );
 
     changed

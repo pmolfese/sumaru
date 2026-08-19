@@ -611,7 +611,7 @@ impl ViewerState {
                     let is_active = self.roi_workspace.active_index == index;
                     let slot = &mut self.roi_workspace.slots[index];
                     egui::Frame::new()
-                        .stroke(egui::Stroke::new(1.0, border_color()))
+                        .stroke(egui::Stroke::new(1.0_f32, border_color()))
                         .fill(panel_fill_color())
                         .corner_radius(egui::CornerRadius::same(6))
                         .inner_margin(egui::Margin::same(8))
