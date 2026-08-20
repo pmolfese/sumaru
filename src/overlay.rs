@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result, ensure};
 
 use crate::color::{ColorMap, ContinuousColorMap, LabelTable};
@@ -13,6 +15,12 @@ pub struct Overlay {
     pub intensity_range: RangeSelection,
     pub threshold: Threshold,
     pub mask_mode: MaskMode,
+    /// Per-node cluster labels from [`crate::cluster::label_clusters`], zero
+    /// meaning "not in a surviving cluster".
+    ///
+    /// Held as a plain array rather than a mesh reference so this module stays
+    /// free of geometry: the viewer owns the topology and does the labeling.
+    pub cluster_labels: Option<Arc<Vec<u32>>>,
     pub clip_mode: ClipMode,
     pub symmetric_range: bool,
     pub opacity: f32,
@@ -235,6 +243,7 @@ impl Overlay {
             intensity_range: RangeSelection::Auto,
             threshold: Threshold::off(),
             mask_mode: MaskMode::None,
+            cluster_labels: None,
             clip_mode: ClipMode::ClampToIntensityRange,
             symmetric_range: false,
             opacity: 1.0,
@@ -270,6 +279,7 @@ impl Overlay {
             intensity_range: RangeSelection::Auto,
             threshold: Threshold::off(),
             mask_mode: MaskMode::None,
+            cluster_labels: None,
             clip_mode: ClipMode::ClampToIntensityRange,
             symmetric_range: false,
             opacity: 1.0,
@@ -391,6 +401,16 @@ impl Overlay {
                 }
             }
 
+            // Cluster rejection is applied last and unconditionally. A node
+            // dropped for being in a too-small cluster *passed* the node-wise
+            // threshold, so its fade ramp is 1.0 and the fade path would leave
+            // it fully opaque. It needs its own rule, not the ramp.
+            if let Some(labels) = self.cluster_labels.as_ref()
+                && labels.get(node).copied().unwrap_or(0) == 0
+            {
+                color[3] = 0.0;
+            }
+
             colors[node] = color;
         }
 
@@ -411,6 +431,13 @@ impl Overlay {
 
     pub fn with_symmetric_range(mut self, symmetric_range: bool) -> Self {
         self.symmetric_range = symmetric_range;
+        self
+    }
+
+    /// Restricts the overlay to surviving clusters. `None` clears the
+    /// restriction.
+    pub fn with_cluster_labels(mut self, labels: Option<Arc<Vec<u32>>>) -> Self {
+        self.cluster_labels = labels;
         self
     }
 
@@ -549,6 +576,12 @@ impl Threshold {
             .range
             .context("threshold mode requires a threshold range")?;
         range.validate("threshold range")
+    }
+
+    /// Public form of [`Threshold::passes`] for callers holding a plain value,
+    /// such as cluster labeling over a per-node scalar array.
+    pub fn passes_value(&self, value: f64) -> bool {
+        self.passes(Some(value))
     }
 
     fn passes(&self, value: Option<f64>) -> bool {

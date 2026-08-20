@@ -2,6 +2,10 @@
 //! draft anchor sync, and saving ROIs to layers/files. Extracted from
 //! `viewer/mod.rs`; all methods stay on `ViewerState`.
 
+use std::collections::BTreeMap;
+
+use crate::io::{NimlDatasetPayload, NimlNumericMatrix, NimlValueType, write_niml_ascii};
+
 use super::*;
 
 /// A loaded set of ROIs rendered together as one overlay layer: the source
@@ -859,6 +863,195 @@ impl ViewerState {
     }
 
     /// Save every saveable ROI in the workspace to disk.
+    /// Write the cluster map as a full-rank `.niml.dset`.
+    ///
+    /// This is the `SurfClust -out_roidset -out_fulllist` form: one value per
+    /// node of the surface, carrying the node's cluster rank, and zero
+    /// everywhere else. A `.niml.roi` instead stores only the nodes that belong
+    /// to a cluster, so it is smaller but does not preserve row-to-node
+    /// correspondence across datasets.
+    pub(super) fn save_clusters_as_dataset(&mut self) -> Result<()> {
+        let summaries = self.cluster_summaries().to_vec();
+        if summaries.is_empty() {
+            self.log_status("No surviving clusters to save.");
+            return Ok(());
+        }
+        let labels = self
+            .cluster_labels
+            .clone()
+            .context("no cluster labels are available")?;
+
+        let Some(path) = save_niml_dset_file(
+            "Save Cluster Map",
+            "sumaru_clusters.niml.dset",
+            self.overlay
+                .source
+                .path
+                .as_ref()
+                .or(self.surface_path.as_ref()),
+        ) else {
+            self.log_status("Cluster map save cancelled.");
+            return Ok(());
+        };
+
+        let payload = cluster_dataset_payload(
+            &labels,
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            self.surfclust_command_for_clusters(true),
+        )?;
+        write_niml_ascii(&path, &[payload.to_element()?])?;
+
+        println!(
+            "# Equivalent SurfClust command for these clusters:\n{}",
+            self.surfclust_command_for_clusters(true)
+        );
+        self.log_status(format!(
+            "Saved {} cluster(s) as a full-rank dataset to {}.",
+            summaries.len(),
+            path.display()
+        ));
+
+        Ok(())
+    }
+
+    /// The `SurfClust` command line that reproduces the current clusters.
+    ///
+    /// `full_list` selects between the full-rank dataset form and the sparse
+    /// ROI form, matching which file the user is writing.
+    pub(super) fn surfclust_command_for_clusters(&self, full_list: bool) -> String {
+        let (threshold, _) = threshold_and_mask_from_appearance(self.overlay.render.appearance);
+        let columns = self.overlay.data.columns();
+        surfclust_command(
+            self.surface_path.as_ref().and_then(|path| path.to_str()),
+            self.overlay
+                .source
+                .path
+                .as_ref()
+                .and_then(|path| path.to_str()),
+            columns.intensity,
+            columns.threshold,
+            threshold,
+            self.overlay.render.appearance.cluster,
+            full_list,
+        )
+    }
+
+    /// Write every surviving cluster as its own ROI in a single `.niml.roi`.
+    ///
+    /// This is the sparse form: only nodes belonging to a cluster are stored.
+    /// The file is written but deliberately not loaded — displaying it is the
+    /// user's decision, not a side effect of exporting.
+    pub(super) fn save_clusters_as_rois(&mut self) -> Result<()> {
+        let summaries = self.cluster_summaries().to_vec();
+        if summaries.is_empty() {
+            self.log_status("No surviving clusters to convert.");
+            return Ok(());
+        }
+        let Some(labels) = self.cluster_labels.clone() else {
+            self.log_status("No cluster labels are available.");
+            return Ok(());
+        };
+
+        // Clusters never span components, so each one maps onto exactly one
+        // hemisphere. Translate combined node indices back to that component's
+        // local indices, which is what an ROI on that surface expects.
+        let components: Vec<(usize, usize, SurfaceSide)> = self
+            .cluster_topology_cache
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .components
+                    .iter()
+                    .map(|component| {
+                        (
+                            component.node_offset,
+                            component.node_offset + component.neighbors.len(),
+                            component.side.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut rois = Vec::new();
+        for summary in &summaries {
+            let nodes = labels
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| **value == summary.label)
+                .map(|(node, _)| node as u32)
+                .collect::<Vec<_>>();
+            if nodes.is_empty() {
+                continue;
+            }
+
+            let (offset, side) = components
+                .iter()
+                .find(|(start, end, _)| {
+                    let first = nodes[0] as usize;
+                    first >= *start && first < *end
+                })
+                .map(|(start, _, side)| (*start as u32, side.clone()))
+                .unwrap_or((0, SurfaceSide::Unknown));
+            let local_nodes = nodes.iter().map(|node| node - offset).collect::<Vec<_>>();
+
+            // Cluster rank is the ROI's integer label, so the ROI numbering
+            // matches the cluster table and the .niml.dset values.
+            let integer_label = summary.label as i32;
+            let label = format!(
+                "Cluster {} ({:.1} mm2, {} nodes)",
+                summary.label, summary.area, summary.node_count
+            );
+            // Color per rank from the same palette the discrete-label colormap
+            // uses, so a loaded .niml.roi looks like the .niml.dset overlay of
+            // the same clusters instead of one flat color. Written into the
+            // file rather than applied at load time, so the colors survive the
+            // round trip and travel to SUMA.
+            let mut roi = Roi::from_nodes(label, integer_label, local_nodes)?
+                .with_style(
+                    roi_fill_color_for_label(integer_label),
+                    roi_edge_color_for_label(integer_label),
+                    2,
+                )?
+                .with_color_by_label(true);
+            roi.parent_side = side;
+            rois.push(self.attach_roi_to_current_surface(roi));
+        }
+
+        if rois.is_empty() {
+            self.log_status("No surviving clusters to save.");
+            return Ok(());
+        }
+
+        let Some(path) = save_roi_file(
+            "Save Cluster ROIs",
+            "sumaru_clusters.niml.roi",
+            self.roi_path.as_ref().or(self.surface_path.as_ref()),
+        ) else {
+            self.log_status("Cluster ROI save cancelled.");
+            return Ok(());
+        };
+
+        write_niml_roi(&path, &rois)?;
+
+        // AFNI's convention: show the command that reproduces this result, so a
+        // clustering found by clicking can be rerun and scripted. ROIs are the
+        // sparse form, so no -out_fulllist here.
+        let command = self.surfclust_command_for_clusters(false);
+        println!("# Equivalent SurfClust command for these clusters:\n{command}");
+
+        // Written, not loaded. Displaying it is the user's call, so the ROI
+        // workspace, the current ROI path, and visibility are all left alone.
+        self.log_status(format!(
+            "Saved {} cluster ROI(s) to {}.",
+            rois.len(),
+            path.display()
+        ));
+
+        Ok(())
+    }
+
     pub(super) fn save_all_rois(&mut self) -> Result<()> {
         let rois = self.roi_workspace.saveable_rois()?;
         if rois.is_empty() {
@@ -1010,5 +1203,77 @@ impl ViewerState {
         ));
 
         Ok(())
+    }
+}
+
+/// Builds the full-rank cluster dataset payload.
+///
+/// Every node of the surface gets a row carrying its cluster rank, zero for
+/// nodes in no surviving cluster. This is what preserves row-to-node
+/// correspondence across datasets, which the sparse ROI form cannot.
+fn cluster_dataset_payload(
+    labels: &[u32],
+    filename: Option<String>,
+    history: String,
+) -> Result<NimlDatasetPayload> {
+    let values: Vec<f64> = labels.iter().map(|label| f64::from(*label)).collect();
+    let node_indices: Vec<u32> = (0..labels.len() as u32).collect();
+    let matrix = NimlNumericMatrix::new(vec![NimlValueType::Int32], labels.len(), values)?;
+
+    Ok(NimlDatasetPayload {
+        dset_type: "Node_Bucket".to_string(),
+        self_idcode: None,
+        filename,
+        label: Some("sumaru clusters".to_string()),
+        sparse_data: Some(matrix),
+        node_indices: Some(node_indices),
+        column_ranges: Vec::new(),
+        column_labels: vec!["Cluster".to_string()],
+        column_types: vec!["Generic_Int".to_string()],
+        column_stats: Vec::new(),
+        fdr_curves: BTreeMap::new(),
+        history: Some(history),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cluster_dataset_payload;
+    use crate::io::{read_niml_dset_str, serialize_niml_ascii};
+
+    #[test]
+    fn cluster_dataset_is_full_rank_and_round_trips() {
+        // Two clusters over six nodes, with gaps. The gaps are what the ROI
+        // form would omit and the dataset form must keep as explicit zeros.
+        let labels = vec![1u32, 1, 0, 2, 0, 0];
+        let payload = cluster_dataset_payload(
+            &labels,
+            Some("clusters.niml.dset".to_string()),
+            "SurfClust -i s.gii".to_string(),
+        )
+        .unwrap();
+
+        let element = payload.to_element().unwrap();
+        let text = serialize_niml_ascii(&[element]);
+        let parsed = read_niml_dset_str(&text).unwrap();
+
+        // Every node is present, not just the clustered ones.
+        let data = parsed.sparse_data.expect("dataset has SPARSE_DATA");
+        assert_eq!(data.rows, labels.len());
+        assert_eq!(
+            data.values,
+            labels
+                .iter()
+                .map(|label| f64::from(*label))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parsed.node_indices.expect("dataset has INDEX_LIST"),
+            (0..labels.len() as u32).collect::<Vec<_>>()
+        );
+        assert_eq!(parsed.column_labels, vec!["Cluster".to_string()]);
+
+        // The reproducing command travels with the file.
+        assert!(parsed.history.unwrap_or_default().contains("SurfClust"));
     }
 }

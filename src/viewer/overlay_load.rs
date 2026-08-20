@@ -80,6 +80,7 @@ impl ViewerState {
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
+        self.auto_select_label_colormap();
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
         let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         self.overlay.source.path = Some(path.clone());
@@ -136,6 +137,7 @@ impl ViewerState {
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
+        self.auto_select_label_colormap();
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
         let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         let primary_path = pair
@@ -487,6 +489,7 @@ impl ViewerState {
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
+        self.auto_select_label_colormap();
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
         self.overlay.source.path = primary_path.clone();
         self.overlay.source.pair_paths = None;
@@ -633,8 +636,36 @@ impl ViewerState {
         Ok(())
     }
 
+    /// Selects the discrete-label colormap when a freshly loaded overlay looks
+    /// like a label map rather than a continuous statistic.
+    ///
+    /// Cluster maps — whether written here, by `SurfClust`, or by
+    /// `3dClusterize` — are integer ranks, and a continuous ramp renders them
+    /// badly: adjacent ranks get near-identical colors and rank 0 paints the
+    /// whole background. Discrete labels give each cluster its own color, and
+    /// the label table's unlabeled color is transparent, so rank 0 drops out
+    /// and the anatomy shows through.
+    ///
+    /// `auto_overlay_label_table` supplies the detection, including its cap on
+    /// distinct values, so a genuinely continuous integer column stays on a
+    /// continuous map. This runs only on load, never on rebuild, so it cannot
+    /// override a colormap the user picked.
+    fn auto_select_label_colormap(&mut self) {
+        let intensity = self.overlay.data.columns().intensity;
+        let Some(dataset) = self.overlay.data.dataset() else {
+            return;
+        };
+        if auto_overlay_label_table(dataset, intensity).is_some() {
+            self.overlay.render.appearance.colormap = OverlayColorMap::DiscreteLabels;
+        }
+    }
+
     /// Rebuild the per-node overlay color model and re-upload colors.
     pub(super) fn rebuild_overlay_model(&mut self) -> Result<()> {
+        // Labels have to be current before colors are built, since cluster
+        // rejection is applied inside the color cache.
+        self.refresh_cluster_labels();
+        let cluster_labels = self.cluster_labels.clone();
         let dataset = self
             .overlay
             .data
@@ -667,6 +698,7 @@ impl ViewerState {
             )))
             .with_symmetric_range(self.overlay.render.appearance.symmetric_range)
             .with_threshold(threshold, mask_mode)
+            .with_cluster_labels(cluster_labels)
             .with_opacity(self.overlay.render.appearance.opacity);
 
         overlay.rebuild_color_cache(dataset, domain)?;

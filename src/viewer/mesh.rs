@@ -3,6 +3,7 @@ use std::ops::Range;
 
 use glam::Vec3;
 
+use crate::cluster::ClusterParams;
 use crate::color::{ColorMap, stable_label_color};
 use crate::command::OverlayThreshold;
 #[cfg(test)]
@@ -214,6 +215,8 @@ pub(super) struct OverlayAppearance {
     pub(super) boxed_threshold: bool,
     pub(super) fade: FadeSettings,
     pub(super) contour: ThresholdContourStyle,
+    pub(super) clusterize: bool,
+    pub(super) cluster: ClusterParams,
     pub(super) opacity: f32,
     pub(super) dim: f32,
 }
@@ -472,8 +475,10 @@ impl PreparedThresholdContour {
         threshold_values: &[f32],
         threshold: Threshold,
         boundary_luminances: &[f32],
+        cluster_labels: Option<&[u32]>,
     ) -> Self {
-        let segments = threshold_contour_segments(geometry, threshold_values, threshold);
+        let segments =
+            threshold_contour_segments(geometry, threshold_values, threshold, cluster_labels);
         let normal_offset = contour_normal_offset(geometry);
         let mut vertices = Vec::with_capacity(segments.len() * 4);
         let mut indices = Vec::with_capacity(segments.len() * 6);
@@ -538,10 +543,18 @@ impl PreparedThresholdContour {
 /// Floats per contour vertex: two endpoints plus the packed params triple.
 pub(super) const CONTOUR_VERTEX_FLOATS: usize = 9;
 
+/// Extracts contour segments where the threshold column crosses each boundary.
+///
+/// When `cluster_labels` is present, a segment is kept only if the crossing
+/// borders a surviving cluster. Cluster rejection is not expressible as a
+/// scalar crossing, so it cannot be folded into the marching-triangles test
+/// itself; filtering emitted segments instead keeps the full interpolated
+/// boundary rather than falling back to a coarse mesh-edge outline.
 fn threshold_contour_segments(
     geometry: &PreparedGeometry,
     threshold_values: &[f32],
     threshold: Threshold,
+    cluster_labels: Option<&[u32]>,
 ) -> Vec<(usize, ThresholdContourSegment)> {
     if geometry.vertices.len() != threshold_values.len() {
         return Vec::new();
@@ -619,6 +632,17 @@ fn threshold_contour_segments(
 
             if crossings.len() != 2 {
                 continue;
+            }
+            // Keep the crossing only if at least one vertex of this triangle
+            // both passed the threshold and belongs to a surviving cluster.
+            if let Some(labels) = cluster_labels {
+                let borders_surviving_cluster = nodes.iter().enumerate().any(|(index, node)| {
+                    threshold.passes_value(f64::from(values[index]))
+                        && labels.get(*node as usize).copied().unwrap_or(0) != 0
+                });
+                if !borders_surviving_cluster {
+                    continue;
+                }
             }
             let (first_key, first) = crossings[0];
             let (second_key, second) = crossings[1];
@@ -978,6 +1002,8 @@ impl OverlayAppearance {
             boxed_threshold: false,
             fade: FadeSettings::new(),
             contour: ThresholdContourStyle::new(),
+            clusterize: false,
+            cluster: ClusterParams::new(),
             opacity: 1.0,
             dim: 1.0,
         }
@@ -1465,7 +1491,7 @@ mod tests {
     fn marching_triangles_interpolates_one_threshold_segment() {
         let geometry = PreparedGeometry::from_surface(&triangle_mesh());
         let segments =
-            threshold_contour_segments(&geometry, &[0.0, 2.0, 2.0], Threshold::above(1.0));
+            threshold_contour_segments(&geometry, &[0.0, 2.0, 2.0], Threshold::above(1.0), None);
 
         assert_eq!(segments.len(), 1);
         let (boundary_index, segment) = segments[0];
@@ -1482,11 +1508,13 @@ mod tests {
         let values = [0.0, 2.0, 4.0];
 
         assert_eq!(
-            threshold_contour_segments(&geometry, &values, Threshold::between(1.0, 3.0)).len(),
+            threshold_contour_segments(&geometry, &values, Threshold::between(1.0, 3.0), None)
+                .len(),
             2
         );
         assert_eq!(
-            threshold_contour_segments(&geometry, &values, Threshold::outside(1.0, 3.0)).len(),
+            threshold_contour_segments(&geometry, &values, Threshold::outside(1.0, 3.0), None)
+                .len(),
             2
         );
     }
@@ -1506,13 +1534,23 @@ mod tests {
         let geometry = PreparedGeometry::from_surface(&mesh);
 
         assert_eq!(
-            threshold_contour_segments(&geometry, &[1.0, 1.0, 0.0, 0.0], Threshold::above(1.0),)
-                .len(),
+            threshold_contour_segments(
+                &geometry,
+                &[1.0, 1.0, 0.0, 0.0],
+                Threshold::above(1.0),
+                None,
+            )
+            .len(),
             1
         );
         assert!(
-            threshold_contour_segments(&geometry, &[1.0, 2.0, 2.0, 2.0], Threshold::above(1.0),)
-                .is_empty()
+            threshold_contour_segments(
+                &geometry,
+                &[1.0, 2.0, 2.0, 2.0],
+                Threshold::above(1.0),
+                None,
+            )
+            .is_empty()
         );
     }
 
@@ -1520,11 +1558,12 @@ mod tests {
     fn marching_triangles_respects_below_threshold_boundary_inclusivity() {
         let geometry = PreparedGeometry::from_surface(&triangle_mesh());
         assert_eq!(
-            threshold_contour_segments(&geometry, &[1.0, 1.0, 2.0], Threshold::below(1.0),).len(),
+            threshold_contour_segments(&geometry, &[1.0, 1.0, 2.0], Threshold::below(1.0), None,)
+                .len(),
             1
         );
         assert!(
-            threshold_contour_segments(&geometry, &[1.0, 0.0, 0.0], Threshold::below(1.0),)
+            threshold_contour_segments(&geometry, &[1.0, 0.0, 0.0], Threshold::below(1.0), None,)
                 .is_empty()
         );
     }
@@ -1536,11 +1575,13 @@ mod tests {
         let combined_values = [0.0, 2.0, 2.0, 2.0, 0.0, 0.0];
 
         assert_eq!(
-            threshold_contour_segments(&left, &combined_values[..3], Threshold::above(1.0),).len(),
+            threshold_contour_segments(&left, &combined_values[..3], Threshold::above(1.0), None)
+                .len(),
             1
         );
         assert_eq!(
-            threshold_contour_segments(&right, &combined_values[3..], Threshold::above(1.0),).len(),
+            threshold_contour_segments(&right, &combined_values[3..], Threshold::above(1.0), None)
+                .len(),
             1
         );
     }
@@ -1549,11 +1590,17 @@ mod tests {
     fn marching_triangles_skips_triangles_with_sparse_or_non_finite_values() {
         let geometry = PreparedGeometry::from_surface(&triangle_mesh());
         assert!(
-            threshold_contour_segments(&geometry, &[0.0, f32::NAN, 2.0], Threshold::above(1.0),)
-                .is_empty()
+            threshold_contour_segments(
+                &geometry,
+                &[0.0, f32::NAN, 2.0],
+                Threshold::above(1.0),
+                None,
+            )
+            .is_empty()
         );
         assert!(
-            threshold_contour_segments(&geometry, &[0.0, 2.0], Threshold::above(1.0)).is_empty()
+            threshold_contour_segments(&geometry, &[0.0, 2.0], Threshold::above(1.0), None)
+                .is_empty()
         );
     }
 
@@ -1565,6 +1612,7 @@ mod tests {
             &[0.0, 2.0, 2.0],
             Threshold::above(1.0),
             &[0.9],
+            None,
         );
 
         // One crossing segment becomes one quad: four corners, two triangles.
