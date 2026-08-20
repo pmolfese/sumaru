@@ -77,6 +77,7 @@ impl ViewerState {
             columns: loaded_overlay.columns,
             node_values: overlay_values,
         };
+        self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
@@ -132,6 +133,7 @@ impl ViewerState {
             columns: loaded_overlay.columns,
             node_values: overlay_values,
         };
+        self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
@@ -482,6 +484,7 @@ impl ViewerState {
             columns: loaded_overlay.columns,
             node_values: overlay_values,
         };
+        self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.controller.overlay.visible = true;
         self.overlay.render.appearance = OverlayAppearance::from_range(range);
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
@@ -524,6 +527,7 @@ impl ViewerState {
 
     fn clear_auto_niml_overlay(&mut self) {
         self.overlay.clear();
+        self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.auto_niml_overlay_active = false;
         self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
@@ -567,6 +571,7 @@ impl ViewerState {
         let range = overlay.range;
         let column_summary = overlay_column_summary(dataset, self.overlay.data.columns());
         self.overlay.data.set_node_values(overlay);
+        self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.overlay.render.appearance.range = if self.overlay.render.appearance.symmetric_range {
             symmetric_value_range(range)
         } else {

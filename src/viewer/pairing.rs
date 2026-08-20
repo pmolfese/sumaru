@@ -182,6 +182,11 @@ impl ViewerState {
                 instance.model_matrix = *matrix;
             }
         }
+        for instance in &mut self.threshold_contour_instances {
+            if let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == instance.side) {
+                instance.model_matrix = *matrix;
+            }
+        }
     }
 
     /// Compute the two hemisphere model matrices for a given layout.

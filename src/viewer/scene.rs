@@ -51,6 +51,25 @@ pub(super) struct SurfaceRenderInstance {
     pub(super) model_matrix: Mat4,
 }
 
+/// One independently transformed threshold contour. Kept separate from surface
+/// instances so it can use an unlit, screen-space-widened pipeline and remain
+/// visible regardless of the active surface render style.
+///
+/// The casing and the inner line share one vertex and index buffer and differ
+/// only in uniforms, so each instance carries a uniform buffer and bind group
+/// per pass.
+pub(super) struct ThresholdContourRenderInstance {
+    pub(super) side: SurfaceSide,
+    pub(super) vertex_buffer: wgpu::Buffer,
+    pub(super) index_buffer: wgpu::Buffer,
+    pub(super) index_count: u32,
+    pub(super) halo_uniform_buffer: wgpu::Buffer,
+    pub(super) halo_bind_group: wgpu::BindGroup,
+    pub(super) core_uniform_buffer: wgpu::Buffer,
+    pub(super) core_bind_group: wgpu::BindGroup,
+    pub(super) model_matrix: Mat4,
+}
+
 impl SurfaceBuffers {
     pub(super) fn index_buffer(&self, style: SurfaceRenderStyle) -> &wgpu::Buffer {
         match style {
