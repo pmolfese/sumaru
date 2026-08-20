@@ -8584,16 +8584,16 @@ mod tests {
         load_spec_component_label_lookup, load_spec_component_mesh, pair_hemisphere_matrices,
         paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
         paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
-        resolved_overlay_color_map, roi_appearance_for_mesh, roi_fill_nodes_from_seed,
-        scene_surface_display_label, scene_surfaces_from_components,
-        scene_surfaces_grouped_by_state, selection_for_component,
+        resolved_overlay_color_map, roi_appearance_for_mesh, roi_edge_color_for_label,
+        roi_fill_color_for_label, roi_fill_nodes_from_seed, scene_surface_display_label,
+        scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
         selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
         spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
         threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
         viewer_required_wgpu_limits,
     };
     use crate::afni::{AfniRgbaOverlay, AfniRouteAction};
-    use crate::color::{LabelEntry, LabelTable, LabelTableSource, Rgba};
+    use crate::color::{LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{FadeCurve, FadeWidth, MaskMode, Threshold};
     use crate::roi::Roi;
@@ -8652,6 +8652,41 @@ mod tests {
 
         background.toggle();
         assert_eq!(background, BackgroundMode::Black);
+    }
+
+    #[test]
+    fn roi_and_overlay_label_palettes_agree_for_the_same_rank() {
+        // A cluster exported as .niml.roi and the same cluster map loaded as a
+        // .niml.dset must look alike. Both go through stable_label_color, so
+        // the hues have to match for a given rank; only the alpha differs,
+        // since ROI fills are drawn slightly transparent.
+        for rank in 1..8i32 {
+            let roi_fill = roi_fill_color_for_label(rank);
+            let overlay = stable_label_color(rank, 255);
+            assert_eq!(
+                (roi_fill.red, roi_fill.green, roi_fill.blue),
+                (overlay.red, overlay.green, overlay.blue),
+                "rank {rank} renders differently as an ROI than as an overlay"
+            );
+        }
+
+        // Distinct ranks must not collide, or clusters would be
+        // indistinguishable from each other.
+        for rank in 1..8i32 {
+            for other in (rank + 1)..8i32 {
+                assert_ne!(
+                    roi_fill_color_for_label(rank),
+                    roi_fill_color_for_label(other),
+                    "ranks {rank} and {other} share a color"
+                );
+            }
+        }
+
+        // The edge is a darkened form of the fill, so outlines stay tied to
+        // their cluster rather than all going black.
+        let fill = roi_fill_color_for_label(3);
+        let edge = roi_edge_color_for_label(3);
+        assert!(edge.red <= fill.red && edge.green <= fill.green && edge.blue <= fill.blue);
     }
 
     #[test]

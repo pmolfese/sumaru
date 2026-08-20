@@ -998,11 +998,23 @@ impl ViewerState {
 
             // Cluster rank is the ROI's integer label, so the ROI numbering
             // matches the cluster table and the .niml.dset values.
+            let integer_label = summary.label as i32;
             let label = format!(
                 "Cluster {} ({:.1} mm2, {} nodes)",
                 summary.label, summary.area, summary.node_count
             );
-            let mut roi = Roi::from_nodes(label, summary.label as i32, local_nodes)?;
+            // Color per rank from the same palette the discrete-label colormap
+            // uses, so a loaded .niml.roi looks like the .niml.dset overlay of
+            // the same clusters instead of one flat color. Written into the
+            // file rather than applied at load time, so the colors survive the
+            // round trip and travel to SUMA.
+            let mut roi = Roi::from_nodes(label, integer_label, local_nodes)?
+                .with_style(
+                    roi_fill_color_for_label(integer_label),
+                    roi_edge_color_for_label(integer_label),
+                    2,
+                )?
+                .with_color_by_label(true);
             roi.parent_side = side;
             rois.push(self.attach_roi_to_current_surface(roi));
         }
