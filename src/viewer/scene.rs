@@ -147,7 +147,32 @@ pub(super) enum SceneSurfaceLayout {
     PairedHemisphere,
 }
 
-#[derive(Clone)]
+/// Cached per-node adjacency and area, one entry per drawn mesh component.
+///
+/// `SurfaceMesh::topology()` rebuilds adjacency from scratch on every call,
+/// which is fine for the one-shot ROI operations that were its only caller.
+/// Clustering runs on every threshold change, so the neighbor lists and node
+/// areas are held rather than recomputed.
+///
+/// Keeping components separate is also what stops a cluster from spanning both
+/// hemispheres in a paired scene: adjacency never crosses a component boundary.
+pub(super) struct ClusterTopologyCache {
+    pub(super) scene_generation: u64,
+    pub(super) surface_id: Option<SurfaceId>,
+    pub(super) node_count: usize,
+    pub(super) components: Vec<ClusterComponentTopology>,
+}
+
+pub(super) struct ClusterComponentTopology {
+    /// Offset of this component's first node within the combined node array.
+    pub(super) node_offset: usize,
+    /// Hemisphere this component draws, so exported cluster ROIs can be
+    /// attached to the right surface with hemisphere-local node indices.
+    pub(super) side: SurfaceSide,
+    pub(super) neighbors: Vec<Vec<u32>>,
+    pub(super) node_areas: Vec<f32>,
+}
+
 pub(super) struct PreparedGeometryCache {
     pub(super) surface_id: SurfaceId,
     pub(super) vertex_count: usize,

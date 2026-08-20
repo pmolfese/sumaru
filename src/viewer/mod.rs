@@ -26,6 +26,10 @@ use crate::afni::{
     AfniPortConfig, AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo,
     DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
 };
+use crate::cluster::{
+    ClusterInput, ClusterParams, ClusterSizeMetric, ClusterSummary, ClusterTails, label_clusters,
+    surfclust_command,
+};
 use crate::color::{ColorMap, LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
 use crate::command::{
     BackgroundMode, CameraControlMode, ControllerState, HemisphereLayout, HemisphereLayoutState,
@@ -1248,6 +1252,16 @@ struct SurfaceRenderPipelines {
 /// dragging those sliders must not rebuild geometry. The colormap and range are
 /// present only when auto-contrast is active, because that mode bakes the
 /// background luminance into each vertex.
+/// Inputs that change cluster labeling.
+#[derive(Debug, Clone, PartialEq)]
+struct ClusterCacheKey {
+    scene_generation: u64,
+    surface_id: Option<SurfaceId>,
+    overlay_data_generation: u64,
+    threshold: Threshold,
+    params: ClusterParams,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ThresholdContourCacheKey {
     scene_generation: u64,
@@ -1257,6 +1271,9 @@ struct ThresholdContourCacheKey {
     pair_layout: HemisphereLayoutState,
     pair_visibility: PairVisibility,
     contrast_inputs: Option<(OverlayColorMap, ValueRange)>,
+    /// Present when C is active, so changing cluster parameters regenerates the
+    /// contour rather than leaving it outlining rejected blobs.
+    cluster_params: Option<ClusterParams>,
 }
 
 struct ViewerState {
@@ -1285,6 +1302,10 @@ struct ViewerState {
     selection_instance: Option<SurfaceRenderInstance>,
     threshold_contour_instances: Vec<ThresholdContourRenderInstance>,
     threshold_contour_key: Option<ThresholdContourCacheKey>,
+    cluster_topology_cache: Option<ClusterTopologyCache>,
+    cluster_labels: Option<Arc<Vec<u32>>>,
+    cluster_summaries: Vec<ClusterSummary>,
+    cluster_key: Option<ClusterCacheKey>,
     overlay_data_generation: u64,
     depth_buffer: DepthBuffer,
     mesh: Option<SurfaceMesh>,
@@ -1783,6 +1804,10 @@ impl ViewerState {
             selection_instance: None,
             threshold_contour_instances: Vec::new(),
             threshold_contour_key: None,
+            cluster_topology_cache: None,
+            cluster_labels: None,
+            cluster_summaries: Vec::new(),
+            cluster_key: None,
             overlay_data_generation: 0,
             depth_buffer,
             mesh: None,
@@ -4174,6 +4199,162 @@ impl ViewerState {
         }
     }
 
+    /// Rebuilds cached per-component adjacency and node areas when the drawn
+    /// mesh changes.
+    fn ensure_cluster_topology(&mut self) {
+        let surface_id = self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone());
+        let matches = self.cluster_topology_cache.as_ref().is_some_and(|cache| {
+            cache.scene_generation == self.scene_generation && cache.surface_id == surface_id
+        });
+        if matches {
+            return;
+        }
+
+        let mut components = Vec::new();
+        let mut node_offset = 0usize;
+        let mut push = |mesh: &SurfaceMesh, side: SurfaceSide, node_offset: &mut usize| {
+            let topology = mesh.topology();
+            components.push(ClusterComponentTopology {
+                node_offset: *node_offset,
+                side,
+                neighbors: topology.node_neighbors,
+                node_areas: mesh.node_areas(),
+            });
+            *node_offset += mesh.vertices.len();
+        };
+
+        if self.has_both_scene() {
+            if let Some(surface) = self
+                .surface_scene
+                .as_ref()
+                .and_then(|scene| scene.surfaces.get(scene.active_index))
+            {
+                for component in &surface.components {
+                    let Some(mesh) = component.mesh.as_ref() else {
+                        components.clear();
+                        break;
+                    };
+                    push(mesh, component.side.clone(), &mut node_offset);
+                }
+            }
+        } else if let Some(mesh) = self.mesh.as_ref() {
+            push(mesh, SurfaceSide::Unknown, &mut node_offset);
+        }
+
+        self.cluster_topology_cache = Some(ClusterTopologyCache {
+            scene_generation: self.scene_generation,
+            surface_id,
+            node_count: node_offset,
+            components,
+        });
+    }
+
+    /// Recomputes cluster labels when the threshold, overlay, mesh, or cluster
+    /// parameters change.
+    ///
+    /// Called from `rebuild_overlay_model`, which is the single path that
+    /// produces overlay colors, so labels are always current by the time they
+    /// are consumed.
+    fn refresh_cluster_labels(&mut self) {
+        let appearance = self.overlay.render.appearance;
+        if !appearance.clusterize
+            || !appearance.threshold.enabled
+            || self.afni_live_overlay_active
+            || !self.overlay.data.is_loaded()
+        {
+            self.cluster_labels = None;
+            self.cluster_summaries.clear();
+            self.cluster_key = None;
+            return;
+        }
+
+        let (threshold, _) = threshold_and_mask_from_appearance(appearance);
+        let key = ClusterCacheKey {
+            scene_generation: self.scene_generation,
+            surface_id: self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone()),
+            overlay_data_generation: self.overlay_data_generation,
+            threshold,
+            params: appearance.cluster,
+        };
+        if self.cluster_key.as_ref() == Some(&key) {
+            return;
+        }
+
+        let Some(threshold_values) = self.active_threshold_scalar_values() else {
+            self.cluster_labels = None;
+            self.cluster_summaries.clear();
+            self.cluster_key = Some(key);
+            return;
+        };
+        let values = self
+            .overlay
+            .data
+            .node_values()
+            .map(|node_values| node_values.values.clone())
+            .unwrap_or_else(|| threshold_values.clone());
+
+        self.ensure_cluster_topology();
+        let Some(topology) = self.cluster_topology_cache.as_ref() else {
+            return;
+        };
+        if topology.components.is_empty() || topology.node_count != threshold_values.len() {
+            self.cluster_labels = None;
+            self.cluster_summaries.clear();
+            self.cluster_key = Some(key);
+            return;
+        }
+
+        let mut labels = vec![0u32; threshold_values.len()];
+        let mut summaries = Vec::new();
+        for component in &topology.components {
+            let start = component.node_offset;
+            let end = start + component.neighbors.len();
+            let (Some(component_thresholds), Some(component_values)) =
+                (threshold_values.get(start..end), values.get(start..end))
+            else {
+                continue;
+            };
+            let passes: Vec<bool> = component_thresholds
+                .iter()
+                .map(|value| threshold.passes_value(f64::from(*value)))
+                .collect();
+
+            let component_labels = label_clusters(
+                ClusterInput {
+                    passes: &passes,
+                    tail_values: component_thresholds,
+                    neighbors: &component.neighbors,
+                    node_areas: &component.node_areas,
+                    values: component_values,
+                },
+                appearance.cluster,
+            );
+
+            // Shift this component's labels and node indices into the combined
+            // node array so downstream consumers see one flat domain.
+            let label_offset = summaries.len() as u32;
+            for (index, label) in component_labels.labels.iter().enumerate() {
+                if *label != 0 {
+                    labels[start + index] = label + label_offset;
+                }
+            }
+            for mut summary in component_labels.clusters {
+                summary.label += label_offset;
+                summary.peak_node += start as u32;
+                summaries.push(summary);
+            }
+        }
+
+        self.cluster_labels = Some(Arc::new(labels));
+        self.cluster_summaries = summaries;
+        self.cluster_key = Some(key);
+    }
+
+    /// Surviving clusters, largest first, for the report table and ROI export.
+    pub(super) fn cluster_summaries(&self) -> &[ClusterSummary] {
+        &self.cluster_summaries
+    }
+
     fn refresh_threshold_contour_buffers(&mut self) {
         let appearance = self.overlay.render.appearance;
         if !appearance.boxed_threshold
@@ -4197,6 +4378,7 @@ impl ViewerState {
             pair_visibility: self.controller.display.pair_visibility,
             contrast_inputs: (appearance.contour.color_mode == ContourColorMode::AutoContrast)
                 .then_some((appearance.colormap, appearance.range)),
+            cluster_params: appearance.clusterize.then_some(appearance.cluster),
         };
         if self.threshold_contour_key.as_ref() == Some(&key) {
             return;
@@ -4210,6 +4392,9 @@ impl ViewerState {
         // which is the colormap sampled at each threshold boundary.
         let boundary_luminances =
             threshold_boundary_luminances(threshold, appearance.range, appearance.colormap);
+        // With C active the contour follows surviving clusters, not the raw
+        // threshold crossing.
+        let cluster_labels = self.cluster_labels.clone();
 
         let mut prepared = Vec::new();
         if self.has_both_scene() {
@@ -4247,6 +4432,9 @@ impl ViewerState {
                     component_values,
                     threshold,
                     &boundary_luminances,
+                    cluster_labels
+                        .as_ref()
+                        .and_then(|labels| labels.get(node_offset..node_end)),
                 );
                 if !contour.is_empty() {
                     let model_matrix = matrices
@@ -4268,6 +4456,7 @@ impl ViewerState {
                 &threshold_values,
                 threshold,
                 &boundary_luminances,
+                cluster_labels.as_deref().map(Vec::as_slice),
             );
             if !contour.is_empty() {
                 prepared.push((contour, SurfaceSide::Unknown, Mat4::IDENTITY));
@@ -6270,6 +6459,32 @@ fn append_niml_roi_extension(path: PathBuf) -> PathBuf {
         path
     } else {
         path.with_extension("niml.roi")
+    }
+}
+
+fn save_niml_dset_file(
+    title: &str,
+    default_name: &str,
+    current_path: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    let dialog = dialog_with_start_directory(
+        rfd::FileDialog::new()
+            .set_title(title)
+            .set_file_name(default_name),
+        current_path,
+    );
+
+    dialog.save_file().map(append_niml_dset_extension)
+}
+
+fn append_niml_dset_extension(path: PathBuf) -> PathBuf {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.with_extension("niml.dset");
+    };
+    if name.to_ascii_lowercase().ends_with(".niml.dset") {
+        path
+    } else {
+        path.with_extension("niml.dset")
     }
 }
 
@@ -8437,6 +8652,54 @@ mod tests {
 
         background.toggle();
         assert_eq!(background, BackgroundMode::Black);
+    }
+
+    #[test]
+    fn cluster_rank_maps_are_detected_as_label_overlays() {
+        // A cluster map written by C (or by SurfClust) is integer ranks with
+        // zero for unclustered nodes. It must resolve to discrete labels, with
+        // rank 0 transparent so the anatomy shows through.
+        let domain = SurfaceDomain::from_triangles(4, vec![[0, 1, 2], [1, 2, 3]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "Cluster",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Int32(vec![1, 1, 0, 2]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let table = auto_overlay_label_table(&dataset, 0).expect("cluster ranks are label-like");
+        assert!(table.label(1).is_some());
+        assert!(table.label(2).is_some());
+        // Rank 0 is deliberately absent, so it takes the unlabeled color.
+        assert!(table.label(0).is_none());
+        assert_eq!(table.color_for_key(0), Rgba::TRANSPARENT);
+        // Distinct clusters get distinct colors.
+        assert_ne!(table.color_for_key(1), table.color_for_key(2));
+
+        // A continuous statistic must not be captured by the same detection.
+        let continuous = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "t",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![0.5, 1.25, -2.75, 3.1]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(auto_overlay_label_table(&continuous, 0).is_none());
     }
 
     #[test]

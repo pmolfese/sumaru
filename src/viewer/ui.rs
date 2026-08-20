@@ -957,6 +957,30 @@ impl ViewerState {
                                     !self.overlay.render.appearance.boxed_threshold;
                                 changed = true;
                             }
+
+                            let cluster_button = ui.add_enabled(
+                                threshold_detail_available,
+                                egui::Button::new("C")
+                                    .selected(self.overlay.render.appearance.clusterize),
+                            );
+                            let cluster_button = if threshold_detail_available {
+                                cluster_button.on_hover_text(
+                                    "Clusterize: keep only connected suprathreshold clusters that meet a minimum size",
+                                )
+                            } else if self.afni_live_overlay_active {
+                                cluster_button.on_hover_text(
+                                    "Unavailable for live AFNI RGBA: the packet does not contain per-node threshold scalars",
+                                )
+                            } else {
+                                cluster_button.on_hover_text(
+                                    "Enable thresholding on a scalar overlay before clusterizing",
+                                )
+                            };
+                            if cluster_button.clicked() {
+                                self.overlay.render.appearance.clusterize =
+                                    !self.overlay.render.appearance.clusterize;
+                                changed = true;
+                            }
                             },
                         );
                         ui.monospace(threshold_value_display(
@@ -1246,6 +1270,142 @@ impl ViewerState {
                                          shade",
                                     )
                                     .changed();
+                            }
+                        });
+                    }
+                    if self.overlay.render.appearance.clusterize {
+                        let cluster = &mut self.overlay.render.appearance.cluster;
+                        ui.horizontal(|ui| {
+                            ui.label("Size by");
+                            changed |= ui
+                                .selectable_value(
+                                    &mut cluster.metric,
+                                    ClusterSizeMetric::Area,
+                                    "Area",
+                                )
+                                .on_hover_text(
+                                    "Measure clusters by surface area in mm2. Comparable between \
+                                     surfaces, unlike node count, which depends on mesh density",
+                                )
+                                .changed();
+                            changed |= ui
+                                .selectable_value(
+                                    &mut cluster.metric,
+                                    ClusterSizeMetric::Nodes,
+                                    "Nodes",
+                                )
+                                .on_hover_text(
+                                    "Measure clusters by node count. Use this when matching a \
+                                     threshold from a cluster-size simulation reported in nodes",
+                                )
+                                .changed();
+                        });
+                        match cluster.metric {
+                            ClusterSizeMetric::Area => {
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut cluster.min_area)
+                                            .speed(1.0)
+                                            .range(0.0..=f32::INFINITY)
+                                            .prefix("Min area ")
+                                            .suffix(" mm2"),
+                                    )
+                                    .on_hover_text(
+                                        "Clusters smaller than this total surface area are hidden",
+                                    )
+                                    .changed();
+                            }
+                            ClusterSizeMetric::Nodes => {
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut cluster.min_nodes)
+                                            .speed(1.0)
+                                            .range(0..=u32::MAX)
+                                            .prefix("Min nodes "),
+                                    )
+                                    .on_hover_text(
+                                        "Clusters with fewer nodes than this are hidden",
+                                    )
+                                    .changed();
+                            }
+                        }
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut cluster.rings, 1..=4).text("Rings"),
+                            )
+                            .on_hover_text(
+                                "How many edges apart two suprathreshold nodes may be and still \
+                                 join the same cluster. 1 is plain edge adjacency, the surface \
+                                 equivalent of a voxel NN setting; larger values bridge small gaps",
+                            )
+                            .changed();
+                        ui.horizontal(|ui| {
+                            ui.label("Tails");
+                            changed |= ui
+                                .selectable_value(
+                                    &mut cluster.tails,
+                                    ClusterTails::Bisided,
+                                    "Bisided",
+                                )
+                                .on_hover_text(
+                                    "Cluster each tail separately, so a positive blob touching a \
+                                     negative one stays two clusters. Matches 3dClusterize -bisided",
+                                )
+                                .changed();
+                            changed |= ui
+                                .selectable_value(
+                                    &mut cluster.tails,
+                                    ClusterTails::Merged,
+                                    "Merged",
+                                )
+                                .on_hover_text(
+                                    "Let opposite-signed regions merge into one cluster where they touch",
+                                )
+                                .changed();
+                        });
+
+                        let summaries = self.cluster_summaries();
+                        let cluster_count = summaries.len();
+                        let total_area: f32 = summaries.iter().map(|summary| summary.area).sum();
+                        ui.label(
+                            egui::RichText::new(if cluster_count == 0 {
+                                "No clusters survive".to_string()
+                            } else {
+                                format!("{cluster_count} cluster(s), {total_area:.1} mm2 total")
+                            })
+                            .color(muted_color()),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    cluster_count > 0,
+                                    egui::Button::new("Save .niml.roi"),
+                                )
+                                .on_hover_text(
+                                    "Write each surviving cluster as its own ROI. Sparse: only \
+                                     nodes belonging to a cluster are stored. The file is not \
+                                     loaded, so open it when you want to see it",
+                                )
+                                .clicked()
+                                && let Err(error) = self.save_clusters_as_rois()
+                            {
+                                self.log_status(format!("Cluster ROI save failed: {error}"));
+                            }
+                            if ui
+                                .add_enabled(
+                                    cluster_count > 0,
+                                    egui::Button::new("Save .niml.dset"),
+                                )
+                                .on_hover_text(
+                                    "Write the cluster map as a full-rank dataset: one value per \
+                                     node of the surface carrying its cluster rank, zero \
+                                     elsewhere. Preserves row-to-node correspondence across \
+                                     datasets, unlike the sparse ROI form",
+                                )
+                                .clicked()
+                                && let Err(error) = self.save_clusters_as_dataset()
+                            {
+                                self.log_status(format!("Cluster dataset save failed: {error}"));
                             }
                         });
                     }

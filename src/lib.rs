@@ -1,4 +1,5 @@
 pub mod afni;
+pub mod cluster;
 pub mod color;
 pub mod command;
 pub mod dataset;
