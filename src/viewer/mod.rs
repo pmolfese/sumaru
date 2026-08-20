@@ -3154,14 +3154,13 @@ impl ViewerState {
             .with_context(|| format!("failed to read SUMA spec {}", spec_path.display()))?;
         let surface_volume_path = surface_volume_path
             .or_else(|| self.surface_volume_path.clone())
-            .map(canonical_or_original_path)
-            .context("loading a SUMA spec requires -sv/--sv")?;
-        self.load_spec_file(spec, Some(surface_volume_path))
+            .map(canonical_or_original_path);
+        self.load_spec_file(spec, surface_volume_path)
     }
 
     /// Load a paired left/right surface set without a spec file by synthesizing a
     /// minimal both-hemisphere `SpecFile` and routing it through the normal
-    /// paired-scene path. The surface volume is optional here (unlike `--spec`).
+    /// paired-scene path. The surface volume is optional.
     fn load_paired_surface_paths(
         &mut self,
         left_path: PathBuf,
@@ -3183,8 +3182,7 @@ impl ViewerState {
     }
 
     /// Build a scene from an already-parsed (or synthesized) `SpecFile`. The
-    /// surface volume is optional: `--spec` requires it (enforced by
-    /// `load_spec_path`), but `--surface-lh/--surface-rh` do not.
+    /// surface volume is optional.
     fn load_spec_file(
         &mut self,
         spec: SpecFile,

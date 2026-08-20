@@ -398,8 +398,8 @@ fn validate_viewer_launch(
     // overlays).
     let has_paired_scene = spec.is_some() || has_paired_surfaces;
 
-    if spec.is_some() && surface_volume.is_none() {
-        bail!("-spec/--spec requires -sv/--sv");
+    if !surface_paths.is_empty() && spec.is_some() {
+        bail!("-i/--surface cannot be combined with -spec/--spec");
     }
     if !has_surface && overlay.is_some() {
         bail!("--overlay requires -i/--surface, -spec/--spec, or --surface-lh/--surface-rh");
@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_launch_requires_surface_volume_context() {
+    fn spec_launch_does_not_require_surface_volume_context() {
         assert!(
             validate_viewer_launch(
                 &[],
@@ -649,7 +649,7 @@ mod tests {
                 &None,
                 &None
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             validate_viewer_launch(

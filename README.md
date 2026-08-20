@@ -112,6 +112,7 @@ cargo run -- --surface /path/to/surface.gii --overlay /path/to/overlay.shape.gii
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.gii.dset
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset --verbose
+cargo run -- -spec /path/to/subj_rh.spec
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --preload
 cargo run -- --volume /path/to/subj_SurfVol.nii
@@ -309,11 +310,11 @@ the completed-work ledger.
   type (used by both the render appearance and the controller command state) and
   `ValueRange` (`f32` render range), keeping the render/domain boundary explicit.
 - `src/main.rs` is the command-line entry point. It parses `sumaru` arguments,
-  launches the viewer with an initial surface or `.spec` scene, requires `-sv`
-  surface-volume context for `.spec` launches, handles `--overlay`, passes
-  through `--verbose` terminal logging, controls spec preloading with
-  `--preload`, opens a NIfTI volume in slice-plane mode with `--volume`, and runs
-  the `inspect` subcommand.
+  launches the viewer with an initial surface or `.spec` scene, accepts optional
+  `-sv` surface-volume context for AFNI/NIML communication, handles `--overlay`,
+  passes through `--verbose` terminal logging, controls spec preloading with
+  `--preload`, opens a NIfTI volume in slice-plane mode with `--volume`, and
+  runs the `inspect` subcommand.
 - `src/color.rs` contains shared RGBA, continuous color-map, and label-table
   models for scalar maps and integer label datasets, including GIFTI and
   FreeSurfer import helpers. Continuous colormaps include 13 byte-exact AFNI
