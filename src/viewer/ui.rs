@@ -6,6 +6,18 @@
 
 use super::*;
 
+/// Seeds the explicit fade width when the user switches away from fade-to-zero,
+/// so the display does not jump. Half the threshold magnitude is a visible but
+/// not drastic change from the fade-to-zero ramp.
+fn fade_width_seed(threshold_value: f32) -> f64 {
+    let magnitude = f64::from(threshold_value).abs();
+    if magnitude.is_finite() && magnitude > 0.0 {
+        magnitude * 0.5
+    } else {
+        1.0
+    }
+}
+
 impl ViewerState {
     pub(super) fn draw_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {
         let mut actions = Vec::new();
@@ -611,7 +623,7 @@ impl ViewerState {
                     let is_active = self.roi_workspace.active_index == index;
                     let slot = &mut self.roi_workspace.slots[index];
                     egui::Frame::new()
-                        .stroke(egui::Stroke::new(1.0, border_color()))
+                        .stroke(egui::Stroke::new(1.0_f32, border_color()))
                         .fill(panel_fill_color())
                         .corner_radius(egui::CornerRadius::same(6))
                         .inner_margin(egui::Margin::same(8))
@@ -886,6 +898,67 @@ impl ViewerState {
                             &mut self.overlay.render.appearance,
                             threshold_range,
                         );
+                        let threshold_detail_available = self.overlay.data.is_loaded()
+                            && self.overlay.render.appearance.threshold.enabled;
+                        let button_row_size = egui::vec2(
+                            ui.available_width(),
+                            ui.spacing().interact_size.y,
+                        );
+                        ui.allocate_ui_with_layout(
+                            button_row_size,
+                            egui::Layout::left_to_right(egui::Align::Center)
+                                .with_main_align(egui::Align::Center),
+                            |ui| {
+                            let fade_button = ui.add_enabled(
+                                threshold_detail_available,
+                                egui::Button::new("A").selected(
+                                    self.overlay.render.appearance.transparent_threshold,
+                                ),
+                            );
+                            let fade_button = if threshold_detail_available {
+                                fade_button.on_hover_text(
+                                    "Fade sub-threshold values by opacity; passing values stay at maximum opacity",
+                                )
+                            } else if self.afni_live_overlay_active {
+                                fade_button.on_hover_text(
+                                    "Unavailable for live AFNI RGBA: the packet does not contain per-node threshold scalars",
+                                )
+                            } else {
+                                fade_button.on_hover_text(
+                                    "Enable thresholding on a scalar overlay before using transparent thresholding",
+                                )
+                            };
+                            if fade_button.clicked() {
+                                self.overlay.render.appearance.transparent_threshold =
+                                    !self.overlay.render.appearance.transparent_threshold;
+                                changed = true;
+                            }
+
+                            let boxed_button = ui.add_enabled(
+                                threshold_detail_available,
+                                egui::Button::new("B")
+                                    .selected(self.overlay.render.appearance.boxed_threshold),
+                            );
+                            let boxed_button = if threshold_detail_available {
+                                boxed_button.on_hover_text(
+                                    "Outline the interpolated boundary of values that pass the threshold",
+                                )
+                            } else if self.afni_live_overlay_active {
+                                boxed_button.on_hover_text(
+                                    "Unavailable for live AFNI RGBA: a true contour requires per-node threshold scalars",
+                                )
+                            } else {
+                                boxed_button.on_hover_text(
+                                    "Enable thresholding on a scalar overlay before drawing its contour",
+                                )
+                            };
+                            if boxed_button.clicked() {
+                                self.overlay.render.appearance.boxed_threshold =
+                                    !self.overlay.render.appearance.boxed_threshold;
+                                changed = true;
+                            }
+                            },
+                        );
                         ui.monospace(threshold_value_display(
                             self.overlay.render.appearance.threshold.value,
                         ));
@@ -997,6 +1070,185 @@ impl ViewerState {
                             )
                             .changed();
                     });
+                    if self.overlay.render.appearance.transparent_threshold {
+                        ui.horizontal(|ui| {
+                            let fade = &mut self.overlay.render.appearance.fade;
+                            ui.label("Fade");
+                            egui::ComboBox::from_id_salt("overlay_threshold_fade_curve")
+                                .selected_text(fade.curve.label())
+                                .show_ui(ui, |ui| {
+                                    for curve in FadeCurve::ALL {
+                                        changed |= ui
+                                            .selectable_value(
+                                                &mut fade.curve,
+                                                curve,
+                                                curve.label(),
+                                            )
+                                            .changed();
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Shape of the sub-threshold opacity ramp. Quadratic matches AFNI; \
+                                     steeper curves pull the near-threshold band down harder, which is \
+                                     where the ramp is otherwise nearly flat",
+                                );
+
+                            let mut fade_to_zero =
+                                matches!(fade.width, FadeWidth::BoundaryMagnitude);
+                            if ui
+                                .checkbox(&mut fade_to_zero, "To zero")
+                                .on_hover_text(
+                                    "Fade across the full distance from the threshold to zero (AFNI behavior). \
+                                     Uncheck to fade across an explicit width instead, which sharpens the \
+                                     distinction between passing and failing values at the cost of context",
+                                )
+                                .changed()
+                            {
+                                fade.width = if fade_to_zero {
+                                    FadeWidth::BoundaryMagnitude
+                                } else {
+                                    FadeWidth::Absolute(fade_width_seed(
+                                        self.overlay.render.appearance.threshold.value,
+                                    ))
+                                };
+                                changed = true;
+                            }
+
+                            if let FadeWidth::Absolute(width) = fade.width {
+                                let mut width = width;
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut width)
+                                            .speed(0.05)
+                                            .range(0.0..=f64::INFINITY),
+                                    )
+                                    .on_hover_text(
+                                        "Fade distance in threshold data units. Values this far below \
+                                         the threshold are fully transparent",
+                                    )
+                                    .changed()
+                                {
+                                    fade.width = FadeWidth::Absolute(width.max(0.0));
+                                    changed = true;
+                                }
+                            }
+                        });
+                        // One full-width slider per row, matching the Dim and
+                        // Opacity rows above. Two sliders share a row cleanly
+                        // only at panel widths this window does not guarantee.
+                        let fade = &mut self.overlay.render.appearance.fade;
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut fade.max_alpha, 0.0..=1.0)
+                                    .fixed_decimals(2)
+                                    .text("Step"),
+                            )
+                            .on_hover_text(
+                                "Ceiling on sub-threshold opacity. The fade curve is nearly flat just \
+                                 below the threshold, so lowering this is what creates a visible step \
+                                 between passing and failing values. AFNI uses 0.87",
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut fade.desaturate, 0.0..=1.0)
+                                    .fixed_decimals(2)
+                                    .text("Desat"),
+                            )
+                            .on_hover_text(
+                                "How far failing values drain toward grey as they fade. Opacity alone \
+                                 is a weak cue; draining color with it separates the two populations \
+                                 much more strongly. 0 matches AFNI",
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut fade.darken, 0.0..=1.0)
+                                    .fixed_decimals(2)
+                                    .text("Dark"),
+                            )
+                            .on_hover_text(
+                                "How far failing values darken as they fade. Fading a bright color \
+                                 toward a light surface barely changes its brightness, so this is \
+                                 what makes sub-threshold regions recede rather than just thin out. \
+                                 0 matches AFNI",
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut fade.boost, 0.0..=1.0)
+                                    .fixed_decimals(2)
+                                    .text("Boost"),
+                            )
+                            .on_hover_text(
+                                "Saturation added to values that pass, widening the gap from the \
+                                 other side. Has no effect on colors already at full saturation, \
+                                 where Dark and the B contour do the work instead. 0 matches AFNI",
+                            )
+                            .changed();
+                    }
+                    if self.overlay.render.appearance.boxed_threshold {
+                        let contour = &mut self.overlay.render.appearance.contour;
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut contour.width_px, 0.5..=8.0)
+                                    .fixed_decimals(1)
+                                    .suffix(" px")
+                                    .text("Border"),
+                            )
+                            .on_hover_text(
+                                "Thickness of the contour line. Widths are in screen pixels, so \
+                                 the line stays the same thickness at any zoom and matches in \
+                                 saved screenshots",
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut contour.halo_px, 0.0..=6.0)
+                                    .fixed_decimals(1)
+                                    .suffix(" px")
+                                    .text("Halo"),
+                            )
+                            .on_hover_text(
+                                "Width of the casing drawn behind the contour, in the opposing \
+                                 shade. A casing is what keeps the line readable over both dark \
+                                 sulci and saturated overlay colors. Set to 0 for a plain line",
+                            )
+                            .changed();
+                        ui.horizontal(|ui| {
+                            let contour = &mut self.overlay.render.appearance.contour;
+                            ui.label("Color");
+                            changed |= ui
+                                .selectable_value(
+                                    &mut contour.color_mode,
+                                    ContourColorMode::AutoContrast,
+                                    "Auto",
+                                )
+                                .on_hover_text(
+                                    "Pick black or white from the overlay color under the contour, so \
+                                     the line never disappears into the colormap",
+                                )
+                                .changed();
+                            changed |= ui
+                                .selectable_value(
+                                    &mut contour.color_mode,
+                                    ContourColorMode::Fixed,
+                                    "Fixed",
+                                )
+                                .on_hover_text("Use one chosen color for the contour")
+                                .changed();
+                            if contour.color_mode == ContourColorMode::Fixed {
+                                changed |= ui
+                                    .color_edit_button_rgb(&mut contour.color)
+                                    .on_hover_text(
+                                        "Contour color. The casing automatically takes the opposing \
+                                         shade",
+                                    )
+                                    .changed();
+                            }
+                        });
+                    }
                     if let Some(stat) = self.selected_threshold_stat_label() {
                         ui.label(egui::RichText::new(format!("Stat: {stat}")).color(muted_color()));
                     }

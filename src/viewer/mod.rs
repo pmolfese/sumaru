@@ -32,14 +32,17 @@ use crate::command::{
     LightingMode, OverlayThreshold, PairVisibility, SurfacePick, SurfaceRenderStyle, ViewNudge,
     ViewPreset, ViewerCommand,
 };
-use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
+use crate::dataset::{
+    ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds,
+};
 use crate::io::{
     NimlElement, read_gifti_dataset, read_gifti_image, read_niml_dataset,
     read_niml_dataset_with_label_table, read_niml_roi, write_niml_roi,
 };
 use crate::niml_debug::NimlRecorder;
 use crate::overlay::{
-    ColumnSelection, MaskMode, Overlay, OverlayColumns, RangeSelection, Threshold,
+    ColumnSelection, FadeCurve, FadeWidth, MaskMode, Overlay, OverlayColumns, RangeSelection,
+    Threshold,
 };
 use crate::roi::{
     Roi, RoiBrushAction, RoiDatum, RoiDrawStatus, RoiDrawingType, RoiElementKind, RoiSource,
@@ -55,8 +58,9 @@ use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
 };
 use mesh::{
-    OverlayAppearance, OverlayColorMap, PreparedGeometry, PreparedGeometryVertex, PreparedSurface,
-    RoiAppearance, SelectionHighlight, cell_color_chunk_ranges, sample_colormap,
+    CONTOUR_VERTEX_FLOATS, ContourColorMode, OverlayAppearance, OverlayColorMap, PreparedGeometry,
+    PreparedGeometryVertex, PreparedSurface, PreparedThresholdContour, RoiAppearance,
+    SelectionHighlight, cell_color_chunk_ranges, sample_colormap, threshold_boundary_luminances,
 };
 use overlay_load::*;
 use pick::{pick_surface, pick_surface_with_model, screen_ray};
@@ -110,6 +114,52 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
 const COLOR_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Float32x4];
 const VERTEX_STRIDE: wgpu::BufferAddress = 24;
 const COLOR_STRIDE: wgpu::BufferAddress = 16;
+/// Contour vertices carry both segment endpoints plus a packed params triple,
+/// so the vertex shader can widen the quad along the screen-space perpendicular.
+const CONTOUR_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+const CONTOUR_VERTEX_STRIDE: wgpu::BufferAddress =
+    (CONTOUR_VERTEX_FLOATS * 4) as wgpu::BufferAddress;
+
+/// Inputs to one contour pass's uniform block.
+struct ContourUniformInputs {
+    view_projection: Mat4,
+    model: Mat4,
+    viewport: [f32; 2],
+    width_px: f32,
+    feather_px: f32,
+    color: [f32; 4],
+    auto_contrast: bool,
+    /// True for the inner line, false for the casing behind it.
+    is_core: bool,
+}
+
+/// Total size of the contour uniform block, in bytes.
+const CONTOUR_UNIFORM_BYTES: usize = 176;
+
+/// Builds the contour uniform block. The layout must match `ContourUniforms` in
+/// `shader.wgsl`: two matrices, then viewport and widths as `vec2`, then the
+/// color and flag `vec4`s on their 16-byte boundaries.
+fn contour_uniform_bytes(input: ContourUniformInputs) -> Vec<u8> {
+    let mut floats = Vec::with_capacity(CONTOUR_UNIFORM_BYTES / 4);
+    floats.extend_from_slice(&input.view_projection.to_cols_array());
+    floats.extend_from_slice(&input.model.to_cols_array());
+    floats.extend_from_slice(&input.viewport);
+    floats.extend_from_slice(&[input.width_px, input.feather_px]);
+    floats.extend_from_slice(&input.color);
+    floats.extend_from_slice(&[
+        if input.auto_contrast { 1.0 } else { 0.0 },
+        if input.is_core { 1.0 } else { 0.0 },
+        0.0,
+        0.0,
+    ]);
+    f32_bytes(&floats)
+}
+
+/// Width in pixels of the alpha ramp on each contour edge. The renderer runs
+/// without MSAA, so this is what keeps a thin diagonal line from breaking into
+/// a dotted stair.
+const CONTOUR_FEATHER_PX: f32 = 1.0;
 const PREPARED_VERTEX_BYTES: usize = 6 * std::mem::size_of::<f32>();
 const PREPARED_COLOR_BYTES: usize = 4 * std::mem::size_of::<f32>();
 const AFNI_CELL_COLOR_VERTEX_BYTES_PER_TRIANGLE: usize = 3 * PREPARED_VERTEX_BYTES;
@@ -297,6 +347,7 @@ pub struct LaunchOptions {
     pub overlay_path: Option<PathBuf>,
     pub overlay_pair_paths: Option<ExplicitOverlayPair>,
     pub roi_path: Option<PathBuf>,
+    pub auto_color_niml: bool,
     pub overlay_subs: Option<Vec<String>>,
     pub overlay_p_value: Option<f64>,
     pub verbose: bool,
@@ -375,6 +426,7 @@ struct ViewerApp {
     initial_overlay_path: Option<PathBuf>,
     initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
     initial_roi_path: Option<PathBuf>,
+    initial_auto_color_niml: bool,
     initial_overlay_subs: Option<Vec<String>>,
     initial_overlay_p_value: Option<f64>,
     verbose: bool,
@@ -401,6 +453,7 @@ impl ViewerApp {
             initial_overlay_path: options.overlay_path,
             initial_overlay_pair_paths: options.overlay_pair_paths,
             initial_roi_path: options.roi_path,
+            initial_auto_color_niml: options.auto_color_niml,
             initial_overlay_subs: options.overlay_subs,
             initial_overlay_p_value: options.overlay_p_value,
             verbose: options.verbose,
@@ -478,6 +531,7 @@ impl ViewerApp {
                 overlay_path: self.initial_overlay_path.take(),
                 overlay_pair_paths: self.initial_overlay_pair_paths.take(),
                 roi_path: self.initial_roi_path.take(),
+                auto_color_niml: self.initial_auto_color_niml,
                 overlay_subs: self.initial_overlay_subs.take(),
                 overlay_p_value: self.initial_overlay_p_value.take(),
             },
@@ -1016,6 +1070,8 @@ struct OverlaySourceInfo {
     path: Option<PathBuf>,
     /// Explicit left/right file pair, when loaded as a paired overlay.
     pair_paths: Option<ExplicitOverlayPair>,
+    /// Label colors supplied by the source dataset.
+    label_table: Option<LabelTable>,
     /// Friendly label that overrides the file name in the UI when set.
     display_name: Option<String>,
 }
@@ -1172,6 +1228,7 @@ struct InitialScene {
     overlay_path: Option<PathBuf>,
     overlay_pair_paths: Option<ExplicitOverlayPair>,
     roi_path: Option<PathBuf>,
+    auto_color_niml: bool,
     overlay_subs: Option<Vec<String>>,
     overlay_p_value: Option<f64>,
 }
@@ -1181,6 +1238,25 @@ struct SurfaceRenderPipelines {
     filled_flat: wgpu::RenderPipeline,
     triangles: wgpu::RenderPipeline,
     vertices: wgpu::RenderPipeline,
+    threshold_contour: wgpu::RenderPipeline,
+}
+
+/// Inputs that change contour *geometry*, and so require re-running the
+/// marching-triangles pass.
+///
+/// Width and color are deliberately absent: they live entirely in uniforms, so
+/// dragging those sliders must not rebuild geometry. The colormap and range are
+/// present only when auto-contrast is active, because that mode bakes the
+/// background luminance into each vertex.
+#[derive(Debug, Clone, PartialEq)]
+struct ThresholdContourCacheKey {
+    scene_generation: u64,
+    surface_id: Option<SurfaceId>,
+    overlay_data_generation: u64,
+    threshold: Threshold,
+    pair_layout: HemisphereLayoutState,
+    pair_visibility: PairVisibility,
+    contrast_inputs: Option<(OverlayColorMap, ValueRange)>,
 }
 
 struct ViewerState {
@@ -1207,6 +1283,9 @@ struct ViewerState {
     /// model-matrix uniform updates.
     surface_render_set: Option<SurfaceRenderSet>,
     selection_instance: Option<SurfaceRenderInstance>,
+    threshold_contour_instances: Vec<ThresholdContourRenderInstance>,
+    threshold_contour_key: Option<ThresholdContourCacheKey>,
+    overlay_data_generation: u64,
     depth_buffer: DepthBuffer,
     mesh: Option<SurfaceMesh>,
     prepared_geometry_cache: Option<PreparedGeometryCache>,
@@ -1215,6 +1294,10 @@ struct ViewerState {
     scene_generation: u64,
     controller: ControllerState,
     overlay: ViewerOverlayState,
+    auto_color_niml: bool,
+    auto_niml_overlay_active: bool,
+    auto_niml_overlay_subs: Option<Vec<String>>,
+    auto_niml_overlay_p_value: Option<f64>,
     surface_path: Option<PathBuf>,
     roi_path: Option<PathBuf>,
     roi_layer: Option<RoiLayer>,
@@ -1310,6 +1393,7 @@ impl ViewerState {
             overlay_path: initial_overlay_path,
             overlay_pair_paths: initial_overlay_pair_paths,
             roi_path: initial_roi_path,
+            auto_color_niml: initial_auto_color_niml,
             overlay_subs: initial_overlay_subs,
             overlay_p_value: initial_overlay_p_value,
         } = scene;
@@ -1543,6 +1627,61 @@ impl ViewerState {
                 "vs_main",
                 "fs_main",
             ),
+            threshold_contour: device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("threshold contour render pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("contour_vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: CONTOUR_VERTEX_STRIDE,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &CONTOUR_VERTEX_ATTRIBUTES,
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("contour_fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    // Quads are widened toward the viewer in screen space and
+                    // have no meaningful facing.
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    // The casing and the inner line overlap by design, and
+                    // neighboring quads overlap at segment joins. Writing depth
+                    // would make them occlude each other and punch holes in the
+                    // line.
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    // A slope-scaled bias, unlike a constant clip-space nudge,
+                    // scales with how fast depth changes across the triangle.
+                    // That is what keeps the contour solid where the surface
+                    // turns away from the camera instead of dropping out in
+                    // patches.
+                    bias: wgpu::DepthBiasState {
+                        constant: -4,
+                        slope_scale: -4.0,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            }),
         };
         let depth_buffer = DepthBuffer::new(&device, view_config.width, view_config.height);
         let view_egui_ctx = egui::Context::default();
@@ -1642,6 +1781,9 @@ impl ViewerState {
             uniform_bind_group_layout,
             surface_render_set: None,
             selection_instance: None,
+            threshold_contour_instances: Vec::new(),
+            threshold_contour_key: None,
+            overlay_data_generation: 0,
             depth_buffer,
             mesh: None,
             prepared_geometry_cache: None,
@@ -1650,6 +1792,10 @@ impl ViewerState {
             scene_generation: 0,
             controller: ControllerState::default(),
             overlay: ViewerOverlayState::default(),
+            auto_color_niml: initial_auto_color_niml,
+            auto_niml_overlay_active: false,
+            auto_niml_overlay_subs: initial_overlay_subs.clone(),
+            auto_niml_overlay_p_value: initial_overlay_p_value,
             surface_path: None,
             roi_path: None,
             roi_layer: None,
@@ -1725,6 +1871,8 @@ impl ViewerState {
                 initial_overlay_subs.as_deref(),
                 initial_overlay_p_value,
             )?;
+        } else if initial_auto_color_niml {
+            state.load_auto_niml_overlay_for_active_surface()?;
         }
         if let Some(path) = initial_roi_path {
             state.load_roi_path(path)?;
@@ -1906,6 +2054,18 @@ impl ViewerState {
                     lighting_mode,
                     surface_opacity,
                 ),
+            );
+        }
+        for instance in &self.threshold_contour_instances {
+            self.queue.write_buffer(
+                &instance.halo_uniform_buffer,
+                0,
+                &self.threshold_contour_uniform_bytes(instance.model_matrix, false),
+            );
+            self.queue.write_buffer(
+                &instance.core_uniform_buffer,
+                0,
+                &self.threshold_contour_uniform_bytes(instance.model_matrix, true),
             );
         }
         if self.surface_render_set.is_none() {
@@ -2149,6 +2309,31 @@ impl ViewerState {
                 wgpu::IndexFormat::Uint32,
             );
             render_pass.draw_indexed(0..buffers.index_count(surface_style), 0, 0..1);
+        }
+
+        if !self.threshold_contour_instances.is_empty() {
+            let draws_halo = self.overlay.render.appearance.contour.draws_halo();
+            render_pass.set_pipeline(&self.surface_render_pipelines.threshold_contour);
+            for instance in &self.threshold_contour_instances {
+                if !self
+                    .controller
+                    .display
+                    .pair_visibility
+                    .is_visible(&instance.side)
+                {
+                    continue;
+                }
+                render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(instance.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                // Casing first, then the inner line on top of it.
+                if draws_halo {
+                    render_pass.set_bind_group(0, &instance.halo_bind_group, &[]);
+                    render_pass.draw_indexed(0..instance.index_count, 0, 0..1);
+                }
+                render_pass.set_bind_group(0, &instance.core_bind_group, &[]);
+                render_pass.draw_indexed(0..instance.index_count, 0, 0..1);
+            }
         }
 
         if let Some(instance) = &self.selection_instance {
@@ -2855,6 +3040,7 @@ impl ViewerState {
 
     fn reset_scene_state(&mut self) {
         self.overlay.clear();
+        self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.controller.overlay.visible = true;
         self.afni_live_overlay_active = false;
         self.afni_rgba_signatures.clear();
@@ -2871,6 +3057,8 @@ impl ViewerState {
         self.controller.display.pair_visibility = PairVisibility::both();
         self.surface_render_set = None;
         self.selection_instance = None;
+        self.threshold_contour_instances.clear();
+        self.threshold_contour_key = None;
     }
 
     fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
@@ -2889,8 +3077,12 @@ impl ViewerState {
             self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone());
         self.controller.surface.current_surface_path = Some(path.clone());
         self.controller.surface.current_scene_surface_index = None;
-        self.upload_surface_buffers();
-        self.update_scene_stats();
+        if self.auto_color_niml {
+            self.load_auto_niml_overlay_for_active_surface()?;
+        } else {
+            self.upload_surface_buffers();
+            self.update_scene_stats();
+        }
         self.camera.reset();
         self.controller.camera.note_reset();
         self.view
@@ -3400,7 +3592,10 @@ impl ViewerState {
         {
             self.refresh_active_pair_render_geometry()?;
         }
-        if self.overlay.data.is_loaded() {
+        if self.auto_color_niml && (self.auto_niml_overlay_active || !self.overlay.data.is_loaded())
+        {
+            self.load_auto_niml_overlay_for_active_surface()?;
+        } else if self.overlay.data.is_loaded() {
             self.refresh_overlay_columns()?;
         } else {
             self.upload_surface_buffers();
@@ -3878,6 +4073,216 @@ impl ViewerState {
         }
     }
 
+    fn threshold_contour_instance_from_prepared(
+        &self,
+        contour: &PreparedThresholdContour,
+        side: SurfaceSide,
+        model_matrix: Mat4,
+    ) -> ThresholdContourRenderInstance {
+        let vertex_bytes = contour.vertex_bytes();
+        let index_bytes = contour.index_bytes();
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("threshold contour vertex buffer"),
+                contents: &vertex_bytes,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("threshold contour index buffer"),
+                contents: &index_bytes,
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+        let make_pass = |is_core: bool| {
+            let buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(if is_core {
+                        "threshold contour core uniform buffer"
+                    } else {
+                        "threshold contour halo uniform buffer"
+                    }),
+                    contents: &self.threshold_contour_uniform_bytes(model_matrix, is_core),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("threshold contour bind group"),
+                layout: &self.uniform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            (buffer, bind_group)
+        };
+        let (halo_uniform_buffer, halo_bind_group) = make_pass(false);
+        let (core_uniform_buffer, core_bind_group) = make_pass(true);
+
+        ThresholdContourRenderInstance {
+            side,
+            vertex_buffer,
+            index_buffer,
+            index_count: contour.index_count(),
+            halo_uniform_buffer,
+            halo_bind_group,
+            core_uniform_buffer,
+            core_bind_group,
+            model_matrix,
+        }
+    }
+
+    /// Uniform block for one contour pass. The casing pass is the inner line
+    /// widened on both sides and colored to oppose it.
+    fn threshold_contour_uniform_bytes(&self, model_matrix: Mat4, is_core: bool) -> Vec<u8> {
+        let style = self.overlay.render.appearance.contour;
+        let scale = self.view.window.scale_factor() as f32;
+        // The scene viewport, not the window surface: the graph dock shrinks the
+        // 3D area, and pixel widths must be measured against what is actually
+        // rendered or the line thickness shifts when the dock opens.
+        let viewport_size = self.scene_viewport_size();
+        let viewport = [viewport_size.width as f32, viewport_size.height as f32];
+        let (width, color) = if is_core {
+            (style.width_px, style.color)
+        } else {
+            (style.halo_width_px(), style.halo_color())
+        };
+        contour_uniform_bytes(ContourUniformInputs {
+            view_projection: self
+                .camera
+                .view_projection_matrix(self.scene_viewport_aspect()),
+            model: model_matrix,
+            viewport,
+            // Widths are authored in logical points so the contour looks the
+            // same on HiDPI and standard displays.
+            width_px: width.max(0.0) * scale,
+            feather_px: CONTOUR_FEATHER_PX * scale,
+            color: [color[0], color[1], color[2], 1.0],
+            auto_contrast: style.color_mode == ContourColorMode::AutoContrast,
+            is_core,
+        })
+    }
+
+    fn active_threshold_scalar_values(&self) -> Option<Vec<f32>> {
+        let values = self.overlay.data.node_values()?;
+        if self.overlay.data.columns().threshold.is_some() {
+            values.threshold_values.clone()
+        } else {
+            Some(values.values.clone())
+        }
+    }
+
+    fn refresh_threshold_contour_buffers(&mut self) {
+        let appearance = self.overlay.render.appearance;
+        if !appearance.boxed_threshold
+            || !appearance.threshold.enabled
+            || !self.controller.overlay.visible
+            || self.afni_live_overlay_active
+            || !self.overlay.data.is_loaded()
+        {
+            self.threshold_contour_instances.clear();
+            self.threshold_contour_key = None;
+            return;
+        }
+
+        let (threshold, _) = threshold_and_mask_from_appearance(appearance);
+        let key = ThresholdContourCacheKey {
+            scene_generation: self.scene_generation,
+            surface_id: self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone()),
+            overlay_data_generation: self.overlay_data_generation,
+            threshold,
+            pair_layout: self.controller.display.pair_state,
+            pair_visibility: self.controller.display.pair_visibility,
+            contrast_inputs: (appearance.contour.color_mode == ContourColorMode::AutoContrast)
+                .then_some((appearance.colormap, appearance.range)),
+        };
+        if self.threshold_contour_key.as_ref() == Some(&key) {
+            return;
+        }
+        let Some(threshold_values) = self.active_threshold_scalar_values() else {
+            self.threshold_contour_instances.clear();
+            self.threshold_contour_key = Some(key);
+            return;
+        };
+        // Auto-contrast needs to know the overlay color the line will sit on,
+        // which is the colormap sampled at each threshold boundary.
+        let boundary_luminances =
+            threshold_boundary_luminances(threshold, appearance.range, appearance.colormap);
+
+        let mut prepared = Vec::new();
+        if self.has_both_scene() {
+            let matrices = self.active_pair_matrices_for_layout(
+                self.controller.display.pair_state,
+                self.controller.display.pair_visibility,
+            );
+            let Some(scene) = self.surface_scene.as_ref() else {
+                self.threshold_contour_instances.clear();
+                self.threshold_contour_key = Some(key);
+                return;
+            };
+            let Some(surface) = scene.surfaces.get(scene.active_index) else {
+                self.threshold_contour_instances.clear();
+                self.threshold_contour_key = Some(key);
+                return;
+            };
+            let mut node_offset = 0usize;
+            let mut components_complete = true;
+            for component in &surface.components {
+                let Some(mesh) = component.mesh.as_ref() else {
+                    components_complete = false;
+                    break;
+                };
+                let node_end = node_offset.saturating_add(mesh.vertices.len());
+                let Some(component_values) = threshold_values.get(node_offset..node_end) else {
+                    components_complete = false;
+                    break;
+                };
+                let normals = mesh.vertex_normals();
+                let geometry =
+                    prepared_geometry_from_raw_component(&mesh.vertices, &normals, &mesh.triangles);
+                let contour = PreparedThresholdContour::from_geometry(
+                    &geometry,
+                    component_values,
+                    threshold,
+                    &boundary_luminances,
+                );
+                if !contour.is_empty() {
+                    let model_matrix = matrices
+                        .iter()
+                        .find(|(side, _)| *side == component.side)
+                        .map(|(_, matrix)| *matrix)
+                        .unwrap_or(Mat4::IDENTITY);
+                    prepared.push((contour, component.side.clone(), model_matrix));
+                }
+                node_offset = node_end;
+            }
+            if !components_complete || node_offset != threshold_values.len() {
+                prepared.clear();
+            }
+        } else if let Some(mesh) = self.mesh.as_ref() {
+            let geometry = PreparedGeometry::from_surface(mesh);
+            let contour = PreparedThresholdContour::from_geometry(
+                &geometry,
+                &threshold_values,
+                threshold,
+                &boundary_luminances,
+            );
+            if !contour.is_empty() {
+                prepared.push((contour, SurfaceSide::Unknown, Mat4::IDENTITY));
+            }
+        }
+
+        self.threshold_contour_instances = prepared
+            .iter()
+            .map(|(contour, side, model_matrix)| {
+                self.threshold_contour_instance_from_prepared(contour, side.clone(), *model_matrix)
+            })
+            .collect();
+        self.threshold_contour_key = Some(key);
+    }
+
     fn push_cell_color_surface_instances(
         &self,
         instances: &mut Vec<SurfaceRenderInstance>,
@@ -4023,6 +4428,11 @@ impl ViewerState {
     }
 
     fn upload_surface_buffers(&mut self) {
+        self.upload_surface_buffers_inner();
+        self.refresh_threshold_contour_buffers();
+    }
+
+    fn upload_surface_buffers_inner(&mut self) {
         self.pending_cell_color_upload = None;
         let underlay = self.visible_anatomical_shading_colors();
         let afni_surface_colors = self
@@ -4786,7 +5196,7 @@ fn paint_launch_button(
     } else {
         ui.visuals().text_color()
     };
-    let stroke = egui::Stroke::new(1.5, stroke_color);
+    let stroke = egui::Stroke::new(1.5_f32, stroke_color);
     let painter = ui.painter();
 
     if enabled && response.hovered() {
@@ -6858,7 +7268,9 @@ fn threshold_and_mask_from_appearance(appearance: OverlayAppearance) -> (Thresho
     } else {
         Threshold::above(value)
     };
-    let mask_mode = if appearance.threshold.hide_failed {
+    let mask_mode = if appearance.transparent_threshold {
+        MaskMode::FadeFailedThreshold(appearance.fade)
+    } else if appearance.threshold.hide_failed {
         MaskMode::HideFailedThreshold
     } else {
         MaskMode::DimFailedThreshold(0.25)
@@ -6878,15 +7290,46 @@ fn resolved_overlay_color_map(
     dataset: &Dataset,
     intensity_index: usize,
     colormap: OverlayColorMap,
+    label_table: Option<&LabelTable>,
 ) -> ColorMap {
     match colormap {
-        OverlayColorMap::DiscreteLabels => auto_overlay_label_table(dataset, intensity_index)
-            .map(ColorMap::labels)
-            .unwrap_or_else(ColorMap::spectrum_red_to_blue),
+        OverlayColorMap::DiscreteLabels => {
+            resolved_overlay_label_table(dataset, intensity_index, label_table)
+                .map(ColorMap::labels)
+                .unwrap_or_else(ColorMap::spectrum_red_to_blue)
+        }
         _ => colormap
             .continuous_color_map()
             .expect("non-discrete overlay color maps are continuous"),
     }
+}
+
+fn resolved_overlay_label_table(
+    dataset: &Dataset,
+    intensity_index: usize,
+    label_table: Option<&LabelTable>,
+) -> Option<LabelTable> {
+    label_table
+        .filter(|table| label_table_matches_overlay_values(dataset, intensity_index, table))
+        .cloned()
+        .or_else(|| auto_overlay_label_table(dataset, intensity_index))
+}
+
+fn label_table_matches_overlay_values(
+    dataset: &Dataset,
+    intensity_index: usize,
+    label_table: &LabelTable,
+) -> bool {
+    let Some(column) = dataset.columns.get(intensity_index) else {
+        return false;
+    };
+    let Some(keys) = discrete_integer_column_keys(column) else {
+        return false;
+    };
+
+    keys.into_iter()
+        .filter(|key| *key != 0)
+        .all(|key| label_table.label(key).is_some())
 }
 
 fn overlay_dataset_from_canonical_dataset(
@@ -7229,7 +7672,10 @@ fn controller_section(
     .show_unindented(ui, |ui| {
         egui::Frame::new()
             .fill(egui::Color32::from_rgb(28, 32, 39))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 62, 74)))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgb(55, 62, 74),
+            ))
             .corner_radius(egui::CornerRadius::same(6))
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, add_contents);
@@ -7335,7 +7781,7 @@ fn draw_graph_snapshot(
     painter.rect_stroke(
         rect,
         egui::CornerRadius::same(6),
-        egui::Stroke::new(1.0, border_color()),
+        egui::Stroke::new(1.0_f32, border_color()),
         egui::StrokeKind::Outside,
     );
 
@@ -7347,7 +7793,7 @@ fn draw_graph_snapshot(
                 egui::pos2(plot_rect.left(), y),
                 egui::pos2(plot_rect.right(), y),
             ],
-            egui::Stroke::new(1.0, grid_color),
+            egui::Stroke::new(1.0_f32, grid_color),
         );
     }
     painter.line_segment(
@@ -7355,14 +7801,14 @@ fn draw_graph_snapshot(
             egui::pos2(plot_rect.left(), plot_rect.top()),
             egui::pos2(plot_rect.left(), plot_rect.bottom()),
         ],
-        egui::Stroke::new(1.0, axis_color),
+        egui::Stroke::new(1.0_f32, axis_color),
     );
     painter.line_segment(
         [
             egui::pos2(plot_rect.left(), plot_rect.bottom()),
             egui::pos2(plot_rect.right(), plot_rect.bottom()),
         ],
-        egui::Stroke::new(1.0, axis_color),
+        egui::Stroke::new(1.0_f32, axis_color),
     );
 
     let y_min = snapshot.y_range.min;
@@ -7384,7 +7830,10 @@ fn draw_graph_snapshot(
 
     let points = graph_plot_positions(snapshot, plot_rect);
     for pair in points.windows(2) {
-        painter.line_segment([pair[0].1, pair[1].1], egui::Stroke::new(2.0, line_color));
+        painter.line_segment(
+            [pair[0].1, pair[1].1],
+            egui::Stroke::new(2.0_f32, line_color),
+        );
     }
 
     for (index, position) in &points {
@@ -7394,7 +7843,7 @@ fn draw_graph_snapshot(
         painter.circle_stroke(
             *position,
             radius,
-            egui::Stroke::new(1.0, egui::Color32::BLACK),
+            egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
         );
     }
 
@@ -7568,7 +8017,7 @@ fn vertical_threshold_bar(
     painter.rect_stroke(
         bar_rect,
         egui::CornerRadius::same(4),
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(95, 104, 121)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(95, 104, 121)),
         egui::StrokeKind::Outside,
     );
 
@@ -7591,13 +8040,13 @@ fn vertical_threshold_bar(
     };
     painter.line_segment(
         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-        egui::Stroke::new(2.0, marker_color),
+        egui::Stroke::new(2.0_f32, marker_color),
     );
     painter.circle_filled(egui::pos2(rect.center().x, y), 3.5, egui::Color32::BLACK);
     painter.circle_stroke(
         egui::pos2(rect.center().x, y),
         3.5,
-        egui::Stroke::new(1.0, marker_color),
+        egui::Stroke::new(1.0_f32, marker_color),
     );
 
     changed
@@ -7907,19 +8356,21 @@ fn size_is_close(current: PhysicalSize<u32>, desired: PhysicalSize<u32>) -> bool
 #[cfg(test)]
 mod tests {
     use super::{
-        AfniSurfaceTarget, BackgroundMode, HemisphereLayout, HemisphereLayoutState, MontageCamera,
-        OverlayAppearance, OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR,
-        PAIR_MAX_OPEN_DEGREES, PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PreparedGeometry,
-        PresetOrientation, RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface,
-        SceneSurfaceComponent, SceneSurfaceLayout, SurfacePick, ViewerCommand,
-        afni_cell_color_max_triangles_per_chunk, afni_cell_color_needs_chunking,
-        afni_component_is_sendable, afni_rgba_overlay_signature, apply_afni_rgba_to_color_cache,
-        auto_overlay_label_table, canonical_overlay_columns, component_transforms,
-        explicit_overlay_pair_display_name, load_spec_component_label_lookup,
-        load_spec_component_mesh, pair_hemisphere_matrices, paired_component_for_node,
-        paired_overlay_dataset, paired_overlay_path_for_side, paired_overlay_paths,
-        paired_spec_montage_shots, resolve_overlay_subs, roi_appearance_for_mesh,
-        roi_fill_nodes_from_seed, scene_surface_display_label, scene_surfaces_from_components,
+        AfniSurfaceTarget, BackgroundMode, CONTOUR_UNIFORM_BYTES, CONTOUR_VERTEX_ATTRIBUTES,
+        CONTOUR_VERTEX_FLOATS, CONTOUR_VERTEX_STRIDE, ContourUniformInputs, HemisphereLayout,
+        HemisphereLayoutState, MontageCamera, OverlayAppearance, OverlayColorMap,
+        OverlayColumnSelections, PAIR_MAX_DRAG_GAP_FACTOR, PAIR_MAX_OPEN_DEGREES,
+        PAIR_OPEN_DEGREES_PER_PIXEL, PairVisibility, PreparedGeometry, PresetOrientation,
+        RoiComponentRange, RoiDraftTarget, RoiWorkspace, SceneSurface, SceneSurfaceComponent,
+        SceneSurfaceLayout, SurfacePick, ViewerCommand, afni_cell_color_max_triangles_per_chunk,
+        afni_cell_color_needs_chunking, afni_component_is_sendable, afni_rgba_overlay_signature,
+        apply_afni_rgba_to_color_cache, auto_overlay_label_table, canonical_overlay_columns,
+        component_transforms, contour_uniform_bytes, explicit_overlay_pair_display_name,
+        load_spec_component_label_lookup, load_spec_component_mesh, pair_hemisphere_matrices,
+        paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
+        paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
+        resolved_overlay_color_map, roi_appearance_for_mesh, roi_fill_nodes_from_seed,
+        scene_surface_display_label, scene_surfaces_from_components,
         scene_surfaces_grouped_by_state, selection_for_component,
         selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
         spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
@@ -7927,9 +8378,9 @@ mod tests {
         viewer_required_wgpu_limits,
     };
     use crate::afni::{AfniRgbaOverlay, AfniRouteAction};
-    use crate::color::Rgba;
+    use crate::color::{LabelEntry, LabelTable, LabelTableSource, Rgba};
     use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind};
-    use crate::overlay::{MaskMode, Threshold};
+    use crate::overlay::{FadeCurve, FadeWidth, MaskMode, Threshold};
     use crate::roi::Roi;
     use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, read_spec};
     use crate::surface::{
@@ -8056,6 +8507,41 @@ mod tests {
             table.label(2).unwrap().color,
             Rgba::from_u8(255, 242, 0, 255)
         );
+    }
+
+    #[test]
+    fn discrete_overlay_colormap_prefers_embedded_label_table() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceLabel,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "labels",
+                    ColumnRole::Label,
+                    None,
+                    ColumnData::Int32(vec![9, 40, 9]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let table = LabelTable::with_name(
+            Some("Haskins".to_string()),
+            LabelTableSource::Unknown,
+            vec![
+                LabelEntry::new(9, "3rd-Ventricle", Rgba::from_u8(253, 82, 250, 255)).unwrap(),
+                LabelEntry::new(40, "ctx-lh-bankssts", Rgba::from_u8(68, 7, 242, 255)).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let colormap =
+            resolved_overlay_color_map(&dataset, 0, OverlayColorMap::DiscreteLabels, Some(&table));
+        let resolved = colormap.label_table().expect("expected label colormap");
+
+        assert_eq!(resolved.color_for_key(9), Rgba::from_u8(253, 82, 250, 255));
+        assert_eq!(resolved.color_for_key(40), Rgba::from_u8(68, 7, 242, 255));
     }
 
     #[test]
@@ -8835,6 +9321,64 @@ mod tests {
     }
 
     #[test]
+    fn contour_uniform_block_matches_the_shader_layout() {
+        // A silent mismatch between this block and `ContourUniforms` in
+        // shader.wgsl does not fail to compile; it renders wrong. Pin the size
+        // and the field offsets that the std140-style alignment depends on.
+        let bytes = contour_uniform_bytes(ContourUniformInputs {
+            view_projection: Mat4::IDENTITY,
+            model: Mat4::IDENTITY,
+            viewport: [800.0, 600.0],
+            width_px: 3.0,
+            feather_px: 1.0,
+            color: [0.25, 0.5, 0.75, 1.0],
+            auto_contrast: true,
+            is_core: false,
+        });
+        assert_eq!(bytes.len(), CONTOUR_UNIFORM_BYTES);
+
+        let floats: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        // Two 4x4 matrices occupy the first 32 floats.
+        assert_eq!(&floats[32..34], &[800.0, 600.0]);
+        assert_eq!(&floats[34..36], &[3.0, 1.0]);
+        // The color vec4 must land on a 16-byte boundary, i.e. float index 36.
+        assert_eq!(&floats[36..40], &[0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(&floats[40..44], &[1.0, 0.0, 0.0, 0.0]);
+
+        // The core pass flips only the is_core flag.
+        let core = contour_uniform_bytes(ContourUniformInputs {
+            view_projection: Mat4::IDENTITY,
+            model: Mat4::IDENTITY,
+            viewport: [800.0, 600.0],
+            width_px: 3.0,
+            feather_px: 1.0,
+            color: [0.25, 0.5, 0.75, 1.0],
+            auto_contrast: true,
+            is_core: true,
+        });
+        assert_eq!(core[..160], bytes[..160]);
+        assert_ne!(core, bytes);
+    }
+
+    #[test]
+    fn contour_vertex_stride_matches_the_prepared_vertex_layout() {
+        // The pipeline's stride and the bytes the mesh writes must agree, or
+        // every contour vertex reads from the wrong offset.
+        assert_eq!(
+            CONTOUR_VERTEX_STRIDE as usize,
+            CONTOUR_VERTEX_FLOATS * size_of::<f32>()
+        );
+        let total: usize = CONTOUR_VERTEX_ATTRIBUTES
+            .iter()
+            .map(|attribute| attribute.format.size() as usize)
+            .sum();
+        assert_eq!(total, CONTOUR_VERTEX_STRIDE as usize);
+    }
+
+    #[test]
     fn viewer_threshold_slider_maps_to_canonical_threshold() {
         let mut appearance = OverlayAppearance::from_range(ValueRange {
             min: -5.0,
@@ -8847,6 +9391,21 @@ mod tests {
         let (threshold, mask_mode) = threshold_and_mask_from_appearance(appearance);
         assert_eq!(threshold, Threshold::outside(-2.0, 2.0));
         assert_eq!(mask_mode, MaskMode::HideFailedThreshold);
+
+        appearance.transparent_threshold = true;
+        appearance.fade.curve = FadeCurve::Linear;
+        let (_, mask_mode) = threshold_and_mask_from_appearance(appearance);
+        assert_eq!(mask_mode, MaskMode::FadeFailedThreshold(appearance.fade));
+        let MaskMode::FadeFailedThreshold(fade) = mask_mode else {
+            panic!("expected a fade mask mode");
+        };
+        assert_eq!(fade.curve, FadeCurve::Linear);
+        assert_eq!(fade.width, FadeWidth::BoundaryMagnitude);
+
+        appearance.transparent_threshold = false;
+        appearance.threshold.hide_failed = false;
+        let (_, mask_mode) = threshold_and_mask_from_appearance(appearance);
+        assert_eq!(mask_mode, MaskMode::DimFailedThreshold(0.25));
 
         appearance.threshold.absolute = false;
         let (threshold, _) = threshold_and_mask_from_appearance(appearance);

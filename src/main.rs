@@ -73,6 +73,11 @@ struct Cli {
     #[arg(long = "roi", value_name = "PATH")]
     roi: Option<PathBuf>,
 
+    /// For each loaded GIFTI surface, automatically load a same-stem
+    /// `.niml.dset` beside it as a discrete-color overlay.
+    #[arg(long = "auto-color-niml")]
+    auto_color_niml: bool,
+
     /// Initial overlay sub-bricks as I,T[,B], using zero-based column numbers
     /// or column labels.
     #[arg(long = "subs", value_name = "I,T[,B]", value_parser = parse_subs)]
@@ -241,6 +246,7 @@ fn main() -> Result<()> {
     let volume = cli.volume;
     let overlay = cli.overlay;
     let roi = cli.roi;
+    let auto_color_niml = cli.auto_color_niml;
 
     match cli.command {
         None => {
@@ -253,6 +259,7 @@ fn main() -> Result<()> {
                 &overlay,
                 &overlay_pair,
                 &roi,
+                auto_color_niml,
                 &subs,
                 &p_value,
             )?;
@@ -267,6 +274,7 @@ fn main() -> Result<()> {
                 overlay_path: overlay,
                 overlay_pair_paths: overlay_pair,
                 roi_path: roi,
+                auto_color_niml,
                 overlay_subs: subs,
                 overlay_p_value: p_value,
                 verbose,
@@ -287,6 +295,7 @@ fn main() -> Result<()> {
                 &overlay,
                 &overlay_pair,
                 &roi,
+                auto_color_niml,
                 &subs,
                 &p_value,
                 &niml_record_path,
@@ -310,6 +319,7 @@ fn main() -> Result<()> {
                 &overlay,
                 &overlay_pair,
                 &roi,
+                auto_color_niml,
                 &subs,
                 &p_value,
                 &niml_record_path,
@@ -374,6 +384,7 @@ fn validate_viewer_launch(
     overlay: &Option<PathBuf>,
     overlay_pair: &Option<ExplicitOverlayPair>,
     roi: &Option<PathBuf>,
+    auto_color_niml: bool,
     subs: &Option<Vec<String>>,
     p_value: &Option<f64>,
 ) -> Result<()> {
@@ -396,17 +407,25 @@ fn validate_viewer_launch(
     if overlay_pair.is_some() && !has_paired_scene {
         bail!("--overlay-lh/--overlay-rh require -spec/--spec or --surface-lh/--surface-rh");
     }
+    if auto_color_niml && !has_surface {
+        bail!(
+            "--auto-color-niml requires -i/--surface, -spec/--spec, or --surface-lh/--surface-rh"
+        );
+    }
+    if auto_color_niml && has_overlay {
+        bail!("--auto-color-niml cannot be combined with --overlay or --overlay-lh/--overlay-rh");
+    }
     if !has_surface && roi.is_some() {
         bail!("--roi requires -i/--surface, -spec/--spec, or --surface-lh/--surface-rh");
     }
     if !has_surface && surface_volume.is_some() {
         bail!("-sv/--sv requires -i/--surface, -spec/--spec, or --surface-lh/--surface-rh");
     }
-    if !has_overlay && subs.is_some() {
-        bail!("--subs requires --overlay or --overlay-lh/--overlay-rh");
+    if !has_overlay && !auto_color_niml && subs.is_some() {
+        bail!("--subs requires --overlay, --overlay-lh/--overlay-rh, or --auto-color-niml");
     }
-    if !has_overlay && p_value.is_some() {
-        bail!("--p-val requires --overlay or --overlay-lh/--overlay-rh");
+    if !has_overlay && !auto_color_niml && p_value.is_some() {
+        bail!("--p-val requires --overlay, --overlay-lh/--overlay-rh, or --auto-color-niml");
     }
 
     Ok(())
@@ -421,6 +440,7 @@ fn validate_no_viewer_launch_options(
     overlay: &Option<PathBuf>,
     overlay_pair: &Option<ExplicitOverlayPair>,
     roi: &Option<PathBuf>,
+    auto_color_niml: bool,
     subs: &Option<Vec<String>>,
     p_value: &Option<f64>,
     niml_record_path: &Option<PathBuf>,
@@ -436,6 +456,7 @@ fn validate_no_viewer_launch_options(
         || overlay.is_some()
         || overlay_pair.is_some()
         || roi.is_some()
+        || auto_color_niml
         || subs.is_some()
         || p_value.is_some()
         || niml_record_path.is_some()
@@ -604,6 +625,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None
             )
@@ -623,6 +645,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None
             )
@@ -638,6 +661,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None
             )
@@ -657,6 +681,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None
             )
@@ -676,6 +701,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None
             )
@@ -695,6 +721,7 @@ mod tests {
                 &path("stats.niml.dset"),
                 &None,
                 &None,
+                false,
                 &None,
                 &None
             )
@@ -714,6 +741,7 @@ mod tests {
                 &None,
                 &None,
                 &path("roi.niml.roi"),
+                false,
                 &None,
                 &None
             )
@@ -729,6 +757,7 @@ mod tests {
                 &None,
                 &None,
                 &path("roi.niml.roi"),
+                false,
                 &None,
                 &None
             )
@@ -748,6 +777,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None
             )
@@ -778,6 +808,78 @@ mod tests {
             ]))
         );
         assert_eq!(cli.p_value, Some(0.05));
+    }
+
+    #[test]
+    fn auto_color_niml_validates_like_an_overlay_source() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--surface",
+            "surface.gii",
+            "--auto-color-niml",
+            "--subs",
+            "0,1",
+        ]);
+        assert!(cli.auto_color_niml);
+        assert!(
+            validate_viewer_launch(
+                &cli.surface_paths,
+                &cli.spec,
+                &None,
+                &None,
+                &cli.surface_volume,
+                &cli.overlay,
+                &None,
+                &cli.roi,
+                cli.auto_color_niml,
+                &cli.subs.map(|subs| subs.0),
+                &cli.p_value,
+            )
+            .is_ok()
+        );
+
+        let cli = Cli::parse_from(["sumaru", "--auto-color-niml"]);
+        assert!(
+            validate_viewer_launch(
+                &cli.surface_paths,
+                &cli.spec,
+                &None,
+                &None,
+                &cli.surface_volume,
+                &cli.overlay,
+                &None,
+                &cli.roi,
+                cli.auto_color_niml,
+                &None,
+                &None,
+            )
+            .is_err()
+        );
+
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--surface",
+            "surface.gii",
+            "--auto-color-niml",
+            "--overlay",
+            "stats.niml.dset",
+        ]);
+        assert!(
+            validate_viewer_launch(
+                &cli.surface_paths,
+                &cli.spec,
+                &None,
+                &None,
+                &cli.surface_volume,
+                &cli.overlay,
+                &None,
+                &cli.roi,
+                cli.auto_color_niml,
+                &None,
+                &None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -882,6 +984,7 @@ mod tests {
                 &cli.overlay,
                 &overlay_pair,
                 &cli.roi,
+                cli.auto_color_niml,
                 &cli.subs.map(|subs| subs.0),
                 &cli.p_value,
             )
@@ -916,6 +1019,7 @@ mod tests {
                 &cli.overlay,
                 &overlay_pair,
                 &cli.roi,
+                cli.auto_color_niml,
                 &cli.subs.map(|subs| subs.0),
                 &cli.p_value,
             )
@@ -934,6 +1038,7 @@ mod tests {
                 &cli.overlay,
                 &overlay_pair,
                 &cli.roi,
+                cli.auto_color_niml,
                 &cli.subs.map(|subs| subs.0),
                 &cli.p_value,
             )
@@ -965,6 +1070,7 @@ mod tests {
                 &None,
                 &pair,
                 &None,
+                false,
                 &None,
                 &None,
             )
@@ -984,6 +1090,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &Some(vec!["0".to_string(), "1".to_string()]),
                 &None
             )
@@ -999,6 +1106,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &Some(0.05)
             )
@@ -1093,6 +1201,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None,
                 &Some(PathBuf::from("session.nimlrec")),
@@ -1119,6 +1228,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None,
                 &None,
@@ -1145,6 +1255,7 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                false,
                 &None,
                 &None,
                 &None,

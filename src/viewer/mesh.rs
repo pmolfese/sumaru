@@ -7,6 +7,7 @@ use crate::color::{ColorMap, stable_label_color};
 use crate::command::OverlayThreshold;
 #[cfg(test)]
 use crate::overlay::Overlay;
+use crate::overlay::{FadeSettings, Threshold, ThresholdMode};
 use crate::surface::{SurfaceMesh, ValueRange};
 
 pub(super) const DEFAULT_SURFACE_COLOR: [f32; 4] = [0.76, 0.78, 0.74, 1.0];
@@ -39,6 +40,124 @@ pub(super) struct PreparedVertex {
     pub(super) normal: [f32; 3],
     pub(super) color: [f32; 4],
 }
+
+/// Threshold contour geometry, expanded into screen-facing quads.
+///
+/// wgpu cannot draw lines wider than one physical pixel — WebGPU has no
+/// line-width state at all — so an adjustable border has to be built from
+/// triangles and widened in the vertex shader, where the segment direction can
+/// be measured in screen space.
+#[derive(Debug, Clone)]
+pub(super) struct PreparedThresholdContour {
+    pub(super) vertices: Vec<ContourVertex>,
+    pub(super) indices: Vec<u32>,
+}
+
+/// One corner of a contour quad. Both segment endpoints travel with every
+/// vertex so the shader can derive the screen-space perpendicular; `params`
+/// carries which side of the centerline this corner sits on, which endpoint it
+/// belongs to, and the background luminance used by auto-contrast coloring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ContourVertex {
+    pub(super) segment_start: [f32; 3],
+    pub(super) segment_end: [f32; 3],
+    /// `[side, at_end, luminance]`, with `side` in `{-1, +1}` and `at_end` in
+    /// `{0, 1}`.
+    pub(super) params: [f32; 3],
+}
+
+/// User-facing appearance of the "B" contour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ThresholdContourStyle {
+    /// Width of the inner line, in physical pixels.
+    pub(super) width_px: f32,
+    /// Extra width of the casing drawn behind the inner line, per side, in
+    /// physical pixels. Zero draws a plain single line.
+    pub(super) halo_px: f32,
+    pub(super) color_mode: ContourColorMode,
+    /// Inner line color, used when `color_mode` is [`ContourColorMode::Fixed`].
+    pub(super) color: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContourColorMode {
+    /// Choose black or white per fragment from the overlay color the contour
+    /// sits on, so the line never vanishes into the colormap.
+    AutoContrast,
+    /// Use [`ThresholdContourStyle::color`] for the inner line.
+    Fixed,
+}
+
+impl ThresholdContourStyle {
+    pub(super) fn new() -> Self {
+        Self {
+            width_px: 2.0,
+            halo_px: 1.5,
+            color_mode: ContourColorMode::AutoContrast,
+            color: [1.0, 1.0, 1.0],
+        }
+    }
+
+    /// Width of the casing pass, which is the inner line widened on both sides.
+    pub(super) fn halo_width_px(self) -> f32 {
+        self.width_px.max(0.0) + self.halo_px.max(0.0) * 2.0
+    }
+
+    pub(super) fn draws_halo(self) -> bool {
+        self.halo_px > 0.0
+    }
+
+    /// Color of the casing. It is the opposite pole from the inner line, so the
+    /// pair reads against any background regardless of which line the eye
+    /// catches first.
+    pub(super) fn halo_color(self) -> [f32; 3] {
+        if luminance(self.color) < 0.5 {
+            [1.0, 1.0, 1.0]
+        } else {
+            [0.0, 0.0, 0.0]
+        }
+    }
+}
+
+impl Default for ThresholdContourStyle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Rec. 709 luminance.
+pub(super) fn luminance(color: [f32; 3]) -> f32 {
+    0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ThresholdContourPoint {
+    position: [f32; 3],
+    normal: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ThresholdContourSegment {
+    start: ThresholdContourPoint,
+    end: ThresholdContourPoint,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThresholdBoundary {
+    value: f64,
+    exact_is_above: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ContourPointKey {
+    Vertex(u32),
+    Edge(u32, u32),
+}
+
+const THRESHOLD_CONTOUR_OFFSET_FACTOR: f32 = 1.0e-4;
+/// Fallback background luminance when the overlay colormap cannot be sampled
+/// (discrete label overlays), chosen so auto-contrast picks a black line.
+const THRESHOLD_CONTOUR_DEFAULT_LUMINANCE: f32 = 1.0;
 
 #[derive(Debug, Clone)]
 pub(super) struct RoiAppearance {
@@ -91,6 +210,10 @@ pub(super) struct OverlayAppearance {
     pub(super) symmetric_range: bool,
     pub(super) colormap: OverlayColorMap,
     pub(super) threshold: OverlayThreshold,
+    pub(super) transparent_threshold: bool,
+    pub(super) boxed_threshold: bool,
+    pub(super) fade: FadeSettings,
+    pub(super) contour: ThresholdContourStyle,
     pub(super) opacity: f32,
     pub(super) dim: f32,
 }
@@ -334,6 +457,275 @@ impl PreparedSurface {
 
     pub(super) fn is_empty(&self) -> bool {
         self.vertices.is_empty() || self.indices.is_empty()
+    }
+}
+
+impl PreparedThresholdContour {
+    /// Builds contour quads for `threshold`.
+    ///
+    /// `boundary_luminances` supplies, per threshold boundary, the luminance of
+    /// the overlay color the contour will sit on. It is only consulted by
+    /// auto-contrast coloring; a missing entry falls back to a light
+    /// background.
+    pub(super) fn from_geometry(
+        geometry: &PreparedGeometry,
+        threshold_values: &[f32],
+        threshold: Threshold,
+        boundary_luminances: &[f32],
+    ) -> Self {
+        let segments = threshold_contour_segments(geometry, threshold_values, threshold);
+        let normal_offset = contour_normal_offset(geometry);
+        let mut vertices = Vec::with_capacity(segments.len() * 4);
+        let mut indices = Vec::with_capacity(segments.len() * 6);
+
+        for (boundary_index, segment) in segments {
+            let luminance = boundary_luminances
+                .get(boundary_index)
+                .copied()
+                .filter(|luminance| luminance.is_finite())
+                .unwrap_or(THRESHOLD_CONTOUR_DEFAULT_LUMINANCE);
+
+            // Lift the line off the surface along the local normal. This is a
+            // world-space nudge; the render pass adds a slope-scaled depth bias
+            // on top, which is what actually keeps the line solid on faces
+            // angled away from the camera.
+            let start = (Vec3::from_array(segment.start.position)
+                + Vec3::from_array(segment.start.normal) * normal_offset)
+                .to_array();
+            let end = (Vec3::from_array(segment.end.position)
+                + Vec3::from_array(segment.end.normal) * normal_offset)
+                .to_array();
+
+            let base = vertices.len() as u32;
+            for (side, at_end) in [(1.0, 0.0), (-1.0, 0.0), (1.0, 1.0), (-1.0, 1.0)] {
+                vertices.push(ContourVertex {
+                    segment_start: start,
+                    segment_end: end,
+                    params: [side, at_end, luminance],
+                });
+            }
+            // Two triangles per segment. Winding is irrelevant because the
+            // contour pipeline disables culling.
+            indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+        }
+
+        Self { vertices, indices }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.vertices.is_empty() || self.indices.is_empty()
+    }
+
+    pub(super) fn index_count(&self) -> u32 {
+        self.indices.len() as u32
+    }
+
+    pub(super) fn vertex_bytes(&self) -> Vec<u8> {
+        let mut floats = Vec::with_capacity(self.vertices.len() * CONTOUR_VERTEX_FLOATS);
+        for vertex in &self.vertices {
+            floats.extend_from_slice(&vertex.segment_start);
+            floats.extend_from_slice(&vertex.segment_end);
+            floats.extend_from_slice(&vertex.params);
+        }
+        super::f32_bytes(&floats)
+    }
+
+    pub(super) fn index_bytes(&self) -> Vec<u8> {
+        indices_to_bytes(&self.indices)
+    }
+}
+
+/// Floats per contour vertex: two endpoints plus the packed params triple.
+pub(super) const CONTOUR_VERTEX_FLOATS: usize = 9;
+
+fn threshold_contour_segments(
+    geometry: &PreparedGeometry,
+    threshold_values: &[f32],
+    threshold: Threshold,
+) -> Vec<(usize, ThresholdContourSegment)> {
+    if geometry.vertices.len() != threshold_values.len() {
+        return Vec::new();
+    }
+
+    let boundaries = threshold_boundaries(threshold);
+    let mut segments = Vec::new();
+    let mut emitted = BTreeSet::new();
+    for (boundary_index, boundary) in boundaries.into_iter().enumerate() {
+        for triangle in geometry.indices.chunks_exact(3) {
+            let nodes = [triangle[0], triangle[1], triangle[2]];
+            let Some(values) = nodes
+                .map(|node| threshold_values.get(node as usize).copied())
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if values.iter().any(|value| !value.is_finite()) {
+                continue;
+            }
+
+            let mut crossings = Vec::with_capacity(2);
+            for (a_index, b_index) in [(0, 1), (1, 2), (2, 0)] {
+                let a_value = f64::from(values[a_index]);
+                let b_value = f64::from(values[b_index]);
+                let a_above = if boundary.exact_is_above {
+                    a_value >= boundary.value
+                } else {
+                    a_value > boundary.value
+                };
+                let b_above = if boundary.exact_is_above {
+                    b_value >= boundary.value
+                } else {
+                    b_value > boundary.value
+                };
+                if a_above == b_above {
+                    continue;
+                }
+
+                let a_node = nodes[a_index];
+                let b_node = nodes[b_index];
+                let key = if a_value == boundary.value {
+                    ContourPointKey::Vertex(a_node)
+                } else if b_value == boundary.value {
+                    ContourPointKey::Vertex(b_node)
+                } else {
+                    ContourPointKey::Edge(a_node.min(b_node), a_node.max(b_node))
+                };
+                if crossings.iter().any(|(existing, _)| *existing == key) {
+                    continue;
+                }
+
+                let denominator = b_value - a_value;
+                if !denominator.is_finite() || denominator.abs() <= f64::EPSILON {
+                    continue;
+                }
+                let t = ((boundary.value - a_value) / denominator).clamp(0.0, 1.0) as f32;
+                let Some(a_vertex) = geometry.vertices.get(a_node as usize) else {
+                    continue;
+                };
+                let Some(b_vertex) = geometry.vertices.get(b_node as usize) else {
+                    continue;
+                };
+                let position = Vec3::from_array(a_vertex.position)
+                    .lerp(Vec3::from_array(b_vertex.position), t)
+                    .to_array();
+                let normal = Vec3::from_array(a_vertex.normal)
+                    .lerp(Vec3::from_array(b_vertex.normal), t)
+                    .try_normalize()
+                    .unwrap_or(Vec3::Z)
+                    .to_array();
+                crossings.push((key, ThresholdContourPoint { position, normal }));
+            }
+
+            if crossings.len() != 2 {
+                continue;
+            }
+            let (first_key, first) = crossings[0];
+            let (second_key, second) = crossings[1];
+            let ordered_keys = if first_key <= second_key {
+                (first_key, second_key)
+            } else {
+                (second_key, first_key)
+            };
+            if emitted.insert((boundary_index, ordered_keys)) {
+                segments.push((
+                    boundary_index,
+                    ThresholdContourSegment {
+                        start: first,
+                        end: second,
+                    },
+                ));
+            }
+        }
+    }
+
+    segments
+}
+
+fn threshold_boundaries(threshold: Threshold) -> Vec<ThresholdBoundary> {
+    let Some(range) = threshold.range else {
+        return Vec::new();
+    };
+    match threshold.mode {
+        ThresholdMode::Off => Vec::new(),
+        ThresholdMode::Above => vec![ThresholdBoundary {
+            value: range.min,
+            exact_is_above: true,
+        }],
+        ThresholdMode::Below => vec![ThresholdBoundary {
+            value: range.max,
+            exact_is_above: false,
+        }],
+        ThresholdMode::Between if range.min == range.max => vec![ThresholdBoundary {
+            value: range.min,
+            exact_is_above: true,
+        }],
+        ThresholdMode::Between => vec![
+            ThresholdBoundary {
+                value: range.min,
+                exact_is_above: true,
+            },
+            ThresholdBoundary {
+                value: range.max,
+                exact_is_above: false,
+            },
+        ],
+        ThresholdMode::Outside if range.min == range.max => Vec::new(),
+        ThresholdMode::Outside => vec![
+            ThresholdBoundary {
+                value: range.min,
+                exact_is_above: false,
+            },
+            ThresholdBoundary {
+                value: range.max,
+                exact_is_above: true,
+            },
+        ],
+    }
+}
+
+/// Luminance of the overlay color at each threshold boundary, in the same order
+/// [`threshold_boundaries`] returns them.
+///
+/// The contour sits exactly on the threshold, so the color it has to stand out
+/// against is the colormap sampled at the boundary value. Two-sided thresholds
+/// get one entry per tail, which matters because the two tails are usually
+/// opposite ends of the colormap.
+pub(super) fn threshold_boundary_luminances(
+    threshold: Threshold,
+    range: ValueRange,
+    colormap: OverlayColorMap,
+) -> Vec<f32> {
+    let Some(ColorMap::Continuous(map)) = colormap.continuous_color_map() else {
+        return Vec::new();
+    };
+    let span = f64::from(range.max) - f64::from(range.min);
+    threshold_boundaries(threshold)
+        .into_iter()
+        .map(|boundary| {
+            if !span.is_finite() || span == 0.0 {
+                return THRESHOLD_CONTOUR_DEFAULT_LUMINANCE;
+            }
+            let normalized = ((boundary.value - f64::from(range.min)) / span) as f32;
+            let color = map.sample(normalized.clamp(0.0, 1.0)).to_array();
+            luminance([color[0], color[1], color[2]])
+        })
+        .collect()
+}
+
+fn contour_normal_offset(geometry: &PreparedGeometry) -> f32 {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for vertex in &geometry.vertices {
+        let position = Vec3::from_array(vertex.position);
+        min = min.min(position);
+        max = max.max(position);
+    }
+    let diagonal = (max - min).length();
+    if diagonal.is_finite() {
+        diagonal.max(1.0) * THRESHOLD_CONTOUR_OFFSET_FACTOR
+    } else {
+        THRESHOLD_CONTOUR_OFFSET_FACTOR
     }
 }
 
@@ -582,6 +974,10 @@ impl OverlayAppearance {
                 value: 0.0,
                 hide_failed: true,
             },
+            transparent_threshold: false,
+            boxed_threshold: false,
+            fade: FadeSettings::new(),
+            contour: ThresholdContourStyle::new(),
             opacity: 1.0,
             dim: 1.0,
         }
@@ -788,13 +1184,15 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SURFACE_COLOR, PreparedGeometry, PreparedSurface, RoiAppearance,
-        SelectionHighlight, cell_color_chunk_ranges,
+        CONTOUR_VERTEX_FLOATS, DEFAULT_SURFACE_COLOR, OverlayColorMap, PreparedGeometry,
+        PreparedSurface, PreparedThresholdContour, RoiAppearance, SelectionHighlight,
+        ThresholdContourStyle, cell_color_chunk_ranges, threshold_boundary_luminances,
+        threshold_contour_segments,
     };
     use crate::color::ColorMap;
     use crate::dataset::{ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind};
     use crate::overlay::{MaskMode, Overlay, OverlayColumns, RangeSelection, Threshold};
-    use crate::surface::SurfaceMesh;
+    use crate::surface::{SurfaceMesh, ValueRange};
     use glam::Vec3;
 
     #[test]
@@ -1061,6 +1459,199 @@ mod tests {
             prepared.vertices.len() * 4 * 4
         );
         assert_eq!(prepared.index_bytes().len(), prepared.indices.len() * 4);
+    }
+
+    #[test]
+    fn marching_triangles_interpolates_one_threshold_segment() {
+        let geometry = PreparedGeometry::from_surface(&triangle_mesh());
+        let segments =
+            threshold_contour_segments(&geometry, &[0.0, 2.0, 2.0], Threshold::above(1.0));
+
+        assert_eq!(segments.len(), 1);
+        let (boundary_index, segment) = segments[0];
+        assert_eq!(boundary_index, 0);
+        assert!((segment.start.position[2]).abs() <= f32::EPSILON);
+        assert!((segment.end.position[2]).abs() <= f32::EPSILON);
+        assert_eq!(segment.start.normal, [0.0, 0.0, 1.0]);
+        assert_eq!(segment.end.normal, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn marching_triangles_emits_both_between_and_outside_boundaries() {
+        let geometry = PreparedGeometry::from_surface(&triangle_mesh());
+        let values = [0.0, 2.0, 4.0];
+
+        assert_eq!(
+            threshold_contour_segments(&geometry, &values, Threshold::between(1.0, 3.0)).len(),
+            2
+        );
+        assert_eq!(
+            threshold_contour_segments(&geometry, &values, Threshold::outside(1.0, 3.0)).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn marching_triangles_handles_exact_vertices_and_deduplicates_shared_edges() {
+        let mesh = SurfaceMesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            vec![[0, 1, 2], [1, 0, 3]],
+        )
+        .unwrap();
+        let geometry = PreparedGeometry::from_surface(&mesh);
+
+        assert_eq!(
+            threshold_contour_segments(&geometry, &[1.0, 1.0, 0.0, 0.0], Threshold::above(1.0),)
+                .len(),
+            1
+        );
+        assert!(
+            threshold_contour_segments(&geometry, &[1.0, 2.0, 2.0, 2.0], Threshold::above(1.0),)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn marching_triangles_respects_below_threshold_boundary_inclusivity() {
+        let geometry = PreparedGeometry::from_surface(&triangle_mesh());
+        assert_eq!(
+            threshold_contour_segments(&geometry, &[1.0, 1.0, 2.0], Threshold::below(1.0),).len(),
+            1
+        );
+        assert!(
+            threshold_contour_segments(&geometry, &[1.0, 0.0, 0.0], Threshold::below(1.0),)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn paired_component_contours_use_their_local_threshold_slices() {
+        let left = PreparedGeometry::from_surface(&triangle_mesh());
+        let right = PreparedGeometry::from_surface(&triangle_mesh());
+        let combined_values = [0.0, 2.0, 2.0, 2.0, 0.0, 0.0];
+
+        assert_eq!(
+            threshold_contour_segments(&left, &combined_values[..3], Threshold::above(1.0),).len(),
+            1
+        );
+        assert_eq!(
+            threshold_contour_segments(&right, &combined_values[3..], Threshold::above(1.0),).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn marching_triangles_skips_triangles_with_sparse_or_non_finite_values() {
+        let geometry = PreparedGeometry::from_surface(&triangle_mesh());
+        assert!(
+            threshold_contour_segments(&geometry, &[0.0, f32::NAN, 2.0], Threshold::above(1.0),)
+                .is_empty()
+        );
+        assert!(
+            threshold_contour_segments(&geometry, &[0.0, 2.0], Threshold::above(1.0)).is_empty()
+        );
+    }
+
+    #[test]
+    fn prepared_threshold_contour_builds_quads_with_surface_offset() {
+        let geometry = PreparedGeometry::from_surface(&triangle_mesh());
+        let contour = PreparedThresholdContour::from_geometry(
+            &geometry,
+            &[0.0, 2.0, 2.0],
+            Threshold::above(1.0),
+            &[0.9],
+        );
+
+        // One crossing segment becomes one quad: four corners, two triangles.
+        assert_eq!(contour.vertices.len(), 4);
+        assert_eq!(contour.indices, vec![0, 1, 2, 1, 3, 2]);
+
+        // Both endpoints travel with every corner so the shader can measure the
+        // segment direction in screen space, and both are lifted off the
+        // surface along its normal.
+        for vertex in &contour.vertices {
+            assert!(vertex.segment_start[2] > 0.0);
+            assert!(vertex.segment_end[2] > 0.0);
+            assert_eq!(vertex.params[2], 0.9);
+        }
+
+        // The four corners cover both sides of the centerline at both ends.
+        let corners: Vec<(f32, f32)> = contour
+            .vertices
+            .iter()
+            .map(|vertex| (vertex.params[0], vertex.params[1]))
+            .collect();
+        assert_eq!(
+            corners,
+            vec![(1.0, 0.0), (-1.0, 0.0), (1.0, 1.0), (-1.0, 1.0)]
+        );
+
+        assert_eq!(
+            contour.vertex_bytes().len(),
+            contour.vertices.len() * CONTOUR_VERTEX_FLOATS * 4
+        );
+    }
+
+    #[test]
+    fn contour_style_casing_widens_and_opposes_the_inner_line() {
+        let mut style = ThresholdContourStyle::new();
+        style.width_px = 2.0;
+        style.halo_px = 1.5;
+        // The casing extends past the inner line on both sides.
+        assert_eq!(style.halo_width_px(), 5.0);
+        assert!(style.draws_halo());
+
+        // A white line gets a black casing and vice versa, so the pair reads on
+        // any background.
+        style.color = [1.0, 1.0, 1.0];
+        assert_eq!(style.halo_color(), [0.0, 0.0, 0.0]);
+        style.color = [0.0, 0.0, 0.0];
+        assert_eq!(style.halo_color(), [1.0, 1.0, 1.0]);
+
+        style.halo_px = 0.0;
+        assert!(!style.draws_halo());
+        assert_eq!(style.halo_width_px(), style.width_px);
+    }
+
+    #[test]
+    fn boundary_luminances_follow_the_colormap_at_each_tail() {
+        // A two-sided threshold outlines both tails, which sit at opposite ends
+        // of the colormap and so need their own contrast decisions.
+        let range = ValueRange {
+            min: -5.0,
+            max: 5.0,
+        };
+        let luminances = threshold_boundary_luminances(
+            Threshold::outside(-2.0, 2.0),
+            range,
+            OverlayColorMap::BlueWhiteRed,
+        );
+        assert_eq!(luminances.len(), 2);
+        assert!(luminances.iter().all(|value| (0.0..=1.0).contains(value)));
+
+        // Label overlays have no continuous colormap to sample; callers fall
+        // back to the default rather than getting a wrong answer.
+        assert!(
+            threshold_boundary_luminances(
+                Threshold::above(2.0),
+                range,
+                OverlayColorMap::DiscreteLabels,
+            )
+            .is_empty()
+        );
+
+        // A degenerate range must not produce NaN luminance.
+        let flat = ValueRange { min: 1.0, max: 1.0 };
+        for luminance in
+            threshold_boundary_luminances(Threshold::above(2.0), flat, OverlayColorMap::Fire)
+        {
+            assert!(luminance.is_finite());
+        }
     }
 
     #[test]

@@ -783,10 +783,16 @@ impl ViewerState {
         self.afni_live_overlay_active = true;
         self.overlay.render.render_model = Some(overlay_model);
         self.overlay.data = DatasetOverlayState::None;
+        self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.overlay.source.path = None;
         self.overlay.source.pair_paths = None;
         self.controller.surface.current_overlay_path = None;
         self.overlay.source.display_name = Some("AFNI SUMA_irgba".to_string());
+        // Live SUMA_irgba carries opaque, already-thresholded colors but no
+        // per-node threshold scalar, so transparent thresholding cannot be
+        // evaluated for this replacement overlay.
+        self.overlay.render.appearance.transparent_threshold = false;
+        self.overlay.render.appearance.boxed_threshold = false;
         if let Some(threshold) = overlay
             .threshold
             .as_deref()
