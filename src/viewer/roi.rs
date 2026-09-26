@@ -1226,6 +1226,7 @@ fn cluster_dataset_payload(
         filename,
         label: Some("sumaru clusters".to_string()),
         sparse_data: Some(matrix),
+        time_step_seconds: None,
         node_indices: Some(node_indices),
         column_ranges: Vec::new(),
         column_labels: vec!["Cluster".to_string()],

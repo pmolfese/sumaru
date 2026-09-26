@@ -10,6 +10,8 @@ pub struct Dataset {
     pub row_count: usize,
     pub node_indices: Option<Vec<u32>>,
     pub columns: Vec<DataColumn>,
+    /// Sampling interval for time-series columns, in seconds when known.
+    pub time_step_seconds: Option<f64>,
     pub parent_ids: DatasetParentIds,
 }
 
@@ -124,6 +126,7 @@ impl Dataset {
             row_count,
             node_indices: None,
             columns,
+            time_step_seconds: None,
             parent_ids: DatasetParentIds::default(),
         })
     }
@@ -157,12 +160,19 @@ impl Dataset {
             row_count,
             node_indices: Some(node_indices),
             columns,
+            time_step_seconds: None,
             parent_ids: DatasetParentIds::default(),
         })
     }
 
     pub fn with_parent_ids(mut self, parent_ids: DatasetParentIds) -> Self {
         self.parent_ids = parent_ids;
+        self
+    }
+
+    pub fn with_time_step_seconds(mut self, time_step_seconds: Option<f64>) -> Self {
+        self.time_step_seconds =
+            time_step_seconds.filter(|value| value.is_finite() && *value > 0.0);
         self
     }
 

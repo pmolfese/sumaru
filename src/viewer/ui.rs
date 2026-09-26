@@ -35,6 +35,7 @@ impl ViewerState {
                 .show(ui, |ui| {
                     ui.set_min_width(CONTROL_CONTENT_WIDTH_POINTS);
                     self.draw_surface_dataset_section(ui, &mut actions);
+                    self.draw_scene_objects_section(ui, &mut actions);
                     self.draw_overlay_workbench(ui, &mut actions);
                     self.draw_scene_section(ui);
                     self.draw_pick_section(ui);
@@ -76,6 +77,14 @@ impl ViewerState {
                             actions.push(ViewerCommand::PickSurfaceVolume);
                             ui.close();
                         }
+                        if ui.button("Open Tractography...").clicked() {
+                            actions.push(ViewerCommand::PickTract);
+                            ui.close();
+                        }
+                        if ui.button("Open Graph Dataset...").clicked() {
+                            actions.push(ViewerCommand::PickGraphDataset);
+                            ui.close();
+                        }
                         ui.separator();
                         if ui
                             .add_enabled(self.mesh.is_some(), egui::Button::new("Open Overlay..."))
@@ -94,7 +103,9 @@ impl ViewerState {
                         ui.separator();
                         if ui
                             .add_enabled(
-                                self.surface_buffers.is_some(),
+                                self.has_renderable_surface()
+                                    || self.volume_view.is_some()
+                                    || !self.scene_objects.is_empty(),
                                 egui::Button::new("Save View..."),
                             )
                             .clicked()
@@ -303,6 +314,13 @@ impl ViewerState {
                         }
                     });
 
+                    ui.menu_button("Settings", |ui| {
+                        if ui.button("Preferences...").clicked() {
+                            self.preferences_open = true;
+                            ui.close();
+                        }
+                    });
+
                     if let Some(volume_view) = self.volume_view.as_ref() {
                         let selected_label = volume_view.selected_label();
                         ui.menu_button("Volume", |ui| {
@@ -367,9 +385,77 @@ impl ViewerState {
         }
 
         self.draw_go_to_location(ctx, &mut actions);
+        self.draw_preferences_window(ctx);
+        self.draw_instacorr_window(ctx);
+        self.draw_scene_object_labels(ctx);
         self.draw_view_transient_label(ctx);
 
         actions
+    }
+
+    fn draw_scene_object_labels(&self, ctx: &egui::Context) {
+        if !self.scene_objects.iter().any(|object| {
+            object.visible
+                && object.graph_labels_visible
+                && matches!(object.payload, SceneObjectPayload::Graph(_))
+        }) {
+            return;
+        }
+        let scene_size = self.scene_viewport_size();
+        let pixels_per_point = ctx.pixels_per_point().max(0.01);
+        let width_points = scene_size.width as f32 / pixels_per_point;
+        let height_points = scene_size.height as f32 / pixels_per_point;
+        let transform = self
+            .camera
+            .view_projection_matrix(self.scene_viewport_aspect())
+            * self.scene_object_model();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("scene_object_node_labels"),
+        ));
+        for object in &self.scene_objects {
+            if !object.visible || !object.graph_labels_visible {
+                continue;
+            }
+            let SceneObjectPayload::Graph(data) = &object.payload else {
+                continue;
+            };
+            for (index, node) in data.nodes.iter().enumerate() {
+                let clip = transform * Vec3::from_array(node.position).extend(1.0);
+                if clip.w <= 0.0 {
+                    continue;
+                }
+                let ndc = clip.truncate() / clip.w;
+                if ndc.x.abs() > 1.0 || ndc.y.abs() > 1.0 || !(0.0..=1.0).contains(&ndc.z) {
+                    continue;
+                }
+                let position = egui::pos2(
+                    (ndc.x + 1.0) * 0.5 * width_points + 7.0,
+                    (1.0 - ndc.y) * 0.5 * height_points,
+                );
+                let [red, green, blue, _] =
+                    stable_label_color(node.index.max(index as i32 + 1), 255).to_array();
+                let color = egui::Color32::from_rgb(
+                    (red * 255.0) as u8,
+                    (green * 255.0) as u8,
+                    (blue * 255.0) as u8,
+                );
+                let text = if node.label.is_empty() {
+                    node.index.to_string()
+                } else {
+                    node.label.clone()
+                };
+                let font = egui::FontId::proportional(12.0);
+                painter.text(
+                    position + egui::vec2(1.0, 1.0),
+                    egui::Align2::LEFT_CENTER,
+                    &text,
+                    font.clone(),
+                    egui::Color32::BLACK,
+                );
+                painter.text(position, egui::Align2::LEFT_CENTER, text, font, color);
+            }
+        }
     }
 
     pub(super) fn draw_graph_dock_ui(
@@ -858,6 +944,202 @@ impl ViewerState {
         });
     }
 
+    pub(super) fn draw_scene_objects_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<ViewerCommand>,
+    ) {
+        controller_section(ui, "TRACTS / GRAPHS", true, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Open tracts...").clicked() {
+                    actions.push(ViewerCommand::PickTract);
+                }
+                if ui.button("Open graph...").clicked() {
+                    actions.push(ViewerCommand::PickGraphDataset);
+                }
+            });
+
+            if self.scene_objects.is_empty() {
+                ui.weak("No tractography or graph objects loaded.");
+                return;
+            }
+
+            ui.add_space(5.0);
+            for (index, object) in self.scene_objects.iter().enumerate() {
+                let selected = self.active_scene_object == Some(index);
+                let mut visible = object.visible;
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut visible, "").changed() {
+                        actions.push(ViewerCommand::SetSceneObjectVisible(index, visible));
+                    }
+                    if ui.selectable_label(selected, &object.name).clicked() {
+                        actions.push(ViewerCommand::SelectSceneObject(index));
+                    }
+                });
+            }
+
+            let Some(index) = self.active_scene_object else {
+                return;
+            };
+            let Some(object) = self.scene_objects.get(index) else {
+                return;
+            };
+            ui.add_space(6.0);
+            ui.small(object.detail());
+            let mut width = object.width_points;
+            if ui
+                .add(egui::Slider::new(&mut width, 0.25..=12.0).text("Ribbon width"))
+                .changed()
+            {
+                actions.push(ViewerCommand::SetSceneObjectWidth(index, width));
+            }
+            let mut opacity = object.opacity;
+            if ui
+                .add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"))
+                .changed()
+            {
+                actions.push(ViewerCommand::SetSceneObjectOpacity(index, opacity));
+            }
+            match &object.payload {
+                SceneObjectPayload::Tracts(data) => {
+                    let mut mode = object.tract_color_mode;
+                    egui::ComboBox::from_id_salt("tract_color_mode")
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            for option in TractColorMode::ALL {
+                                ui.selectable_value(&mut mode, option, option.label());
+                            }
+                        });
+                    if mode != object.tract_color_mode {
+                        actions.push(ViewerCommand::SetTractColorMode(index, mode));
+                    }
+                    ui.add_space(3.0);
+                    ui.strong("Bundles");
+                    egui::ScrollArea::vertical()
+                        .id_salt("tract_bundle_list")
+                        .max_height(170.0)
+                        .show(ui, |ui| {
+                            for (bundle_index, bundle) in data.bundles.iter().enumerate() {
+                                let Some(appearance) = object.tract_bundles.get(bundle_index)
+                                else {
+                                    continue;
+                                };
+                                let label = bundle
+                                    .ends
+                                    .as_deref()
+                                    .map(str::to_owned)
+                                    .or_else(|| bundle.tag.map(|tag| format!("Bundle {tag}")))
+                                    .unwrap_or_else(|| format!("Bundle {}", bundle_index + 1));
+                                let mut visible = appearance.visible;
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut visible, "").changed() {
+                                        actions.push(ViewerCommand::SetTractBundleVisible(
+                                            index,
+                                            bundle_index,
+                                            visible,
+                                        ));
+                                    }
+                                    ui.label(format!("{label} ({} tracts)", bundle.tracts.len()));
+                                });
+                                let mut bundle_opacity = appearance.opacity;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut bundle_opacity, 0.0..=1.0)
+                                            .text("opacity"),
+                                    )
+                                    .changed()
+                                {
+                                    actions.push(ViewerCommand::SetTractBundleOpacity(
+                                        index,
+                                        bundle_index,
+                                        bundle_opacity,
+                                    ));
+                                }
+                            }
+                        });
+                }
+                SceneObjectPayload::Graph(data) => {
+                    let mut measure = object
+                        .graph_measure
+                        .min(data.edge_column_count.saturating_sub(1));
+                    let measure_label = data
+                        .edge_labels
+                        .get(measure)
+                        .cloned()
+                        .unwrap_or_else(|| format!("Measure {}", measure + 1));
+                    egui::ComboBox::from_id_salt("graph_measure")
+                        .selected_text(measure_label)
+                        .show_ui(ui, |ui| {
+                            for measure_index in 0..data.edge_column_count {
+                                let label =
+                                    data.edge_labels.get(measure_index).cloned().unwrap_or_else(
+                                        || format!("Measure {}", measure_index + 1),
+                                    );
+                                ui.selectable_value(&mut measure, measure_index, label);
+                            }
+                        });
+                    if measure != object.graph_measure {
+                        actions.push(ViewerCommand::SetGraphMeasure(index, measure));
+                    }
+                    let max_abs = data
+                        .column_range(measure)
+                        .map(|(min, max)| min.abs().max(max.abs()))
+                        .unwrap_or(1.0)
+                        .max(f32::EPSILON);
+                    let mut threshold = object.graph_threshold.min(max_abs);
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut threshold, 0.0..=max_abs)
+                                .text("|value| threshold"),
+                        )
+                        .changed()
+                    {
+                        actions.push(ViewerCommand::SetGraphThreshold(index, threshold));
+                    }
+                    let mut color_mode = object.graph_color_mode;
+                    egui::ComboBox::from_id_salt("graph_color_mode")
+                        .selected_text(color_mode.label())
+                        .show_ui(ui, |ui| {
+                            for option in GraphColorMode::ALL {
+                                ui.selectable_value(&mut color_mode, option, option.label());
+                            }
+                        });
+                    if color_mode != object.graph_color_mode {
+                        actions.push(ViewerCommand::SetGraphColorMode(index, color_mode));
+                    }
+                    let mut node_size = object.graph_node_size_points;
+                    if ui
+                        .add(egui::Slider::new(&mut node_size, 2.0..=40.0).text("Node size"))
+                        .changed()
+                    {
+                        actions.push(ViewerCommand::SetGraphNodeSize(index, node_size));
+                    }
+                    let mut labels_visible = object.graph_labels_visible;
+                    if ui
+                        .checkbox(&mut labels_visible, "Show node labels")
+                        .changed()
+                    {
+                        actions.push(ViewerCommand::SetGraphLabelsVisible(index, labels_visible));
+                    }
+                }
+            }
+            if let Some(pick) = self
+                .scene_object_pick
+                .as_ref()
+                .filter(|pick| pick.object_index() == index)
+            {
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new("Selection").strong());
+                ui.small(pick.status_text());
+            } else {
+                ui.weak("Right-click a tract, graph node, or graph edge to inspect it.");
+            }
+            if ui.button("Remove object").clicked() {
+                actions.push(ViewerCommand::RemoveSceneObject(index));
+            }
+        });
+    }
+
     pub(super) fn draw_overlay_workbench(
         &mut self,
         ui: &mut egui::Ui,
@@ -878,6 +1160,64 @@ impl ViewerState {
         let mut changed = false;
 
         controller_section(ui, "OVERLAY WORKBENCH", true, |ui| {
+            if self.overlay_count() > 0 {
+                let active = self.active_overlay_index().unwrap_or(0);
+                let mut requested = active;
+                ui.horizontal(|ui| {
+                    ui.label("Dataset");
+                    egui::ComboBox::from_id_salt("active_overlay_selector")
+                        .selected_text(
+                            self.overlay_label_at(active)
+                                .unwrap_or_else(|| "none".to_string()),
+                        )
+                        .width(OVERLAY_SELECTOR_WIDTH_POINTS)
+                        .show_ui(ui, |ui| {
+                            for index in 0..self.overlay_count() {
+                                let label = self
+                                    .overlay_label_at(index)
+                                    .unwrap_or_else(|| format!("Overlay {}", index + 1));
+                                ui.selectable_value(&mut requested, index, label);
+                            }
+                        });
+                    if ui
+                        .add_enabled(self.overlay_count() > 1, egui::Button::new("◀"))
+                        .on_hover_text("Previous overlay (Ctrl+PageUp)")
+                        .clicked()
+                    {
+                        actions.push(ViewerCommand::CycleOverlay(-1));
+                    }
+                    if ui
+                        .add_enabled(self.overlay_count() > 1, egui::Button::new("▶"))
+                        .on_hover_text("Next overlay (Ctrl+PageDown)")
+                        .clicked()
+                    {
+                        actions.push(ViewerCommand::CycleOverlay(1));
+                    }
+                    if ui
+                        .button("Remove")
+                        .on_hover_text("Unload the active overlay")
+                        .clicked()
+                    {
+                        actions.push(ViewerCommand::RemoveActiveOverlay);
+                    }
+                });
+                if requested != active {
+                    actions.push(ViewerCommand::SelectOverlay(requested));
+                }
+                ui.separator();
+            }
+            if let Some((state, detail)) = self.instacorr_readout() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("InstaCorr").color(accent_color()));
+                    ui.label(state);
+                    if ui.small_button("Controls").clicked() {
+                        self.instacorr_window_open = true;
+                        self.view_window().request_redraw();
+                    }
+                });
+                ui.label(egui::RichText::new(detail).small().color(muted_color()));
+                ui.separator();
+            }
             if !overlay_loaded {
                 ui.label(egui::RichText::new("No overlay loaded").color(muted_color()));
                 return;
@@ -992,12 +1332,12 @@ impl ViewerState {
                             ))
                             .color(muted_color()),
                         );
-                        if let Some(q_value) = self.selected_threshold_q_value() {
-                            ui.label(
-                                egui::RichText::new(threshold_q_value_display(q_value))
-                                    .color(muted_color()),
-                            );
-                        }
+                        ui.label(
+                            egui::RichText::new(threshold_q_value_display(
+                                self.selected_threshold_q_value(),
+                            ))
+                            .color(muted_color()),
+                        );
                     },
                 );
 
@@ -1426,6 +1766,57 @@ impl ViewerState {
         }
     }
 
+    fn draw_preferences_window(&mut self, ctx: &egui::Context) {
+        if !self.preferences_open {
+            return;
+        }
+        let mut open = true;
+        let mut threshold_sync = self.preferences.overlay_threshold_sync;
+        let mut changed = false;
+        egui::Window::new("Preferences")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                ui.heading("Overlay switching");
+                ui.label("When the active overlay changes:");
+                ui.add_space(4.0);
+                for option in OverlayThresholdSync::ALL {
+                    changed |= ui
+                        .radio_value(&mut threshold_sync, option, option.label())
+                        .on_hover_text(option.description())
+                        .changed();
+                    if threshold_sync == option {
+                        ui.indent(option.label(), |ui| {
+                            ui.label(
+                                egui::RichText::new(option.description()).color(muted_color()),
+                            );
+                        });
+                    }
+                }
+                ui.separator();
+                if let Some(path) = self.preferences_path.as_ref() {
+                    ui.label(
+                        egui::RichText::new(format!("Saved automatically to {}", path.display()))
+                            .color(muted_color()),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Preferences cannot be persisted: no home directory")
+                            .color(egui::Color32::LIGHT_RED),
+                    );
+                }
+                if let Some(status) = self.preferences_status.as_deref() {
+                    ui.label(egui::RichText::new(status).color(muted_color()));
+                }
+            });
+        self.preferences_open = open;
+        if changed {
+            self.preferences.overlay_threshold_sync = threshold_sync;
+            self.save_preferences();
+        }
+    }
+
     pub(super) fn draw_overlay_range_controls(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
 
@@ -1491,7 +1882,7 @@ impl ViewerState {
         dataset.columns.get(index)?.stat.clone()
     }
 
-    fn selected_threshold_stat_spec(&self) -> Option<AfniStatSpec> {
+    pub(super) fn selected_threshold_stat_spec(&self) -> Option<AfniStatSpec> {
         self.selected_threshold_stat_label()
             .as_deref()
             .and_then(AfniStatSpec::parse)

@@ -182,6 +182,7 @@ impl ViewerState {
         };
         self.log_status(pick.status_text());
         self.controller.interaction.set_pick(Some(pick));
+        self.note_instacorr_pick(pick.node_index);
         if let Err(error) = self.send_afni_crosshair_for_pick(pick) {
             self.set_error(error);
         }

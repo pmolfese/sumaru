@@ -85,14 +85,6 @@ impl ViewerState {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
                 ..
-            } if self.volume_view.is_some() => {
-                self.select_volume_plane_at_cursor();
-                true
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Right,
-                ..
             } => {
                 let roi_draw_active = self
                     .roi_workspace
@@ -102,8 +94,12 @@ impl ViewerState {
                     if let Err(error) = self.handle_roi_draw_click_at_cursor() {
                         self.set_error(error);
                     }
+                } else if self.inspect_scene_object_at_cursor() {
+                    // The scene-object hit owns this click.
+                } else if self.volume_view.is_some() {
+                    self.select_volume_plane_at_cursor();
                 } else {
-                    self.inspect_surface_at_cursor();
+                    self.inspect_surface_at_cursor(!self.modifiers.shift_key());
                 }
                 true
             }
@@ -111,6 +107,12 @@ impl ViewerState {
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
                 match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyD)
+                        if !self.modifiers.control_key() && !self.modifiers.alt_key() =>
+                    {
+                        self.toggle_instacorr();
+                        true
+                    }
                     PhysicalKey::Code(KeyCode::KeyR) if self.modifiers.control_key() => {
                         self.set_roi_controller_open(true);
                         true
@@ -125,6 +127,14 @@ impl ViewerState {
                         if let Err(error) = self.force_resend_afni_surfaces() {
                             self.set_error(error);
                         }
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::PageUp) if self.modifiers.control_key() => {
+                        self.apply_commands(vec![ViewerCommand::CycleOverlay(-1)]);
+                        true
+                    }
+                    PhysicalKey::Code(KeyCode::PageDown) if self.modifiers.control_key() => {
+                        self.apply_commands(vec![ViewerCommand::CycleOverlay(1)]);
                         true
                     }
                     PhysicalKey::Code(KeyCode::KeyT) => {

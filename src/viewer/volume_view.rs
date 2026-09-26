@@ -103,6 +103,10 @@ pub(super) struct VolumeView {
 }
 
 impl VolumeView {
+    pub(super) fn scene_model(&self) -> Mat4 {
+        self.scene_model
+    }
+
     /// Upload `volume` to the GPU and build the slice-plane pipeline. Axial is
     /// enabled by default, centered in the volume.
     pub(super) fn new(

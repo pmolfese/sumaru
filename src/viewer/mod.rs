@@ -39,6 +39,8 @@ use crate::command::{
 use crate::dataset::{
     ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds,
 };
+use crate::graph_dataset::read_graph_bucket;
+use crate::instacorr::{InstaCorrOptions, PreparedInstaCorr, prepare_dataset};
 use crate::io::{
     NimlElement, read_gifti_dataset, read_gifti_image, read_niml_dataset,
     read_niml_dataset_with_label_table, read_niml_roi, write_niml_roi,
@@ -48,6 +50,7 @@ use crate::overlay::{
     ColumnSelection, FadeCurve, FadeWidth, MaskMode, Overlay, OverlayColumns, RangeSelection,
     Threshold,
 };
+use crate::preferences::{AppPreferences, OverlayThresholdSync, default_preferences_path};
 use crate::roi::{
     Roi, RoiBrushAction, RoiDatum, RoiDrawStatus, RoiDrawingType, RoiElementKind, RoiSource,
 };
@@ -57,6 +60,7 @@ use crate::surface::{
     AnatomicalCorrectness, NodeMask, NormalDirection, OverlayDataset, SmoothingWeights,
     SurfaceDomain, SurfaceDomainId, SurfaceId, SurfaceKind, SurfaceMesh, SurfaceSide, ValueRange,
 };
+use crate::tractography::{SpatialBounds, read_niml_tract};
 use camera::{Camera, CameraMode, CameraNudgeDirection, PresetOrientation};
 use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
@@ -80,17 +84,26 @@ mod edit;
 mod gpu;
 mod graph;
 mod input;
+mod instacorr;
 mod mesh;
 mod overlay_load;
+mod overlay_stack;
 mod pairing;
 mod pick;
 mod roi;
 mod scene;
+mod scene_objects;
 mod screenshot;
 mod transform;
 mod ui;
 mod volume_view;
 use edit::{CoordConvention, GoToLocationState};
+use instacorr::{InstaCorrSession, InstaCorrWorkerResult};
+pub use scene_objects::{GraphColorMode, TractColorMode};
+use scene_objects::{
+    SceneObject, SceneObjectGpu, SceneObjectPayload, SceneObjectPick, SceneObjectRenderer,
+    normalization_model, pick_scene_objects,
+};
 use volume_view::{SlicePlane, VolumeView};
 
 impl From<CameraMode> for CameraControlMode {
@@ -348,6 +361,8 @@ pub struct LaunchOptions {
     pub surface_rh_path: Option<PathBuf>,
     pub surface_volume_path: Option<PathBuf>,
     pub volume_path: Option<PathBuf>,
+    pub tract_paths: Vec<PathBuf>,
+    pub graph_paths: Vec<PathBuf>,
     pub overlay_path: Option<PathBuf>,
     pub overlay_pair_paths: Option<ExplicitOverlayPair>,
     pub roi_path: Option<PathBuf>,
@@ -427,6 +442,8 @@ struct ViewerApp {
     initial_surface_rh_path: Option<PathBuf>,
     initial_surface_volume_path: Option<PathBuf>,
     initial_volume_path: Option<PathBuf>,
+    initial_tract_paths: Vec<PathBuf>,
+    initial_graph_paths: Vec<PathBuf>,
     initial_overlay_path: Option<PathBuf>,
     initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
     initial_roi_path: Option<PathBuf>,
@@ -454,6 +471,8 @@ impl ViewerApp {
             initial_surface_rh_path: options.surface_rh_path,
             initial_surface_volume_path: options.surface_volume_path,
             initial_volume_path: options.volume_path,
+            initial_tract_paths: options.tract_paths,
+            initial_graph_paths: options.graph_paths,
             initial_overlay_path: options.overlay_path,
             initial_overlay_pair_paths: options.overlay_pair_paths,
             initial_roi_path: options.roi_path,
@@ -532,6 +551,8 @@ impl ViewerApp {
                 surface_rh_path: self.initial_surface_rh_path.take(),
                 surface_volume_path: self.initial_surface_volume_path.take(),
                 volume_path: self.initial_volume_path.take(),
+                tract_paths: std::mem::take(&mut self.initial_tract_paths),
+                graph_paths: std::mem::take(&mut self.initial_graph_paths),
                 overlay_path: self.initial_overlay_path.take(),
                 overlay_pair_paths: self.initial_overlay_pair_paths.take(),
                 roi_path: self.initial_roi_path.take(),
@@ -776,6 +797,12 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             ViewerEvent::SceneStatsReady => {
                 if state.drain_scene_stats() {
                     // Only the controls panel shows scene stats.
+                    state.control_window().request_redraw();
+                }
+            }
+            ViewerEvent::InstaCorrComputed => {
+                if state.drain_instacorr_results() {
+                    state.view_window().request_redraw();
                     state.control_window().request_redraw();
                 }
             }
@@ -1078,6 +1105,8 @@ struct OverlaySourceInfo {
     label_table: Option<LabelTable>,
     /// Friendly label that overrides the file name in the UI when set.
     display_name: Option<String>,
+    /// Stable identity for an in-memory generated overlay such as InstaCorr.
+    generated_id: Option<u64>,
 }
 
 /// The canonical overlay data and the per-node scalars derived from it. Either
@@ -1186,6 +1215,33 @@ struct ViewerOverlayState {
     render: OverlayRenderCache,
 }
 
+/// Stable file identity for one logical overlay. Hemisphere pairs are one key
+/// and therefore one selector entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OverlayKey {
+    Single(PathBuf),
+    Pair {
+        left: Option<PathBuf>,
+        right: Option<PathBuf>,
+    },
+    Generated(u64),
+}
+
+/// Inactive overlays live in `slots`; the active slot is `None` because its
+/// state is held in `ViewerState::overlay`, preserving the existing render hot
+/// path without cloning large datasets on every switch.
+#[derive(Default)]
+struct ViewerOverlayStack {
+    slots: Vec<Option<ViewerOverlayState>>,
+    active: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OverlayThresholdTransfer {
+    threshold: OverlayThreshold,
+    p_value: Option<f64>,
+}
+
 impl ViewerOverlayState {
     /// Reset to the unloaded state (used by `reset_scene_state`).
     fn clear(&mut self) {
@@ -1229,6 +1285,8 @@ struct InitialScene {
     surface_rh_path: Option<PathBuf>,
     surface_volume_path: Option<PathBuf>,
     volume_path: Option<PathBuf>,
+    tract_paths: Vec<PathBuf>,
+    graph_paths: Vec<PathBuf>,
     overlay_path: Option<PathBuf>,
     overlay_pair_paths: Option<ExplicitOverlayPair>,
     roi_path: Option<PathBuf>,
@@ -1290,6 +1348,11 @@ struct ViewerState {
     graph_dock_height_points: f32,
     startup_redraw_until: Instant,
     surface_render_pipelines: SurfaceRenderPipelines,
+    scene_object_renderer: SceneObjectRenderer,
+    scene_objects: Vec<SceneObject>,
+    scene_object_gpu: Vec<SceneObjectGpu>,
+    active_scene_object: Option<usize>,
+    scene_object_pick: Option<SceneObjectPick>,
     surface_buffers: Option<SurfaceBuffers>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
@@ -1315,6 +1378,17 @@ struct ViewerState {
     scene_generation: u64,
     controller: ControllerState,
     overlay: ViewerOverlayState,
+    overlay_stack: ViewerOverlayStack,
+    preferences: AppPreferences,
+    preferences_path: Option<PathBuf>,
+    preferences_open: bool,
+    preferences_status: Option<String>,
+    instacorr_sessions: Vec<InstaCorrSession>,
+    active_instacorr_session: Option<u64>,
+    instacorr_window_open: bool,
+    next_instacorr_id: u64,
+    instacorr_sender: mpsc::Sender<InstaCorrWorkerResult>,
+    instacorr_receiver: mpsc::Receiver<InstaCorrWorkerResult>,
     auto_color_niml: bool,
     auto_niml_overlay_active: bool,
     auto_niml_overlay_subs: Option<Vec<String>>,
@@ -1411,6 +1485,8 @@ impl ViewerState {
             surface_rh_path: initial_surface_rh_path,
             surface_volume_path: initial_surface_volume_path,
             volume_path: initial_volume_path,
+            tract_paths: initial_tract_paths,
+            graph_paths: initial_graph_paths,
             overlay_path: initial_overlay_path,
             overlay_pair_paths: initial_overlay_pair_paths,
             roi_path: initial_roi_path,
@@ -1705,6 +1781,7 @@ impl ViewerState {
             }),
         };
         let depth_buffer = DepthBuffer::new(&device, view_config.width, view_config.height);
+        let scene_object_renderer = SceneObjectRenderer::new(&device, surface_format);
         let view_egui_ctx = egui::Context::default();
         view_egui_ctx.set_visuals(egui::Visuals::dark());
         let mut view_egui_state = egui_winit::State::new(
@@ -1760,6 +1837,27 @@ impl ViewerState {
             query_afni_dataset_idcode_optional(initial_surface_volume_path.as_deref())?;
         let afni_recorder = niml_record_path.map(NimlRecorder::create).transpose()?;
         let (scene_stats_sender, scene_stats_receiver) = mpsc::channel();
+        let (instacorr_sender, instacorr_receiver) = mpsc::channel();
+        let preferences_path = default_preferences_path();
+        let (preferences, preferences_notice) = match preferences_path.as_deref() {
+            Some(path) => match AppPreferences::load_or_create(path) {
+                Ok((preferences, created)) => (
+                    preferences,
+                    created.then(|| format!("Created default preferences at {}.", path.display())),
+                ),
+                Err(error) => (
+                    AppPreferences::default(),
+                    Some(format!(
+                        "Could not load or create preferences {}; using defaults: {error}",
+                        path.display()
+                    )),
+                ),
+            },
+            None => (
+                AppPreferences::default(),
+                Some("Could not locate the home directory; preferences will not persist.".into()),
+            ),
+        };
 
         let mut state = Self {
             view: WindowPane::new(
@@ -1796,6 +1894,11 @@ impl ViewerState {
             graph_dock_height_points: GRAPH_DOCK_DEFAULT_HEIGHT_POINTS,
             startup_redraw_until: Instant::now(),
             surface_render_pipelines,
+            scene_object_renderer,
+            scene_objects: Vec::new(),
+            scene_object_gpu: Vec::new(),
+            active_scene_object: None,
+            scene_object_pick: None,
             surface_buffers: None,
             uniform_buffer,
             uniform_bind_group,
@@ -1817,6 +1920,17 @@ impl ViewerState {
             scene_generation: 0,
             controller: ControllerState::default(),
             overlay: ViewerOverlayState::default(),
+            overlay_stack: ViewerOverlayStack::default(),
+            preferences,
+            preferences_path,
+            preferences_open: false,
+            preferences_status: None,
+            instacorr_sessions: Vec::new(),
+            active_instacorr_session: None,
+            instacorr_window_open: false,
+            next_instacorr_id: 1,
+            instacorr_sender,
+            instacorr_receiver,
             auto_color_niml: initial_auto_color_niml,
             auto_niml_overlay_active: false,
             auto_niml_overlay_subs: initial_overlay_subs.clone(),
@@ -1866,6 +1980,10 @@ impl ViewerState {
             mode_label: None,
         };
 
+        if let Some(notice) = preferences_notice {
+            state.log_status(notice);
+        }
+
         if initial_surface_paths.len() == 1 {
             state.load_surface_path(
                 initial_surface_paths
@@ -1883,6 +2001,12 @@ impl ViewerState {
         }
         if let Some(path) = initial_volume_path {
             state.load_volume_path(path)?;
+        }
+        for path in initial_tract_paths {
+            state.load_tract_path(path)?;
+        }
+        for path in initial_graph_paths {
+            state.load_graph_path(path)?;
         }
         if let Some(path) = initial_overlay_path {
             state.load_overlay_path(path)?;
@@ -2033,6 +2157,112 @@ impl ViewerState {
         self.surface_render_set.is_some() || self.surface_buffers.is_some()
     }
 
+    fn scene_object_model(&self) -> Mat4 {
+        if let Some(mesh) = &self.mesh {
+            return Mat4::from_scale(Vec3::splat(1.0 / mesh.bounds.radius.max(f32::EPSILON)))
+                * Mat4::from_translation(-Vec3::from_array(mesh.bounds.center));
+        }
+        if let Some(volume) = &self.volume_view {
+            return volume.scene_model();
+        }
+        let mut visible = self.scene_objects.iter().filter(|object| object.visible);
+        let Some(first) = visible.next() else {
+            return Mat4::IDENTITY;
+        };
+        let mut min = first.bounds.min;
+        let mut max = first.bounds.max;
+        for object in visible {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(object.bounds.min[axis]);
+                max[axis] = max[axis].max(object.bounds.max[axis]);
+            }
+        }
+        let center = [
+            (min[0] + max[0]) * 0.5,
+            (min[1] + max[1]) * 0.5,
+            (min[2] + max[2]) * 0.5,
+        ];
+        let bounds = SpatialBounds {
+            min,
+            max,
+            center,
+            radius: Vec3::from_array(max)
+                .distance(Vec3::from_array(center))
+                .max(f32::EPSILON),
+        };
+        normalization_model(bounds)
+    }
+
+    fn load_tract_path(&mut self, path: PathBuf) -> Result<()> {
+        let path = canonical_or_original_path(path);
+        let data = read_niml_tract(&path)?;
+        self.insert_scene_object(SceneObject::from_tracts(path, data));
+        Ok(())
+    }
+
+    fn load_graph_path(&mut self, path: PathBuf) -> Result<()> {
+        let path = canonical_or_original_path(path);
+        let data = read_graph_bucket(&path)?;
+        self.insert_scene_object(SceneObject::from_graph(path, data)?);
+        Ok(())
+    }
+
+    fn insert_scene_object(&mut self, object: SceneObject) {
+        let detail = object.detail();
+        let name = object.name.clone();
+        let gpu = self.scene_object_renderer.upload(&self.device, &object);
+        if let Some(index) = self
+            .scene_objects
+            .iter()
+            .position(|loaded| loaded.path == object.path)
+        {
+            self.scene_objects[index] = object;
+            self.scene_object_gpu[index] = gpu;
+            self.active_scene_object = Some(index);
+            self.log_status(format!("Refreshed {name}: {detail}."));
+        } else {
+            self.scene_objects.push(object);
+            self.scene_object_gpu.push(gpu);
+            self.active_scene_object = Some(self.scene_objects.len() - 1);
+            self.log_status(format!("Loaded {name}: {detail}."));
+        }
+        self.view.window.request_redraw();
+        self.control.window.request_redraw();
+    }
+
+    fn rebuild_scene_object_gpu(&mut self, index: usize) {
+        let Some(object) = self.scene_objects.get(index) else {
+            return;
+        };
+        self.scene_object_gpu[index] = self.scene_object_renderer.upload(&self.device, object);
+    }
+
+    fn clear_scene_object_pick_for(&mut self, index: usize) {
+        if self
+            .scene_object_pick
+            .as_ref()
+            .is_some_and(|pick| pick.object_index() == index)
+        {
+            self.scene_object_pick = None;
+        }
+    }
+
+    fn remove_scene_object(&mut self, index: usize) {
+        if index >= self.scene_objects.len() {
+            return;
+        }
+        let name = self.scene_objects[index].name.clone();
+        self.scene_objects.remove(index);
+        self.scene_object_gpu.remove(index);
+        self.scene_object_pick = None;
+        self.active_scene_object = if self.scene_objects.is_empty() {
+            None
+        } else {
+            Some(index.min(self.scene_objects.len() - 1))
+        };
+        self.log_status(format!("Removed {name}."));
+    }
+
     fn scene_viewport_size(&self) -> PhysicalSize<u32> {
         let height = if self.controller.panels.graph_window_open {
             // Reserve the dock's current height for the plot, leaving the rest of
@@ -2091,6 +2321,21 @@ impl ViewerState {
                 &instance.core_uniform_buffer,
                 0,
                 &self.threshold_contour_uniform_bytes(instance.model_matrix, true),
+            );
+        }
+        let object_model = self.scene_object_model();
+        let viewport_size = self.scene_viewport_size();
+        let view_projection = camera.view_projection_matrix(aspect);
+        let scale_factor = self.view.window.scale_factor() as f32;
+        for (object, gpu) in self.scene_objects.iter().zip(&self.scene_object_gpu) {
+            SceneObjectRenderer::update(
+                &self.queue,
+                gpu,
+                object,
+                view_projection,
+                object_model,
+                [viewport_size.width as f32, viewport_size.height as f32],
+                scale_factor,
             );
         }
         if self.surface_render_set.is_none() {
@@ -2378,6 +2623,12 @@ impl ViewerState {
                 .camera
                 .view_projection_matrix(self.scene_viewport_aspect());
             volume_view.render(&self.queue, &mut render_pass, view_projection);
+        }
+
+        for (object, gpu) in self.scene_objects.iter().zip(&self.scene_object_gpu) {
+            if object.visible {
+                self.scene_object_renderer.render(&mut render_pass, gpu);
+            }
         }
     }
 
@@ -2692,6 +2943,126 @@ impl ViewerState {
                         self.set_error(error);
                     }
                 }
+                ViewerCommand::PickTract => {
+                    let current = self
+                        .active_scene_object
+                        .and_then(|index| self.scene_objects.get(index))
+                        .map(|object| &object.path)
+                        .or(self.surface_path.as_ref());
+                    if let Some(path) = pick_tract_file(current)
+                        && let Err(error) = self.load_tract_path(path)
+                    {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::PickGraphDataset => {
+                    let current = self
+                        .active_scene_object
+                        .and_then(|index| self.scene_objects.get(index))
+                        .map(|object| &object.path)
+                        .or(self.surface_path.as_ref());
+                    if let Some(path) = pick_graph_file(current)
+                        && let Err(error) = self.load_graph_path(path)
+                    {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::SelectSceneObject(index) => {
+                    if index < self.scene_objects.len() {
+                        self.active_scene_object = Some(index);
+                    }
+                }
+                ViewerCommand::SetSceneObjectVisible(index, visible) => {
+                    if let Some(object) = self.scene_objects.get_mut(index) {
+                        object.visible = visible;
+                    }
+                    if !visible {
+                        self.clear_scene_object_pick_for(index);
+                    }
+                }
+                ViewerCommand::SetSceneObjectWidth(index, width) => {
+                    if let Some(object) = self.scene_objects.get_mut(index) {
+                        object.width_points = width.clamp(0.25, 12.0);
+                    }
+                }
+                ViewerCommand::SetSceneObjectOpacity(index, opacity) => {
+                    if let Some(object) = self.scene_objects.get_mut(index) {
+                        object.opacity = opacity.clamp(0.0, 1.0);
+                    }
+                }
+                ViewerCommand::SetTractColorMode(index, mode) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Tracts(_))
+                    {
+                        object.tract_color_mode = mode;
+                        self.rebuild_scene_object_gpu(index);
+                    }
+                }
+                ViewerCommand::SetTractBundleVisible(index, bundle_index, visible) => {
+                    if let Some(appearance) = self
+                        .scene_objects
+                        .get_mut(index)
+                        .and_then(|object| object.tract_bundles.get_mut(bundle_index))
+                    {
+                        appearance.visible = visible;
+                        self.rebuild_scene_object_gpu(index);
+                        self.clear_scene_object_pick_for(index);
+                    }
+                }
+                ViewerCommand::SetTractBundleOpacity(index, bundle_index, opacity) => {
+                    if let Some(appearance) = self
+                        .scene_objects
+                        .get_mut(index)
+                        .and_then(|object| object.tract_bundles.get_mut(bundle_index))
+                    {
+                        appearance.opacity = opacity.clamp(0.0, 1.0);
+                        self.rebuild_scene_object_gpu(index);
+                        self.clear_scene_object_pick_for(index);
+                    }
+                }
+                ViewerCommand::SetGraphMeasure(index, measure) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && let SceneObjectPayload::Graph(data) = &object.payload
+                        && measure < data.edge_column_count
+                    {
+                        object.graph_measure = measure;
+                        object.graph_threshold = 0.0;
+                        self.rebuild_scene_object_gpu(index);
+                        self.clear_scene_object_pick_for(index);
+                    }
+                }
+                ViewerCommand::SetGraphThreshold(index, threshold) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                    {
+                        object.graph_threshold = threshold.max(0.0);
+                        self.rebuild_scene_object_gpu(index);
+                        self.clear_scene_object_pick_for(index);
+                    }
+                }
+                ViewerCommand::SetGraphColorMode(index, mode) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                    {
+                        object.graph_color_mode = mode;
+                        self.rebuild_scene_object_gpu(index);
+                    }
+                }
+                ViewerCommand::SetGraphNodeSize(index, size) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                    {
+                        object.graph_node_size_points = size.clamp(2.0, 40.0);
+                    }
+                }
+                ViewerCommand::SetGraphLabelsVisible(index, visible) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                    {
+                        object.graph_labels_visible = visible;
+                    }
+                }
+                ViewerCommand::RemoveSceneObject(index) => self.remove_scene_object(index),
                 ViewerCommand::RefreshOverlayColumns => {
                     if let Err(error) = self.refresh_overlay_columns() {
                         self.set_error(error);
@@ -2699,6 +3070,21 @@ impl ViewerState {
                 }
                 ViewerCommand::RefreshOverlayAppearance => {
                     if let Err(error) = self.refresh_overlay_appearance() {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::SelectOverlay(index) => {
+                    if let Err(error) = self.select_overlay(index) {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::CycleOverlay(step) => {
+                    if let Err(error) = self.cycle_overlay(step) {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::RemoveActiveOverlay => {
+                    if let Err(error) = self.remove_active_overlay() {
                         self.set_error(error);
                     }
                 }
@@ -3064,6 +3450,8 @@ impl ViewerState {
     }
 
     fn reset_scene_state(&mut self) {
+        self.clear_instacorr_sessions();
+        self.reset_overlay_stack_storage();
         self.overlay.clear();
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.controller.overlay.visible = true;
@@ -3869,17 +4257,61 @@ impl ViewerState {
             .map(|overlay| overlay.color_cache.colors.as_slice())
     }
 
+    fn inspect_scene_object_at_cursor(&mut self) -> bool {
+        let Some(cursor) = self.view_cursor_position else {
+            return false;
+        };
+        let scene_size = self.scene_viewport_size();
+        if cursor.0 < 0.0
+            || cursor.1 < 0.0
+            || cursor.0 > f64::from(scene_size.width)
+            || cursor.1 > f64::from(scene_size.height)
+        {
+            return false;
+        }
+        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
+            return false;
+        };
+        // Convert an approximately eight-pixel hit radius at the camera target
+        // into normalized scene units. This keeps picking usable while zooming.
+        let tolerance =
+            (2.0 * self.camera.distance * (camera::CAMERA_FOV_Y_RADIANS * 0.5).tan() * 8.0
+                / scene_size.height.max(1) as f32)
+                .clamp(0.003, 0.05);
+        let pick = pick_scene_objects(
+            &self.scene_objects,
+            self.scene_object_model(),
+            origin,
+            direction,
+            tolerance,
+        );
+        let Some(pick) = pick else {
+            self.scene_object_pick = None;
+            self.control.window.request_redraw();
+            return false;
+        };
+        self.active_scene_object = Some(pick.object_index());
+        self.log_status(pick.status_text());
+        self.scene_object_pick = Some(pick);
+        self.control.window.request_redraw();
+        self.view.window.request_redraw();
+        true
+    }
+
     fn visible_roi_layer(&self) -> Option<&RoiLayer> {
         self.roi_layer
             .as_ref()
             .filter(|_| self.controller.roi.visible)
     }
 
-    fn inspect_surface_at_cursor(&mut self) {
+    fn inspect_surface_at_cursor(&mut self, update_instacorr: bool) {
         match self.pick_surface_at_cursor() {
             Some(pick) => {
                 self.log_status(pick.status_text());
                 self.controller.interaction.set_pick(Some(pick));
+                if update_instacorr {
+                    self.note_instacorr_pick(pick.node_index);
+                }
                 if let Err(error) = self.send_afni_crosshair_for_pick(pick) {
                     self.set_error(error);
                 }
@@ -5620,6 +6052,7 @@ struct ControlUiOutput {
 enum ViewerEvent {
     AfniMessagesReady,
     SceneStatsReady,
+    InstaCorrComputed,
 }
 
 struct PendingCellColorUpload {
@@ -6605,6 +7038,26 @@ fn pick_surface_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
+fn pick_tract_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
+    dialog_with_start_directory(
+        rfd::FileDialog::new()
+            .set_title("Open AFNI/FATCAT tractography")
+            .add_filter("AFNI NIML tractography", &["tract", "niml.tract"]),
+        current_path,
+    )
+    .pick_file()
+}
+
+fn pick_graph_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
+    dialog_with_start_directory(
+        rfd::FileDialog::new()
+            .set_title("Open AFNI graph dataset")
+            .add_filter("AFNI Graph_Bucket", &["dset", "niml.dset"]),
+        current_path,
+    )
+    .pick_file()
+}
+
 fn pick_overlay_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     let dialog = dialog_with_start_directory(
         rfd::FileDialog::new()
@@ -6692,6 +7145,7 @@ fn single_hemisphere_overlay_dataset(
     node_offset: u32,
 ) -> Result<Dataset> {
     let kind = dataset.kind.clone();
+    let time_step_seconds = dataset.time_step_seconds;
     let columns = dataset.columns;
     let parent_ids = dataset.parent_ids;
     let row_count = dataset.row_count;
@@ -6707,7 +7161,11 @@ fn single_hemisphere_overlay_dataset(
     };
 
     Dataset::sparse(kind, domain, node_indices, columns)
-        .map(|dataset| dataset.with_parent_ids(parent_ids))
+        .map(|dataset| {
+            dataset
+                .with_parent_ids(parent_ids)
+                .with_time_step_seconds(time_step_seconds)
+        })
         .context("failed to remap hemisphere overlay into the active paired surface")
 }
 
@@ -6806,6 +7264,7 @@ fn paired_overlay_dataset(
     } else {
         DatasetKind::Unknown
     };
+    let time_step_seconds = paired_time_step(left.time_step_seconds, right.time_step_seconds)?;
 
     let columns = left
         .columns
@@ -6820,6 +7279,7 @@ fn paired_overlay_dataset(
         && left_row_count + right_row_count == domain.node_count
     {
         return Dataset::dense(kind, domain, columns)
+            .map(|dataset| dataset.with_time_step_seconds(time_step_seconds))
             .context("failed to build paired dense overlay dataset");
     }
 
@@ -6836,7 +7296,18 @@ fn paired_overlay_dataset(
     }
 
     Dataset::sparse(kind, domain, node_indices, columns)
+        .map(|dataset| dataset.with_time_step_seconds(time_step_seconds))
         .context("failed to build paired overlay dataset")
+}
+
+fn paired_time_step(left: Option<f64>, right: Option<f64>) -> Result<Option<f64>> {
+    if let (Some(left), Some(right)) = (left, right) {
+        ensure!(
+            (left - right).abs() <= 1.0e-9 * left.abs().max(right.abs()).max(1.0),
+            "paired time-series overlays have different TR values: {left} vs {right} seconds"
+        );
+    }
+    Ok(left.or(right))
 }
 
 fn paired_data_column(left: DataColumn, right: DataColumn) -> Result<DataColumn> {
@@ -8503,11 +8974,11 @@ fn threshold_p_value_display(pvalue: Option<f64>) -> String {
     }
 }
 
-fn threshold_q_value_display(qvalue: f64) -> String {
-    if qvalue < 0.001 {
-        format!("q <= {qvalue:.2e}")
-    } else {
-        format!("q <= {qvalue:.4}")
+fn threshold_q_value_display(qvalue: Option<f64>) -> String {
+    match qvalue {
+        Some(value) if value < 0.001 => format!("q <= {value:.2e}"),
+        Some(value) => format!("q <= {value:.4}"),
+        None => "q --".to_string(),
     }
 }
 
@@ -8879,6 +9350,12 @@ mod tests {
         assert_eq!(super::scalar_value_label(0.0), "0.0000");
         assert!(super::scalar_value_label(1.2e-10).contains('e'));
         assert!(super::overlay_value_label(Some(-3.4e-8)).contains('e'));
+    }
+
+    #[test]
+    fn unavailable_statistical_thresholds_keep_both_placeholders_visible() {
+        assert_eq!(super::threshold_p_value_display(None), "p --");
+        assert_eq!(super::threshold_q_value_display(None), "q --");
     }
 
     #[test]

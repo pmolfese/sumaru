@@ -46,8 +46,8 @@ fn local_surface_fixture_loads_with_expected_counts_and_metadata() -> Result<()>
 
 #[test]
 fn local_gifti_dataset_fixture_is_detected_and_loads_as_overlay() -> Result<()> {
-    let Some(path) = local_fixture("rh.thickness.gii.dset") else {
-        eprintln!("skipping local fixture test: testing/rh.thickness.gii.dset is absent");
+    let Some(path) = local_fixture("rh.thickness.gii") else {
+        eprintln!("skipping local fixture test: testing/rh.thickness.gii is absent");
         return Ok(());
     };
 
@@ -374,7 +374,7 @@ fn local_reference_folder_contains_expected_starter_files() -> Result<()> {
         "ISC_rh_theta_pos.niml.dset",
         "fs_lowres_std-lh.gii",
         "fs_lowres_std-rh.gii",
-        "rh.thickness.gii.dset",
+        "rh.thickness.gii",
         "rh.white.gii",
         "sub-3_rh.spec",
         "suma_clickmiddle_joined.finished.niml.roi",

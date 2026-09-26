@@ -20,6 +20,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 nifti = { version = "0.17.0", features = ["nalgebra_affine"] }
 pollster = "0.4"
 rfd = "0.15"
+rustfft = "6"
 wgpu = "29"
 winit = "0.30"
 

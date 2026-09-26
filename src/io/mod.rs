@@ -256,7 +256,7 @@ mod tests {
         let payload = read_niml_dset_str(
             r#"
 <AFNI_dataset ni_form="ni_group" dset_type="Node_Bucket" self_idcode="XYZ_DATA" filename="toy.niml.dset" >
-<SPARSE_DATA ni_type="float,float" ni_dimen="2" data_type="Node_Bucket_data" >
+<SPARSE_DATA ni_type="float,float" ni_dimen="2" data_type="Node_Bucket_data" ni_timestep="1.25" >
 1.5 2.5
 3.5 4.5
 </SPARSE_DATA>
@@ -278,6 +278,7 @@ mod tests {
         let dataset = payload.to_dataset(&domain).unwrap();
 
         assert_eq!(dataset.kind, DatasetKind::SurfaceScalar);
+        assert_eq!(dataset.time_step_seconds, Some(1.25));
         assert_eq!(dataset.node_indices, Some(vec![10, 12]));
         assert_eq!(
             dataset.parent_ids.source_dataset_id.as_deref(),
@@ -323,6 +324,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            time_step_seconds: None,
             node_indices: None,
             column_ranges: Vec::new(),
             column_labels: vec!["roi".to_string()],
@@ -530,6 +532,7 @@ mod tests {
             filename: None,
             label: None,
             sparse_data: None,
+            time_step_seconds: None,
             node_indices: None,
             column_ranges: Vec::new(),
             column_labels: Vec::new(),

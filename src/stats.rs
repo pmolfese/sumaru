@@ -51,7 +51,9 @@ impl AfniStatSpec {
                 f_upper_tail_p_value(value, self.params[0], self.params[1])
             }
             "correlation" | "correl" if !self.params.is_empty() => {
-                correlation_two_tailed_p_value(value, self.params[0])
+                let nfit = self.params.get(1).copied().unwrap_or(1.0);
+                let nort = self.params.get(2).copied().unwrap_or(1.0);
+                correlation_two_tailed_p_value(value, self.params[0], nfit, nort)
             }
             "fisherz" | "zscore" => normal_two_tailed_p_value(value),
             "chisq" | "chi2" if !self.params.is_empty() => {
@@ -118,11 +120,19 @@ fn f_upper_tail_p_value(f: f64, df_num: f64, df_den: f64) -> Option<f64> {
     regularized_beta(x, df_den * 0.5, df_num * 0.5).map(|p| p.clamp(0.0, 1.0))
 }
 
-fn correlation_two_tailed_p_value(r: f64, n_or_df: f64) -> Option<f64> {
-    let df = (n_or_df - 2.0).max(1.0);
-    let clipped = r.clamp(-0.999_999, 0.999_999);
-    let t = clipped * (df / (1.0 - clipped * clipped).max(1.0e-12)).sqrt();
-    t_two_tailed_p_value(t, df)
+fn correlation_two_tailed_p_value(r: f64, samples: f64, nfit: f64, nort: f64) -> Option<f64> {
+    if samples <= nfit + nort || nfit + nort < 1.0 {
+        return None;
+    }
+    let rho = r.abs();
+    if rho <= 0.0 {
+        return Some(1.0);
+    }
+    if rho >= 0.999_999_9 {
+        return Some(0.0);
+    }
+    regularized_beta(1.0 - rho * rho, 0.5 * (samples - nfit - nort), 0.5 * nfit)
+        .map(|p| p.clamp(0.0, 1.0))
 }
 
 pub fn normal_two_tailed_p_value(z: f64) -> Option<f64> {
@@ -388,6 +398,14 @@ mod tests {
         assert!(spec.statistic_for_p_value(0.0).is_none());
         assert!(spec.statistic_for_p_value(-0.1).is_none());
         assert!(spec.statistic_for_p_value(1.1).is_none());
+    }
+
+    #[test]
+    fn correlation_uses_all_afni_parameters() {
+        let usual = AfniStatSpec::parse("Correl(50,1,1)").unwrap();
+        let regressed = AfniStatSpec::parse("Correl(50,1,10)").unwrap();
+        assert_close(usual.two_sided_p_value(0.278_711).unwrap(), 0.05, 0.001);
+        assert!(regressed.two_sided_p_value(0.278_711).unwrap() > 0.05);
     }
 
     fn assert_close(actual: f64, expected: f64, tolerance: f64) {
