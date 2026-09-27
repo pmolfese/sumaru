@@ -27,6 +27,21 @@ pub enum GraphColorMode {
     Magnitude,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphEdgeGeometry {
+    Straight,
+    LinkedBundles,
+}
+
+impl GraphEdgeGeometry {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Straight => "straight edges",
+            Self::LinkedBundles => "linked tract bundles",
+        }
+    }
+}
+
 impl GraphColorMode {
     pub(super) const ALL: [Self; 2] = [Self::Signed, Self::Magnitude];
 
@@ -80,6 +95,8 @@ pub(super) enum SceneObjectPick {
     GraphEdge {
         object_index: usize,
         object_name: String,
+        source_index: usize,
+        target_index: usize,
         source: String,
         target: String,
         measure: String,
@@ -174,6 +191,12 @@ pub(super) struct SceneObject {
     pub(super) graph_color_mode: GraphColorMode,
     pub(super) graph_node_size_points: f32,
     pub(super) graph_labels_visible: bool,
+    pub(super) graph_edge_geometry: GraphEdgeGeometry,
+    pub(super) graph_matrix_open: bool,
+    pub(super) graph_matrix_lower_triangle: bool,
+    pub(super) graph_matrix_cell_points: f32,
+    pub(super) graph_matrix_selected_cell: Option<(usize, usize)>,
+    pub(super) linked_tracts: Option<TractographyDataset>,
     pub(super) payload: SceneObjectPayload,
     pub(super) bounds: SpatialBounds,
     tract_pick_index: Option<TractPickIndex>,
@@ -205,15 +228,30 @@ impl SceneObject {
             graph_color_mode: GraphColorMode::Signed,
             graph_node_size_points: 11.0,
             graph_labels_visible: false,
+            graph_edge_geometry: GraphEdgeGeometry::Straight,
+            graph_matrix_open: false,
+            graph_matrix_lower_triangle: false,
+            graph_matrix_cell_points: 22.0,
+            graph_matrix_selected_cell: None,
+            linked_tracts: None,
             payload: SceneObjectPayload::Tracts(data),
             bounds,
             tract_pick_index,
         }
     }
 
-    pub(super) fn from_graph(path: PathBuf, data: GraphDataset) -> Result<Self> {
-        let bounds = SpatialBounds::from_points(data.nodes.iter().map(|node| &node.position))
+    pub(super) fn from_graph_with_linked_tracts(
+        path: PathBuf,
+        data: GraphDataset,
+        linked_tracts: Option<TractographyDataset>,
+    ) -> Result<Self> {
+        let graph_bounds = SpatialBounds::from_points(data.nodes.iter().map(|node| &node.position))
             .context("graph contains no positioned nodes")?;
+        let bounds = linked_tracts
+            .as_ref()
+            .map(|tracts| union_bounds(graph_bounds, tracts.bounds))
+            .unwrap_or(graph_bounds);
+        let tract_pick_index = linked_tracts.as_ref().map(TractPickIndex::build);
         Ok(Self {
             name: display_name(&path),
             path,
@@ -227,9 +265,15 @@ impl SceneObject {
             graph_color_mode: GraphColorMode::Signed,
             graph_node_size_points: 11.0,
             graph_labels_visible: false,
+            graph_edge_geometry: GraphEdgeGeometry::Straight,
+            graph_matrix_open: false,
+            graph_matrix_lower_triangle: false,
+            graph_matrix_cell_points: 22.0,
+            graph_matrix_selected_cell: None,
+            linked_tracts,
             payload: SceneObjectPayload::Graph(data),
             bounds,
-            tract_pick_index: None,
+            tract_pick_index,
         })
     }
 
@@ -242,7 +286,7 @@ impl SceneObject {
                 data.point_count()
             ),
             SceneObjectPayload::Graph(data) => format!(
-                "{} nodes · {} measures · {} matrix",
+                "{} nodes · {} measures · {} matrix{}",
                 data.nodes.len(),
                 data.edge_column_count,
                 match data.matrix_shape {
@@ -250,7 +294,10 @@ impl SceneObject {
                     GraphMatrixShape::Triangle => "triangle",
                     GraphMatrixShape::TriangleWithDiagonal => "triangle + diagonal",
                     GraphMatrixShape::Sparse => "sparse",
-                }
+                },
+                self.linked_tracts
+                    .as_ref()
+                    .map_or("", |_| " · linked tracts")
             ),
         }
     }
@@ -262,6 +309,8 @@ impl SceneObject {
             }
             SceneObjectPayload::Graph(data) => visit_graph_segments(
                 data,
+                self.linked_tracts.as_ref(),
+                self.graph_edge_geometry,
                 self.graph_measure,
                 self.graph_threshold,
                 self.graph_color_mode,
@@ -269,6 +318,20 @@ impl SceneObject {
             ),
         }
     }
+}
+
+fn union_bounds(first: SpatialBounds, second: SpatialBounds) -> SpatialBounds {
+    let min = [
+        first.min[0].min(second.min[0]),
+        first.min[1].min(second.min[1]),
+        first.min[2].min(second.min[2]),
+    ];
+    let max = [
+        first.max[0].max(second.max[0]),
+        first.max[1].max(second.max[1]),
+        first.max[2].max(second.max[2]),
+    ];
+    SpatialBounds::from_points([min, max].iter()).expect("two bounds corners")
 }
 
 impl TractPickIndex {
@@ -422,35 +485,188 @@ fn pick_graph_object(
         }
     }
 
-    visit_graph_edges(data, object.graph_measure, |source, target, value| {
-        if !value.is_finite() || value == 0.0 || value.abs() < object.graph_threshold.max(0.0) {
-            return;
-        }
-        let start = model.transform_point3(Vec3::from_array(data.nodes[source].position));
-        let end = model.transform_point3(Vec3::from_array(data.nodes[target].position));
-        let (distance, ray_distance, _) =
-            segment_ray_distance(start, end, ray_origin, ray_direction);
-        if distance <= tolerance {
-            let measure = data
-                .edge_labels
-                .get(object.graph_measure)
-                .cloned()
-                .unwrap_or_else(|| format!("Measure {}", object.graph_measure + 1));
-            update_best_pick(
-                best,
-                distance / tolerance,
-                ray_distance,
-                SceneObjectPick::GraphEdge {
-                    object_index,
-                    object_name: object.name.clone(),
-                    source: data.nodes[source].label.clone(),
-                    target: data.nodes[target].label.clone(),
-                    measure,
+    if object.graph_edge_geometry == GraphEdgeGeometry::LinkedBundles {
+        pick_graph_bundle_edges(
+            object_index,
+            object,
+            data,
+            model,
+            ray_origin,
+            ray_direction,
+            tolerance,
+            best,
+        );
+    }
+
+    visit_graph_edges(
+        data,
+        object.graph_measure,
+        |source, target, value, edge_ids| {
+            if !value.is_finite() || value == 0.0 || value.abs() < object.graph_threshold.max(0.0) {
+                return;
+            }
+            if object.graph_edge_geometry == GraphEdgeGeometry::LinkedBundles
+                && object
+                    .linked_tracts
+                    .as_ref()
+                    .and_then(|tracts| linked_bundle_index_for_edge(tracts, edge_ids))
+                    .is_some()
+            {
+                return;
+            }
+            let start = model.transform_point3(Vec3::from_array(data.nodes[source].position));
+            let end = model.transform_point3(Vec3::from_array(data.nodes[target].position));
+            let (distance, ray_distance, _) =
+                segment_ray_distance(start, end, ray_origin, ray_direction);
+            if distance <= tolerance {
+                let measure = data
+                    .edge_labels
+                    .get(object.graph_measure)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Measure {}", object.graph_measure + 1));
+                update_best_pick(
+                    best,
+                    distance / tolerance,
+                    ray_distance,
+                    SceneObjectPick::GraphEdge {
+                        object_index,
+                        object_name: object.name.clone(),
+                        source_index: source,
+                        target_index: target,
+                        source: data.nodes[source].label.clone(),
+                        target: data.nodes[target].label.clone(),
+                        measure,
+                        value,
+                    },
+                );
+            }
+        },
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GraphBundlePickInfo {
+    source: usize,
+    target: usize,
+    value: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pick_graph_bundle_edges(
+    object_index: usize,
+    object: &SceneObject,
+    data: &GraphDataset,
+    model: Mat4,
+    ray_origin: Vec3,
+    ray_direction: Vec3,
+    tolerance: f32,
+    best: &mut Option<(f32, f32, SceneObjectPick)>,
+) {
+    let (Some(tracts), Some(index)) = (&object.linked_tracts, &object.tract_pick_index) else {
+        return;
+    };
+    if index.nodes.is_empty() {
+        return;
+    }
+    let mut bundle_edges = vec![None; tracts.bundles.len()];
+    visit_graph_edges(
+        data,
+        object.graph_measure,
+        |source, target, value, edge_ids| {
+            if value.is_finite()
+                && value != 0.0
+                && value.abs() >= object.graph_threshold.max(0.0)
+                && let Some(bundle_index) = linked_bundle_index_for_edge(tracts, edge_ids)
+            {
+                bundle_edges[bundle_index] = Some(GraphBundlePickInfo {
+                    source,
+                    target,
                     value,
-                },
-            );
+                });
+            }
+        },
+    );
+
+    let inverse = model.inverse();
+    let local_origin = inverse.transform_point3(ray_origin);
+    let local_direction = inverse.transform_vector3(ray_direction).normalize_or_zero();
+    if local_direction.length_squared() <= f32::EPSILON {
+        return;
+    }
+    let local_tolerance = inverse
+        .transform_vector3(Vec3::X * tolerance)
+        .length()
+        .max(f32::EPSILON);
+    let measure = data
+        .edge_labels
+        .get(object.graph_measure)
+        .cloned()
+        .unwrap_or_else(|| format!("Measure {}", object.graph_measure + 1));
+    let mut stack = vec![0_usize];
+    while let Some(node_index) = stack.pop() {
+        let node = index.nodes[node_index];
+        if !ray_intersects_aabb(
+            local_origin,
+            local_direction,
+            node.min,
+            node.max,
+            local_tolerance,
+        ) {
+            continue;
         }
-    });
+        if node.count == 0 {
+            stack.push(node.left as usize);
+            stack.push(node.right as usize);
+            continue;
+        }
+        for entry in &index.entries[node.start as usize..(node.start + node.count) as usize] {
+            let Some(edge) = bundle_edges
+                .get(entry.bundle_index as usize)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            if !ray_intersects_aabb(
+                local_origin,
+                local_direction,
+                entry.min,
+                entry.max,
+                local_tolerance,
+            ) {
+                continue;
+            }
+            let tract =
+                &tracts.bundles[entry.bundle_index as usize].tracts[entry.tract_index as usize];
+            for pair in tract.points.windows(2) {
+                let start = Vec3::from_array(pair[0]);
+                let end = Vec3::from_array(pair[1]);
+                let (distance, _, segment_fraction) =
+                    segment_ray_distance(start, end, local_origin, local_direction);
+                if distance > local_tolerance {
+                    continue;
+                }
+                let scene_position = model.transform_point3(start.lerp(end, segment_fraction));
+                let (scene_distance, scene_ray_distance) =
+                    point_ray_distance(scene_position, ray_origin, ray_direction);
+                update_best_pick(
+                    best,
+                    scene_distance / tolerance,
+                    scene_ray_distance,
+                    SceneObjectPick::GraphEdge {
+                        object_index,
+                        object_name: object.name.clone(),
+                        source_index: edge.source,
+                        target_index: edge.target,
+                        source: data.nodes[edge.source].label.clone(),
+                        target: data.nodes[edge.target].label.clone(),
+                        measure: measure.clone(),
+                        value: edge.value,
+                    },
+                );
+            }
+        }
+    }
 }
 
 fn pick_tract_object(
@@ -671,6 +887,12 @@ struct SceneSegment {
     start: [f32; 3],
     end: [f32; 3],
     color: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraphEdgeIds {
+    primary: i32,
+    alternate: Option<i32>,
 }
 
 impl SceneObjectRenderer {
@@ -941,6 +1163,8 @@ fn visit_tract_segments(
 
 fn visit_graph_segments(
     data: &GraphDataset,
+    linked_tracts: Option<&TractographyDataset>,
+    geometry: GraphEdgeGeometry,
     measure: usize,
     threshold: f32,
     color_mode: GraphColorMode,
@@ -954,22 +1178,57 @@ fn visit_graph_segments(
         .map(|(min, max)| min.abs().max(max.abs()))
         .unwrap_or(1.0)
         .max(f32::EPSILON);
-    visit_graph_edges(data, measure, |source, target, value| {
+    visit_graph_edges(data, measure, |source, target, value, edge_ids| {
         if !value.is_finite() || value == 0.0 || value.abs() < threshold.max(0.0) {
             return;
         }
-        visitor(SceneSegment {
-            start: data.nodes[source].position,
-            end: data.nodes[target].position,
-            color: graph_value_color(value, max_abs, color_mode),
-        });
+        let color = graph_value_color(value, max_abs, color_mode);
+        let linked_bundle = (geometry == GraphEdgeGeometry::LinkedBundles)
+            .then(|| linked_tracts.and_then(|tracts| linked_bundle_for_edge(tracts, edge_ids)))
+            .flatten();
+        if let Some(bundle) = linked_bundle {
+            for tract in &bundle.tracts {
+                for pair in tract.points.windows(2) {
+                    visitor(SceneSegment {
+                        start: pair[0],
+                        end: pair[1],
+                        color,
+                    });
+                }
+            }
+        } else {
+            visitor(SceneSegment {
+                start: data.nodes[source].position,
+                end: data.nodes[target].position,
+                color,
+            });
+        }
     });
+}
+
+fn linked_bundle_for_edge<'a>(
+    tracts: &'a TractographyDataset,
+    edge_ids: GraphEdgeIds,
+) -> Option<&'a crate::tractography::TractBundle> {
+    linked_bundle_index_for_edge(tracts, edge_ids).map(|index| &tracts.bundles[index])
+}
+
+fn linked_bundle_index_for_edge(
+    tracts: &TractographyDataset,
+    edge_ids: GraphEdgeIds,
+) -> Option<usize> {
+    tracts.bundles.iter().position(|bundle| {
+        [bundle.tag, bundle.alternate_tag]
+            .into_iter()
+            .flatten()
+            .any(|tag| tag == edge_ids.primary || edge_ids.alternate == Some(tag))
+    })
 }
 
 fn visit_graph_edges(
     data: &GraphDataset,
     measure: usize,
-    mut visitor: impl FnMut(usize, usize, f32),
+    mut visitor: impl FnMut(usize, usize, f32, GraphEdgeIds),
 ) {
     if measure >= data.edge_column_count {
         return;
@@ -990,7 +1249,15 @@ fn visit_graph_edges(
                     .filter(|value| value.is_finite())
                     .max_by(|a, b| a.abs().total_cmp(&b.abs()))
                     .unwrap_or(0.0);
-                visitor(source, target, value);
+                visitor(
+                    source,
+                    target,
+                    value,
+                    GraphEdgeIds {
+                        primary: (target * data.nodes.len() + source) as i32,
+                        alternate: Some((source * data.nodes.len() + target) as i32),
+                    },
+                );
             }
         }
     } else {
@@ -1006,12 +1273,28 @@ fn visit_graph_edges(
                 .and_then(|values| values.get(measure))
                 .copied()
                 .unwrap_or(0.0);
-            visitor(source, target, value);
+            let primary = if data.matrix_shape == GraphMatrixShape::Sparse {
+                data.edge_indices
+                    .get(row)
+                    .map(|indices| indices[0])
+                    .unwrap_or(row as i32)
+            } else {
+                row as i32
+            };
+            visitor(
+                source,
+                target,
+                value,
+                GraphEdgeIds {
+                    primary,
+                    alternate: None,
+                },
+            );
         }
     }
 }
 
-fn graph_value_color(value: f32, max_abs: f32, mode: GraphColorMode) -> [f32; 4] {
+pub(super) fn graph_value_color(value: f32, max_abs: f32, mode: GraphColorMode) -> [f32; 4] {
     let strength = (value.abs() / max_abs.max(f32::EPSILON)).clamp(0.0, 1.0);
     match mode {
         GraphColorMode::Signed if value < 0.0 => [0.12 + 0.45 * (1.0 - strength), 0.35, 1.0, 0.78],
@@ -1131,15 +1414,27 @@ mod tests {
             network_file: None,
         };
         let mut weak = Vec::new();
-        visit_graph_segments(&data, 0, 0.5, GraphColorMode::Signed, |segment| {
-            weak.push(segment)
-        });
+        visit_graph_segments(
+            &data,
+            None,
+            GraphEdgeGeometry::Straight,
+            0,
+            0.5,
+            GraphColorMode::Signed,
+            |segment| weak.push(segment),
+        );
         assert!(weak.is_empty());
 
         let mut strong = Vec::new();
-        visit_graph_segments(&data, 1, 0.5, GraphColorMode::Signed, |segment| {
-            strong.push(segment)
-        });
+        visit_graph_segments(
+            &data,
+            None,
+            GraphEdgeGeometry::Straight,
+            1,
+            0.5,
+            GraphColorMode::Signed,
+            |segment| strong.push(segment),
+        );
         assert_eq!(strong.len(), 1);
         assert!(strong[0].color[2] > strong[0].color[0]);
     }
@@ -1167,7 +1462,12 @@ mod tests {
             edge_indices: Vec::new(),
             network_file: None,
         };
-        let mut object = SceneObject::from_graph(PathBuf::from("network.niml.dset"), data).unwrap();
+        let mut object = SceneObject::from_graph_with_linked_tracts(
+            PathBuf::from("network.niml.dset"),
+            data,
+            None,
+        )
+        .unwrap();
         object.graph_measure = 1;
         let pick = pick_scene_objects(
             &[object],
@@ -1251,5 +1551,137 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn linked_graph_fixture(bundle_tag: i32) -> (GraphDataset, TractographyDataset) {
+        let graph = GraphDataset {
+            path: None,
+            nodes: vec![
+                crate::graph_dataset::GraphNode {
+                    index: 0,
+                    position: [0.0, 0.0, 0.0],
+                    label: "A".into(),
+                },
+                crate::graph_dataset::GraphNode {
+                    index: 1,
+                    position: [1.0, 0.0, 0.0],
+                    label: "B".into(),
+                },
+            ],
+            edge_values: vec![0.0, 1.0, 0.0, 0.0],
+            edge_column_count: 1,
+            edge_labels: vec!["NT".into()],
+            matrix_shape: GraphMatrixShape::Full,
+            edge_indices: Vec::new(),
+            network_file: Some(PathBuf::from("tract.niml.tract")),
+        };
+        let tracts = TractographyDataset {
+            path: None,
+            bundles: vec![TractBundle {
+                tag: Some(bundle_tag),
+                alternate_tag: Some(2),
+                ends: Some("A<->B".into()),
+                tracts: vec![Tract {
+                    id: 9,
+                    points: vec![[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [1.0, 0.0, 0.0]],
+                }],
+            }],
+            bounds: SpatialBounds::from_points(
+                [[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [1.0, 0.0, 0.0]].iter(),
+            )
+            .unwrap(),
+        };
+        (graph, tracts)
+    }
+
+    #[test]
+    fn linked_graph_bundles_match_suma_primary_and_alternate_edge_tags() {
+        for tag in [1, 2] {
+            let (graph, tracts) = linked_graph_fixture(tag);
+            let mut segments = Vec::new();
+            visit_graph_segments(
+                &graph,
+                Some(&tracts),
+                GraphEdgeGeometry::LinkedBundles,
+                0,
+                0.0,
+                GraphColorMode::Signed,
+                |segment| segments.push(segment),
+            );
+            assert_eq!(segments.len(), 2);
+            assert_eq!(segments[0].end, [0.5, 0.5, 0.0]);
+        }
+    }
+
+    #[test]
+    fn linked_graph_falls_back_to_straight_edge_without_matching_bundle() {
+        let (graph, mut tracts) = linked_graph_fixture(99);
+        tracts.bundles[0].alternate_tag = None;
+        let mut segments = Vec::new();
+        visit_graph_segments(
+            &graph,
+            Some(&tracts),
+            GraphEdgeGeometry::LinkedBundles,
+            0,
+            0.0,
+            GraphColorMode::Signed,
+            |segment| segments.push(segment),
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start, [0.0, 0.0, 0.0]);
+        assert_eq!(segments[0].end, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn linked_graph_bundle_pick_reports_graph_edge_value() {
+        let (graph, tracts) = linked_graph_fixture(1);
+        let mut object = SceneObject::from_graph_with_linked_tracts(
+            PathBuf::from("network.niml.dset"),
+            graph,
+            Some(tracts),
+        )
+        .unwrap();
+        object.graph_edge_geometry = GraphEdgeGeometry::LinkedBundles;
+        let pick = pick_scene_objects(
+            &[object],
+            Mat4::IDENTITY,
+            Vec3::new(0.5, 0.5, 3.0),
+            -Vec3::Z,
+            0.02,
+        )
+        .unwrap();
+        assert!(matches!(
+            pick,
+            SceneObjectPick::GraphEdge {
+                source,
+                target,
+                measure,
+                value: 1.0,
+                ..
+            } if source == "A" && target == "B" && measure == "NT"
+        ));
+    }
+
+    #[test]
+    fn local_fatcat_linked_graph_tags_cover_nonzero_edges_when_available() {
+        let graph_path = Path::new("/Users/molfesepj/FATCAT_DEMO/DTI/o.NETS_AND_000.niml.dset");
+        let tract_path = Path::new("/Users/molfesepj/FATCAT_DEMO/DTI/o.NETS_AND_000.niml.tract");
+        if !graph_path.exists() || !tract_path.exists() {
+            return;
+        }
+        let graph = crate::graph_dataset::read_graph_bucket(graph_path).unwrap();
+        let tracts = crate::tractography::read_niml_tract(tract_path).unwrap();
+        let mut nonzero_edges = 0;
+        let mut matched_edges = 0;
+        visit_graph_edges(&graph, 0, |_, _, value, edge_ids| {
+            if value != 0.0 {
+                nonzero_edges += 1;
+                if linked_bundle_index_for_edge(&tracts, edge_ids).is_some() {
+                    matched_edges += 1;
+                }
+            }
+        });
+        assert_eq!(nonzero_edges, tracts.bundles.len());
+        assert_eq!(matched_edges, nonzero_edges);
     }
 }

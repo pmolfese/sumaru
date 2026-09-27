@@ -103,8 +103,9 @@ refreshed as the viewer changes.
 - AFNI/FATCAT `.niml.tract` objects with adjustable screen-space ribbon width,
   per-bundle visibility/opacity, and SUMA-style local-orientation,
   tract-orientation, or bundle coloring.
-- AFNI `Graph_Bucket .niml.dset` objects with shaded 3D node glyphs and straight
-  edges; full, triangular, and sparse edge encodings are parsed.
+- AFNI `Graph_Bucket .niml.dset` objects with shaded 3D node glyphs, straight
+  or tract-bundle edges, and an interactive matrix view; full, triangular, and
+  sparse edge encodings are parsed.
 - Headless file inspection for quick metadata checks.
 
 Some useful ways to launch it:
@@ -137,6 +138,17 @@ Right-click a visible tract, graph node, or displayed graph edge to inspect it.
 Graph node labels can be toggled per object. Tract hit-testing uses a compact
 streamline bounding-volume hierarchy so large whole-brain datasets do not scan
 every segment for each click.
+Choose **Open matrix view** in a graph's inspector for a floating, scrollable
+heatmap. It shares the 3D graph's selected measure, signed/magnitude coloring,
+and absolute-value threshold; thresholded cells are dimmed rather than removed.
+The view can show the full matrix or its lower triangle, and clicking a cell
+selects that edge in the normal graph selection readout.
+When a `Graph_Bucket` contains a `network_file` link, Sumaru resolves and loads
+the associated `.niml.tract` network. The graph defaults to straight edges like
+SUMA; choose **linked tract bundles** in the graph inspector to replace each
+edge with the bundle identified by its `Bundle_Tag` or reciprocal
+`Bundle_Alt_Tag`. Thresholding, coloring, and picking continue to use the
+selected graph measure, and unmatched edges retain the straight-edge fallback.
 
 ## Cargo Commands
 

@@ -91,6 +91,106 @@ impl GraphDataset {
                 })
             })
     }
+
+    /// Value displayed at one row/column in a matrix view. Full matrices retain
+    /// directionality; triangular encodings are mirrored; sparse encodings use
+    /// their explicit endpoint order.
+    pub fn matrix_value(&self, row: usize, column: usize, measure: usize) -> Option<f32> {
+        if row >= self.nodes.len()
+            || column >= self.nodes.len()
+            || measure >= self.edge_column_count
+        {
+            return None;
+        }
+        match self.matrix_shape {
+            GraphMatrixShape::Full => self.full_edge_row(row, column)?.get(measure).copied(),
+            GraphMatrixShape::Triangle | GraphMatrixShape::TriangleWithDiagonal => {
+                let matrix_row = row.max(column);
+                let matrix_column = row.min(column);
+                let include_diagonal = self.matrix_shape == GraphMatrixShape::TriangleWithDiagonal;
+                if !include_diagonal && matrix_row == matrix_column {
+                    return None;
+                }
+                let count = self.nodes.len();
+                let prior_rows = if include_diagonal {
+                    matrix_column * (2 * count - matrix_column + 1) / 2
+                } else {
+                    matrix_column * (2 * count - matrix_column - 1) / 2
+                };
+                let row_offset = if include_diagonal {
+                    matrix_row - matrix_column
+                } else {
+                    matrix_row - matrix_column - 1
+                };
+                let row_index = prior_rows + row_offset;
+                self.edge_row(row_index)?.get(measure).copied()
+            }
+            GraphMatrixShape::Sparse => {
+                let row_index = self.edge_indices.iter().position(|indices| {
+                    usize::try_from(indices.get(1).copied().unwrap_or(-1)).ok() == Some(row)
+                        && usize::try_from(indices.get(2).copied().unwrap_or(-1)).ok()
+                            == Some(column)
+                })?;
+                self.edge_row(row_index)?.get(measure).copied()
+            }
+        }
+    }
+
+    /// Materialize one measure in display row/column order. This avoids a
+    /// sparse-edge search per cell when the matrix window is drawn.
+    pub fn matrix_values(&self, measure: usize) -> Vec<Option<f32>> {
+        let count = self.nodes.len();
+        let mut values = vec![None; count.saturating_mul(count)];
+        if measure >= self.edge_column_count {
+            return values;
+        }
+        match self.matrix_shape {
+            GraphMatrixShape::Full => {
+                for row in 0..count {
+                    for column in 0..count {
+                        values[row * count + column] = self.matrix_value(row, column, measure);
+                    }
+                }
+            }
+            GraphMatrixShape::Triangle | GraphMatrixShape::TriangleWithDiagonal => {
+                let include_diagonal = self.matrix_shape == GraphMatrixShape::TriangleWithDiagonal;
+                let mut edge_row = 0;
+                for column in 0..count {
+                    let first_row = if include_diagonal { column } else { column + 1 };
+                    for row in first_row..count {
+                        let value = self
+                            .edge_row(edge_row)
+                            .and_then(|edge| edge.get(measure))
+                            .copied();
+                        values[row * count + column] = value;
+                        values[column * count + row] = value;
+                        edge_row += 1;
+                    }
+                }
+            }
+            GraphMatrixShape::Sparse => {
+                for (edge_row, indices) in self.edge_indices.iter().enumerate() {
+                    let (Some(source), Some(target)) = (
+                        indices
+                            .get(1)
+                            .and_then(|value| usize::try_from(*value).ok()),
+                        indices
+                            .get(2)
+                            .and_then(|value| usize::try_from(*value).ok()),
+                    ) else {
+                        continue;
+                    };
+                    if source < count && target < count {
+                        values[source * count + target] = self
+                            .edge_row(edge_row)
+                            .and_then(|edge| edge.get(measure))
+                            .copied();
+                    }
+                }
+            }
+        }
+        values
+    }
 }
 
 pub fn read_graph_bucket(path: impl AsRef<Path>) -> Result<GraphDataset> {
@@ -311,5 +411,45 @@ mod tests {
         assert_eq!(graph.column_range(0), Some((1.0, 3.0)));
         assert_eq!(graph.column_range(1), Some((-4.0, 8.0)));
         assert_eq!(graph.column_range(2), None);
+    }
+
+    #[test]
+    fn matrix_value_preserves_full_direction_and_mirrors_triangles() {
+        let mut graph = GraphDataset {
+            path: None,
+            nodes: (0..2)
+                .map(|index| GraphNode {
+                    index,
+                    position: [0.0; 3],
+                    label: index.to_string(),
+                })
+                .collect(),
+            edge_values: vec![0.0, 2.0, 3.0, 0.0],
+            edge_column_count: 1,
+            edge_labels: Vec::new(),
+            matrix_shape: GraphMatrixShape::Full,
+            edge_indices: Vec::new(),
+            network_file: None,
+        };
+        assert_eq!(graph.matrix_value(0, 1, 0), Some(3.0));
+        assert_eq!(graph.matrix_value(1, 0, 0), Some(2.0));
+        assert_eq!(
+            graph.matrix_values(0),
+            vec![Some(0.0), Some(3.0), Some(2.0), Some(0.0)]
+        );
+
+        graph.matrix_shape = GraphMatrixShape::Triangle;
+        graph.edge_values = vec![7.0];
+        assert_eq!(graph.matrix_value(0, 1, 0), Some(7.0));
+        assert_eq!(graph.matrix_value(1, 0, 0), Some(7.0));
+        assert_eq!(
+            graph.matrix_values(0),
+            vec![None, Some(7.0), Some(7.0), None]
+        );
+
+        graph.matrix_shape = GraphMatrixShape::Sparse;
+        graph.edge_values = vec![9.0];
+        graph.edge_indices = vec![[0, 1, 0]];
+        assert_eq!(graph.matrix_values(0), vec![None, None, Some(9.0), None]);
     }
 }

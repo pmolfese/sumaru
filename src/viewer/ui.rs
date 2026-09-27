@@ -388,9 +388,231 @@ impl ViewerState {
         self.draw_preferences_window(ctx);
         self.draw_instacorr_window(ctx);
         self.draw_scene_object_labels(ctx);
+        self.draw_graph_matrix_window(ctx, &mut actions);
         self.draw_view_transient_label(ctx);
 
         actions
+    }
+
+    fn draw_graph_matrix_window(&mut self, ctx: &egui::Context, actions: &mut Vec<ViewerCommand>) {
+        let Some(index) = self.active_scene_object else {
+            return;
+        };
+        let Some(object) = self.scene_objects.get(index) else {
+            return;
+        };
+        let SceneObjectPayload::Graph(data) = &object.payload else {
+            return;
+        };
+        if !object.graph_matrix_open {
+            return;
+        }
+
+        let mut open = true;
+        let title = format!("Graph Matrix — {}", object.name);
+        egui::Window::new(title)
+            .id(egui::Id::new(("graph_matrix_window", index)))
+            .open(&mut open)
+            .default_width(560.0)
+            .default_height(620.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let mut measure = object
+                    .graph_measure
+                    .min(data.edge_column_count.saturating_sub(1));
+                let measure_label = data
+                    .edge_labels
+                    .get(measure)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Measure {}", measure + 1));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Measure");
+                    egui::ComboBox::from_id_salt(("graph_matrix_measure", index))
+                        .selected_text(measure_label)
+                        .show_ui(ui, |ui| {
+                            for measure_index in 0..data.edge_column_count {
+                                let label =
+                                    data.edge_labels.get(measure_index).cloned().unwrap_or_else(
+                                        || format!("Measure {}", measure_index + 1),
+                                    );
+                                ui.selectable_value(&mut measure, measure_index, label);
+                            }
+                        });
+                    if measure != object.graph_measure {
+                        actions.push(ViewerCommand::SetGraphMeasure(index, measure));
+                    }
+
+                    ui.separator();
+                    let mut lower_triangle = object.graph_matrix_lower_triangle;
+                    ui.selectable_value(&mut lower_triangle, false, "Full");
+                    ui.selectable_value(&mut lower_triangle, true, "Lower triangle");
+                    if lower_triangle != object.graph_matrix_lower_triangle {
+                        actions.push(ViewerCommand::SetGraphMatrixLowerTriangle(
+                            index,
+                            lower_triangle,
+                        ));
+                    }
+                });
+
+                let max_abs = data
+                    .column_range(measure)
+                    .map(|(min, max)| min.abs().max(max.abs()))
+                    .unwrap_or(1.0)
+                    .max(f32::EPSILON);
+                ui.horizontal(|ui| {
+                    let mut threshold = object.graph_threshold.min(max_abs);
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut threshold, 0.0..=max_abs)
+                                .text("|value| threshold"),
+                        )
+                        .changed()
+                    {
+                        actions.push(ViewerCommand::SetGraphThreshold(index, threshold));
+                    }
+                    let mut cell_size = object.graph_matrix_cell_points;
+                    if ui
+                        .add(egui::Slider::new(&mut cell_size, 12.0..=42.0).text("Cell size"))
+                        .changed()
+                    {
+                        actions.push(ViewerCommand::SetGraphMatrixCellSize(index, cell_size));
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    graph_matrix_legend_swatch(ui, -max_abs, max_abs, object.graph_color_mode);
+                    ui.small(format!("−{max_abs:.3}"));
+                    graph_matrix_legend_swatch(ui, 0.0, max_abs, object.graph_color_mode);
+                    ui.small("0");
+                    graph_matrix_legend_swatch(ui, max_abs, max_abs, object.graph_color_mode);
+                    ui.small(format!("+{max_abs:.3}"));
+                    ui.separator();
+                    ui.weak("Dim cells are below the 3D threshold");
+                });
+                ui.separator();
+
+                let cell_size = object.graph_matrix_cell_points.clamp(12.0, 42.0);
+                let matrix_values = data.matrix_values(measure);
+                let node_count = data.nodes.len();
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new(("graph_matrix_grid", index))
+                            .spacing(egui::vec2(2.0, 2.0))
+                            .show(ui, |ui| {
+                                ui.add_sized([68.0, cell_size], egui::Label::new(""));
+                                for (column, node) in data.nodes.iter().enumerate() {
+                                    let label = compact_matrix_label(&node.label, column);
+                                    ui.add_sized(
+                                        [cell_size, cell_size],
+                                        egui::Label::new(egui::RichText::new(label).small()),
+                                    )
+                                    .on_hover_text(format!("{} · node {}", node.label, node.index));
+                                }
+                                ui.end_row();
+
+                                for (row, row_node) in data.nodes.iter().enumerate() {
+                                    let row_label = compact_matrix_label(&row_node.label, row);
+                                    ui.add_sized(
+                                        [68.0, cell_size],
+                                        egui::Label::new(egui::RichText::new(row_label).small()),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{} · node {}",
+                                        row_node.label, row_node.index
+                                    ));
+                                    for (column, column_node) in data.nodes.iter().enumerate() {
+                                        if object.graph_matrix_lower_triangle && column > row {
+                                            ui.add_sized(
+                                                [cell_size, cell_size],
+                                                egui::Label::new(""),
+                                            );
+                                            continue;
+                                        }
+                                        let value = matrix_values
+                                            .get(row * node_count + column)
+                                            .copied()
+                                            .flatten();
+                                        let below_threshold = value.is_none_or(|value| {
+                                            !value.is_finite()
+                                                || value.abs() < object.graph_threshold.max(0.0)
+                                        });
+                                        let fill = value
+                                            .filter(|value| value.is_finite())
+                                            .map(|value| {
+                                                let rgba = scene_objects::graph_value_color(
+                                                    value,
+                                                    max_abs,
+                                                    object.graph_color_mode,
+                                                );
+                                                graph_matrix_color32(rgba, below_threshold)
+                                            })
+                                            .unwrap_or_else(|| ui.visuals().faint_bg_color);
+                                        let selected = object.graph_matrix_selected_cell
+                                            == Some((row, column));
+                                        let stroke = if selected {
+                                            egui::Stroke::new(
+                                                2.0_f32,
+                                                ui.visuals().strong_text_color(),
+                                            )
+                                        } else {
+                                            egui::Stroke::NONE
+                                        };
+                                        let response = ui
+                                            .add_sized(
+                                                [cell_size, cell_size],
+                                                egui::Button::new("")
+                                                    .fill(fill)
+                                                    .stroke(stroke)
+                                                    .corner_radius(1.0),
+                                            )
+                                            .on_hover_text(match value {
+                                                Some(value) => format!(
+                                                    "{} → {}\n{} = {value:.6}",
+                                                    row_node.label,
+                                                    column_node.label,
+                                                    data.edge_labels
+                                                        .get(measure)
+                                                        .map(String::as_str)
+                                                        .unwrap_or("Value")
+                                                ),
+                                                None => format!(
+                                                    "{} → {}\nNo edge value",
+                                                    row_node.label, column_node.label
+                                                ),
+                                            });
+                                        if response.clicked() && value.is_some() {
+                                            actions.push(ViewerCommand::SelectGraphMatrixCell(
+                                                index, row, column,
+                                            ));
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                if let Some((row, column)) = object.graph_matrix_selected_cell
+                    && let (Some(source), Some(target), Some(value)) = (
+                        data.nodes.get(row),
+                        data.nodes.get(column),
+                        data.matrix_value(row, column, measure),
+                    )
+                {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} → {}    {value:.6}",
+                            source.label, target.label
+                        ))
+                        .strong(),
+                    );
+                }
+            });
+
+        if !open {
+            actions.push(ViewerCommand::SetGraphMatrixOpen(index, false));
+        }
     }
 
     fn draw_scene_object_labels(&self, ctx: &egui::Context) {
@@ -1059,6 +1281,36 @@ impl ViewerState {
                         });
                 }
                 SceneObjectPayload::Graph(data) => {
+                    if let Some(linked) = object.linked_tracts.as_ref() {
+                        let mut geometry = object.graph_edge_geometry;
+                        egui::ComboBox::from_id_salt("graph_edge_geometry")
+                            .selected_text(geometry.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut geometry,
+                                    GraphEdgeGeometry::Straight,
+                                    GraphEdgeGeometry::Straight.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut geometry,
+                                    GraphEdgeGeometry::LinkedBundles,
+                                    GraphEdgeGeometry::LinkedBundles.label(),
+                                );
+                            });
+                        if geometry != object.graph_edge_geometry {
+                            actions.push(ViewerCommand::SetGraphEdgeGeometry(index, geometry));
+                        }
+                        ui.small(format!(
+                            "Linked network: {} bundles · {} tracts",
+                            linked.bundles.len(),
+                            linked.tract_count()
+                        ));
+                    } else if let Some(path) = data.network_file.as_ref() {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            format!("Linked network unavailable: {}", path.display()),
+                        );
+                    }
                     let mut measure = object
                         .graph_measure
                         .min(data.edge_column_count.saturating_sub(1));
@@ -1120,6 +1372,19 @@ impl ViewerState {
                         .changed()
                     {
                         actions.push(ViewerCommand::SetGraphLabelsVisible(index, labels_visible));
+                    }
+                    if ui
+                        .button(if object.graph_matrix_open {
+                            "Close matrix view"
+                        } else {
+                            "Open matrix view"
+                        })
+                        .clicked()
+                    {
+                        actions.push(ViewerCommand::SetGraphMatrixOpen(
+                            index,
+                            !object.graph_matrix_open,
+                        ));
                     }
                 }
             }
@@ -1987,4 +2252,42 @@ impl ViewerState {
             }
         });
     }
+}
+
+fn compact_matrix_label(label: &str, index: usize) -> String {
+    let label = label.trim();
+    if label.is_empty() {
+        return (index + 1).to_string();
+    }
+    let mut chars = label.chars();
+    let compact: String = chars.by_ref().take(7).collect();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        compact
+    }
+}
+
+fn graph_matrix_color32(rgba: [f32; 4], below_threshold: bool) -> egui::Color32 {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let color = egui::Color32::from_rgba_unmultiplied(
+        channel(rgba[0]),
+        channel(rgba[1]),
+        channel(rgba[2]),
+        channel(rgba[3]),
+    );
+    if below_threshold {
+        color.gamma_multiply(0.28)
+    } else {
+        color
+    }
+}
+
+fn graph_matrix_legend_swatch(ui: &mut egui::Ui, value: f32, max_abs: f32, mode: GraphColorMode) {
+    let color = graph_matrix_color32(
+        scene_objects::graph_value_color(value, max_abs, mode),
+        false,
+    );
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 10.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 1.0, color);
 }

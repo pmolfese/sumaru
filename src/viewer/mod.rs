@@ -99,7 +99,7 @@ mod ui;
 mod volume_view;
 use edit::{CoordConvention, GoToLocationState};
 use instacorr::{InstaCorrSession, InstaCorrWorkerResult};
-pub use scene_objects::{GraphColorMode, TractColorMode};
+pub use scene_objects::{GraphColorMode, GraphEdgeGeometry, TractColorMode};
 use scene_objects::{
     SceneObject, SceneObjectGpu, SceneObjectPayload, SceneObjectPick, SceneObjectRenderer,
     normalization_model, pick_scene_objects,
@@ -2203,7 +2203,34 @@ impl ViewerState {
     fn load_graph_path(&mut self, path: PathBuf) -> Result<()> {
         let path = canonical_or_original_path(path);
         let data = read_graph_bucket(&path)?;
-        self.insert_scene_object(SceneObject::from_graph(path, data)?);
+        let (linked_tracts, link_notice) = match data.network_file.as_ref() {
+            Some(network_path) if network_path.exists() => match read_niml_tract(network_path) {
+                Ok(tracts) => (Some(tracts), None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "Graph loaded, but linked tract file {} could not be read: {error:#}",
+                        network_path.display()
+                    )),
+                ),
+            },
+            Some(network_path) => (
+                None,
+                Some(format!(
+                    "Graph loaded, but linked tract file {} was not found.",
+                    network_path.display()
+                )),
+            ),
+            None => (None, None),
+        };
+        self.insert_scene_object(SceneObject::from_graph_with_linked_tracts(
+            path,
+            data,
+            linked_tracts,
+        )?);
+        if let Some(notice) = link_notice {
+            self.log_status(notice);
+        }
         Ok(())
     }
 
@@ -2244,6 +2271,9 @@ impl ViewerState {
             .is_some_and(|pick| pick.object_index() == index)
         {
             self.scene_object_pick = None;
+        }
+        if let Some(object) = self.scene_objects.get_mut(index) {
+            object.graph_matrix_selected_cell = None;
         }
     }
 
@@ -3060,6 +3090,80 @@ impl ViewerState {
                         && matches!(object.payload, SceneObjectPayload::Graph(_))
                     {
                         object.graph_labels_visible = visible;
+                    }
+                }
+                ViewerCommand::SetGraphEdgeGeometry(index, geometry) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                        && (geometry == GraphEdgeGeometry::Straight
+                            || object.linked_tracts.is_some())
+                    {
+                        object.graph_edge_geometry = geometry;
+                        self.rebuild_scene_object_gpu(index);
+                        self.clear_scene_object_pick_for(index);
+                    }
+                }
+                ViewerCommand::SetGraphMatrixOpen(index, open) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                    {
+                        object.graph_matrix_open = open;
+                        if open {
+                            self.active_scene_object = Some(index);
+                        }
+                        self.control.window.request_redraw();
+                        self.view.window.request_redraw();
+                    }
+                }
+                ViewerCommand::SetGraphMatrixLowerTriangle(index, lower_triangle) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                    {
+                        object.graph_matrix_lower_triangle = lower_triangle;
+                        self.view.window.request_redraw();
+                    }
+                }
+                ViewerCommand::SetGraphMatrixCellSize(index, size) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                    {
+                        object.graph_matrix_cell_points = size.clamp(12.0, 42.0);
+                        self.view.window.request_redraw();
+                    }
+                }
+                ViewerCommand::SelectGraphMatrixCell(index, row, column) => {
+                    let selection = self.scene_objects.get(index).and_then(|object| {
+                        let SceneObjectPayload::Graph(data) = &object.payload else {
+                            return None;
+                        };
+                        let value = data.matrix_value(row, column, object.graph_measure)?;
+                        let source = data.nodes.get(row)?;
+                        let target = data.nodes.get(column)?;
+                        let measure = data
+                            .edge_labels
+                            .get(object.graph_measure)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Measure {}", object.graph_measure + 1));
+                        Some(SceneObjectPick::GraphEdge {
+                            object_index: index,
+                            object_name: object.name.clone(),
+                            source_index: row,
+                            target_index: column,
+                            source: source.label.clone(),
+                            target: target.label.clone(),
+                            measure,
+                            value,
+                        })
+                    });
+                    if let Some(pick) = selection {
+                        if let Some(object) = self.scene_objects.get_mut(index) {
+                            object.graph_matrix_selected_cell = Some((row, column));
+                        }
+                        self.active_scene_object = Some(index);
+                        self.log_status(pick.status_text());
+                        self.scene_object_pick = Some(pick);
+                        self.control.window.request_redraw();
+                        self.view.window.request_redraw();
                     }
                 }
                 ViewerCommand::RemoveSceneObject(index) => self.remove_scene_object(index),
@@ -4290,7 +4394,17 @@ impl ViewerState {
             self.control.window.request_redraw();
             return false;
         };
-        self.active_scene_object = Some(pick.object_index());
+        let object_index = pick.object_index();
+        if let SceneObjectPick::GraphEdge {
+            source_index,
+            target_index,
+            ..
+        } = &pick
+            && let Some(object) = self.scene_objects.get_mut(object_index)
+        {
+            object.graph_matrix_selected_cell = Some((*source_index, *target_index));
+        }
+        self.active_scene_object = Some(object_index);
         self.log_status(pick.status_text());
         self.scene_object_pick = Some(pick);
         self.control.window.request_redraw();
