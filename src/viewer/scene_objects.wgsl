@@ -24,7 +24,7 @@ fn vs_main(input: SegmentInput, @builtin(vertex_index) vertex_index: u32) -> Ver
     let perpendicular = vec2<f32>(-direction.y, direction.x);
     let half_width = (max(uniforms.widths.x, 0.0) + max(uniforms.widths.y, 0.0)) * 0.5;
     let offset_px = perpendicular * corner.y * half_width;
-    clip.xy += (offset_px / half_viewport) * clip.w;
+    clip = vec4<f32>(clip.xy + (offset_px / half_viewport) * clip.w, clip.zw);
     var output: VertexOutput; output.clip_position = clip; output.offset_px = corner.y * half_width; output.color = input.color; return output;
 }
 
@@ -47,7 +47,7 @@ fn node_vs(input: NodeInput, @builtin(vertex_index) vertex_index: u32) -> NodeOu
     var clip = uniforms.view_projection * uniforms.model * vec4<f32>(input.position, 1.0);
     let half_viewport = max(uniforms.viewport, vec2<f32>(1.0)) * 0.5;
     let radius_px = max(uniforms.appearance.y, 1.0) * 0.5;
-    clip.xy += (corner * radius_px / half_viewport) * clip.w;
+    clip = vec4<f32>(clip.xy + (corner * radius_px / half_viewport) * clip.w, clip.zw);
     var output: NodeOutput;
     output.clip_position = clip;
     output.local = corner;
