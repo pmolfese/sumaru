@@ -780,6 +780,9 @@ impl ViewerState {
             .clone()
             .or_else(|| Some("AFNI SUMA_irgba".to_string()));
         let overlay_model = Overlay::from_color_cache(&mesh.domain, colors, dataset_id)?;
+        if !self.afni_live_overlay_active {
+            self.reset_overlay_stack_storage();
+        }
         self.afni_live_overlay_active = true;
         self.overlay.render.render_model = Some(overlay_model);
         self.overlay.data = DatasetOverlayState::None;
@@ -984,6 +987,7 @@ impl ViewerState {
             })?;
 
         self.controller.interaction.set_pick(Some(pick));
+        self.note_instacorr_pick(pick.node_index);
         self.afni_crosshair_node = Some(node_index);
         self.refresh_pick_overlay_value();
         self.refresh_graph_snapshot_if_open();

@@ -51,9 +51,21 @@ struct Cli {
     #[arg(long = "sv", value_name = "PATH")]
     surface_volume: Option<PathBuf>,
 
-    /// Load a NIfTI volume (.nii/.nii.gz) for orthogonal slice-plane rendering.
+    /// Load a NIfTI or AFNI HEAD/BRIK volume for orthogonal slice rendering.
     #[arg(long = "volume", visible_alias = "vol", value_name = "PATH")]
     volume: Option<PathBuf>,
+
+    /// Load one or more AFNI/FATCAT `.niml.tract` tractography objects.
+    #[arg(long = "tract", value_name = "PATH")]
+    tract_paths: Vec<PathBuf>,
+
+    /// Load one or more AFNI/FATCAT `.grid` or `Graph_Bucket` `.niml.dset` graph objects.
+    #[arg(
+        long = "graph",
+        visible_aliases = ["gdset", "grid"],
+        value_name = "PATH"
+    )]
+    graph_paths: Vec<PathBuf>,
 
     /// Load this GIFTI data array as a per-vertex surface overlay.
     #[arg(long = "overlay", value_name = "PATH")]
@@ -244,6 +256,8 @@ fn main() -> Result<()> {
     let surface_rh = cli.surface_rh;
     let surface_volume = cli.surface_volume;
     let volume = cli.volume;
+    let tract_paths = cli.tract_paths;
+    let graph_paths = cli.graph_paths;
     let overlay = cli.overlay;
     let roi = cli.roi;
     let auto_color_niml = cli.auto_color_niml;
@@ -271,6 +285,8 @@ fn main() -> Result<()> {
                 surface_rh_path: surface_rh,
                 surface_volume_path: surface_volume,
                 volume_path: volume,
+                tract_paths,
+                graph_paths,
                 overlay_path: overlay,
                 overlay_pair_paths: overlay_pair,
                 roi_path: roi,
@@ -299,6 +315,8 @@ fn main() -> Result<()> {
                 &subs,
                 &p_value,
                 &niml_record_path,
+                &tract_paths,
+                &graph_paths,
                 onestate,
                 big_mem,
                 gpu,
@@ -323,6 +341,8 @@ fn main() -> Result<()> {
                 &subs,
                 &p_value,
                 &niml_record_path,
+                &tract_paths,
+                &graph_paths,
                 onestate,
                 big_mem,
                 gpu,
@@ -444,6 +464,8 @@ fn validate_no_viewer_launch_options(
     subs: &Option<Vec<String>>,
     p_value: &Option<f64>,
     niml_record_path: &Option<PathBuf>,
+    tract_paths: &[PathBuf],
+    graph_paths: &[PathBuf],
     onestate: bool,
     big_mem: bool,
     gpu: bool,
@@ -460,6 +482,8 @@ fn validate_no_viewer_launch_options(
         || subs.is_some()
         || p_value.is_some()
         || niml_record_path.is_some()
+        || !tract_paths.is_empty()
+        || !graph_paths.is_empty()
         || onestate
         || big_mem
         || gpu
@@ -578,6 +602,12 @@ fn normalize_afni_style_arg(arg: OsString) -> OsString {
         OsString::from("--spec")
     } else if arg == "-sv" {
         OsString::from("--sv")
+    } else if arg == "-vol" {
+        OsString::from("--vol")
+    } else if arg == "-gdset" {
+        OsString::from("--gdset")
+    } else if arg == "-grid" {
+        OsString::from("--grid")
     } else if arg == "-onestate" {
         OsString::from("--onestate")
     } else if matches!(
@@ -1181,6 +1211,49 @@ mod tests {
     }
 
     #[test]
+    fn tract_and_graph_launch_options_repeat() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "--tract",
+            "a.niml.tract",
+            "--tract",
+            "b.niml.tract",
+            "--graph",
+            "network.niml.dset",
+        ]);
+
+        assert_eq!(
+            cli.tract_paths,
+            vec![PathBuf::from("a.niml.tract"), PathBuf::from("b.niml.tract")]
+        );
+        assert_eq!(cli.graph_paths, vec![PathBuf::from("network.niml.dset")]);
+    }
+
+    #[test]
+    fn suma_compatible_volume_and_graph_aliases_parse() {
+        for volume_flag in ["--volume", "--vol"] {
+            let cli = Cli::parse_from(["sumaru", volume_flag, "anat+orig."]);
+            assert_eq!(cli.volume, Some(PathBuf::from("anat+orig.")));
+        }
+
+        for graph_flag in ["--graph", "--gdset", "--grid"] {
+            let cli = Cli::parse_from(["sumaru", graph_flag, "network.grid"]);
+            assert_eq!(cli.graph_paths, vec![PathBuf::from("network.grid")]);
+        }
+
+        for (suma_flag, long_flag) in [
+            ("-vol", "--vol"),
+            ("-gdset", "--gdset"),
+            ("-grid", "--grid"),
+        ] {
+            assert_eq!(
+                normalize_afni_style_arg(OsString::from(suma_flag)),
+                OsString::from(long_flag)
+            );
+        }
+    }
+
+    #[test]
     fn niml_record_path_is_viewer_only() {
         let cli = Cli::parse_from([
             "sumaru",
@@ -1205,6 +1278,8 @@ mod tests {
                 &None,
                 &None,
                 &Some(PathBuf::from("session.nimlrec")),
+                &[],
+                &[],
                 false,
                 false,
                 false,
@@ -1232,6 +1307,8 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &[],
+                &[],
                 false,
                 true,
                 false,
@@ -1259,6 +1336,8 @@ mod tests {
                 &None,
                 &None,
                 &None,
+                &[],
+                &[],
                 false,
                 false,
                 true,

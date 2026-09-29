@@ -18,7 +18,16 @@ pub enum NimlData {
     Numeric(NimlNumericMatrix),
     Mixed(NimlMixedTable),
     RoiDatums(Vec<NimlRoiDatumRecord>),
+    TractDatums(Vec<NimlTractDatumRecord>),
     Group(Vec<NimlElement>),
+}
+
+/// One AFNI/FATCAT `TAYLOR_TRACT_DATUM` row. `points` remain in the
+/// RAI/DICOM world coordinates stored in the file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NimlTractDatumRecord {
+    pub id: i32,
+    pub points: Vec<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +61,7 @@ pub enum NimlValueType {
     String,
     CString,
     SumaRoiDatum,
+    TaylorTractDatum,
     Other(String),
 }
 
@@ -62,6 +72,8 @@ pub struct NimlDatasetPayload {
     pub filename: Option<String>,
     pub label: Option<String>,
     pub sparse_data: Option<NimlNumericMatrix>,
+    /// `SPARSE_DATA`'s `ni_timestep`, expressed in seconds by AFNI/SUMA.
+    pub time_step_seconds: Option<f64>,
     pub node_indices: Option<Vec<u32>>,
     pub column_ranges: Vec<String>,
     pub column_labels: Vec<String>,
@@ -451,6 +463,7 @@ impl NimlValueType {
             "string" => Self::String,
             "cstring" => Self::CString,
             "suma_niml_roi_datum" => Self::SumaRoiDatum,
+            "taylor_tract_datum" => Self::TaylorTractDatum,
             _ => Self::Other(name.trim().to_string()),
         }
     }
@@ -465,6 +478,7 @@ impl NimlValueType {
             Self::String => "String",
             Self::CString => "CString",
             Self::SumaRoiDatum => "SUMA_NIML_ROI_DATUM",
+            Self::TaylorTractDatum => "TAYLOR_TRACT_DATUM",
             Self::Other(value) => value,
         }
     }
@@ -502,6 +516,7 @@ impl NimlDatasetPayload {
             filename: element.attrs.get("filename").cloned(),
             label: element.attrs.get("label").cloned(),
             sparse_data: None,
+            time_step_seconds: None,
             node_indices: None,
             column_ranges: Vec::new(),
             column_labels: Vec::new(),
@@ -518,6 +533,11 @@ impl NimlDatasetPayload {
                         bail!("SPARSE_DATA payload is not numeric");
                     };
                     payload.sparse_data = Some(matrix.clone());
+                    payload.time_step_seconds = child
+                        .attrs
+                        .get("ni_timestep")
+                        .and_then(|value| value.trim().parse::<f64>().ok())
+                        .filter(|value| value.is_finite() && *value > 0.0);
                 }
                 "INDEX_LIST" => {
                     let NimlData::Numeric(matrix) = &child.data else {
@@ -598,6 +618,9 @@ impl NimlDatasetPayload {
 
         let mut sparse_attrs = BTreeMap::new();
         sparse_attrs.insert("data_type".to_string(), "Node_Bucket_data".to_string());
+        if let Some(value) = self.time_step_seconds {
+            sparse_attrs.insert("ni_timestep".to_string(), value.to_string());
+        }
 
         let mut index_attrs = BTreeMap::new();
         index_attrs.insert(
@@ -699,6 +722,7 @@ impl NimlDatasetPayload {
             volume_parent_id: None,
             originator_id: self.filename.clone(),
         };
+        dataset.time_step_seconds = self.time_step_seconds;
 
         Ok(dataset)
     }
@@ -895,7 +919,14 @@ impl<'a> NimlByteParser<'a> {
         } else {
             let end_marker = format!("</{name}>");
             if element_is_binary(&attrs) {
-                let payload_len = binary_payload_len(&attrs)?;
+                let payload_len = if attrs
+                    .get("ni_type")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("TAYLOR_TRACT_DATUM"))
+                {
+                    binary_tract_payload_len(&self.input[self.pos..], &attrs)?
+                } else {
+                    binary_payload_len(&attrs)?
+                };
                 ensure!(
                     self.pos + payload_len <= self.input.len(),
                     "binary NIML payload for {name} ended early"
@@ -1010,6 +1041,13 @@ pub(crate) fn parse_element_data_bytes(
         if column_types == [NimlValueType::SumaRoiDatum] {
             bail!("binary SUMA_NIML_ROI_DATUM payloads are not supported yet");
         }
+        if column_types == [NimlValueType::TaylorTractDatum] {
+            return Ok(NimlData::TractDatums(parse_binary_tract_datums(
+                body,
+                rows,
+                attrs.get("ni_form").map(String::as_str),
+            )?));
+        }
         ensure!(
             column_types.iter().all(NimlValueType::is_numeric),
             "binary NIML payloads with string or mixed columns are not supported"
@@ -1026,6 +1064,10 @@ pub(crate) fn parse_element_data_bytes(
 
     if column_types == [NimlValueType::SumaRoiDatum] {
         return Ok(NimlData::RoiDatums(parse_roi_datum_records(body, rows)?));
+    }
+
+    if column_types == [NimlValueType::TaylorTractDatum] {
+        return Ok(NimlData::TractDatums(parse_ascii_tract_datums(body, rows)?));
     }
 
     if column_types.iter().all(NimlValueType::is_numeric) {
@@ -1109,6 +1151,148 @@ pub(crate) fn parse_binary_numeric_matrix(
     }
 
     NimlNumericMatrix::new(column_types, rows, values)
+}
+
+fn binary_tract_payload_len(input: &[u8], attrs: &BTreeMap<String, String>) -> Result<usize> {
+    let rows = attrs
+        .get("ni_dimen")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .context("invalid NIML ni_dimen")?
+        .unwrap_or(0);
+    let byte_order = BinaryByteOrder::from_ni_form(
+        attrs.get("ni_form").map(String::as_str).unwrap_or("binary"),
+    )?;
+    let mut offset = 0usize;
+    for row in 0..rows {
+        ensure!(
+            offset + 8 <= input.len(),
+            "binary tract row {row} ended before its header"
+        );
+        let value_count = decode_i32(&input[offset + 4..offset + 8], byte_order)?;
+        ensure!(
+            value_count >= 0 && value_count % 3 == 0,
+            "binary tract row {row} has invalid coordinate count {value_count}"
+        );
+        let row_len = 8usize
+            .checked_add(
+                (value_count as usize)
+                    .checked_mul(4)
+                    .context("tract row is too large")?,
+            )
+            .context("tract row is too large")?;
+        offset = offset
+            .checked_add(row_len)
+            .context("tract payload is too large")?;
+        ensure!(offset <= input.len(), "binary tract row {row} ended early");
+    }
+    Ok(offset)
+}
+
+fn parse_binary_tract_datums(
+    body: &[u8],
+    rows: usize,
+    ni_form: Option<&str>,
+) -> Result<Vec<NimlTractDatumRecord>> {
+    let byte_order = BinaryByteOrder::from_ni_form(ni_form.unwrap_or("binary"))?;
+    let mut offset = 0usize;
+    let mut records = Vec::with_capacity(rows);
+    for row in 0..rows {
+        ensure!(
+            offset + 8 <= body.len(),
+            "binary tract row {row} ended before its header"
+        );
+        let id = decode_i32(&body[offset..offset + 4], byte_order)?;
+        let value_count = decode_i32(&body[offset + 4..offset + 8], byte_order)?;
+        ensure!(
+            value_count >= 0 && value_count % 3 == 0,
+            "binary tract row {row} has invalid coordinate count {value_count}"
+        );
+        offset += 8;
+        let mut points = Vec::with_capacity(value_count as usize / 3);
+        for _ in 0..value_count / 3 {
+            ensure!(
+                offset + 12 <= body.len(),
+                "binary tract row {row} ended early"
+            );
+            let x = decode_f32(&body[offset..offset + 4], byte_order)?;
+            let y = decode_f32(&body[offset + 4..offset + 8], byte_order)?;
+            let z = decode_f32(&body[offset + 8..offset + 12], byte_order)?;
+            ensure!(
+                x.is_finite() && y.is_finite() && z.is_finite(),
+                "binary tract row {row} contains a non-finite coordinate"
+            );
+            points.push([x, y, z]);
+            offset += 12;
+        }
+        records.push(NimlTractDatumRecord { id, points });
+    }
+    ensure!(
+        offset == body.len(),
+        "binary tract payload contains trailing bytes"
+    );
+    Ok(records)
+}
+
+fn parse_ascii_tract_datums(body: &str, rows: usize) -> Result<Vec<NimlTractDatumRecord>> {
+    let mut tokens = body.split_whitespace();
+    let mut records = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let id = tokens
+            .next()
+            .with_context(|| format!("ASCII tract row {row} has no id"))?
+            .parse::<i32>()
+            .with_context(|| format!("ASCII tract row {row} has an invalid id"))?;
+        let value_count = tokens
+            .next()
+            .with_context(|| format!("ASCII tract row {row} has no coordinate count"))?
+            .parse::<usize>()
+            .with_context(|| format!("ASCII tract row {row} has an invalid coordinate count"))?;
+        ensure!(
+            value_count % 3 == 0,
+            "ASCII tract row {row} coordinate count is not divisible by 3"
+        );
+        let mut points = Vec::with_capacity(value_count / 3);
+        for _ in 0..value_count / 3 {
+            let mut next = || -> Result<f32> {
+                let value = tokens
+                    .next()
+                    .with_context(|| format!("ASCII tract row {row} ended early"))?
+                    .parse::<f32>()
+                    .with_context(|| format!("ASCII tract row {row} has an invalid coordinate"))?;
+                ensure!(
+                    value.is_finite(),
+                    "ASCII tract row {row} contains a non-finite coordinate"
+                );
+                Ok(value)
+            };
+            points.push([next()?, next()?, next()?]);
+        }
+        records.push(NimlTractDatumRecord { id, points });
+    }
+    ensure!(
+        tokens.next().is_none(),
+        "ASCII tract payload contains trailing data"
+    );
+    Ok(records)
+}
+
+fn decode_i32(bytes: &[u8], byte_order: BinaryByteOrder) -> Result<i32> {
+    let bytes: [u8; 4] = bytes.try_into().context("invalid i32 byte width")?;
+    Ok(if byte_order.is_little() {
+        i32::from_le_bytes(bytes)
+    } else {
+        i32::from_be_bytes(bytes)
+    })
+}
+
+fn decode_f32(bytes: &[u8], byte_order: BinaryByteOrder) -> Result<f32> {
+    let bytes: [u8; 4] = bytes.try_into().context("invalid f32 byte width")?;
+    Ok(if byte_order.is_little() {
+        f32::from_le_bytes(bytes)
+    } else {
+        f32::from_be_bytes(bytes)
+    })
 }
 
 pub(crate) fn parse_mixed_table(
@@ -1522,6 +1706,13 @@ pub(crate) fn serialize_element(element: &NimlElement, out: &mut String) {
             );
             attrs.insert("ni_dimen".to_string(), records.len().to_string());
         }
+        NimlData::TractDatums(records) => {
+            attrs.insert(
+                "ni_type".to_string(),
+                NimlValueType::TaylorTractDatum.canonical_name().to_string(),
+            );
+            attrs.insert("ni_dimen".to_string(), records.len().to_string());
+        }
         NimlData::Text(_) => {
             attrs
                 .entry("ni_type".to_string())
@@ -1595,6 +1786,19 @@ pub(crate) fn serialize_element(element: &NimlElement, out: &mut String) {
                 for node in &record.node_path {
                     out.push(' ');
                     out.push_str(&node.to_string());
+                }
+            }
+            out.push('\n');
+        }
+        NimlData::TractDatums(records) => {
+            for record in records {
+                out.push('\n');
+                out.push_str(&format!("{} {}", record.id, record.points.len() * 3));
+                for point in &record.points {
+                    for value in point {
+                        out.push(' ');
+                        out.push_str(&format_float(f64::from(*value)));
+                    }
                 }
             }
             out.push('\n');

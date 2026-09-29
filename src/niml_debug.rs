@@ -448,6 +448,7 @@ fn data_summary(data: &NimlData) -> String {
             table.column_types
         ),
         NimlData::RoiDatums(records) => format!("roi_datums count={}", records.len()),
+        NimlData::TractDatums(records) => format!("tract_datums count={}", records.len()),
         NimlData::Group(children) => format!("group children={}", children.len()),
     }
 }

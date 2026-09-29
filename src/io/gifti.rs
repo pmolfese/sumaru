@@ -90,7 +90,17 @@ pub(crate) fn gifti_image_to_dataset(
         DatasetKind::SurfaceScalar
     };
 
-    Dataset::dense(kind, domain, columns).map(|dataset| dataset.with_parent_ids(parent_ids))
+    let time_step_seconds = ["TimeStep", "AFNI_TimeStep", "ni_timestep", "TR"]
+        .iter()
+        .find_map(|key| gifti_meta_value(&image.meta, key))
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+
+    Dataset::dense(kind, domain, columns).map(|dataset| {
+        dataset
+            .with_parent_ids(parent_ids)
+            .with_time_step_seconds(time_step_seconds)
+    })
 }
 
 pub(crate) fn gifti_array_to_data_column(array: &DataArray, index: usize) -> Result<DataColumn> {
@@ -274,7 +284,7 @@ mod tests {
         let image = GiftiImage {
             version: "1.0".to_string(),
             num_data_arrays: 3,
-            meta: Vec::new(),
+            meta: vec![("TimeStep".to_string(), "0.8".to_string())],
             label_table: None,
             data_arrays: vec![
                 float_array(gifti_rs::intent::POINTSET, vec![3], vec![1.0, 2.0, 3.0]),
@@ -287,6 +297,7 @@ mod tests {
             .expect("scalar pointsets should load as overlay columns");
 
         assert_eq!(dataset.kind, DatasetKind::SurfaceTimeSeries);
+        assert_eq!(dataset.time_step_seconds, Some(0.8));
         assert_eq!(dataset.columns.len(), 2);
         assert!(
             dataset

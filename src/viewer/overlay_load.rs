@@ -67,6 +67,12 @@ impl ViewerState {
             overlay_column_summary(&loaded_overlay.dataset, loaded_overlay.columns);
         let overlay_values = loaded_overlay.overlay_values;
         let range = overlay_values.range;
+        let pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
+        let key = pair_paths
+            .as_ref()
+            .map(OverlayKey::pair)
+            .unwrap_or_else(|| OverlayKey::single(&path));
+        let threshold_transfer = self.prepare_overlay_install(key);
 
         self.overlay.clear();
         self.auto_niml_overlay_active = false;
@@ -84,10 +90,12 @@ impl ViewerState {
         self.overlay.render.appearance.symmetric_range = range.min < 0.0 && range.max > 0.0;
         let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         self.overlay.source.path = Some(path.clone());
-        self.overlay.source.pair_paths = self.explicit_overlay_pair_for_loaded_path(&path);
+        self.overlay.source.pair_paths = pair_paths;
         self.overlay.source.label_table = None;
         self.controller.surface.current_overlay_path = Some(path.clone());
         self.overlay.source.display_name = Some(loaded_selection.display_name);
+        self.apply_overlay_install_threshold(threshold_transfer);
+        self.sanitize_overlay_appearance();
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
@@ -124,6 +132,7 @@ impl ViewerState {
             overlay_column_summary(&loaded_overlay.dataset, loaded_overlay.columns);
         let overlay_values = loaded_overlay.overlay_values;
         let range = overlay_values.range;
+        let threshold_transfer = self.prepare_overlay_install(OverlayKey::pair(&pair));
 
         self.overlay.clear();
         self.auto_niml_overlay_active = false;
@@ -149,6 +158,8 @@ impl ViewerState {
         self.overlay.source.label_table = None;
         self.controller.surface.current_overlay_path = Some(primary_path);
         self.overlay.source.display_name = Some(loaded_selection.display_name);
+        self.apply_overlay_install_threshold(threshold_transfer);
+        self.sanitize_overlay_appearance();
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
         self.upload_surface_buffers();
@@ -476,6 +487,10 @@ impl ViewerState {
         let range = overlay_values.range;
         let primary_path = display_paths.first().cloned();
         let display_name = auto_niml_display_name(&display_paths);
+        let threshold_transfer = primary_path
+            .as_deref()
+            .map(OverlayKey::single)
+            .and_then(|key| self.prepare_overlay_install(key));
 
         self.overlay.clear();
         self.auto_niml_overlay_active = true;
@@ -497,6 +512,8 @@ impl ViewerState {
         self.controller.surface.current_overlay_path = primary_path;
         self.overlay.source.display_name = Some(display_name);
         let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
+        self.apply_overlay_install_threshold(threshold_transfer);
+        self.sanitize_overlay_appearance();
         self.rebuild_overlay_model()?;
         self.apply_initial_overlay_options(
             self.auto_niml_overlay_subs.clone().as_deref(),
@@ -529,6 +546,7 @@ impl ViewerState {
     }
 
     fn clear_auto_niml_overlay(&mut self) {
+        self.reset_overlay_stack_storage();
         self.overlay.clear();
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.auto_niml_overlay_active = false;
@@ -764,6 +782,7 @@ fn append_sparse_overlay_dataset(
     } else {
         DatasetKind::Unknown
     };
+    let time_step_seconds = paired_time_step(left.time_step_seconds, right.time_step_seconds)?;
     let parent_ids = if left.parent_ids == right.parent_ids {
         left.parent_ids.clone()
     } else {
@@ -792,7 +811,11 @@ fn append_sparse_overlay_dataset(
     }
 
     Dataset::sparse(kind, domain, node_indices, columns)
-        .map(|dataset| dataset.with_parent_ids(parent_ids))
+        .map(|dataset| {
+            dataset
+                .with_parent_ids(parent_ids)
+                .with_time_step_seconds(time_step_seconds)
+        })
         .context("failed to combine auto NIML overlay datasets")
 }
 

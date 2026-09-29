@@ -5,6 +5,92 @@
 use super::*;
 
 impl ViewerState {
+    pub(super) fn graph_matrix_dock_open(&self) -> bool {
+        self.active_scene_object
+            .and_then(|index| self.scene_objects.get(index))
+            .is_some_and(|object| {
+                object.graph_matrix_open
+                    && object.graph_matrix_placement == GraphMatrixPlacement::Docked
+                    && matches!(object.payload, SceneObjectPayload::Graph(_))
+            })
+    }
+
+    pub(super) fn graph_matrix_window_open(&self) -> bool {
+        self.active_scene_object
+            .and_then(|index| self.scene_objects.get(index))
+            .is_some_and(|object| {
+                object.graph_matrix_open
+                    && object.graph_matrix_placement == GraphMatrixPlacement::Window
+                    && matches!(object.payload, SceneObjectPayload::Graph(_))
+            })
+    }
+
+    pub(super) fn bottom_dock_open(&self) -> bool {
+        self.controller.panels.graph_window_open || self.graph_matrix_dock_open()
+    }
+
+    pub(super) fn set_graph_matrix_open(&mut self, index: usize, open: bool) {
+        let dock_was_open = self.bottom_dock_open();
+        if open {
+            for object in &mut self.scene_objects {
+                object.graph_matrix_open = false;
+            }
+        }
+        let Some(object) = self.scene_objects.get_mut(index) else {
+            return;
+        };
+        if !matches!(object.payload, SceneObjectPayload::Graph(_)) {
+            return;
+        }
+        object.graph_matrix_open = open;
+        if open {
+            self.active_scene_object = Some(index);
+        }
+        self.sync_graph_matrix_presentation(dock_was_open);
+    }
+
+    pub(super) fn set_graph_matrix_placement(
+        &mut self,
+        index: usize,
+        placement: GraphMatrixPlacement,
+    ) {
+        let dock_was_open = self.bottom_dock_open();
+        let Some(object) = self.scene_objects.get_mut(index) else {
+            return;
+        };
+        if !matches!(object.payload, SceneObjectPayload::Graph(_)) {
+            return;
+        }
+        object.graph_matrix_placement = placement;
+        self.active_scene_object = Some(index);
+        self.sync_graph_matrix_presentation(dock_was_open);
+    }
+
+    pub(super) fn sync_graph_matrix_presentation(&mut self, dock_was_open: bool) {
+        let dock_is_open = self.bottom_dock_open();
+        if dock_is_open && !dock_was_open {
+            self.grow_view_window_for_graph_dock();
+        } else if !dock_is_open && dock_was_open {
+            self.shrink_view_window_after_graph_dock();
+        }
+
+        let window_open = self.graph_matrix_window_open();
+        if window_open {
+            let title = self
+                .active_scene_object
+                .and_then(|index| self.scene_objects.get(index))
+                .map(|object| format!("Graph Matrix — {}", object.name))
+                .unwrap_or_else(|| "Graph Matrix".to_string());
+            self.graph.window.set_title(&title);
+        }
+        self.graph.window.set_visible(window_open);
+        if window_open {
+            self.graph.window.request_redraw();
+        }
+        self.control.window.request_redraw();
+        self.view.window.request_redraw();
+    }
+
     /// Open the graph for the current pick, growing the view to fit the dock.
     pub(super) fn open_graph_for_current_pick(&mut self) -> Result<()> {
         let Some(pick) = self.controller.interaction.pick else {
@@ -22,14 +108,14 @@ impl ViewerState {
 
     /// Toggle the graph dock open/closed and resize the view window to match.
     pub(super) fn set_graph_window_open(&mut self, open: bool) {
-        let was_open = self.controller.panels.graph_window_open;
-        if open && !was_open {
+        let dock_was_open = self.bottom_dock_open();
+        self.controller.panels.graph_window_open = open;
+        let dock_is_open = self.bottom_dock_open();
+        if dock_is_open && !dock_was_open {
             self.grow_view_window_for_graph_dock();
-        } else if !open && was_open {
+        } else if !dock_is_open && dock_was_open {
             self.shrink_view_window_after_graph_dock();
         }
-        self.controller.panels.graph_window_open = open;
-        self.graph.window.set_visible(false);
         if open {
             self.view.window.request_redraw();
         }

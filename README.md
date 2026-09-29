@@ -94,12 +94,19 @@ refreshed as the viewer changes.
 ## What Works Right Now
 
 - GIFTI surface/shape/dataset I/O through `gifti-rs` from `PennLINC/gifti-rs`.
-- NIfTI volume I/O through `nifti` from `Enet4/nifti-rs`.
+- NIfTI volume I/O through `nifti` from `Enet4/nifti-rs`, plus native AFNI
+  HEAD/BRIK volume loading.
 - SUMA `.spec` parsing for the common single-hemisphere and paired-hemisphere
   viewer cases I have been testing.
 - A surface viewer through `winit`, `wgpu`, and `egui`, with overlays, drawn
   ROIs, and paired-hemisphere layouts.
 - A `--volume` mode that renders orthogonal NIfTI slice planes in the 3D scene.
+- AFNI/FATCAT `.niml.tract` objects with adjustable screen-space ribbon width,
+  per-bundle visibility/opacity, and SUMA-style local-orientation,
+  tract-orientation, or bundle coloring.
+- AFNI `Graph_Bucket .niml.dset` objects with shaded 3D node glyphs, straight
+  or tract-bundle edges, and an interactive matrix view; full, triangular, and
+  sparse edge encodings are parsed.
 - Headless file inspection for quick metadata checks.
 
 Some useful ways to launch it:
@@ -116,8 +123,40 @@ cargo run -- -spec /path/to/subj_rh.spec
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --preload
 cargo run -- --volume /path/to/subj_SurfVol.nii
+cargo run -- --volume /path/to/anat+tlrc.
+cargo run -- --tract /path/to/network.niml.tract
+cargo run -- --volume /path/to/anat.nii.gz --tract /path/to/network.niml.tract
+cargo run -- --graph /path/to/network.niml.dset
+cargo run -- --vol /path/to/anat+orig. --gdset /path/to/network.niml.dset
+cargo run -- -vol /path/to/anat+orig. -gdset /path/to/network.grid
 cargo run -- inspect /path/to/file.nii.gz
 ```
+
+For SUMA compatibility, `--vol` aliases `--volume`, while `--gdset` and
+`--grid` alias `--graph`. The single-dash SUMA spellings `-vol`, `-gdset`, and
+`-grid` are accepted as well.
+
+Tracts and graphs are independent scene objects: several may be loaded at
+once, either alone or beside surfaces and volume slices. Use the
+`TRACTS / GRAPHS` controls to select an object, show or hide it, adjust ribbon
+width and opacity, change tract coloring, control individual bundles, select a
+graph edge measure and threshold, resize graph nodes, or remove it. Reopening
+an already loaded path refreshes and activates that object.
+Right-click a visible tract, graph node, or displayed graph edge to inspect it.
+Graph node labels can be toggled per object. Tract hit-testing uses a compact
+streamline bounding-volume hierarchy so large whole-brain datasets do not scan
+every segment for each click.
+Choose **Open matrix view** in a graph's inspector for a floating, scrollable
+heatmap. It shares the 3D graph's selected measure, signed/magnitude coloring,
+and absolute-value threshold; thresholded cells are dimmed rather than removed.
+The view can show the full matrix or its lower triangle, and clicking a cell
+selects that edge in the normal graph selection readout.
+When a `Graph_Bucket` contains a `network_file` link, Sumaru resolves and loads
+the associated `.niml.tract` network. The graph defaults to straight edges like
+SUMA; choose **linked tract bundles** in the graph inspector to replace each
+edge with the bundle identified by its `Bundle_Tag` or reciprocal
+`Bundle_Alt_Tag`. Thresholding, coloring, and picking continue to use the
+selected graph measure, and unmatched edges retain the straight-edge fallback.
 
 ## Cargo Commands
 
@@ -141,6 +180,24 @@ selected threshold column carries an AFNI stat label such as `Ttest(48)`, the
 threshold control can operate in p-value mode. Treat this as a viewer
 convenience rather than a statistics package: it is meant to help inspect the
 data you already understand.
+
+Opening another overlay adds it to the overlay workbench and makes it active.
+Use the dataset selector or Control-PageUp/Control-PageDown to switch between
+loaded overlays; only the active overlay is rendered. Reopening an existing
+source refreshes its existing list entry rather than adding a duplicate, and a
+left/right dataset pair is represented by one entry.
+
+The Settings > Preferences panel controls how thresholds move between overlays.
+The default keeps the current numeric slider value. The alternatives match the
+p-value when both datasets carry compatible stat metadata, or remember a
+separate threshold for every overlay. Preferences are saved automatically in
+`~/.sumaru`; on first launch Sumaru creates the fully documented default file
+if it does not already exist. The file follows the self-documenting AFNI/SUMA `~/.sumarc`
+convention: it has an `***ENVIRONMENT` section, stable `SUMARU_...` keys, and
+an adjacent description, allowed values, and default for every setting. The
+current threshold policy is stored as `SUMARU_OverlayThresholdSync`. Older
+minimal files using `overlay_threshold_sync` remain readable and are migrated
+to the documented form the next time Preferences saves the file.
 
 ## AFNI NIML Talk
 
@@ -215,10 +272,20 @@ fields, so they can be tested without launching the GUI.
 - Left-drag to orbit.
 - Right-click the surface to inspect the nearest node, triangle, and loaded
   overlay value.
+- With a surface time-series overlay active, press `D` to open or toggle
+  InstaCorr. Its floating panel exposes a SUMA preprocessing switch plus
+  editable TR, polort, and bandpass settings; press **Recalculate** to apply
+  changes. Turning preprocessing off disables those dependent settings and
+  computes a raw dot product, matching SUMA's `normalize_dset` gate. Ordinary
+  right-clicks then update the seed using the applied settings.
+  Shift-right-click moves the crosshair without recalculating InstaCorr.
 - Scroll to zoom.
 - Press Space to reset the camera.
 - Press `C` to switch camera mode between `orbit` and `turntable`.
-- Press `O` to toggle a loaded overlay on or off.
+- Press Shift-`V` to toggle a loaded overlay on or off.
+- Press Control-PageUp or Control-PageDown to move through the ordered overlay
+  list. The same actions are available beside the dataset selector in the
+  overlay workbench.
 - Press `.` to advance to the next surface in a loaded single-hemisphere
   `.spec` scene, or the next matched left/right state pair in a `both` scene.
   Press `,` to move backward.
@@ -250,7 +317,9 @@ fields, so they can be tested without launching the GUI.
 ## Volume Slices
 
 Launch with `--volume path/to/volume.nii` (or `.nii.gz`) to render a NIfTI
-volume as orthogonal slice planes inside the 3D scene. All three planes show by
+volume, or pass an AFNI `.HEAD`, `.BRIK`, `.BRIK.gz`, or dataset prefix such as
+`--volume path/to/anat+tlrc.`. The volume is rendered as orthogonal slice planes
+inside the 3D scene. All three planes show by
 default, color-coded by orientation: **axial red, coronal green, sagittal
 blue**, each with a colored grab tab.
 
@@ -343,6 +412,8 @@ the completed-work ledger.
 - `src/overlay.rs` contains display state layered on datasets. It selects
   intensity/threshold/brightness columns, stores color-map and range controls,
   and builds per-node RGBA color caches for rendering.
+- `src/preferences.rs` loads and atomically saves the human-readable
+  `~/.sumaru` preferences file.
 - `src/roi.rs` contains the shared ROI model for drawn, imported, dataset-born,
   and threshold-derived surface regions. It stores labels, styling,
   parent-surface/domain links, source/provenance, path history, domain
@@ -373,6 +444,8 @@ the completed-work ledger.
   `SurfaceScene`/`SceneSurface` and the resident vertex/index buffers.
 - `src/viewer/overlay_load.rs` loads single and paired overlays and refreshes
   the overlay columns, appearance, and render model.
+- `src/viewer/overlay_stack.rs` owns ordered overlay switching, source
+  deduplication, removal, and preference-driven threshold transfer.
 - `src/viewer/roi.rs` holds the drawn-ROI editing, fill, save, and load logic
   plus the ROI workspace/slot/draft types.
 - `src/viewer/pairing.rs` handles paired-hemisphere drag, transform, and layout.

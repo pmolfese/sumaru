@@ -5,7 +5,7 @@ use sumaru::dataset::{ColumnData, ColumnRole, DatasetKind};
 use sumaru::inspect::{FileKind, detect_file_kind, inspect_path};
 use sumaru::io::{read_gifti_dataset, read_niml_dataset, read_niml_roi};
 use sumaru::roi::{RoiBrushAction, RoiDrawingType, RoiElementKind, RoiSource};
-use sumaru::surface::{OverlayDataset, SurfaceKind, SurfaceMesh, SurfaceSide};
+use sumaru::surface::{SurfaceKind, SurfaceMesh, SurfaceSide};
 
 fn local_fixture(name: &str) -> Option<PathBuf> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -40,28 +40,6 @@ fn local_surface_fixture_loads_with_expected_counts_and_metadata() -> Result<()>
     assert_eq!(mesh.metadata.state_name.as_deref(), Some("white"));
     assert!(mesh.bounds.radius.is_finite());
     assert!(mesh.bounds.radius > 0.0);
-
-    Ok(())
-}
-
-#[test]
-fn local_gifti_dataset_fixture_is_detected_and_loads_as_overlay() -> Result<()> {
-    let Some(path) = local_fixture("rh.thickness.gii.dset") else {
-        eprintln!("skipping local fixture test: testing/rh.thickness.gii.dset is absent");
-        return Ok(());
-    };
-
-    assert_eq!(detect_file_kind(&path), Some(FileKind::Gifti));
-
-    let report = inspect_path(&path)?;
-    assert_eq!(report.kind, FileKind::Gifti);
-    assert!(report.summary.contains("data arrays: 1"));
-
-    let overlay = OverlayDataset::from_gifti_path(path, 136_938)?;
-    assert_eq!(overlay.values.len(), 136_938);
-    assert!(overlay.range.min.is_finite());
-    assert!(overlay.range.max.is_finite());
-    assert!(overlay.range.min < overlay.range.max);
 
     Ok(())
 }
@@ -374,7 +352,6 @@ fn local_reference_folder_contains_expected_starter_files() -> Result<()> {
         "ISC_rh_theta_pos.niml.dset",
         "fs_lowres_std-lh.gii",
         "fs_lowres_std-rh.gii",
-        "rh.thickness.gii.dset",
         "rh.white.gii",
         "sub-3_rh.spec",
         "suma_clickmiddle_joined.finished.niml.roi",

@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use nifti::{NiftiObject, NiftiVolume, ReaderOptions};
 
+use crate::graph_dataset::read_graph_bucket;
 use crate::io::read_gifti_image;
 use crate::niml_debug::inspect_debug_path;
+use crate::tractography::read_niml_tract;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -139,6 +141,44 @@ fn inspect_nifti(path: &Path) -> Result<InspectReport> {
 }
 
 fn inspect_niml(path: &Path) -> Result<InspectReport> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if filename.ends_with(".niml.tract") {
+        let data = read_niml_tract(path)?;
+        return Ok(InspectReport {
+            path: path.to_path_buf(),
+            kind: FileKind::Niml,
+            summary: format!(
+                "type: AFNI/FATCAT tractography\nbundles: {}\ntracts: {}\npoints: {}\nbounds: {:?} .. {:?}",
+                data.bundles.len(),
+                data.tract_count(),
+                data.point_count(),
+                data.bounds.min,
+                data.bounds.max
+            ),
+        });
+    }
+    if filename.ends_with(".niml.dset")
+        && let Ok(data) = read_graph_bucket(path)
+    {
+        return Ok(InspectReport {
+            path: path.to_path_buf(),
+            kind: FileKind::Niml,
+            summary: format!(
+                "type: AFNI Graph_Bucket\nnodes: {}\nedge rows: {}\nedge measures: {}\nmatrix shape: {:?}\nnetwork file: {}",
+                data.nodes.len(),
+                data.edge_values.len() / data.edge_column_count.max(1),
+                data.edge_column_count,
+                data.matrix_shape,
+                data.network_file
+                    .as_ref()
+                    .map_or_else(|| "--".to_string(), |path| path.display().to_string())
+            ),
+        });
+    }
     let summary = inspect_debug_path(path)
         .with_context(|| format!("failed to inspect NIML file {}", path.display()))?
         .lines()
