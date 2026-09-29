@@ -59,8 +59,12 @@ struct Cli {
     #[arg(long = "tract", value_name = "PATH")]
     tract_paths: Vec<PathBuf>,
 
-    /// Load one or more AFNI `Graph_Bucket` `.niml.dset` graph objects.
-    #[arg(long = "graph", visible_alias = "gdset", value_name = "PATH")]
+    /// Load one or more AFNI/FATCAT `.grid` or `Graph_Bucket` `.niml.dset` graph objects.
+    #[arg(
+        long = "graph",
+        visible_aliases = ["gdset", "grid"],
+        value_name = "PATH"
+    )]
     graph_paths: Vec<PathBuf>,
 
     /// Load this GIFTI data array as a per-vertex surface overlay.
@@ -598,6 +602,12 @@ fn normalize_afni_style_arg(arg: OsString) -> OsString {
         OsString::from("--spec")
     } else if arg == "-sv" {
         OsString::from("--sv")
+    } else if arg == "-vol" {
+        OsString::from("--vol")
+    } else if arg == "-gdset" {
+        OsString::from("--gdset")
+    } else if arg == "-grid" {
+        OsString::from("--grid")
     } else if arg == "-onestate" {
         OsString::from("--onestate")
     } else if matches!(
@@ -1217,6 +1227,30 @@ mod tests {
             vec![PathBuf::from("a.niml.tract"), PathBuf::from("b.niml.tract")]
         );
         assert_eq!(cli.graph_paths, vec![PathBuf::from("network.niml.dset")]);
+    }
+
+    #[test]
+    fn suma_compatible_volume_and_graph_aliases_parse() {
+        for volume_flag in ["--volume", "--vol"] {
+            let cli = Cli::parse_from(["sumaru", volume_flag, "anat+orig."]);
+            assert_eq!(cli.volume, Some(PathBuf::from("anat+orig.")));
+        }
+
+        for graph_flag in ["--graph", "--gdset", "--grid"] {
+            let cli = Cli::parse_from(["sumaru", graph_flag, "network.grid"]);
+            assert_eq!(cli.graph_paths, vec![PathBuf::from("network.grid")]);
+        }
+
+        for (suma_flag, long_flag) in [
+            ("-vol", "--vol"),
+            ("-gdset", "--gdset"),
+            ("-grid", "--grid"),
+        ] {
+            assert_eq!(
+                normalize_afni_style_arg(OsString::from(suma_flag)),
+                OsString::from(long_flag)
+            );
+        }
     }
 
     #[test]

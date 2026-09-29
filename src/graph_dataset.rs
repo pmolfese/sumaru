@@ -255,9 +255,13 @@ pub fn graph_from_element(root: &NimlElement, source_path: Option<&Path>) -> Res
             Some(NimlValue::Text(value)) => value.clone(),
             _ => bail!("NODE_COORDS row {row} label is not text"),
         };
+        // FATCAT writes Graph_Bucket node coordinates in AFNI's RAI/DICOM
+        // convention. Sumaru renders AFNI volumes and linked tractography in
+        // RAS, so convert the graph nodes into that same world space.
+        let position = afni_rai_to_ras([number(1)?, number(2)?, number(3)?]);
         nodes.push(GraphNode {
             index: integer(0)?,
-            position: [number(1)?, number(2)?, number(3)?],
+            position,
             label,
         });
     }
@@ -351,6 +355,10 @@ pub fn graph_from_element(root: &NimlElement, source_path: Option<&Path>) -> Res
     })
 }
 
+fn afni_rai_to_ras([x, y, z]: [f32; 3]) -> [f32; 3] {
+    [-x, -y, z]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +374,8 @@ mod tests {
         let root = parse_niml_str(text).unwrap().remove(0);
         let graph = graph_from_element(&root, Some(Path::new("/tmp/net.niml.dset"))).unwrap();
         assert_eq!(graph.nodes[1].label, "B");
+        assert_eq!(graph.nodes[0].position, [-1.0, -2.0, 3.0]);
+        assert_eq!(graph.nodes[1].position, [-4.0, -5.0, 6.0]);
         assert_eq!(graph.full_edge_row(1, 1), Some(&[3.0, 4.0][..]));
         assert_eq!(
             graph.network_file,

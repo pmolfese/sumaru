@@ -127,8 +127,14 @@ cargo run -- --volume /path/to/anat+tlrc.
 cargo run -- --tract /path/to/network.niml.tract
 cargo run -- --volume /path/to/anat.nii.gz --tract /path/to/network.niml.tract
 cargo run -- --graph /path/to/network.niml.dset
+cargo run -- --vol /path/to/anat+orig. --gdset /path/to/network.niml.dset
+cargo run -- -vol /path/to/anat+orig. -gdset /path/to/network.grid
 cargo run -- inspect /path/to/file.nii.gz
 ```
+
+For SUMA compatibility, `--vol` aliases `--volume`, while `--gdset` and
+`--grid` alias `--graph`. The single-dash SUMA spellings `-vol`, `-gdset`, and
+`-grid` are accepted as well.
 
 Tracts and graphs are independent scene objects: several may be loaded at
 once, either alone or beside surfaces and volume slices. Use the

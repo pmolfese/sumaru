@@ -33,6 +33,23 @@ pub enum GraphEdgeGeometry {
     LinkedBundles,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphMatrixPlacement {
+    Docked,
+    Window,
+}
+
+impl GraphMatrixPlacement {
+    pub const ALL: [Self; 2] = [Self::Docked, Self::Window];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Docked => "attached panel",
+            Self::Window => "separate window",
+        }
+    }
+}
+
 impl GraphEdgeGeometry {
     pub(super) fn label(self) -> &'static str {
         match self {
@@ -191,8 +208,10 @@ pub(super) struct SceneObject {
     pub(super) graph_color_mode: GraphColorMode,
     pub(super) graph_node_size_points: f32,
     pub(super) graph_labels_visible: bool,
+    pub(super) graph_endpoint_labels_visible: bool,
     pub(super) graph_edge_geometry: GraphEdgeGeometry,
     pub(super) graph_matrix_open: bool,
+    pub(super) graph_matrix_placement: GraphMatrixPlacement,
     pub(super) graph_matrix_lower_triangle: bool,
     pub(super) graph_matrix_cell_points: f32,
     pub(super) graph_matrix_selected_cell: Option<(usize, usize)>,
@@ -228,8 +247,10 @@ impl SceneObject {
             graph_color_mode: GraphColorMode::Signed,
             graph_node_size_points: 11.0,
             graph_labels_visible: false,
+            graph_endpoint_labels_visible: false,
             graph_edge_geometry: GraphEdgeGeometry::Straight,
             graph_matrix_open: false,
+            graph_matrix_placement: GraphMatrixPlacement::Docked,
             graph_matrix_lower_triangle: false,
             graph_matrix_cell_points: 22.0,
             graph_matrix_selected_cell: None,
@@ -265,8 +286,10 @@ impl SceneObject {
             graph_color_mode: GraphColorMode::Signed,
             graph_node_size_points: 11.0,
             graph_labels_visible: false,
+            graph_endpoint_labels_visible: false,
             graph_edge_geometry: GraphEdgeGeometry::Straight,
             graph_matrix_open: false,
+            graph_matrix_placement: GraphMatrixPlacement::Docked,
             graph_matrix_lower_triangle: false,
             graph_matrix_cell_points: 22.0,
             graph_matrix_selected_cell: None,
@@ -314,6 +337,7 @@ impl SceneObject {
                 self.graph_measure,
                 self.graph_threshold,
                 self.graph_color_mode,
+                self.graph_matrix_selected_cell,
                 visitor,
             ),
         }
@@ -1168,6 +1192,7 @@ fn visit_graph_segments(
     measure: usize,
     threshold: f32,
     color_mode: GraphColorMode,
+    selected_cell: Option<(usize, usize)>,
     mut visitor: impl FnMut(SceneSegment),
 ) {
     if measure >= data.edge_column_count {
@@ -1179,10 +1204,20 @@ fn visit_graph_segments(
         .unwrap_or(1.0)
         .max(f32::EPSILON);
     visit_graph_edges(data, measure, |source, target, value, edge_ids| {
-        if !value.is_finite() || value == 0.0 || value.abs() < threshold.max(0.0) {
+        let selected = selected_cell.is_some_and(|(row, column)| {
+            (row == source && column == target) || (row == target && column == source)
+        });
+        if !value.is_finite() || (!selected && (value == 0.0 || value.abs() < threshold.max(0.0))) {
             return;
         }
-        let color = graph_value_color(value, max_abs, color_mode);
+        let mut color = if selected {
+            [1.0, 0.88, 0.08, 1.0]
+        } else {
+            graph_value_color(value, max_abs, color_mode)
+        };
+        if selected_cell.is_some() && !selected {
+            color[3] *= 0.28;
+        }
         let linked_bundle = (geometry == GraphEdgeGeometry::LinkedBundles)
             .then(|| linked_tracts.and_then(|tracts| linked_bundle_for_edge(tracts, edge_ids)))
             .flatten();
@@ -1421,6 +1456,7 @@ mod tests {
             0,
             0.5,
             GraphColorMode::Signed,
+            None,
             |segment| weak.push(segment),
         );
         assert!(weak.is_empty());
@@ -1433,10 +1469,29 @@ mod tests {
             1,
             0.5,
             GraphColorMode::Signed,
+            None,
             |segment| strong.push(segment),
         );
         assert_eq!(strong.len(), 1);
         assert!(strong[0].color[2] > strong[0].color[0]);
+
+        let mut selected = Vec::new();
+        visit_graph_segments(
+            &data,
+            None,
+            GraphEdgeGeometry::Straight,
+            0,
+            0.5,
+            GraphColorMode::Signed,
+            Some((1, 0)),
+            |segment| selected.push(segment),
+        );
+        assert_eq!(
+            selected.len(),
+            1,
+            "selection overrides the display threshold"
+        );
+        assert_eq!(selected[0].color, [1.0, 0.88, 0.08, 1.0]);
     }
 
     #[test]
@@ -1606,6 +1661,7 @@ mod tests {
                 0,
                 0.0,
                 GraphColorMode::Signed,
+                None,
                 |segment| segments.push(segment),
             );
             assert_eq!(segments.len(), 2);
@@ -1625,6 +1681,7 @@ mod tests {
             0,
             0.0,
             GraphColorMode::Signed,
+            None,
             |segment| segments.push(segment),
         );
         assert_eq!(segments.len(), 1);

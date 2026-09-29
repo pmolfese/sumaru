@@ -99,7 +99,7 @@ mod ui;
 mod volume_view;
 use edit::{CoordConvention, GoToLocationState};
 use instacorr::{InstaCorrSession, InstaCorrWorkerResult};
-pub use scene_objects::{GraphColorMode, GraphEdgeGeometry, TractColorMode};
+pub use scene_objects::{GraphColorMode, GraphEdgeGeometry, GraphMatrixPlacement, TractColorMode};
 use scene_objects::{
     SceneObject, SceneObjectGpu, SceneObjectPayload, SceneObjectPick, SceneObjectRenderer,
     normalization_model, pick_scene_objects,
@@ -739,7 +739,11 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             }
             match event {
                 WindowEvent::CloseRequested => {
-                    state.apply_commands(vec![ViewerCommand::SetGraphWindowOpen(false)]);
+                    if let Some(index) = state.active_scene_object {
+                        state.apply_commands(vec![ViewerCommand::SetGraphMatrixOpen(index, false)]);
+                    } else {
+                        state.graph.window.set_visible(false);
+                    }
                 }
                 WindowEvent::Occluded(occluded) => {
                     state.set_aux_window_occluded(AuxWindowPane::Graph, occluded);
@@ -833,9 +837,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             .then_some(state.roi_control.repaint_at)
             .flatten();
         let next_graph = state
-            .controller
-            .panels
-            .graph_window_open
+            .graph_matrix_window_open()
             .then_some(state.graph.repaint_at)
             .flatten();
         let view_due = repaint_due(now, next_view, state.view.occluded);
@@ -2101,7 +2103,7 @@ impl ViewerState {
         if self.controller.panels.roi_controller_open {
             self.roi_control.window.request_redraw();
         }
-        if self.controller.panels.graph_window_open {
+        if self.graph_matrix_window_open() {
             self.graph.window.request_redraw();
         }
     }
@@ -2264,7 +2266,7 @@ impl ViewerState {
         self.scene_object_gpu[index] = self.scene_object_renderer.upload(&self.device, object);
     }
 
-    fn clear_scene_object_pick_for(&mut self, index: usize) {
+    fn clear_scene_object_pick_for(&mut self, index: usize) -> bool {
         if self
             .scene_object_pick
             .as_ref()
@@ -2272,15 +2274,18 @@ impl ViewerState {
         {
             self.scene_object_pick = None;
         }
+        let mut matrix_selection_cleared = false;
         if let Some(object) = self.scene_objects.get_mut(index) {
-            object.graph_matrix_selected_cell = None;
+            matrix_selection_cleared = object.graph_matrix_selected_cell.take().is_some();
         }
+        matrix_selection_cleared
     }
 
     fn remove_scene_object(&mut self, index: usize) {
         if index >= self.scene_objects.len() {
             return;
         }
+        let dock_was_open = self.bottom_dock_open();
         let name = self.scene_objects[index].name.clone();
         self.scene_objects.remove(index);
         self.scene_object_gpu.remove(index);
@@ -2290,11 +2295,12 @@ impl ViewerState {
         } else {
             Some(index.min(self.scene_objects.len() - 1))
         };
+        self.sync_graph_matrix_presentation(dock_was_open);
         self.log_status(format!("Removed {name}."));
     }
 
     fn scene_viewport_size(&self) -> PhysicalSize<u32> {
-        let height = if self.controller.panels.graph_window_open {
+        let height = if self.bottom_dock_open() {
             // Reserve the dock's current height for the plot, leaving the rest of
             // the window for the 3D scene.
             let dock = self.graph_dock_height_pixels();
@@ -2417,6 +2423,9 @@ impl ViewerState {
             }
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
+            }
+            if self.graph_matrix_window_open() {
+                self.graph.window.request_redraw();
             }
         }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -2705,6 +2714,9 @@ impl ViewerState {
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
             }
+            if self.graph_matrix_window_open() {
+                self.graph.window.request_redraw();
+            }
         }
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
@@ -2764,6 +2776,9 @@ impl ViewerState {
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
             }
+            if self.graph_matrix_window_open() {
+                self.graph.window.request_redraw();
+            }
         }
 
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -2791,15 +2806,28 @@ impl ViewerState {
     fn render_graph(&mut self) -> RenderStatus {
         let raw_input = self.graph.take_egui_input();
         let egui_ctx = self.graph.egui.ctx.clone();
+        let mut ui_actions = Vec::new();
         #[allow(deprecated)]
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            self.draw_graph_ui(ctx);
+            ui_actions = self.draw_graph_matrix_window_ui(ctx);
         });
         self.graph.repaint_at = repaint_delay_to_instant(&full_output);
+        let actions_present = !ui_actions.is_empty();
         self.graph
             .egui
             .state
             .handle_platform_output(&self.graph.window, full_output.platform_output);
+        self.apply_commands(ui_actions);
+        if actions_present {
+            self.view.window.request_redraw();
+            self.control.window.request_redraw();
+            if self.controller.panels.roi_controller_open {
+                self.roi_control.window.request_redraw();
+            }
+            if self.graph_matrix_window_open() {
+                self.graph.window.request_redraw();
+            }
+        }
 
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = ScreenDescriptor {
@@ -3003,7 +3031,9 @@ impl ViewerState {
                 }
                 ViewerCommand::SelectSceneObject(index) => {
                     if index < self.scene_objects.len() {
+                        let dock_was_open = self.bottom_dock_open();
                         self.active_scene_object = Some(index);
+                        self.sync_graph_matrix_presentation(dock_was_open);
                     }
                 }
                 ViewerCommand::SetSceneObjectVisible(index, visible) => {
@@ -3011,7 +3041,9 @@ impl ViewerState {
                         object.visible = visible;
                     }
                     if !visible {
-                        self.clear_scene_object_pick_for(index);
+                        if self.clear_scene_object_pick_for(index) {
+                            self.rebuild_scene_object_gpu(index);
+                        }
                     }
                 }
                 ViewerCommand::SetSceneObjectWidth(index, width) => {
@@ -3040,7 +3072,7 @@ impl ViewerState {
                     {
                         appearance.visible = visible;
                         self.rebuild_scene_object_gpu(index);
-                        self.clear_scene_object_pick_for(index);
+                        let _ = self.clear_scene_object_pick_for(index);
                     }
                 }
                 ViewerCommand::SetTractBundleOpacity(index, bundle_index, opacity) => {
@@ -3051,7 +3083,7 @@ impl ViewerState {
                     {
                         appearance.opacity = opacity.clamp(0.0, 1.0);
                         self.rebuild_scene_object_gpu(index);
-                        self.clear_scene_object_pick_for(index);
+                        let _ = self.clear_scene_object_pick_for(index);
                     }
                 }
                 ViewerCommand::SetGraphMeasure(index, measure) => {
@@ -3061,8 +3093,8 @@ impl ViewerState {
                     {
                         object.graph_measure = measure;
                         object.graph_threshold = 0.0;
+                        let _ = self.clear_scene_object_pick_for(index);
                         self.rebuild_scene_object_gpu(index);
-                        self.clear_scene_object_pick_for(index);
                     }
                 }
                 ViewerCommand::SetGraphThreshold(index, threshold) => {
@@ -3070,8 +3102,8 @@ impl ViewerState {
                         && matches!(object.payload, SceneObjectPayload::Graph(_))
                     {
                         object.graph_threshold = threshold.max(0.0);
+                        let _ = self.clear_scene_object_pick_for(index);
                         self.rebuild_scene_object_gpu(index);
-                        self.clear_scene_object_pick_for(index);
                     }
                 }
                 ViewerCommand::SetGraphColorMode(index, mode) => {
@@ -3096,6 +3128,13 @@ impl ViewerState {
                         object.graph_labels_visible = visible;
                     }
                 }
+                ViewerCommand::SetGraphEndpointLabelsVisible(index, visible) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Graph(_))
+                    {
+                        object.graph_endpoint_labels_visible = visible;
+                    }
+                }
                 ViewerCommand::SetGraphEdgeGeometry(index, geometry) => {
                     if let Some(object) = self.scene_objects.get_mut(index)
                         && matches!(object.payload, SceneObjectPayload::Graph(_))
@@ -3103,21 +3142,15 @@ impl ViewerState {
                             || object.linked_tracts.is_some())
                     {
                         object.graph_edge_geometry = geometry;
+                        let _ = self.clear_scene_object_pick_for(index);
                         self.rebuild_scene_object_gpu(index);
-                        self.clear_scene_object_pick_for(index);
                     }
                 }
                 ViewerCommand::SetGraphMatrixOpen(index, open) => {
-                    if let Some(object) = self.scene_objects.get_mut(index)
-                        && matches!(object.payload, SceneObjectPayload::Graph(_))
-                    {
-                        object.graph_matrix_open = open;
-                        if open {
-                            self.active_scene_object = Some(index);
-                        }
-                        self.control.window.request_redraw();
-                        self.view.window.request_redraw();
-                    }
+                    self.set_graph_matrix_open(index, open);
+                }
+                ViewerCommand::SetGraphMatrixPlacement(index, placement) => {
+                    self.set_graph_matrix_placement(index, placement);
                 }
                 ViewerCommand::SetGraphMatrixLowerTriangle(index, lower_triangle) => {
                     if let Some(object) = self.scene_objects.get_mut(index)
@@ -3163,6 +3196,7 @@ impl ViewerState {
                         if let Some(object) = self.scene_objects.get_mut(index) {
                             object.graph_matrix_selected_cell = Some((row, column));
                         }
+                        self.rebuild_scene_object_gpu(index);
                         self.active_scene_object = Some(index);
                         self.log_status(pick.status_text());
                         self.scene_object_pick = Some(pick);
@@ -4407,6 +4441,7 @@ impl ViewerState {
             && let Some(object) = self.scene_objects.get_mut(object_index)
         {
             object.graph_matrix_selected_cell = Some((*source_index, *target_index));
+            self.rebuild_scene_object_gpu(object_index);
         }
         self.active_scene_object = Some(object_index);
         self.log_status(pick.status_text());
