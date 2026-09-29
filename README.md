@@ -94,7 +94,8 @@ refreshed as the viewer changes.
 ## What Works Right Now
 
 - GIFTI surface/shape/dataset I/O through `gifti-rs` from `PennLINC/gifti-rs`.
-- NIfTI volume I/O through `nifti` from `Enet4/nifti-rs`.
+- NIfTI volume I/O through `nifti` from `Enet4/nifti-rs`, plus native AFNI
+  HEAD/BRIK volume loading.
 - SUMA `.spec` parsing for the common single-hemisphere and paired-hemisphere
   viewer cases I have been testing.
 - A surface viewer through `winit`, `wgpu`, and `egui`, with overlays, drawn
@@ -122,6 +123,7 @@ cargo run -- -spec /path/to/subj_rh.spec
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --preload
 cargo run -- --volume /path/to/subj_SurfVol.nii
+cargo run -- --volume /path/to/anat+tlrc.
 cargo run -- --tract /path/to/network.niml.tract
 cargo run -- --volume /path/to/anat.nii.gz --tract /path/to/network.niml.tract
 cargo run -- --graph /path/to/network.niml.dset
@@ -309,7 +311,9 @@ fields, so they can be tested without launching the GUI.
 ## Volume Slices
 
 Launch with `--volume path/to/volume.nii` (or `.nii.gz`) to render a NIfTI
-volume as orthogonal slice planes inside the 3D scene. All three planes show by
+volume, or pass an AFNI `.HEAD`, `.BRIK`, `.BRIK.gz`, or dataset prefix such as
+`--volume path/to/anat+tlrc.`. The volume is rendered as orthogonal slice planes
+inside the 3D scene. All three planes show by
 default, color-coded by orientation: **axial red, coronal green, sagittal
 blue**, each with a colored grab tab.
 

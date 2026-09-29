@@ -384,8 +384,8 @@ impl VolumeView {
     }
 
     /// World-space ray from a camera-space (scene-normalized) ray.
-    fn world_ray(&self, origin: Vec3, direction: Vec3) -> (Vec3, Vec3) {
-        let inverse = self.scene_model.inverse();
+    fn world_ray(&self, scene_model: Mat4, origin: Vec3, direction: Vec3) -> (Vec3, Vec3) {
+        let inverse = scene_model.inverse();
         let world_origin = inverse.transform_point3(origin);
         let world_dir = inverse.transform_vector3(direction).normalize_or_zero();
         (world_origin, world_dir)
@@ -399,8 +399,13 @@ impl VolumeView {
     /// nearest one the ray passes through (anywhere on the quad). Used for
     /// right-click selection; with overlapping parallel slices, the closer one
     /// wins.
-    pub(super) fn slice_at_ray(&self, origin: Vec3, direction: Vec3) -> Option<usize> {
-        let (o, d) = self.world_ray(origin, direction);
+    pub(super) fn slice_at_ray(
+        &self,
+        scene_model: Mat4,
+        origin: Vec3,
+        direction: Vec3,
+    ) -> Option<usize> {
+        let (o, d) = self.world_ray(scene_model, origin, direction);
         if d.length_squared() <= f32::EPSILON {
             return None;
         }
@@ -453,13 +458,14 @@ impl VolumeView {
         &mut self,
         device: &wgpu::Device,
         index: usize,
+        scene_model: Mat4,
         origin: Vec3,
         direction: Vec3,
     ) -> bool {
         let Some(slice) = self.slices.get(index) else {
             return false;
         };
-        let (o, d) = self.world_ray(origin, direction);
+        let (o, d) = self.world_ray(scene_model, origin, direction);
         if d.length_squared() <= f32::EPSILON {
             return false;
         }
@@ -579,6 +585,7 @@ impl VolumeView {
         queue: &wgpu::Queue,
         render_pass: &mut wgpu::RenderPass<'_>,
         view_projection: Mat4,
+        scene_model: Mat4,
     ) {
         let Some(vertex_buffer) = self.vertex_buffer.as_ref() else {
             return;
@@ -587,7 +594,7 @@ impl VolumeView {
             return;
         }
 
-        let clip_from_world = view_projection * self.scene_model;
+        let clip_from_world = view_projection * scene_model;
         let world_to_voxel =
             Mat4::from_cols_array_2d(&self.volume.space.world_to_voxel.to_matrix());
         let [nx, ny, nz] = self.volume.dimensions;
@@ -621,9 +628,9 @@ fn inverse_lerp(a: f32, b: f32, value: f32) -> f32 {
 /// load/select/drag handlers that the central event loop and command dispatch
 /// call. Kept next to [`VolumeView`] so the whole feature lives in one module.
 impl ViewerState {
-    /// Load a NIfTI volume for `--volume` slice-plane rendering.
+    /// Load a NIfTI or AFNI volume for `--volume` slice-plane rendering.
     pub(super) fn load_volume_path(&mut self, path: PathBuf) -> Result<()> {
-        let volume = Volume::read_nifti(&path)
+        let volume = Volume::read(&path)
             .with_context(|| format!("failed to load volume {}", path.display()))?;
         let dims = volume.dimensions;
         let color_format = self.view.config.format;
@@ -687,10 +694,11 @@ impl ViewerState {
             return true;
         };
         let scene_size = self.scene_viewport_size();
+        let scene_model = self.scene_object_model();
         let hit = screen_ray(&self.camera, scene_size, cursor).and_then(|(origin, direction)| {
             self.volume_view
                 .as_ref()
-                .and_then(|view| view.slice_at_ray(origin, direction))
+                .and_then(|view| view.slice_at_ray(scene_model, origin, direction))
         });
         let label = if let Some(view) = self.volume_view.as_mut() {
             view.set_selected(&self.device, hit);
@@ -731,8 +739,11 @@ impl ViewerState {
         let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
             return;
         };
+        let scene_model = self.scene_object_model();
         let changed = match self.volume_view.as_mut() {
-            Some(view) => view.drag_slice_to_ray(&self.device, index, origin, direction),
+            Some(view) => {
+                view.drag_slice_to_ray(&self.device, index, scene_model, origin, direction)
+            }
             None => false,
         };
         if changed {

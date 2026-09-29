@@ -51,7 +51,7 @@ struct Cli {
     #[arg(long = "sv", value_name = "PATH")]
     surface_volume: Option<PathBuf>,
 
-    /// Load a NIfTI volume (.nii/.nii.gz) for orthogonal slice-plane rendering.
+    /// Load a NIfTI or AFNI HEAD/BRIK volume for orthogonal slice rendering.
     #[arg(long = "volume", visible_alias = "vol", value_name = "PATH")]
     volume: Option<PathBuf>,
 

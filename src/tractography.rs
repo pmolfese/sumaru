@@ -107,7 +107,13 @@ pub fn read_niml_tract(path: impl AsRef<Path>) -> Result<TractographyDataset> {
             .iter()
             .map(|record| Tract {
                 id: record.id,
-                points: record.points.clone(),
+                // FATCAT writes TAYLOR_TRACT_DATUM coordinates in AFNI's
+                // RAI/DICOM world convention. Sumaru's surfaces and volume
+                // renderer use NIfTI/GIFTI RAS (AFNI calls it LPI), whose x
+                // and y axes have the opposite signs. AFNI's Create_Tract_NEW
+                // likewise documents and enforces an RAI grid before writing
+                // these values (ptaylor/TrackIO.c).
+                points: record.points.iter().copied().map(afni_rai_to_ras).collect(),
             })
             .collect();
         bundles.push(TractBundle {
@@ -146,6 +152,10 @@ pub fn read_niml_tract(path: impl AsRef<Path>) -> Result<TractographyDataset> {
     })
 }
 
+fn afni_rai_to_ras([x, y, z]: [f32; 3]) -> [f32; 3] {
+    [-x, -y, z]
+}
+
 fn parse_optional_i32(
     attrs: &std::collections::BTreeMap<String, String>,
     key: &str,
@@ -162,7 +172,13 @@ fn parse_optional_i32(
 
 #[cfg(test)]
 mod tests {
+    use super::afni_rai_to_ras;
     use crate::io::{NimlData, parse_niml_bytes, parse_niml_str};
+
+    #[test]
+    fn converts_afni_rai_tract_coordinates_to_ras() {
+        assert_eq!(afni_rai_to_ras([12.5, -7.0, 3.25]), [-12.5, 7.0, 3.25]);
+    }
 
     #[test]
     fn reads_ascii_taylor_tract_rows() {

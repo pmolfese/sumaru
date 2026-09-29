@@ -2652,7 +2652,11 @@ impl ViewerState {
             let view_projection = self
                 .camera
                 .view_projection_matrix(self.scene_viewport_aspect());
-            volume_view.render(&self.queue, &mut render_pass, view_projection);
+            // Surfaces are normalized from their own millimeter-space bounds.
+            // Use that same transform for the volume whenever both are present,
+            // rather than independently fitting the full volume field of view.
+            let scene_model = self.scene_object_model();
+            volume_view.render(&self.queue, &mut render_pass, view_projection, scene_model);
         }
 
         for (object, gpu) in self.scene_objects.iter().zip(&self.scene_object_gpu) {
