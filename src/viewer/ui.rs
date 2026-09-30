@@ -813,11 +813,17 @@ impl ViewerState {
                 ui.add_space(GRAPH_DOCK_HANDLE_HEIGHT_POINTS);
 
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Graph").strong().color(accent_color()));
+                    let (title, subtitle) = if self.timecourse.is_some() {
+                        (
+                            "Timecourse",
+                            "cursor, baseline, response, and activation map",
+                        )
+                    } else {
+                        ("Graph", "picked node overlay values")
+                    };
+                    ui.label(egui::RichText::new(title).strong().color(accent_color()));
                     ui.separator();
-                    ui.label(
-                        egui::RichText::new("picked node overlay values").color(muted_color()),
-                    );
+                    ui.label(egui::RichText::new(subtitle).color(muted_color()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Close").clicked() {
                             actions.push(ViewerCommand::SetGraphWindowOpen(false));
@@ -825,7 +831,11 @@ impl ViewerState {
                     });
                 });
                 ui.separator();
-                self.draw_graph_contents(ui);
+                if self.timecourse.is_some() {
+                    self.draw_timecourse_contents(ui, actions);
+                } else {
+                    self.draw_graph_contents(ui);
+                }
 
                 next_height
             });
@@ -945,7 +955,7 @@ impl ViewerState {
             return;
         }
 
-        draw_graph_snapshot(ui, snapshot, self.overlay.data.columns());
+        let _ = draw_graph_snapshot(ui, snapshot, self.overlay.data.columns(), None);
     }
 
     pub(super) fn draw_roi_control_contents(

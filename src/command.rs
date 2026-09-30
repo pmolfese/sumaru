@@ -533,6 +533,7 @@ pub enum ViewerCommand {
     RemoveSceneObject(usize),
     RefreshOverlayColumns,
     RefreshOverlayAppearance,
+    SetTimeCourseControls(crate::viewer::TimeCourseControls),
     SelectOverlay(usize),
     CycleOverlay(isize),
     RemoveActiveOverlay,

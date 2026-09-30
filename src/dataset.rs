@@ -12,6 +12,8 @@ pub struct Dataset {
     pub columns: Vec<DataColumn>,
     /// Sampling interval for time-series columns, in seconds when known.
     pub time_step_seconds: Option<f64>,
+    /// Time of the first time-series column, in seconds relative to the event.
+    pub time_start_seconds: Option<f64>,
     pub parent_ids: DatasetParentIds,
 }
 
@@ -127,6 +129,7 @@ impl Dataset {
             node_indices: None,
             columns,
             time_step_seconds: None,
+            time_start_seconds: None,
             parent_ids: DatasetParentIds::default(),
         })
     }
@@ -161,6 +164,7 @@ impl Dataset {
             node_indices: Some(node_indices),
             columns,
             time_step_seconds: None,
+            time_start_seconds: None,
             parent_ids: DatasetParentIds::default(),
         })
     }
@@ -173,6 +177,11 @@ impl Dataset {
     pub fn with_time_step_seconds(mut self, time_step_seconds: Option<f64>) -> Self {
         self.time_step_seconds =
             time_step_seconds.filter(|value| value.is_finite() && *value > 0.0);
+        self
+    }
+
+    pub fn with_time_start_seconds(mut self, time_start_seconds: Option<f64>) -> Self {
+        self.time_start_seconds = time_start_seconds.filter(|value| value.is_finite());
         self
     }
 

@@ -165,7 +165,20 @@ impl ViewerState {
     /// Build the per-column value series plotted for a given node pick.
     pub(super) fn graph_snapshot_for_pick(&self, pick: SurfacePick) -> Option<GraphSnapshot> {
         let mut points = Vec::new();
-        if let Some(dataset) = self.overlay.data.dataset()
+        if let Some(timecourse) = self.timecourse.as_ref()
+            && let Some(row) = dataset_row_for_node(&timecourse.source_dataset, pick.node_index)
+        {
+            for sample_index in 0..timecourse.time_columns.len() {
+                let Some(value) = timecourse.sample_value(row, sample_index) else {
+                    continue;
+                };
+                points.push(GraphPoint {
+                    column_index: sample_index,
+                    label: format!("{:.1} ms", timecourse.sample_time(sample_index) * 1000.0),
+                    value,
+                });
+            }
+        } else if let Some(dataset) = self.overlay.data.dataset()
             && let Some(row) = dataset_row_for_node(dataset, pick.node_index)
         {
             for (column_index, column) in dataset.columns.iter().enumerate() {

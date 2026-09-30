@@ -783,6 +783,7 @@ fn append_sparse_overlay_dataset(
         DatasetKind::Unknown
     };
     let time_step_seconds = paired_time_step(left.time_step_seconds, right.time_step_seconds)?;
+    let time_start_seconds = paired_time_start(left.time_start_seconds, right.time_start_seconds)?;
     let parent_ids = if left.parent_ids == right.parent_ids {
         left.parent_ids.clone()
     } else {
@@ -815,6 +816,7 @@ fn append_sparse_overlay_dataset(
             dataset
                 .with_parent_ids(parent_ids)
                 .with_time_step_seconds(time_step_seconds)
+                .with_time_start_seconds(time_start_seconds)
         })
         .context("failed to combine auto NIML overlay datasets")
 }

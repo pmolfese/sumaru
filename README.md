@@ -100,6 +100,9 @@ refreshed as the viewer changes.
   viewer cases I have been testing.
 - A surface viewer through `winit`, `wgpu`, and `egui`, with overlays, drawn
   ROIs, and paired-hemisphere layouts.
+- A `tc` timecourse mode for MNE-style 3D+time GIFTI overlays, with playback,
+  baseline correction, response windows, peak/mean/AUC maps, and activation
+  thresholds.
 - A `--volume` mode that renders orthogonal NIfTI slice planes in the 3D scene.
 - AFNI/FATCAT `.niml.tract` objects with adjustable screen-space ribbon width,
   per-bundle visibility/opacity, and SUMA-style local-orientation,
@@ -119,6 +122,7 @@ cargo run -- --surface /path/to/surface.gii --overlay /path/to/overlay.shape.gii
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.gii.dset
 cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset --verbose
+cargo run -- tc -i /path/to/underlay-lh.gii --overlay /path/to/stc-lh.gii
 cargo run -- -spec /path/to/subj_rh.spec
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
 cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --preload
@@ -198,6 +202,35 @@ an adjacent description, allowed values, and default for every setting. The
 current threshold policy is stored as `SUMARU_OverlayThresholdSync`. Older
 minimal files using `overlay_threshold_sync` remain readable and are migrated
 to the documented form the next time Preferences saves the file.
+
+## Timecourse Mode
+
+Launch a surface timecourse directly with:
+
+```sh
+sumaru tc -i underlay-lh.gii --overlay stc-lh.gii
+```
+
+If matching `-rh` files exist beside the supplied `-lh` files, Sumaru loads
+both hemispheres automatically. `--surface-rh` and `--overlay-rh` can specify
+the partners explicitly. A single hemisphere works normally.
+
+The bottom timecourse dock drives the existing surface renderer. Move the time
+slider or press **Play** to display successive samples. Select a baseline and
+choose raw values, baseline subtraction, or baseline z-scores. Select a
+response window and show its mean, positive peak, negative peak, signed
+absolute peak, or trapezoidal area under the curve on the surface. The
+activation threshold can be signed or absolute and uses the normal overlay
+masking path. Right-click any surface node to add its full timecourse to the
+dock; blue and orange bands mark the baseline and response windows, and the
+white cursor line is the time currently displayed on the surface. Click the
+graph to move the cursor, drag across it to select the response window, or
+Shift-drag to select the baseline window.
+
+MNE-style GIFTI metadata keys `TimeStart` and `TimeStep` are read in seconds.
+When absent, Sumaru falls back to a zero start and one-second spacing so the
+data remain inspectable, but correctly exported metadata are required for
+meaningful ERP/ERF timing and AUC units.
 
 ## AFNI NIML Talk
 

@@ -1,10 +1,10 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use sumaru::afni::{DEFAULT_AFNI_HOST, resolve_afni_port_config};
 use sumaru::inspect::inspect_path;
 use sumaru::niml_debug::{
@@ -153,6 +153,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Launch the surface timecourse viewer for a 3D+time GIFTI overlay.
+    Tc(TimeCourseArgs),
     /// Read a supported neuroimaging file and print a short summary.
     Inspect {
         /// Path to a GIFTI or NIFTI file.
@@ -163,6 +165,33 @@ enum Commands {
         #[command(subcommand)]
         command: NimlCommands,
     },
+}
+
+#[derive(Debug, Args)]
+struct TimeCourseArgs {
+    /// GIFTI surface underlay. A matching opposite hemisphere is loaded when present.
+    #[arg(short = 'i', long = "surface", value_name = "PATH")]
+    surface: PathBuf,
+
+    /// 3D+time GIFTI surface overlay.
+    #[arg(long = "overlay", visible_alias = "overaly", value_name = "PATH")]
+    overlay: PathBuf,
+
+    /// Explicit right-hemisphere surface (disables automatic surface pairing).
+    #[arg(long = "surface-rh", value_name = "PATH")]
+    surface_rh: Option<PathBuf>,
+
+    /// Explicit right-hemisphere timecourse overlay.
+    #[arg(long = "overlay-rh", value_name = "PATH")]
+    overlay_rh: Option<PathBuf>,
+
+    /// Print viewer status messages to the terminal.
+    #[arg(long = "verbose")]
+    verbose: bool,
+
+    /// Request the GPU adapter's native maximum buffer size.
+    #[arg(long = "big-mem")]
+    big_mem: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -299,6 +328,76 @@ fn main() -> Result<()> {
                 gpu,
                 afni,
                 niml_record_path,
+                timecourse_mode: false,
+            })?;
+        }
+        Some(Commands::Tc(args)) => {
+            validate_no_viewer_launch_options(
+                &surface_paths,
+                &spec,
+                &surface_lh,
+                &surface_rh,
+                &surface_volume,
+                &overlay,
+                &overlay_pair,
+                &roi,
+                auto_color_niml,
+                &subs,
+                &p_value,
+                &niml_record_path,
+                &tract_paths,
+                &graph_paths,
+                onestate,
+                big_mem,
+                gpu,
+            )?;
+            if afni_requested {
+                bail!("AFNI connection flags do not apply to `sumaru tc`");
+            }
+
+            let (surface_lh_path, surface_rh_path) = if let Some(right) = args.surface_rh {
+                (Some(args.surface.clone()), Some(right))
+            } else if let Some((left, right)) = discover_hemisphere_pair(&args.surface) {
+                (Some(left), Some(right))
+            } else {
+                (None, None)
+            };
+            let paired_scene = surface_lh_path.is_some();
+            let (surface_paths, overlay_path, overlay_pair_paths) = if paired_scene {
+                let overlay_pair = if let Some(right) = args.overlay_rh {
+                    ExplicitOverlayPair {
+                        left_path: Some(args.overlay),
+                        right_path: Some(right),
+                    }
+                } else if let Some((left, right)) = discover_hemisphere_pair(&args.overlay) {
+                    ExplicitOverlayPair {
+                        left_path: Some(left),
+                        right_path: Some(right),
+                    }
+                } else {
+                    ExplicitOverlayPair {
+                        left_path: Some(args.overlay),
+                        right_path: None,
+                    }
+                };
+                (Vec::new(), None, Some(overlay_pair))
+            } else {
+                if args.overlay_rh.is_some() {
+                    bail!("--overlay-rh requires a paired surface in `sumaru tc`");
+                }
+                (vec![args.surface], Some(args.overlay), None)
+            };
+
+            viewer::run(viewer::LaunchOptions {
+                surface_paths,
+                surface_lh_path,
+                surface_rh_path,
+                overlay_path,
+                overlay_pair_paths,
+                verbose: verbose || args.verbose,
+                big_mem: big_mem || args.big_mem,
+                timecourse_mode: true,
+                ..viewer::LaunchOptions::default()
             })?;
         }
         Some(Commands::Inspect { path }) => {
@@ -507,6 +606,37 @@ fn explicit_overlay_pair(
     }
 }
 
+/// Resolve common MNE/SUMA hemisphere filename pairs without adding a new
+/// surface-loading path. Pairing is opportunistic: a lone hemisphere remains a
+/// perfectly valid timecourse launch.
+fn discover_hemisphere_pair(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    const TOKENS: [(&str, &str); 6] = [
+        ("-lh.", "-rh."),
+        ("_lh.", "_rh."),
+        (".lh.", ".rh."),
+        ("lh.", "rh."),
+        ("-lh-", "-rh-"),
+        ("_lh_", "_rh_"),
+    ];
+    for (left_token, right_token) in TOKENS {
+        let (left_name, right_name) = if name.contains(left_token) {
+            (name.to_string(), name.replacen(left_token, right_token, 1))
+        } else if name.contains(right_token) {
+            (name.replacen(right_token, left_token, 1), name.to_string())
+        } else {
+            continue;
+        };
+        let left = parent.join(left_name);
+        let right = parent.join(right_name);
+        if left.exists() && right.exists() {
+            return Some((left, right));
+        }
+    }
+    None
+}
+
 fn validate_onestate_order(args: &[OsString]) -> Result<()> {
     let mut saw_surface = false;
     for arg in args.iter().skip(1) {
@@ -661,6 +791,24 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn timecourse_subcommand_parses_compact_launch_syntax() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "tc",
+            "-i",
+            "underlay-lh.gii",
+            "--overlay",
+            "stc-lh.gii",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tc(args))
+                if args.surface == PathBuf::from("underlay-lh.gii")
+                    && args.overlay == PathBuf::from("stc-lh.gii")
+        ));
     }
 
     #[test]

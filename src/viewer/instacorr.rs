@@ -553,6 +553,7 @@ impl ViewerState {
             node_indices: source_dataset.node_indices.clone(),
             columns: vec![column],
             time_step_seconds: None,
+            time_start_seconds: None,
             parent_ids: DatasetParentIds {
                 source_dataset_id: source_dataset.parent_ids.source_dataset_id.clone(),
                 domain_parent_id: source_dataset.parent_ids.domain_parent_id.clone(),

@@ -94,6 +94,7 @@ mod roi;
 mod scene;
 mod scene_objects;
 mod screenshot;
+mod timecourse;
 mod transform;
 mod ui;
 mod volume_view;
@@ -104,6 +105,10 @@ use scene_objects::{
     SceneObject, SceneObjectGpu, SceneObjectPayload, SceneObjectPick, SceneObjectRenderer,
     normalization_model, pick_scene_objects,
 };
+pub use timecourse::{
+    TimeCourseBaseline, TimeCourseControls, TimeCourseDisplay, TimeCourseMeasure,
+};
+use timecourse::{TimeCoursePlotInteraction, TimeCoursePlotMarkers, TimeCourseState};
 use volume_view::{SlicePlane, VolumeView};
 
 impl From<CameraMode> for CameraControlMode {
@@ -375,6 +380,8 @@ pub struct LaunchOptions {
     pub gpu: bool,
     pub afni: AfniViewerOptions,
     pub niml_record_path: Option<PathBuf>,
+    /// Start in the compact interactive surface-timecourse workflow.
+    pub timecourse_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,6 +463,7 @@ struct ViewerApp {
     gpu: bool,
     afni: AfniViewerOptions,
     niml_record_path: Option<PathBuf>,
+    initial_timecourse_mode: bool,
     event_proxy: EventLoopProxy<ViewerEvent>,
     state: Option<ViewerState>,
     setup_error: Option<anyhow::Error>,
@@ -485,6 +493,7 @@ impl ViewerApp {
             gpu: options.gpu,
             afni: options.afni,
             niml_record_path: options.niml_record_path,
+            initial_timecourse_mode: options.timecourse_mode,
             event_proxy,
             state: None,
             setup_error: None,
@@ -492,10 +501,15 @@ impl ViewerApp {
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let view_title = if self.initial_timecourse_mode {
+            "sumaru tc".to_string()
+        } else {
+            window_title(self.initial_surface_paths.first())
+        };
         let view_window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
-                    .with_title(window_title(self.initial_surface_paths.first()))
+                    .with_title(view_title)
                     .with_inner_size(PhysicalSize::new(1280, 900)),
             )?,
         );
@@ -559,6 +573,7 @@ impl ViewerApp {
                 auto_color_niml: self.initial_auto_color_niml,
                 overlay_subs: self.initial_overlay_subs.take(),
                 overlay_p_value: self.initial_overlay_p_value.take(),
+                timecourse_mode: self.initial_timecourse_mode,
             },
             self.verbose,
             self.preload,
@@ -1295,6 +1310,7 @@ struct InitialScene {
     auto_color_niml: bool,
     overlay_subs: Option<Vec<String>>,
     overlay_p_value: Option<f64>,
+    timecourse_mode: bool,
 }
 
 struct SurfaceRenderPipelines {
@@ -1400,6 +1416,7 @@ struct ViewerState {
     roi_layer: Option<RoiLayer>,
     roi_workspace: RoiWorkspace,
     graph_snapshot: Option<GraphSnapshot>,
+    timecourse: Option<TimeCourseState>,
     surface_volume_path: Option<PathBuf>,
     surface_volume_idcode: Option<String>,
     /// Loaded display volume and its slice-plane render state (`--volume` mode).
@@ -1495,6 +1512,7 @@ impl ViewerState {
             auto_color_niml: initial_auto_color_niml,
             overlay_subs: initial_overlay_subs,
             overlay_p_value: initial_overlay_p_value,
+            timecourse_mode: initial_timecourse_mode,
         } = scene;
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
@@ -1942,6 +1960,7 @@ impl ViewerState {
             roi_layer: None,
             roi_workspace: RoiWorkspace::default(),
             graph_snapshot: None,
+            timecourse: None,
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             volume_view: None,
@@ -2024,6 +2043,9 @@ impl ViewerState {
             )?;
         } else if initial_auto_color_niml {
             state.load_auto_niml_overlay_for_active_surface()?;
+        }
+        if initial_timecourse_mode {
+            state.initialize_timecourse_mode()?;
         }
         if let Some(path) = initial_roi_path {
             state.load_roi_path(path)?;
@@ -2146,6 +2168,7 @@ impl ViewerState {
 
     fn update(&mut self) {
         let now = Instant::now();
+        self.update_timecourse_playback(now);
         let elapsed = now.saturating_duration_since(self.camera_tick_at);
         self.camera_tick_at = now;
         if self.camera.tick_momentum(elapsed) {
@@ -3212,6 +3235,11 @@ impl ViewerState {
                 }
                 ViewerCommand::RefreshOverlayAppearance => {
                     if let Err(error) = self.refresh_overlay_appearance() {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::SetTimeCourseControls(controls) => {
+                    if let Err(error) = self.set_timecourse_controls(controls) {
                         self.set_error(error);
                     }
                 }
@@ -7299,6 +7327,7 @@ fn single_hemisphere_overlay_dataset(
 ) -> Result<Dataset> {
     let kind = dataset.kind.clone();
     let time_step_seconds = dataset.time_step_seconds;
+    let time_start_seconds = dataset.time_start_seconds;
     let columns = dataset.columns;
     let parent_ids = dataset.parent_ids;
     let row_count = dataset.row_count;
@@ -7318,6 +7347,7 @@ fn single_hemisphere_overlay_dataset(
             dataset
                 .with_parent_ids(parent_ids)
                 .with_time_step_seconds(time_step_seconds)
+                .with_time_start_seconds(time_start_seconds)
         })
         .context("failed to remap hemisphere overlay into the active paired surface")
 }
@@ -7418,6 +7448,7 @@ fn paired_overlay_dataset(
         DatasetKind::Unknown
     };
     let time_step_seconds = paired_time_step(left.time_step_seconds, right.time_step_seconds)?;
+    let time_start_seconds = paired_time_start(left.time_start_seconds, right.time_start_seconds)?;
 
     let columns = left
         .columns
@@ -7432,7 +7463,11 @@ fn paired_overlay_dataset(
         && left_row_count + right_row_count == domain.node_count
     {
         return Dataset::dense(kind, domain, columns)
-            .map(|dataset| dataset.with_time_step_seconds(time_step_seconds))
+            .map(|dataset| {
+                dataset
+                    .with_time_step_seconds(time_step_seconds)
+                    .with_time_start_seconds(time_start_seconds)
+            })
             .context("failed to build paired dense overlay dataset");
     }
 
@@ -7449,7 +7484,11 @@ fn paired_overlay_dataset(
     }
 
     Dataset::sparse(kind, domain, node_indices, columns)
-        .map(|dataset| dataset.with_time_step_seconds(time_step_seconds))
+        .map(|dataset| {
+            dataset
+                .with_time_step_seconds(time_step_seconds)
+                .with_time_start_seconds(time_start_seconds)
+        })
         .context("failed to build paired overlay dataset")
 }
 
@@ -7458,6 +7497,16 @@ fn paired_time_step(left: Option<f64>, right: Option<f64>) -> Result<Option<f64>
         ensure!(
             (left - right).abs() <= 1.0e-9 * left.abs().max(right.abs()).max(1.0),
             "paired time-series overlays have different TR values: {left} vs {right} seconds"
+        );
+    }
+    Ok(left.or(right))
+}
+
+fn paired_time_start(left: Option<f64>, right: Option<f64>) -> Result<Option<f64>> {
+    if let (Some(left), Some(right)) = (left, right) {
+        ensure!(
+            (left - right).abs() <= 1.0e-9 * left.abs().max(right.abs()).max(1.0),
+            "paired time-series overlays have different start times: {left} vs {right} seconds"
         );
     }
     Ok(left.or(right))
@@ -8594,7 +8643,8 @@ fn draw_graph_snapshot(
     ui: &mut egui::Ui,
     snapshot: &GraphSnapshot,
     columns: OverlayColumnSelections,
-) {
+    timecourse: Option<TimeCoursePlotMarkers>,
+) -> Option<TimeCoursePlotInteraction> {
     let available_height = ui.available_height();
     let plot_height = (available_height - 32.0).clamp(
         GRAPH_MIN_PLOT_HEIGHT_POINTS,
@@ -8604,7 +8654,12 @@ fn draw_graph_snapshot(
         ui.available_width().max(GRAPH_MIN_PLOT_WIDTH_POINTS),
         plot_height,
     );
-    let (rect, _) = ui.allocate_exact_size(plot_size, egui::Sense::hover());
+    let sense = if timecourse.is_some() {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(plot_size, sense);
     let painter = ui.painter_at(rect);
     let plot_rect = egui::Rect::from_min_max(
         rect.min + egui::vec2(54.0, 14.0),
@@ -8621,6 +8676,38 @@ fn draw_graph_snapshot(
         egui::Stroke::new(1.0_f32, border_color()),
         egui::StrokeKind::Outside,
     );
+
+    if let Some(markers) = timecourse {
+        let count = snapshot.points.len().max(1);
+        let sample_x = |sample: usize| {
+            let denominator = count.saturating_sub(1).max(1) as f32;
+            egui::lerp(
+                plot_rect.left()..=plot_rect.right(),
+                sample.min(count - 1) as f32 / denominator,
+            )
+        };
+        let band = |range: [usize; 2], color: egui::Color32| {
+            let half_sample = plot_rect.width() / count.saturating_sub(1).max(1) as f32 * 0.5;
+            let left = (sample_x(range[0]) - half_sample).max(plot_rect.left());
+            let right = (sample_x(range[1]) + half_sample).min(plot_rect.right());
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(left, plot_rect.top()),
+                    egui::pos2(right, plot_rect.bottom()),
+                ),
+                0.0,
+                color,
+            );
+        };
+        band(
+            markers.baseline,
+            egui::Color32::from_rgba_unmultiplied(72, 126, 176, 38),
+        );
+        band(
+            markers.response,
+            egui::Color32::from_rgba_unmultiplied(232, 154, 64, 38),
+        );
+    }
 
     for step in 0..=4 {
         let t = step as f32 / 4.0;
@@ -8673,6 +8760,35 @@ fn draw_graph_snapshot(
         );
     }
 
+    if let Some(markers) = timecourse {
+        let denominator = snapshot.points.len().saturating_sub(1).max(1) as f32;
+        let cursor_x = egui::lerp(
+            plot_rect.left()..=plot_rect.right(),
+            markers.cursor.min(snapshot.points.len().saturating_sub(1)) as f32 / denominator,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(cursor_x, plot_rect.top()),
+                egui::pos2(cursor_x, plot_rect.bottom()),
+            ],
+            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+        );
+        painter.text(
+            egui::pos2(plot_rect.left(), plot_rect.bottom() + 8.0),
+            egui::Align2::LEFT_TOP,
+            format!("{:.1} ms", markers.start_seconds * 1000.0),
+            egui::FontId::monospace(10.0),
+            muted_color(),
+        );
+        painter.text(
+            egui::pos2(plot_rect.right(), plot_rect.bottom() + 8.0),
+            egui::Align2::RIGHT_TOP,
+            format!("{:.1} ms", markers.end_seconds * 1000.0),
+            egui::FontId::monospace(10.0),
+            muted_color(),
+        );
+    }
+
     for (index, position) in &points {
         let point = &snapshot.points[*index];
         let (color, radius) = graph_point_style(columns, point.column_index);
@@ -8684,16 +8800,24 @@ fn draw_graph_snapshot(
         );
     }
 
-    for (index, position) in points.iter().step_by(graph_label_stride(points.len())) {
-        let label = &snapshot.points[*index].label;
-        draw_rotated_graph_label(
-            &painter,
-            egui::pos2(position.x, plot_rect.bottom() + 8.0),
-            &truncate_middle(label, 18),
-        );
+    if timecourse.is_none() {
+        for (index, position) in points.iter().step_by(graph_label_stride(points.len())) {
+            let label = &snapshot.points[*index].label;
+            draw_rotated_graph_label(
+                &painter,
+                egui::pos2(position.x, plot_rect.bottom() + 8.0),
+                &truncate_middle(label, 18),
+            );
+        }
     }
 
     ui.horizontal_wrapped(|ui| {
+        if timecourse.is_some() {
+            graph_legend_chip(ui, "baseline", egui::Color32::from_rgb(72, 126, 176));
+            graph_legend_chip(ui, "response", egui::Color32::from_rgb(232, 154, 64));
+            ui.label(egui::RichText::new("white line = surface time").color(muted_color()));
+            return;
+        }
         graph_legend_chip(ui, "I", egui::Color32::from_rgb(123, 184, 226));
         graph_legend_chip(ui, "T", egui::Color32::from_rgb(246, 199, 94));
         graph_legend_chip(ui, "B", egui::Color32::from_rgb(170, 132, 255));
@@ -8735,6 +8859,27 @@ fn draw_graph_snapshot(
             ));
         }
     });
+
+    timecourse?;
+    let pointer = response.interact_pointer_pos()?;
+    let sample_for_x = |x: f32| {
+        let fraction = ((x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 1.0);
+        (fraction * snapshot.points.len().saturating_sub(1) as f32).round() as usize
+    };
+    if response.dragged() {
+        let current = sample_for_x(pointer.x);
+        let start = sample_for_x(pointer.x - response.drag_delta().x);
+        let range = [start.min(current), start.max(current)];
+        if ui.input(|input| input.modifiers.shift) {
+            Some(TimeCoursePlotInteraction::Baseline(range))
+        } else {
+            Some(TimeCoursePlotInteraction::Response(range))
+        }
+    } else if response.clicked() {
+        Some(TimeCoursePlotInteraction::Cursor(sample_for_x(pointer.x)))
+    } else {
+        None
+    }
 }
 
 fn draw_rotated_graph_label(painter: &egui::Painter, anchor: egui::Pos2, label: &str) {
