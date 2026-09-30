@@ -177,7 +177,10 @@ AFNI/SUMA `.niml.dset`, or an AFNI-converted `.gii.dset`. Multi-column datasets
 are parsed into the canonical `Dataset` table first; the controller can then
 choose intensity, threshold, and brightness columns from the dataset. If the
 selected threshold column carries an AFNI stat label such as `Ttest(48)`, the
-threshold control can operate in p-value mode. Treat this as a viewer
+threshold control can operate in p-value mode. Embedded GIFTI FDR curves are
+used automatically. If a statistical `.gii.dset` has no embedded curve, set
+`GIFTI_DSET_AUTO_QCALC = YES` in `~/.sumaru` (or enable the matching preference)
+to reconstruct q-values while loading; the default is `NO`. Treat this as a viewer
 convenience rather than a statistics package: it is meant to help inspect the
 data you already understand.
 
@@ -193,9 +196,10 @@ p-value when both datasets carry compatible stat metadata, or remember a
 separate threshold for every overlay. Preferences are saved automatically in
 `~/.sumaru`; on first launch Sumaru creates the fully documented default file
 if it does not already exist. The file follows the self-documenting AFNI/SUMA `~/.sumarc`
-convention: it has an `***ENVIRONMENT` section, stable `SUMARU_...` keys, and
+convention: it has an `***ENVIRONMENT` section, stable preference keys, and
 an adjacent description, allowed values, and default for every setting. The
-current threshold policy is stored as `SUMARU_OverlayThresholdSync`. Older
+current threshold policy is stored as `SUMARU_OverlayThresholdSync`; optional
+GIFTI q-value reconstruction is stored as `GIFTI_DSET_AUTO_QCALC`. Older
 minimal files using `overlay_threshold_sync` remain readable and are migrated
 to the documented form the next time Preferences saves the file.
 

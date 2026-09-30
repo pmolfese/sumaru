@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use sumaru::dataset::{ColumnData, ColumnRole, DatasetKind};
 use sumaru::inspect::{FileKind, detect_file_kind, inspect_path};
-use sumaru::io::{read_gifti_dataset, read_niml_dataset, read_niml_roi};
+use sumaru::io::{
+    read_gifti_dataset, read_gifti_dataset_with_auto_qcalc, read_niml_dataset, read_niml_roi,
+};
 use sumaru::roi::{RoiBrushAction, RoiDrawingType, RoiElementKind, RoiSource};
 use sumaru::surface::{SurfaceKind, SurfaceMesh, SurfaceSide};
 
@@ -205,7 +207,8 @@ fn local_afni_gifti_dset_fixture_matches_converted_niml_dataset() -> Result<()> 
     let mesh = SurfaceMesh::from_gifti_path(surface_path)?;
     let niml = read_niml_dataset(niml_path, &mesh.domain)?;
     let report = inspect_path(&gifti_path)?;
-    let gifti = read_gifti_dataset(&gifti_path, &mesh.domain)?;
+    let gifti_without_auto_qcalc = read_gifti_dataset(&gifti_path, &mesh.domain)?;
+    let gifti = read_gifti_dataset_with_auto_qcalc(&gifti_path, &mesh.domain, true)?;
 
     assert_eq!(report.kind, FileKind::Gifti);
     assert!(report.summary.contains("data arrays: 12"));
@@ -237,6 +240,22 @@ fn local_afni_gifti_dset_fixture_matches_converted_niml_dataset() -> Result<()> 
     );
     assert_eq!(gifti.columns[1].role, ColumnRole::Statistic);
     assert_eq!(gifti.columns[1].stat.as_deref(), Some("Ttest(48)"));
+    assert!(gifti_without_auto_qcalc.columns[1].fdr_curve.is_none());
+    let gifti_fdr = gifti.columns[1]
+        .fdr_curve
+        .as_ref()
+        .expect("GIFTI statistic column has a reconstructed FDR curve");
+    let niml_fdr = niml.columns[1]
+        .fdr_curve
+        .as_ref()
+        .expect("NIML statistic column has its stored FDR curve");
+    for threshold in [0.5, 1.0, 2.0, 3.0, 5.0] {
+        assert_close(
+            gifti_fdr.q_value(threshold).unwrap(),
+            niml_fdr.q_value(threshold).unwrap(),
+            0.000_01,
+        );
+    }
 
     let first_range = gifti.columns[0]
         .range

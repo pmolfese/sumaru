@@ -285,10 +285,18 @@ impl ViewerState {
                 paths.right_path.display()
             );
 
-            let left_dataset = load_dataset_from_path(&paths.left_path, left_mesh)
-                .with_context(|| format!("failed to load {}", paths.left_path.display()))?;
-            let right_dataset = load_dataset_from_path(&paths.right_path, right_mesh)
-                .with_context(|| format!("failed to load {}", paths.right_path.display()))?;
+            let left_dataset = load_dataset_from_path(
+                &paths.left_path,
+                left_mesh,
+                self.preferences.gifti_dset_auto_qcalc,
+            )
+            .with_context(|| format!("failed to load {}", paths.left_path.display()))?;
+            let right_dataset = load_dataset_from_path(
+                &paths.right_path,
+                right_mesh,
+                self.preferences.gifti_dset_auto_qcalc,
+            )
+            .with_context(|| format!("failed to load {}", paths.right_path.display()))?;
             let dataset = paired_overlay_dataset(
                 left_dataset,
                 right_dataset,
@@ -304,7 +312,7 @@ impl ViewerState {
         }
 
         Ok(LoadedOverlaySelection {
-            overlay: load_overlay_from_path(path, mesh)?,
+            overlay: load_overlay_from_path(path, mesh, self.preferences.gifti_dset_auto_qcalc)?,
             display_name: file_name_display(path),
         })
     }
@@ -339,10 +347,18 @@ impl ViewerState {
                     right_path.display()
                 );
 
-                let left_dataset = load_dataset_from_path(left_path, left_mesh)
-                    .with_context(|| format!("failed to load {}", left_path.display()))?;
-                let right_dataset = load_dataset_from_path(right_path, right_mesh)
-                    .with_context(|| format!("failed to load {}", right_path.display()))?;
+                let left_dataset = load_dataset_from_path(
+                    left_path,
+                    left_mesh,
+                    self.preferences.gifti_dset_auto_qcalc,
+                )
+                .with_context(|| format!("failed to load {}", left_path.display()))?;
+                let right_dataset = load_dataset_from_path(
+                    right_path,
+                    right_mesh,
+                    self.preferences.gifti_dset_auto_qcalc,
+                )
+                .with_context(|| format!("failed to load {}", right_path.display()))?;
                 paired_overlay_dataset(
                     left_dataset,
                     right_dataset,
@@ -356,8 +372,12 @@ impl ViewerState {
                     "left hemisphere overlay {} does not exist",
                     left_path.display()
                 );
-                let left_dataset = load_dataset_from_path(left_path, left_mesh)
-                    .with_context(|| format!("failed to load {}", left_path.display()))?;
+                let left_dataset = load_dataset_from_path(
+                    left_path,
+                    left_mesh,
+                    self.preferences.gifti_dset_auto_qcalc,
+                )
+                .with_context(|| format!("failed to load {}", left_path.display()))?;
                 single_hemisphere_overlay_dataset(left_dataset, &mesh.domain, 0)?
             }
             (None, Some(right_path)) => {
@@ -366,8 +386,12 @@ impl ViewerState {
                     "right hemisphere overlay {} does not exist",
                     right_path.display()
                 );
-                let right_dataset = load_dataset_from_path(right_path, right_mesh)
-                    .with_context(|| format!("failed to load {}", right_path.display()))?;
+                let right_dataset = load_dataset_from_path(
+                    right_path,
+                    right_mesh,
+                    self.preferences.gifti_dset_auto_qcalc,
+                )
+                .with_context(|| format!("failed to load {}", right_path.display()))?;
                 single_hemisphere_overlay_dataset(
                     right_dataset,
                     &mesh.domain,
