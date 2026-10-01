@@ -15,10 +15,18 @@ pub(crate) const NIFTI_INTENT_ZSCORE: i32 = 5;
 pub(crate) const NIFTI_INTENT_CHISQ: i32 = 6;
 
 pub fn read_gifti_dataset(path: impl AsRef<Path>, domain: &SurfaceDomain) -> Result<Dataset> {
+    read_gifti_dataset_with_auto_qcalc(path, domain, false)
+}
+
+pub fn read_gifti_dataset_with_auto_qcalc(
+    path: impl AsRef<Path>,
+    domain: &SurfaceDomain,
+    auto_qcalc: bool,
+) -> Result<Dataset> {
     let path = path.as_ref();
     let image = read_gifti_image(path)
         .with_context(|| format!("failed to read GIFTI dataset {}", path.display()))?;
-    gifti_image_to_dataset(&image, domain, path)
+    gifti_image_to_dataset(&image, domain, path, auto_qcalc)
 }
 
 pub fn read_gifti_image(path: impl AsRef<Path>) -> Result<GiftiImage> {
@@ -56,13 +64,17 @@ pub(crate) fn gifti_image_to_dataset(
     image: &GiftiImage,
     domain: &SurfaceDomain,
     path: &Path,
+    auto_qcalc: bool,
 ) -> Result<Dataset> {
     let columns = image
         .data_arrays
         .iter()
         .enumerate()
         .filter(|(_, array)| gifti_array_is_dataset_column(array, domain.node_count))
-        .map(|(index, array)| gifti_array_to_data_column(array, index))
+        .map(|(index, array)| {
+            let embedded_fdr_curve = gifti_fdr_curve_from_metadata(image, array, index)?;
+            gifti_array_to_data_column(array, index, embedded_fdr_curve, auto_qcalc)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     ensure!(
@@ -109,13 +121,74 @@ pub(crate) fn gifti_image_to_dataset(
     })
 }
 
-pub(crate) fn gifti_array_to_data_column(array: &DataArray, index: usize) -> Result<DataColumn> {
+pub(crate) fn gifti_array_to_data_column(
+    array: &DataArray,
+    index: usize,
+    embedded_fdr_curve: Option<AfniFdrCurve>,
+    auto_qcalc: bool,
+) -> Result<DataColumn> {
     let label = gifti_meta_value(&array.meta, "Name").unwrap_or_else(|| format!("col_{index}"));
     let role = column_role_from_gifti_array(array);
     let stat = gifti_stat_from_array(array);
+    let values = column_data_from_gifti_array(array)?;
+    let fdr_curve = embedded_fdr_curve.or_else(|| {
+        auto_qcalc
+            .then(|| {
+                stat.as_deref()
+                    .and_then(crate::stats::AfniStatSpec::parse)
+                    .and_then(|stat| AfniFdrCurve::from_statistics(&stat, &values))
+            })
+            .flatten()
+    });
 
-    DataColumn::new(label, role, None, column_data_from_gifti_array(array)?)
-        .map(|column| column.with_stat(stat))
+    DataColumn::new(label, role, None, values)
+        .map(|column| column.with_stat(stat).with_fdr_curve(fdr_curve))
+}
+
+fn gifti_fdr_curve_from_metadata(
+    image: &GiftiImage,
+    array: &DataArray,
+    column_index: usize,
+) -> Result<Option<AfniFdrCurve>> {
+    let indexed_names = [
+        format!("FDRCURVE_{column_index:06}"),
+        format!("FDRCURVE_{column_index}"),
+        format!("AFNI_FDRCURVE_{column_index:06}"),
+        format!("FDR_CURVE_{column_index:06}"),
+    ];
+    let encoded = ["FDRCURVE", "AFNI_FDRCURVE", "FDR_CURVE"]
+        .iter()
+        .find_map(|name| gifti_meta_value(&array.meta, name))
+        .or_else(|| {
+            indexed_names
+                .iter()
+                .find_map(|name| gifti_meta_value(&array.meta, name))
+        })
+        .or_else(|| {
+            indexed_names
+                .iter()
+                .find_map(|name| gifti_meta_value(&image.meta, name))
+        });
+
+    encoded
+        .map(|encoded| parse_gifti_fdr_curve(&encoded, column_index))
+        .transpose()
+}
+
+fn parse_gifti_fdr_curve(encoded: &str, column_index: usize) -> Result<AfniFdrCurve> {
+    let values = encoded
+        .trim()
+        .trim_matches(|ch| matches!(ch, '[' | ']' | '(' | ')'))
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',' || ch == ';')
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| {
+            piece.parse::<f64>().with_context(|| {
+                format!("invalid GIFTI FDR curve value '{piece}' for column {column_index}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    AfniFdrCurve::from_afni_values(&values)
+        .with_context(|| format!("invalid GIFTI FDR curve for column {column_index}"))
 }
 
 fn gifti_array_is_dataset_column(array: &DataArray, node_count: usize) -> bool {
@@ -302,8 +375,9 @@ mod tests {
             ],
         };
 
-        let dataset = gifti_image_to_dataset(&image, &triangle_domain(), Path::new("time.gii"))
-            .expect("scalar pointsets should load as overlay columns");
+        let dataset =
+            gifti_image_to_dataset(&image, &triangle_domain(), Path::new("time.gii"), false)
+                .expect("scalar pointsets should load as overlay columns");
 
         assert_eq!(dataset.kind, DatasetKind::SurfaceTimeSeries);
         assert_eq!(dataset.time_step_seconds, Some(0.8));
@@ -334,13 +408,81 @@ mod tests {
             ],
         };
 
-        let error = gifti_image_to_dataset(&image, &triangle_domain(), Path::new("surface.gii"))
-            .unwrap_err();
+        let error =
+            gifti_image_to_dataset(&image, &triangle_domain(), Path::new("surface.gii"), false)
+                .unwrap_err();
 
         assert!(
             error
                 .to_string()
                 .contains("no scalar data arrays matching 3 surface nodes")
         );
+    }
+
+    #[test]
+    fn statistical_arrays_reconstruct_missing_afni_fdr_curves() {
+        let mut array = float_array(
+            NIFTI_INTENT_TTEST,
+            vec![64],
+            (0..64).map(|index| (index as f32 - 31.5) / 4.0).collect(),
+        );
+        array.meta = vec![
+            ("Name".to_string(), "group t".to_string()),
+            ("intent_p1".to_string(), "48".to_string()),
+        ];
+
+        let column = gifti_array_to_data_column(&array, 0, None, true).unwrap();
+        let curve = column
+            .fdr_curve
+            .expect("a statistical GIFTI array should receive an FDR curve");
+
+        assert_eq!(column.stat.as_deref(), Some("Ttest(48)"));
+        assert!(curve.q_value(3.0).unwrap() < curve.q_value(2.0).unwrap());
+    }
+
+    #[test]
+    fn statistical_arrays_do_not_auto_calculate_fdr_curves_by_default() {
+        let mut array = float_array(
+            NIFTI_INTENT_TTEST,
+            vec![64],
+            (0..64).map(|index| (index as f32 - 31.5) / 4.0).collect(),
+        );
+        array.meta = vec![("intent_p1".to_string(), "48".to_string())];
+
+        let column = gifti_array_to_data_column(&array, 0, None, false).unwrap();
+
+        assert!(column.fdr_curve.is_none());
+    }
+
+    #[test]
+    fn embedded_gifti_fdr_curve_is_used_when_auto_calculation_is_off() {
+        let mut array = float_array(NIFTI_INTENT_TTEST, vec![3], vec![1.0, 2.0, 3.0]);
+        array.meta = vec![("intent_p1".to_string(), "48".to_string())];
+        let image = GiftiImage {
+            version: "1.0".to_string(),
+            num_data_arrays: 2,
+            meta: vec![("FDRCURVE_000001".to_string(), "0 1 2 1 0.5".to_string())],
+            label_table: None,
+            data_arrays: vec![
+                float_array(
+                    gifti_rs::intent::POINTSET,
+                    vec![3, 3],
+                    vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                ),
+                array,
+            ],
+        };
+
+        let dataset =
+            gifti_image_to_dataset(&image, &triangle_domain(), Path::new("stats.gii"), false)
+                .unwrap();
+        let curve = dataset.columns[0]
+            .fdr_curve
+            .as_ref()
+            .expect("embedded curves must not depend on auto calculation");
+
+        assert_eq!(curve.x0, 0.0);
+        assert_eq!(curve.dx, 1.0);
+        assert_eq!(curve.samples, vec![2.0, 1.0, 0.5]);
     }
 }

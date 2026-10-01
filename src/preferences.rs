@@ -1,7 +1,7 @@
 //! Persistent user preferences stored in `~/.sumaru`.
 //!
 //! The format follows AFNI/SUMA's self-documenting `~/.sumarc` convention:
-//! stable `SUMARU_...` keys, an `***ENVIRONMENT` section, and comments that
+//! stable preference keys, an `***ENVIRONMENT` section, and comments that
 //! explain every setting, allowed value, and default. It remains tolerant of
 //! unknown keys so newer Sumaru versions do not make older builds reject the
 //! file.
@@ -74,6 +74,7 @@ impl OverlayThresholdSync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppPreferences {
     pub overlay_threshold_sync: OverlayThresholdSync,
+    pub gifti_dset_auto_qcalc: bool,
 }
 
 impl AppPreferences {
@@ -142,6 +143,17 @@ impl AppPreferences {
                             line_number + 1
                         )
                     })?;
+            } else if matches!(
+                key.trim(),
+                "GIFTI_DSET_AUTO_QCALC" | "SUMARU_GIFTI_DSET_AUTO_QCALC"
+            ) {
+                preferences.gifti_dset_auto_qcalc = parse_yes_no(value).with_context(|| {
+                    format!(
+                        "invalid GIFTI_DSET_AUTO_QCALC at {}:{}",
+                        path.display(),
+                        line_number + 1
+                    )
+                })?;
             }
         }
         Ok(preferences)
@@ -196,8 +208,20 @@ impl AppPreferences {
 //       supported stat metadata; otherwise fall back to CURRENT_VALUE.\n\
 //     PER_OVERLAY: restore the threshold last used on each overlay.\n\
 //     default:   SUMARU_OverlayThresholdSync = CURRENT_VALUE\n\
-   SUMARU_OverlayThresholdSync = {}\n",
-            self.overlay_threshold_sync.file_value()
+   SUMARU_OverlayThresholdSync = {}\n\
+// 001-GIFTI_DSET_AUTO_QCALC:\n\
+//     Reconstruct q-values when a statistical .gii.dset does not contain an\n\
+//     embedded AFNI FDR curve. Embedded curves are always used when present.\n\
+//     YES: calculate missing GIFTI q-values while loading the dataset.\n\
+//     NO: leave missing GIFTI q-values unavailable.\n\
+//     default:   GIFTI_DSET_AUTO_QCALC = NO\n\
+   GIFTI_DSET_AUTO_QCALC = {}\n",
+            self.overlay_threshold_sync.file_value(),
+            if self.gifti_dset_auto_qcalc {
+                "YES"
+            } else {
+                "NO"
+            }
         )
     }
 }
@@ -228,6 +252,14 @@ fn unquote(value: &str) -> &str {
         .strip_prefix('"')
         .and_then(|inner| inner.strip_suffix('"'))
         .unwrap_or(value)
+}
+
+fn parse_yes_no(value: &str) -> Option<bool> {
+    match unquote(value).trim().to_ascii_uppercase().as_str() {
+        "YES" | "TRUE" | "ON" | "1" => Some(true),
+        "NO" | "FALSE" | "OFF" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn preference_line(raw_line: &str) -> &str {
@@ -270,6 +302,7 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("***ENVIRONMENT"));
         assert!(text.contains("SUMARU_OverlayThresholdSync = CURRENT_VALUE"));
+        assert!(text.contains("GIFTI_DSET_AUTO_QCALC = NO"));
 
         fs::write(&path, "SUMARU_OverlayThresholdSync = PER_OVERLAY\n").unwrap();
         let (preferences, created) = AppPreferences::load_or_create(&path).unwrap();
@@ -290,16 +323,19 @@ mod tests {
         let path = test_path("round-trip");
         AppPreferences {
             overlay_threshold_sync: OverlayThresholdSync::MatchPValue,
+            gifti_dset_auto_qcalc: true,
         }
         .save(&path)
         .unwrap();
         let mut text = fs::read_to_string(&path).unwrap();
         text.push_str("SUMARU_FutureSetting = YES\n");
         fs::write(&path, text).unwrap();
+        let preferences = AppPreferences::load(&path).unwrap();
         assert_eq!(
-            AppPreferences::load(&path).unwrap().overlay_threshold_sync,
+            preferences.overlay_threshold_sync,
             OverlayThresholdSync::MatchPValue
         );
+        assert!(preferences.gifti_dset_auto_qcalc);
         let _ = fs::remove_file(path);
     }
 
@@ -307,6 +343,8 @@ mod tests {
     fn invalid_known_value_is_reported() {
         let path = test_path("invalid");
         fs::write(&path, "SUMARU_OverlayThresholdSync = nope\n").unwrap();
+        assert!(AppPreferences::load(&path).is_err());
+        fs::write(&path, "GIFTI_DSET_AUTO_QCALC = maybe\n").unwrap();
         assert!(AppPreferences::load(&path).is_err());
         let _ = fs::remove_file(path);
     }
@@ -318,6 +356,9 @@ mod tests {
         assert!(text.contains("// 000-SUMARU_OverlayThresholdSync:"));
         assert!(text.contains("default:   SUMARU_OverlayThresholdSync = CURRENT_VALUE"));
         assert!(text.contains("SUMARU_OverlayThresholdSync = CURRENT_VALUE"));
+        assert!(text.contains("// 001-GIFTI_DSET_AUTO_QCALC:"));
+        assert!(text.contains("default:   GIFTI_DSET_AUTO_QCALC = NO"));
+        assert!(text.contains("GIFTI_DSET_AUTO_QCALC = NO"));
     }
 
     #[test]
@@ -333,6 +374,9 @@ mod tests {
             AppPreferences::load(&path).unwrap().overlay_threshold_sync,
             OverlayThresholdSync::MatchPValue
         );
+
+        fs::write(&path, "GIFTI_DSET_AUTO_QCALC = yes\n").unwrap();
+        assert!(AppPreferences::load(&path).unwrap().gifti_dset_auto_qcalc);
 
         fs::write(&path, "overlay_threshold_sync = \"per_overlay\"\n").unwrap();
         assert_eq!(

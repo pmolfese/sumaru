@@ -1,6 +1,6 @@
 use anyhow::{Result, ensure};
 
-use crate::stats::normal_two_tailed_p_value;
+use crate::stats::{AfniStatSpec, normal_two_tailed_p_value};
 use crate::surface::{SurfaceDomain, SurfaceDomainId};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -281,6 +281,111 @@ impl AfniFdrCurve {
         Self::new(values[0], values[1], values[2..].to_vec())
     }
 
+    /// Rebuild the FDR curve AFNI normally stores alongside a statistical
+    /// sub-brick. This is needed for formats such as GIFTI that preserve the
+    /// statistic intent but can discard AFNI's `FDRCURVE_*` header fields.
+    pub fn from_statistics(stat: &AfniStatSpec, values: &ColumnData) -> Option<Self> {
+        const PMAX: f64 = 0.9999;
+        const PBOT: f64 = 1.0e-15;
+        const ZTOP: f64 = 9.0;
+        const CURVE_SAMPLES: usize = 101;
+
+        let statistics = numeric_column_values(values)?;
+        let mut ranked = statistics
+            .into_iter()
+            .filter(|value| value.is_finite() && *value != 0.0)
+            .filter_map(|value| {
+                stat.two_sided_p_value(value.abs())
+                    .filter(|p| *p >= 0.0 && *p < PMAX)
+                    .map(|p| (p.max(PBOT), value.abs()))
+            })
+            .collect::<Vec<_>>();
+        if ranked.len() <= 19 {
+            return None;
+        }
+        ranked.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+        let count = ranked.len();
+        let mut q_values = vec![1.0; count];
+        let mut q_min = 1.0_f64;
+        let mut has_small_q_after_first = false;
+        for index in (0..count).rev() {
+            let q = ((count as f64 * ranked[index].0) / (index as f64 + 1.0)).min(q_min);
+            q_min = q;
+            q_values[index] = q;
+            has_small_q_after_first |= index > 0 && q <= 0.15;
+        }
+
+        if has_small_q_after_first
+            && ranked[0].0 > 0.0
+            && let Some(true_positive_count) = estimate_afni_true_positive_count(&ranked)
+            && true_positive_count > 0
+        {
+            let mut factor = (count - true_positive_count) as f64 / count as f64;
+            if factor < 0.5 {
+                factor = 0.25 + factor * factor;
+            }
+            for q in &mut q_values {
+                *q *= factor;
+            }
+        }
+
+        let mut curve_points = ranked
+            .into_iter()
+            .zip(q_values)
+            .filter_map(|((_, statistic), q)| {
+                let z = normal_statistic_for_two_tailed_p_value(q)?;
+                (z > 0.0).then_some((z, statistic))
+            })
+            .collect::<Vec<_>>();
+        if curve_points.len() < 9 {
+            return None;
+        }
+        curve_points.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+        let mut last = curve_points.len() - 1;
+        while last > 0 && curve_points[last].0 >= ZTOP {
+            last -= 1;
+        }
+        if last == 0 {
+            return None;
+        }
+        if last < curve_points.len() - 1 {
+            last += 1;
+        }
+
+        let x0 = curve_points[0].1;
+        let top = curve_points[last].1;
+        let dx = (top - x0) / (CURVE_SAMPLES - 1) as f64;
+        if !dx.is_finite() || dx.abs() <= f64::EPSILON {
+            return None;
+        }
+
+        let mut samples = Vec::with_capacity(CURVE_SAMPLES);
+        samples.push(curve_points[0].0);
+        let mut point = 1;
+        for sample_index in 1..CURVE_SAMPLES - 1 {
+            let threshold = x0 + sample_index as f64 * dx;
+            while point < curve_points.len() && curve_points[point].1 < threshold {
+                point += 1;
+            }
+            if point >= curve_points.len() {
+                return None;
+            }
+            let (left_z, left_stat) = curve_points[point - 1];
+            let (right_z, right_stat) = curve_points[point];
+            let fraction = if (right_stat - left_stat).abs() <= f64::EPSILON {
+                0.0
+            } else {
+                (threshold - left_stat) / (right_stat - left_stat)
+            };
+            samples.push(left_z + fraction * (right_z - left_z));
+        }
+        samples.push(curve_points[last].0);
+
+        Self::new(x0, dx, samples).ok()
+    }
+
     pub fn to_afni_values(&self) -> Vec<f64> {
         let mut values = Vec::with_capacity(self.samples.len() + 2);
         values.push(self.x0);
@@ -336,6 +441,75 @@ impl AfniFdrCurve {
             .flatten()
             .or(Some(1.0))
     }
+}
+
+fn numeric_column_values(values: &ColumnData) -> Option<Vec<f64>> {
+    match values {
+        ColumnData::UInt32(values) => Some(values.iter().map(|value| *value as f64).collect()),
+        ColumnData::Int32(values) => Some(values.iter().map(|value| *value as f64).collect()),
+        ColumnData::Float32(values) => Some(values.iter().map(|value| *value as f64).collect()),
+        ColumnData::Float64(values) => Some(values.clone()),
+        ColumnData::Text(_) => None,
+    }
+}
+
+fn estimate_afni_true_positive_count(ranked: &[(f64, f64)]) -> Option<usize> {
+    if ranked.len() < 233 {
+        return None;
+    }
+
+    let mut histogram = [0_usize; 16];
+    let mut histogram_count = 0;
+    for (p, _) in ranked {
+        let bin = ((*p - 0.15) * 20.0) as isize;
+        if (0..16).contains(&bin) {
+            histogram[bin as usize] += 1;
+            histogram_count += 1;
+        }
+    }
+    if histogram_count < 160 {
+        return None;
+    }
+    histogram.sort_unstable();
+
+    let count = ranked.len() as f64;
+    let estimate_four = count
+        - 20.0 * (histogram[6] + 2 * histogram[7] + 2 * histogram[8] + histogram[9]) as f64 / 6.0;
+    let estimate_six = count
+        - 20.0
+            * (histogram[5]
+                + 2 * histogram[6]
+                + 2 * histogram[7]
+                + 2 * histogram[8]
+                + 2 * histogram[9]
+                + histogram[10]) as f64
+            / 10.0;
+    let estimate = estimate_four.min(estimate_six).trunc();
+    (estimate >= 0.0).then_some(estimate as usize)
+}
+
+fn normal_statistic_for_two_tailed_p_value(p: f64) -> Option<f64> {
+    if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+        return None;
+    }
+    if p == 1.0 {
+        return Some(0.0);
+    }
+    if p == 0.0 {
+        return Some(9.0);
+    }
+
+    let mut low = 0.0_f64;
+    let mut high = 9.0_f64;
+    for _ in 0..64 {
+        let midpoint = (low + high) * 0.5;
+        if normal_two_tailed_p_value(midpoint)? <= p {
+            high = midpoint;
+        } else {
+            low = midpoint;
+        }
+    }
+    Some(high)
 }
 
 impl ColumnData {

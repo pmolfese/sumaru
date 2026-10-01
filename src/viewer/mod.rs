@@ -42,8 +42,8 @@ use crate::dataset::{
 use crate::graph_dataset::read_graph_bucket;
 use crate::instacorr::{InstaCorrOptions, PreparedInstaCorr, prepare_dataset};
 use crate::io::{
-    NimlElement, read_gifti_dataset, read_gifti_image, read_niml_dataset,
-    read_niml_dataset_with_label_table, read_niml_roi, write_niml_roi,
+    NimlElement, read_gifti_dataset, read_gifti_dataset_with_auto_qcalc, read_gifti_image,
+    read_niml_dataset, read_niml_dataset_with_label_table, read_niml_roi, write_niml_roi,
 };
 use crate::niml_debug::NimlRecorder;
 use crate::overlay::{
@@ -296,7 +296,11 @@ const PAIRED_SURFACE_BUFFER_LABELS: SurfaceInstanceBufferLabels = SurfaceInstanc
     bind_group: "paired surface bind group",
 };
 const CONTROL_INITIAL_INNER_HEIGHT: u32 = 720;
-const CONTROL_MAX_INNER_WIDTH: u32 = 900;
+// `desired_panel_size` applies this cap after converting egui points to
+// physical pixels. Leave enough room for the controller's 560-point content
+// on 2x displays; a 900-pixel cap shrinks it to about 450 points and clips the
+// overlay selector and threshold-value rows.
+const CONTROL_MAX_INNER_WIDTH: u32 = 1800;
 const CONTROL_RESIZE_THRESHOLD: u32 = 12;
 const ROI_CONTROL_CONTENT_WIDTH_POINTS: f32 = 360.0;
 const ROI_CONTROL_MIN_INNER_WIDTH: u32 = 430;
@@ -7582,11 +7586,16 @@ fn paired_column_data(left: ColumnData, right: ColumnData) -> Result<ColumnData>
     }
 }
 
-fn load_dataset_from_path(path: &Path, mesh: &SurfaceMesh) -> Result<Dataset> {
+fn load_dataset_from_path(
+    path: &Path,
+    mesh: &SurfaceMesh,
+    gifti_dset_auto_qcalc: bool,
+) -> Result<Dataset> {
     if is_niml_dset_path(path) {
         read_niml_dataset(path, &mesh.domain)
     } else if is_gifti_path(path) {
-        read_gifti_dataset(path, &mesh.domain).or_else(|dataset_error| {
+        read_gifti_dataset_with_auto_qcalc(path, &mesh.domain, gifti_dset_auto_qcalc).or_else(
+            |dataset_error| {
             let overlay_values =
                 OverlayDataset::from_gifti_path(path, mesh.vertices.len()).with_context(|| {
                     format!(
@@ -7594,15 +7603,20 @@ fn load_dataset_from_path(path: &Path, mesh: &SurfaceMesh) -> Result<Dataset> {
                     )
                 })?;
             dataset_from_simple_overlay(&mesh.domain, overlay_values.values)
-        })
+            },
+        )
     } else {
         let overlay_values = OverlayDataset::from_gifti_path(path, mesh.vertices.len())?;
         dataset_from_simple_overlay(&mesh.domain, overlay_values.values)
     }
 }
 
-fn load_overlay_from_path(path: &Path, mesh: &SurfaceMesh) -> Result<LoadedOverlay> {
-    let dataset = load_dataset_from_path(path, mesh)?;
+fn load_overlay_from_path(
+    path: &Path,
+    mesh: &SurfaceMesh,
+    gifti_dset_auto_qcalc: bool,
+) -> Result<LoadedOverlay> {
+    let dataset = load_dataset_from_path(path, mesh, gifti_dset_auto_qcalc)?;
     loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "overlay")
 }
 
@@ -9640,6 +9654,14 @@ mod tests {
             winit::dpi::PhysicalSize::new(420, 700),
             winit::dpi::PhysicalSize::new(460, 700)
         ));
+    }
+
+    #[test]
+    fn control_width_cap_allows_full_content_on_two_x_displays() {
+        let required_physical_width =
+            ((super::CONTROL_CONTENT_WIDTH_POINTS + 32.0) * 2.0).ceil() as u32;
+
+        assert!(super::CONTROL_MAX_INNER_WIDTH >= required_physical_width);
     }
 
     #[test]

@@ -23,7 +23,7 @@ impl ViewerState {
         let mut actions = Vec::new();
         let panel_height = (self.control.size.height as f32 - 24.0).max(240.0);
         let mut desired_control_size_points = egui::vec2(
-            CONTROL_CONTENT_WIDTH_POINTS + 24.0,
+            CONTROL_CONTENT_WIDTH_POINTS + 32.0,
             CONTROL_MIN_INNER_HEIGHT as f32,
         );
 
@@ -31,21 +31,29 @@ impl ViewerState {
         egui::CentralPanel::default().show(ctx, |ui| {
             let scroll_output = egui::ScrollArea::vertical()
                 .max_height(panel_height)
-                .auto_shrink([false, true])
+                // Shrink horizontally around the controls. Keeping horizontal
+                // auto-shrink disabled makes the content width inherit the
+                // current window width, which feeds that width back into
+                // `fit_control_window` and prevents an oversized window from
+                // returning to its natural content width.
+                .auto_shrink([true, true])
                 .show(ui, |ui| {
-                    ui.set_min_width(CONTROL_CONTENT_WIDTH_POINTS);
+                    // The controller is deliberately designed around this
+                    // width. Constrain both bounds so full-width frames cannot
+                    // inherit an oversized native window and report that size
+                    // as their content width.
+                    ui.set_width(CONTROL_CONTENT_WIDTH_POINTS);
                     self.draw_surface_dataset_section(ui, &mut actions);
-                    self.draw_scene_objects_section(ui, &mut actions);
                     self.draw_overlay_workbench(ui, &mut actions);
+                    self.draw_scene_objects_section(ui, &mut actions);
                     self.draw_scene_section(ui);
                     self.draw_pick_section(ui);
                 });
             desired_control_size_points = egui::vec2(
-                scroll_output
-                    .content_size
-                    .x
-                    .max(CONTROL_CONTENT_WIDTH_POINTS)
-                    + 32.0,
+                // Keep width independent of the current native window. The
+                // height remains content-driven because sections can expand
+                // and collapse.
+                CONTROL_CONTENT_WIDTH_POINTS + 32.0,
                 scroll_output.content_size.y + 32.0,
             );
         });
@@ -2164,6 +2172,7 @@ impl ViewerState {
         }
         let mut open = true;
         let mut threshold_sync = self.preferences.overlay_threshold_sync;
+        let mut gifti_dset_auto_qcalc = self.preferences.gifti_dset_auto_qcalc;
         let mut changed = false;
         egui::Window::new("Preferences")
             .open(&mut open)
@@ -2187,6 +2196,23 @@ impl ViewerState {
                     }
                 }
                 ui.separator();
+                ui.heading("GIFTI datasets");
+                changed |= ui
+                    .checkbox(
+                        &mut gifti_dset_auto_qcalc,
+                        "Calculate q-values when FDR metadata is missing",
+                    )
+                    .on_hover_text(
+                        "Applies when a statistical .gii.dset is next loaded. Embedded FDR curves are always used; this only reconstructs a missing curve.",
+                    )
+                    .changed();
+                ui.label(
+                    egui::RichText::new(
+                        "Off by default because reconstruction adds work while loading each statistical column.",
+                    )
+                    .color(muted_color()),
+                );
+                ui.separator();
                 if let Some(path) = self.preferences_path.as_ref() {
                     ui.label(
                         egui::RichText::new(format!("Saved automatically to {}", path.display()))
@@ -2205,6 +2231,7 @@ impl ViewerState {
         self.preferences_open = open;
         if changed {
             self.preferences.overlay_threshold_sync = threshold_sync;
+            self.preferences.gifti_dset_auto_qcalc = gifti_dset_auto_qcalc;
             self.save_preferences();
         }
     }
