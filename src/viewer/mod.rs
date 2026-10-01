@@ -24,7 +24,9 @@ use winit::window::{Window, WindowId};
 use crate::afni::{
     AfniConnection, AfniConnectionEvent, AfniIncomingMessage, AfniNimlSession, AfniOverlayState,
     AfniPortConfig, AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo,
-    DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
+    DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, DEFAULT_DRIVESUMA_NIML_PORT, DriveSumaAction,
+    DriveSumaColorMap, DriveSumaCommandMode, DriveSumaDisplayMode, DriveSumaServer,
+    DriveSumaServerEvent, DriveSumaThresholdValue, surface_crosshair_element,
 };
 use crate::cluster::{
     ClusterInput, ClusterParams, ClusterSizeMetric, ClusterSummary, ClusterTails, label_clusters,
@@ -54,7 +56,7 @@ use crate::preferences::{AppPreferences, OverlayThresholdSync, default_preferenc
 use crate::roi::{
     Roi, RoiBrushAction, RoiDatum, RoiDrawStatus, RoiDrawingType, RoiElementKind, RoiSource,
 };
-use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, read_spec};
+use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, infer_surface_side, read_spec};
 use crate::stats::AfniStatSpec;
 use crate::surface::{
     AnatomicalCorrectness, NodeMask, NormalDirection, OverlayDataset, SmoothingWeights,
@@ -66,9 +68,10 @@ use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
 };
 use mesh::{
-    CONTOUR_VERTEX_FLOATS, ContourColorMode, OverlayAppearance, OverlayColorMap, PreparedGeometry,
-    PreparedGeometryVertex, PreparedSurface, PreparedThresholdContour, RoiAppearance,
-    SelectionHighlight, cell_color_chunk_ranges, sample_colormap, threshold_boundary_luminances,
+    CONTOUR_VERTEX_FLOATS, ContourColorMode, OverlayAppearance, OverlayColorMap,
+    OverlayDisplayMode, PreparedGeometry, PreparedGeometryVertex, PreparedSurface,
+    PreparedThresholdContour, RoiAppearance, SelectionHighlight, cell_color_chunk_ranges,
+    luminance, sample_colormap, threshold_boundary_luminances,
 };
 use overlay_load::*;
 use pick::{pick_surface, pick_surface_with_model, screen_ray};
@@ -412,6 +415,9 @@ impl ExplicitOverlayPair {
 pub struct AfniViewerOptions {
     pub connect_on_launch: bool,
     pub port_config: AfniPortConfig,
+    pub listen_for_drivesuma: bool,
+    pub drivesuma_port_config: AfniPortConfig,
+    pub drivesuma_command_mode: DriveSumaCommandMode,
 }
 
 impl Default for AfniViewerOptions {
@@ -424,6 +430,14 @@ impl Default for AfniViewerOptions {
                 port_offset: None,
                 port_bloc: None,
             },
+            listen_for_drivesuma: false,
+            drivesuma_port_config: AfniPortConfig {
+                host: DEFAULT_AFNI_HOST.to_string(),
+                port: DEFAULT_DRIVESUMA_NIML_PORT,
+                port_offset: None,
+                port_bloc: None,
+            },
+            drivesuma_command_mode: DriveSumaCommandMode::Sumaru,
         }
     }
 }
@@ -792,7 +806,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ViewerEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ViewerEvent) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -815,6 +829,28 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                         state.view_window().request_redraw();
                     }
                     state.view_window().request_redraw();
+                }
+            }
+            ViewerEvent::DriveSumaCommandsReady => {
+                state
+                    .drivesuma_work_scheduled
+                    .store(false, Ordering::Release);
+                let changed = state.drain_drivesuma_events();
+                if state.drivesuma_quit_requested {
+                    event_loop.exit();
+                    return;
+                }
+                if changed {
+                    state.control_window().request_redraw();
+                    if !state.view.occluded {
+                        state.view_window().request_redraw();
+                    }
+                    if state.controller.panels.roi_controller_open {
+                        state.roi_control_window().request_redraw();
+                    }
+                    if state.graph_matrix_window_open() {
+                        state.graph_window().request_redraw();
+                    }
                 }
             }
             ViewerEvent::SceneStatsReady => {
@@ -1347,13 +1383,68 @@ struct ThresholdContourCacheKey {
     scene_generation: u64,
     surface_id: Option<SurfaceId>,
     overlay_data_generation: u64,
-    threshold: Threshold,
+    threshold: Option<Threshold>,
+    display_mode: OverlayDisplayMode,
+    dataset_inputs: Option<(OverlayColorMap, ValueRange)>,
     pair_layout: HemisphereLayoutState,
     pair_visibility: PairVisibility,
     contrast_inputs: Option<(OverlayColorMap, ValueRange)>,
     /// Present when C is active, so changing cluster parameters regenerates the
     /// contour rather than leaving it outlining rejected blobs.
     cluster_params: Option<ClusterParams>,
+}
+
+/// Scalar boundaries used for SUMA-style dataset contours.
+///
+/// Continuous maps in Sumaru are interpolated rather than pane-based, so they
+/// do not have SUMA's intrinsic palette-row boundaries. Ten evenly spaced
+/// bands give `Dsp Con` a stable, useful equivalent. Label maps instead use
+/// the midpoints between their actual integer keys, preserving region edges.
+fn dataset_contour_levels(
+    values: &[f32],
+    range: ValueRange,
+    colormap: OverlayColorMap,
+) -> (Vec<f64>, Vec<f32>) {
+    let levels = if colormap == OverlayColorMap::DiscreteLabels {
+        let mut unique: Vec<f32> = values
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        unique.sort_by(f32::total_cmp);
+        unique.dedup_by(|a, b| *a == *b);
+        unique
+            .windows(2)
+            .take(256)
+            .map(|pair| f64::from(pair[0]) + f64::from(pair[1] - pair[0]) * 0.5)
+            .collect()
+    } else {
+        let low = range.min.min(range.max);
+        let high = range.min.max(range.max);
+        let span = high - low;
+        if !span.is_finite() || span <= f32::EPSILON {
+            Vec::new()
+        } else {
+            (1..10)
+                .map(|band| f64::from(low + span * band as f32 / 10.0))
+                .collect()
+        }
+    };
+
+    let span = range.max - range.min;
+    let luminances = levels
+        .iter()
+        .map(|level| {
+            let t = if span.is_finite() && span.abs() > f32::EPSILON {
+                ((*level as f32 - range.min) / span).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            let color = sample_colormap(colormap, t);
+            luminance([color[0], color[1], color[2]])
+        })
+        .collect();
+    (levels, luminances)
 }
 
 struct ViewerState {
@@ -1449,6 +1540,7 @@ struct ViewerState {
     event_proxy: EventLoopProxy<ViewerEvent>,
     afni_options: AfniViewerOptions,
     afni_connection: Option<AfniConnection>,
+    drivesuma_server: Option<DriveSumaServer>,
     afni_session: AfniNimlSession,
     afni_recorder: Option<NimlRecorder>,
     pending_afni_surface_registrations: VecDeque<PendingAfniSurfaceRegistration>,
@@ -1458,6 +1550,8 @@ struct ViewerState {
     pending_cell_color_upload: Option<PendingCellColorUpload>,
     deferred_afni_rgba_overlays: Vec<AfniRgbaOverlay>,
     afni_work_scheduled: Arc<AtomicBool>,
+    drivesuma_work_scheduled: Arc<AtomicBool>,
+    drivesuma_quit_requested: bool,
     afni_live_overlay_active: bool,
     /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
     /// resends identical colorizations on every redraw; this lets us skip the
@@ -1981,6 +2075,7 @@ impl ViewerState {
             event_proxy,
             afni_options,
             afni_connection: None,
+            drivesuma_server: None,
             afni_session: AfniNimlSession::new(),
             afni_recorder,
             pending_afni_surface_registrations: VecDeque::new(),
@@ -1990,6 +2085,8 @@ impl ViewerState {
             pending_cell_color_upload: None,
             deferred_afni_rgba_overlays: Vec::new(),
             afni_work_scheduled: Arc::new(AtomicBool::new(false)),
+            drivesuma_work_scheduled: Arc::new(AtomicBool::new(false)),
+            drivesuma_quit_requested: false,
             afni_live_overlay_active: false,
             afni_rgba_signatures: HashMap::new(),
             sent_crosshair_node: None,
@@ -2056,6 +2153,9 @@ impl ViewerState {
         }
         state.arm_startup_redraw_guard();
         state.log_status("Viewer initialized.");
+        if state.afni_options.listen_for_drivesuma {
+            state.start_drivesuma_server()?;
+        }
         if state.afni_options.connect_on_launch
             && let Err(error) = state.connect_afni_talk()
         {
@@ -2895,6 +2995,20 @@ impl ViewerState {
             range.max = range.min + 1.0;
         }
 
+        if let Some(brightness_range) = self.overlay.render.appearance.brightness_range.as_mut() {
+            if !brightness_range.min.is_finite() || !brightness_range.max.is_finite() {
+                self.overlay.render.appearance.brightness_range = None;
+            } else if brightness_range.max < brightness_range.min {
+                std::mem::swap(&mut brightness_range.min, &mut brightness_range.max);
+            }
+        }
+        let brightness_scale = &mut self.overlay.render.appearance.brightness_scale;
+        if brightness_scale.iter().any(|value| !value.is_finite()) {
+            *brightness_scale = [0.0, 1.0];
+        } else if brightness_scale[1] < brightness_scale[0] {
+            brightness_scale.swap(0, 1);
+        }
+
         self.overlay.render.appearance.dim = self.overlay.render.appearance.dim.clamp(0.0, 1.5);
         self.overlay.render.appearance.opacity =
             self.overlay.render.appearance.opacity.clamp(0.0, 1.0);
@@ -3292,6 +3406,21 @@ impl ViewerState {
                 }
                 ViewerCommand::ToggleCameraMomentum => self.toggle_camera_momentum(),
                 ViewerCommand::ToggleBackground => self.controller.display.background.toggle(),
+                ViewerCommand::ToggleAfniTalk => {
+                    if let Err(error) = self.toggle_afni_talk() {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::ToggleHemisphereVisibility(side) => {
+                    if let Err(error) = self.toggle_pair_hemisphere_visibility(side) {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::ToggleSumaComponentVisibility(side) => {
+                    if let Err(error) = self.toggle_suma_component_visibility(side) {
+                        self.set_error(error);
+                    }
+                }
                 ViewerCommand::SetAnatomicalShadingVisible(visible) => {
                     self.controller.display.anatomical_shading_visible = visible;
                     self.upload_surface_buffers();
@@ -3543,6 +3672,17 @@ impl ViewerState {
                 ViewerCommand::AddVolumeCoronal => self.add_volume_slice(SlicePlane::Coronal),
                 ViewerCommand::AddVolumeSagittal => self.add_volume_slice(SlicePlane::Sagittal),
                 ViewerCommand::RemoveSelectedVolumeSlice => self.remove_selected_volume_slice(),
+                ViewerCommand::SetVolumeSliceOpacity(opacity) => {
+                    if let Some(view) = self.volume_view.as_mut()
+                        && view.set_opacity(opacity)
+                    {
+                        self.view.window.request_redraw();
+                        self.log_status(format!(
+                            "Volume slice opacity: {:.0}%.",
+                            opacity.clamp(0.0, 1.0) * 100.0
+                        ));
+                    }
+                }
                 ViewerCommand::CopyVertexIndex => self.copy_vertex_index(),
                 ViewerCommand::CopyXyzRas => self.copy_picked_xyz(CoordConvention::Ras),
                 ViewerCommand::CopyXyzRai => self.copy_picked_xyz(CoordConvention::Rai),
@@ -4546,7 +4686,7 @@ impl ViewerState {
         {
             return None;
         }
-        if let Some(pick) = self.pick_active_pair_surface_at_cursor(cursor) {
+        if let Some(pick) = self.pick_active_component_surface_at_cursor(cursor) {
             return Some(pick);
         }
 
@@ -4560,30 +4700,26 @@ impl ViewerState {
         )
     }
 
-    fn pick_active_pair_surface_at_cursor(&self, cursor: (f64, f64)) -> Option<SurfacePick> {
-        if !self.has_both_scene() {
+    fn pick_active_component_surface_at_cursor(&self, cursor: (f64, f64)) -> Option<SurfacePick> {
+        if !self.has_component_surface() {
             return None;
         }
         let scene = self.surface_scene.as_ref()?;
         let surface = scene.surfaces.get(scene.active_index)?;
-        let matrices = pair_hemisphere_matrices(
-            &surface.components,
-            self.controller.display.pair_state,
-            self.controller.display.pair_visibility,
-        );
+        let matrices = self.active_component_model_matrices();
         let mut best = None;
         let mut best_distance = f32::INFINITY;
         let mut node_offset = 0u32;
         let mut face_offset = 0usize;
 
-        for component in &surface.components {
+        for (component_index, component) in surface.components.iter().enumerate() {
             let mesh = component.mesh.as_ref()?;
             if self
                 .controller
                 .display
                 .pair_visibility
                 .is_visible(&component.side)
-                && let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == component.side)
+                && let Some(matrix) = matrices.get(component_index)
                 && let Some((pick, distance)) = pick_surface_with_model(
                     mesh,
                     self.overlay.data.node_values(),
@@ -4833,12 +4969,13 @@ impl ViewerState {
                 node_offset: *node_offset,
                 side,
                 neighbors: topology.node_neighbors,
+                positions: mesh.vertices.clone(),
                 node_areas: mesh.node_areas(),
             });
             *node_offset += mesh.vertices.len();
         };
 
-        if self.has_both_scene() {
+        if self.has_component_surface() {
             if let Some(surface) = self
                 .surface_scene
                 .as_ref()
@@ -4939,6 +5076,7 @@ impl ViewerState {
                     passes: &passes,
                     tail_values: component_thresholds,
                     neighbors: &component.neighbors,
+                    positions: &component.positions,
                     node_areas: &component.node_areas,
                     values: component_values,
                 },
@@ -4972,8 +5110,10 @@ impl ViewerState {
 
     fn refresh_threshold_contour_buffers(&mut self) {
         let appearance = self.overlay.render.appearance;
-        if !appearance.boxed_threshold
-            || !appearance.threshold.enabled
+        let draw_threshold = appearance.boxed_threshold && appearance.threshold.enabled;
+        let draw_dataset = appearance.display_mode.shows_contour();
+        if (!draw_threshold && !draw_dataset)
+            || appearance.display_mode == OverlayDisplayMode::Hidden
             || !self.controller.overlay.visible
             || self.afni_live_overlay_active
             || !self.overlay.data.is_loaded()
@@ -4983,12 +5123,14 @@ impl ViewerState {
             return;
         }
 
-        let (threshold, _) = threshold_and_mask_from_appearance(appearance);
+        let threshold = draw_threshold.then(|| threshold_and_mask_from_appearance(appearance).0);
         let key = ThresholdContourCacheKey {
             scene_generation: self.scene_generation,
             surface_id: self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone()),
             overlay_data_generation: self.overlay_data_generation,
             threshold,
+            display_mode: appearance.display_mode,
+            dataset_inputs: draw_dataset.then_some((appearance.colormap, appearance.range)),
             pair_layout: self.controller.display.pair_state,
             pair_visibility: self.controller.display.pair_visibility,
             contrast_inputs: (appearance.contour.color_mode == ContourColorMode::AutoContrast)
@@ -4998,25 +5140,43 @@ impl ViewerState {
         if self.threshold_contour_key.as_ref() == Some(&key) {
             return;
         }
-        let Some(threshold_values) = self.active_threshold_scalar_values() else {
+        let Some(intensity_values) = self
+            .overlay
+            .data
+            .node_values()
+            .map(|values| values.values.clone())
+        else {
             self.threshold_contour_instances.clear();
             self.threshold_contour_key = Some(key);
             return;
         };
+        let threshold_values = draw_threshold
+            .then(|| self.active_threshold_scalar_values())
+            .flatten();
+        if draw_threshold && threshold_values.is_none() {
+            self.threshold_contour_instances.clear();
+            self.threshold_contour_key = Some(key);
+            return;
+        }
         // Auto-contrast needs to know the overlay color the line will sit on,
         // which is the colormap sampled at each threshold boundary.
-        let boundary_luminances =
-            threshold_boundary_luminances(threshold, appearance.range, appearance.colormap);
+        let boundary_luminances = threshold
+            .map(|threshold| {
+                threshold_boundary_luminances(threshold, appearance.range, appearance.colormap)
+            })
+            .unwrap_or_default();
+        let (dataset_levels, dataset_luminances) = if draw_dataset {
+            dataset_contour_levels(&intensity_values, appearance.range, appearance.colormap)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         // With C active the contour follows surviving clusters, not the raw
         // threshold crossing.
         let cluster_labels = self.cluster_labels.clone();
 
         let mut prepared = Vec::new();
-        if self.has_both_scene() {
-            let matrices = self.active_pair_matrices_for_layout(
-                self.controller.display.pair_state,
-                self.controller.display.pair_visibility,
-            );
+        if self.has_component_surface() {
+            let matrices = self.active_component_model_matrices();
             let Some(scene) = self.surface_scene.as_ref() else {
                 self.threshold_contour_instances.clear();
                 self.threshold_contour_key = Some(key);
@@ -5029,52 +5189,82 @@ impl ViewerState {
             };
             let mut node_offset = 0usize;
             let mut components_complete = true;
-            for component in &surface.components {
+            for (component_index, component) in surface.components.iter().enumerate() {
                 let Some(mesh) = component.mesh.as_ref() else {
                     components_complete = false;
                     break;
                 };
                 let node_end = node_offset.saturating_add(mesh.vertices.len());
-                let Some(component_values) = threshold_values.get(node_offset..node_end) else {
+                let Some(component_intensities) = intensity_values.get(node_offset..node_end)
+                else {
                     components_complete = false;
                     break;
                 };
                 let normals = mesh.vertex_normals();
                 let geometry =
                     prepared_geometry_from_raw_component(&mesh.vertices, &normals, &mesh.triangles);
-                let contour = PreparedThresholdContour::from_geometry(
-                    &geometry,
-                    component_values,
-                    threshold,
-                    &boundary_luminances,
-                    cluster_labels
-                        .as_ref()
-                        .and_then(|labels| labels.get(node_offset..node_end)),
-                );
-                if !contour.is_empty() {
-                    let model_matrix = matrices
-                        .iter()
-                        .find(|(side, _)| *side == component.side)
-                        .map(|(_, matrix)| *matrix)
-                        .unwrap_or(Mat4::IDENTITY);
-                    prepared.push((contour, component.side.clone(), model_matrix));
+                let model_matrix = matrices
+                    .get(component_index)
+                    .copied()
+                    .unwrap_or(Mat4::IDENTITY);
+                if draw_dataset {
+                    let contour = PreparedThresholdContour::from_geometry_levels(
+                        &geometry,
+                        component_intensities,
+                        &dataset_levels,
+                        &dataset_luminances,
+                    );
+                    if !contour.is_empty() {
+                        prepared.push((contour, component.side.clone(), model_matrix));
+                    }
+                }
+                if let (Some(threshold), Some(threshold_values)) = (threshold, &threshold_values) {
+                    let Some(component_values) = threshold_values.get(node_offset..node_end) else {
+                        components_complete = false;
+                        break;
+                    };
+                    let contour = PreparedThresholdContour::from_geometry(
+                        &geometry,
+                        component_values,
+                        threshold,
+                        &boundary_luminances,
+                        cluster_labels
+                            .as_ref()
+                            .and_then(|labels| labels.get(node_offset..node_end)),
+                    );
+                    if !contour.is_empty() {
+                        prepared.push((contour, component.side.clone(), model_matrix));
+                    }
                 }
                 node_offset = node_end;
             }
-            if !components_complete || node_offset != threshold_values.len() {
+            if !components_complete || node_offset != intensity_values.len() {
                 prepared.clear();
             }
         } else if let Some(mesh) = self.mesh.as_ref() {
             let geometry = PreparedGeometry::from_surface(mesh);
-            let contour = PreparedThresholdContour::from_geometry(
-                &geometry,
-                &threshold_values,
-                threshold,
-                &boundary_luminances,
-                cluster_labels.as_deref().map(Vec::as_slice),
-            );
-            if !contour.is_empty() {
-                prepared.push((contour, SurfaceSide::Unknown, Mat4::IDENTITY));
+            if draw_dataset {
+                let contour = PreparedThresholdContour::from_geometry_levels(
+                    &geometry,
+                    &intensity_values,
+                    &dataset_levels,
+                    &dataset_luminances,
+                );
+                if !contour.is_empty() {
+                    prepared.push((contour, SurfaceSide::Unknown, Mat4::IDENTITY));
+                }
+            }
+            if let (Some(threshold), Some(threshold_values)) = (threshold, &threshold_values) {
+                let contour = PreparedThresholdContour::from_geometry(
+                    &geometry,
+                    threshold_values,
+                    threshold,
+                    &boundary_luminances,
+                    cluster_labels.as_deref().map(Vec::as_slice),
+                );
+                if !contour.is_empty() {
+                    prepared.push((contour, SurfaceSide::Unknown, Mat4::IDENTITY));
+                }
             }
         }
 
@@ -5271,8 +5461,9 @@ impl ViewerState {
             return;
         }
 
-        if self.has_both_scene()
-            && self.upload_paired_surface_render_set(surface_colors.as_deref().map(Vec::as_slice))
+        if self.has_component_surface()
+            && self
+                .upload_component_surface_render_set(surface_colors.as_deref().map(Vec::as_slice))
         {
             return;
         }
@@ -5541,7 +5732,7 @@ impl ViewerState {
         self.upload_selection_highlight_buffer();
     }
 
-    fn upload_paired_surface_render_set(&mut self, surface_colors: Option<&[[f32; 4]]>) -> bool {
+    fn upload_component_surface_render_set(&mut self, surface_colors: Option<&[[f32; 4]]>) -> bool {
         struct RawRenderComponent {
             side: SurfaceSide,
             node_offset: u32,
@@ -5555,12 +5746,12 @@ impl ViewerState {
             let Some(scene) = self.surface_scene.as_mut() else {
                 return false;
             };
-            if scene.hemisphere != SpecHemisphere::Both {
-                return false;
-            }
             let Some(surface) = scene.surfaces.get_mut(scene.active_index) else {
                 return false;
             };
+            if surface.components.len() <= 1 {
+                return false;
+            }
 
             let mut raw = Vec::with_capacity(surface.components.len());
             let mut node_offset = 0u32;
@@ -5588,10 +5779,6 @@ impl ViewerState {
             }
             raw
         };
-        if raw.len() != 2 {
-            return false;
-        }
-
         let visible_overlay = (!self.afni_live_overlay_active)
             .then(|| self.visible_overlay())
             .flatten();
@@ -5602,13 +5789,11 @@ impl ViewerState {
             .map(|layer| layer.appearance.node_colors.clone());
         let selection = self.controller.interaction.pick;
         let dim = self.overlay.render.appearance.dim;
-        let layout = self.controller.display.pair_state;
-        let visibility = self.controller.display.pair_visibility;
-        let matrices = self.active_pair_matrices_for_layout(layout, visibility);
+        let matrices = self.active_component_model_matrices();
         let selection_scale = selection_scale_from_model_matrices(&matrices);
 
         let mut instances = Vec::with_capacity(raw.len());
-        for component in raw {
+        for (component_index, component) in raw.into_iter().enumerate() {
             let node_start = component.node_offset as usize;
             let node_end = node_start + component.positions.len();
             let surface_color_slice =
@@ -5632,9 +5817,8 @@ impl ViewerState {
                 &component.triangles,
             );
             let model_matrix = matrices
-                .iter()
-                .find(|(side, _)| *side == component.side)
-                .map(|(_, matrix)| *matrix)
+                .get(component_index)
+                .copied()
                 .unwrap_or(Mat4::IDENTITY);
             if use_afni_cell_colors
                 && afni_cell_color_needs_chunking(
@@ -5753,7 +5937,7 @@ impl ViewerState {
     }
 
     fn upload_selection_highlight_buffer(&mut self) {
-        if self.has_both_scene() {
+        if self.has_component_surface() {
             self.selection_instance = None;
             return;
         }
@@ -6137,10 +6321,10 @@ fn selection_for_component(
     ))
 }
 
-fn selection_scale_from_model_matrices(matrices: &[(SurfaceSide, Mat4)]) -> f32 {
+fn selection_scale_from_model_matrices(matrices: &[Mat4]) -> f32 {
     matrices
         .iter()
-        .find_map(|(_, matrix)| {
+        .find_map(|matrix| {
             let inv_radius = matrix.transform_vector3(Vec3::X).length();
             (inv_radius.is_finite() && inv_radius > f32::EPSILON).then_some(1.0 / inv_radius)
         })
@@ -6236,6 +6420,7 @@ struct ControlUiOutput {
 #[derive(Debug, Clone, Copy)]
 enum ViewerEvent {
     AfniMessagesReady,
+    DriveSumaCommandsReady,
     SceneStatsReady,
     InstaCorrComputed,
 }
@@ -6495,6 +6680,7 @@ fn synthetic_surface_spec(paths: &[PathBuf], onestate: bool) -> SpecFile {
                 states.push(state.clone());
             }
             let name = file_name_display(path);
+            let side = infer_surface_side(&name);
             SpecSurface {
                 name: name.clone(),
                 path: path.clone(),
@@ -6504,7 +6690,7 @@ fn synthetic_surface_spec(paths: &[PathBuf], onestate: bool) -> SpecFile {
                 state: Some(state.clone()),
                 raw_state: Some(state),
                 anatomical: Some(true),
-                side: SurfaceSide::Unknown,
+                side,
                 local_domain_parent: None,
                 local_curvature_parent: None,
                 label_dataset: None,
@@ -9370,8 +9556,8 @@ mod tests {
         scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
         selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
         spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
-        threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
-        viewer_required_wgpu_limits,
+        synthetic_surface_spec, threshold_and_mask_from_appearance,
+        timestamped_png_name_from_unix_seconds, viewer_required_wgpu_limits,
     };
     use crate::afni::{AfniRgbaOverlay, AfniRouteAction};
     use crate::color::{LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
@@ -10706,6 +10892,27 @@ mod tests {
     }
 
     #[test]
+    fn command_line_onestate_infers_component_sides_and_keeps_unknown_surfaces() {
+        let spec = synthetic_surface_spec(
+            &[
+                PathBuf::from("lh.pial.gii"),
+                PathBuf::from("rh.pial.gii"),
+                PathBuf::from("Net_000.gii"),
+            ],
+            true,
+        );
+
+        assert_eq!(spec.surfaces[0].side, SurfaceSide::Left);
+        assert_eq!(spec.surfaces[1].side, SurfaceSide::Right);
+        assert_eq!(spec.surfaces[2].side, SurfaceSide::Unknown);
+        assert!(
+            spec.surfaces
+                .iter()
+                .all(|surface| surface.state.as_deref() == Some("iS"))
+        );
+    }
+
+    #[test]
     fn command_line_default_components_keep_separate_states() {
         let spec = SpecFile {
             path: PathBuf::from("i_surfaces"),
@@ -10860,10 +11067,7 @@ mod tests {
             threshold_value: Some(2.5),
         };
         let positions = vec![[10.0, 0.0, 0.0], [11.0, 2.0, 3.0], [12.0, 0.0, 0.0]];
-        let matrices = vec![(
-            SurfaceSide::Right,
-            Mat4::from_scale(Vec3::splat(1.0 / 100.0)),
-        )];
+        let matrices = vec![Mat4::from_scale(Vec3::splat(1.0 / 100.0))];
         let scale = selection_scale_from_model_matrices(&matrices);
 
         let highlight = selection_for_component(Some(pick), 3, 7, &positions, scale).unwrap();

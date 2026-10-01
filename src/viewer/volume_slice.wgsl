@@ -14,7 +14,7 @@ struct SliceUniforms {
     world_to_voxel: mat4x4<f32>,
     // 1.0 / dimension per axis (xyz), w unused.
     inv_dimensions: vec4<f32>,
-    // window.x = display low, window.y = display high; zw unused.
+    // window.x = display low, window.y = display high, window.z = opacity.
     window: vec4<f32>,
 }
 
@@ -79,5 +79,5 @@ fn slice_fs(input: SliceVertexOutput) -> @location(0) vec4<f32> {
     let low = slice.window.x;
     let high = slice.window.y;
     let gray = clamp((value - low) / max(high - low, 1e-6), 0.0, 1.0);
-    return vec4<f32>(gray, gray, gray, 1.0);
+    return vec4<f32>(gray, gray, gray, slice.window.z);
 }

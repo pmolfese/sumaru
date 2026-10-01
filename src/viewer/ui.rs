@@ -331,7 +331,19 @@ impl ViewerState {
 
                     if let Some(volume_view) = self.volume_view.as_ref() {
                         let selected_label = volume_view.selected_label();
+                        let volume_opacity = volume_view.opacity();
                         ui.menu_button("Volume", |ui| {
+                            let mut opacity = volume_opacity;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut opacity, 0.0..=1.0)
+                                        .text("Slice opacity"),
+                                )
+                                .changed()
+                            {
+                                actions.push(ViewerCommand::SetVolumeSliceOpacity(opacity));
+                            }
+                            ui.separator();
                             if ui.button("Add Axial slice").clicked() {
                                 actions.push(ViewerCommand::AddVolumeAxial);
                                 ui.close();
@@ -1791,6 +1803,37 @@ impl ViewerState {
                                 }
                             });
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Display");
+                        egui::ComboBox::from_id_salt("overlay_display_mode")
+                            .selected_text(self.overlay.render.appearance.display_mode.label())
+                            .width(170.0)
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    OverlayDisplayMode::Hidden,
+                                    OverlayDisplayMode::Color,
+                                    OverlayDisplayMode::Contour,
+                                    OverlayDisplayMode::ColorAndContour,
+                                ] {
+                                    changed |= ui
+                                        .selectable_value(
+                                            &mut self.overlay.render.appearance.display_mode,
+                                            mode,
+                                            mode.label(),
+                                        )
+                                        .changed();
+                                }
+                            });
+                    });
+                    changed |= ui
+                        .checkbox(
+                            &mut self.overlay.render.appearance.show_zero,
+                            "Show intensity zero",
+                        )
+                        .on_hover_text(
+                            "Display nodes whose intensity is exactly zero (SUMA shw_0)",
+                        )
+                        .changed();
                     ui.add_space(8.0);
                     if self
                         .overlay
@@ -1807,6 +1850,11 @@ impl ViewerState {
                             )
                             .color(muted_color()),
                         );
+                    }
+                    if let Some(brightness_index) = columns.brightness {
+                        ui.add_space(6.0);
+                        changed |=
+                            self.draw_brightness_mapping_controls(ui, brightness_index);
                     }
                     ui.add_space(6.0);
                     changed |= ui
@@ -1952,7 +2000,14 @@ impl ViewerState {
                             )
                             .changed();
                     }
-                    if self.overlay.render.appearance.boxed_threshold {
+                    if self.overlay.render.appearance.boxed_threshold
+                        || self
+                            .overlay
+                            .render
+                            .appearance
+                            .display_mode
+                            .shows_contour()
+                    {
                         let contour = &mut self.overlay.render.appearance.contour;
                         changed |= ui
                             .add(
@@ -2069,16 +2124,46 @@ impl ViewerState {
                                     .changed();
                             }
                         }
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(&mut cluster.rings, 1..=4).text("Rings"),
-                            )
-                            .on_hover_text(
-                                "How many edges apart two suprathreshold nodes may be and still \
-                                 join the same cluster. 1 is plain edge adjacency, the surface \
-                                 equivalent of a voxel NN setting; larger values bridge small gaps",
-                            )
-                            .changed();
+                        ui.horizontal(|ui| {
+                            ui.label("Connect by");
+                            if ui
+                                .selectable_label(cluster.radius_mm.is_none(), "Rings")
+                                .clicked()
+                            {
+                                cluster.radius_mm = None;
+                                changed = true;
+                            }
+                            if ui
+                                .selectable_label(cluster.radius_mm.is_some(), "mm")
+                                .clicked()
+                            {
+                                cluster.radius_mm = Some(cluster.radius_mm.unwrap_or(2.0));
+                                changed = true;
+                            }
+                        });
+                        if let Some(radius_mm) = &mut cluster.radius_mm {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(radius_mm)
+                                        .speed(0.1)
+                                        .range(0.0..=f32::INFINITY)
+                                        .prefix("Radius ")
+                                        .suffix(" mm"),
+                                )
+                                .on_hover_text(
+                                    "Maximum accumulated distance along mesh edges between cluster members",
+                                )
+                                .changed();
+                        } else {
+                            changed |= ui
+                                .add(egui::Slider::new(&mut cluster.rings, 1..=4).text("Rings"))
+                                .on_hover_text(
+                                    "How many edges apart two suprathreshold nodes may be and still \
+                                     join the same cluster. 1 is plain edge adjacency; larger values \
+                                     bridge small gaps",
+                                )
+                                .changed();
+                        }
                         ui.horizontal(|ui| {
                             ui.label("Tails");
                             changed |= ui
@@ -2290,6 +2375,71 @@ impl ViewerState {
                     )
                     .changed();
             }
+        });
+
+        changed
+    }
+
+    fn draw_brightness_mapping_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        brightness_index: usize,
+    ) -> bool {
+        let automatic_seed = self
+            .overlay
+            .data
+            .dataset()
+            .and_then(|dataset| dataset.columns.get(brightness_index))
+            .and_then(|column| column.range)
+            .map(|range| ValueRange {
+                min: range.min as f32,
+                max: range.max as f32,
+            })
+            .unwrap_or(DEFAULT_OVERLAY_RANGE);
+        let appearance = &mut self.overlay.render.appearance;
+        let mut automatic = appearance.brightness_range.is_none();
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            ui.label("B range");
+            if ui.checkbox(&mut automatic, "Auto").changed() {
+                appearance.brightness_range = (!automatic).then_some(automatic_seed);
+                changed = true;
+            }
+            if let Some(range) = appearance.brightness_range.as_mut() {
+                let speed = range_drag_speed(*range);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut range.min)
+                            .speed(speed)
+                            .prefix("min "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut range.max)
+                            .speed(speed)
+                            .prefix("max "),
+                    )
+                    .changed();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("B scale");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut appearance.brightness_scale[0])
+                        .speed(0.01)
+                        .prefix("low "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut appearance.brightness_scale[1])
+                        .speed(0.01)
+                        .prefix("high "),
+                )
+                .changed();
         });
 
         changed

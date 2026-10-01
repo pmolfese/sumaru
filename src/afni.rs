@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::command::{
     BackgroundMode, ControllerState, CrosshairState, OverlayThreshold, ViewNudge, ViewPreset,
@@ -22,8 +22,10 @@ use crate::niml_debug::{NimlDirection, NimlRecorder};
 use crate::surface::{SurfaceMesh, ValueRange};
 
 pub const DEFAULT_AFNI_NIML_PORT: u16 = 53211;
+pub const DEFAULT_DRIVESUMA_NIML_PORT: u16 = 53219;
 pub const DEFAULT_PORT_OFFSET: u16 = 1024;
 pub const AFNI_SUMA_NIML_PORT_NAME: &str = "AFNI_SUMA_NIML";
+pub const SUMA_DRIVESUMA_NIML_PORT_NAME: &str = "SUMA_DRIVESUMA_NIML";
 pub const DEFAULT_AFNI_HOST: &str = "127.0.0.1";
 
 const AFNI_READ_TIMEOUT: Duration = Duration::from_millis(250);
@@ -136,7 +138,58 @@ pub enum AfniIncomingMessage {
     OverlayState(AfniOverlayState),
     ControllerCommand(AfniControllerCommand),
     ViewerCommands(Vec<ViewerCommand>),
+    DriveSumaCommands(Vec<DriveSumaAction>),
     RoiUpdate(AfniRoiUpdate),
+}
+
+/// One operation from a DriveSuma `EngineCommand`. A single NIML element can
+/// contain several attributes whose effects must be applied together and in a
+/// predictable order (for example: load a dataset, select its color map, then
+/// set its dim factor).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DriveSumaAction {
+    SelectSurface(String),
+    SetSurfaceControllerVisible(bool),
+    LoadDataset(PathBuf),
+    SelectDataset(String),
+    SetColorMap(DriveSumaColorMap),
+    SetIntensityColumn(usize),
+    SetIntensityRange { min: f32, max: f32, symmetric: bool },
+    SetBrightnessColumn(Option<usize>),
+    SetBrightnessRange { min: f32, max: f32 },
+    SetBrightnessScale { low: f32, high: f32 },
+    SetThresholdColumn(Option<usize>),
+    SetThresholdValue(DriveSumaThresholdValue),
+    SetDim(f32),
+    SetOpacity(f32),
+    SetDisplayMode(DriveSumaDisplayMode),
+    SetClusterParams { radius: f32, minimum: f32 },
+    SetClusterEnabled(bool),
+    SetShowZero(bool),
+    SetOneOnly(bool),
+    SetOverlayVisible(bool),
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveSumaDisplayMode {
+    Hidden,
+    Color,
+    Contour,
+    ColorAndContour,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DriveSumaThresholdValue {
+    Numeric(f32),
+    PValue(f64),
+    Percentile(f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveSumaColorMap {
+    AmberMonochrome,
+    RoiI32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +239,7 @@ pub enum AfniRouteAction {
     OverlayState(AfniOverlayState),
     SurfaceCrosshair(AfniSurfaceCrosshair),
     RoiUpdate(AfniRoiUpdate),
+    DriveSumaCommands(Vec<DriveSumaAction>),
 }
 
 #[derive(Debug, Default, Clone)]
@@ -204,6 +258,21 @@ pub enum AfniConnectionEvent {
     Messages(Vec<AfniIncomingMessage>),
     Error(String),
     Disconnected,
+}
+
+#[derive(Debug)]
+pub enum DriveSumaServerEvent {
+    Messages(Vec<AfniIncomingMessage>),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DriveSumaCommandMode {
+    /// Treat key strings as remote equivalents of Sumaru's own keyboard input.
+    #[default]
+    Sumaru,
+    /// Translate the agreed SUMA/DriveSuma subset into Sumaru operations.
+    SumaCompatibility,
 }
 
 #[derive(Debug)]
@@ -234,6 +303,83 @@ pub struct AfniConnection {
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
+}
+
+/// A SUMA-compatible listener for the short-lived NIML connections opened by
+/// AFNI's `DriveSuma` program.
+///
+/// This is deliberately independent of [`AfniConnection`]: AFNI/SUMA talk is
+/// an outbound, long-lived connection to `AFNI_SUMA_NIML`, while DriveSuma is
+/// an inbound command stream on `SUMA_DRIVESUMA_NIML`.
+#[derive(Debug)]
+pub struct DriveSumaServer {
+    local_addr: SocketAddr,
+    event_receiver: Receiver<DriveSumaServerEvent>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DriveSumaServer {
+    pub fn bind(
+        config: &AfniPortConfig,
+        command_mode: DriveSumaCommandMode,
+        verbose: bool,
+        recorder: Option<NimlRecorder>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Self> {
+        let listener =
+            TcpListener::bind((config.host.as_str(), config.port)).with_context(|| {
+                format!(
+                    "failed to listen for DriveSuma at {}:{}",
+                    config.host, config.port
+                )
+            })?;
+        listener.set_nonblocking(true)?;
+        let local_addr = listener.local_addr()?;
+        let (event_sender, event_receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let wake: WakeCallback = Arc::new(Mutex::new(Box::new(wake)));
+        let worker = thread::spawn(move || {
+            run_drivesuma_server(
+                listener,
+                event_sender,
+                worker_stop,
+                command_mode,
+                verbose,
+                recorder,
+                wake,
+            );
+        });
+
+        Ok(Self {
+            local_addr,
+            event_receiver,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn try_recv(&self) -> Option<DriveSumaServerEvent> {
+        self.event_receiver.try_recv().ok()
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for DriveSumaServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl AfniConnection {
@@ -593,6 +739,7 @@ fn afni_incoming_message_key(message: &AfniIncomingMessage) -> Option<AfniIncomi
         AfniIncomingMessage::OverlayState(_) => Some(AfniIncomingMessageKey::OverlayState),
         AfniIncomingMessage::RoiUpdate(_) => Some(AfniIncomingMessageKey::RoiUpdate),
         AfniIncomingMessage::ViewerCommands(_) => None,
+        AfniIncomingMessage::DriveSumaCommands(_) => None,
         AfniIncomingMessage::ControllerCommand(command) => match command {
             AfniControllerCommand::ResetCamera => Some(AfniIncomingMessageKey::ResetCamera),
             AfniControllerCommand::ToggleOverlay => None,
@@ -1042,6 +1189,175 @@ fn wake_gui(wake: &WakeCallback) {
     }
 }
 
+fn run_drivesuma_server(
+    listener: TcpListener,
+    event_sender: Sender<DriveSumaServerEvent>,
+    stop: Arc<AtomicBool>,
+    command_mode: DriveSumaCommandMode,
+    verbose: bool,
+    recorder: Option<NimlRecorder>,
+    wake: WakeCallback,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                if verbose {
+                    eprintln!("sumaru DriveSuma: accepted connection from {peer}");
+                }
+                if let Err(error) = read_drivesuma_stream(
+                    stream,
+                    &event_sender,
+                    &stop,
+                    command_mode,
+                    verbose,
+                    recorder.as_ref(),
+                    &wake,
+                ) {
+                    let _ = event_sender.send(DriveSumaServerEvent::Error(format!(
+                        "DriveSuma connection from {peer} failed: {error:#}"
+                    )));
+                    wake_gui(&wake);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                if !stop.load(Ordering::Relaxed) {
+                    let _ = event_sender.send(DriveSumaServerEvent::Error(format!(
+                        "DriveSuma listener failed: {error}"
+                    )));
+                    wake_gui(&wake);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn read_drivesuma_stream(
+    mut stream: TcpStream,
+    event_sender: &Sender<DriveSumaServerEvent>,
+    stop: &AtomicBool,
+    command_mode: DriveSumaCommandMode,
+    verbose: bool,
+    recorder: Option<&NimlRecorder>,
+    wake: &WakeCallback,
+) -> Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(AFNI_READ_TIMEOUT))?;
+    let mut pending = Vec::new();
+    let mut chunk = [0_u8; 65_536];
+
+    while !stop.load(Ordering::Relaxed) {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                pending.extend_from_slice(&chunk[..read]);
+                ensure!(
+                    pending.len() <= AFNI_MAX_PENDING_BYTES,
+                    "DriveSuma NIML stream exceeded {} pending bytes",
+                    AFNI_MAX_PENDING_BYTES
+                );
+
+                if process_drivesuma_payload(
+                    &mut pending,
+                    event_sender,
+                    command_mode,
+                    verbose,
+                    recorder,
+                    wake,
+                )? == Some(true)
+                {
+                    // DriveSuma waits for SUMA to close this socket before it exits.
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Ok(());
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            // `DriveSuma -com kill_suma` closes without CloseKillStream. On
+            // macOS the final read can surface as EINVAL instead of EOF; the
+            // complete command is already buffered and must still be routed.
+            Err(error) if error.kind() == ErrorKind::InvalidInput => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    if !pending.iter().all(u8::is_ascii_whitespace)
+        && process_drivesuma_payload(
+            &mut pending,
+            event_sender,
+            command_mode,
+            verbose,
+            recorder,
+            wake,
+        )?
+        .is_none()
+    {
+        bail!("DriveSuma connection closed with an incomplete NIML element");
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+/// Route a complete buffered DriveSuma payload. `None` means more bytes are
+/// needed before the payload forms valid NIML.
+fn process_drivesuma_payload(
+    pending: &mut Vec<u8>,
+    event_sender: &Sender<DriveSumaServerEvent>,
+    command_mode: DriveSumaCommandMode,
+    verbose: bool,
+    recorder: Option<&NimlRecorder>,
+    wake: &WakeCallback,
+) -> Result<Option<bool>> {
+    let elements = match parse_niml_bytes(pending) {
+        Ok(elements) => elements,
+        Err(_) => return Ok(None),
+    };
+    if elements.is_empty() {
+        pending.clear();
+        return Ok(Some(false));
+    }
+    if let Some(recorder) = recorder {
+        recorder.record_payload(NimlDirection::Rx, pending)?;
+    }
+    if verbose {
+        log_niml_elements(verbose, "drivesuma-rx", &elements, pending.len());
+    }
+
+    let mut messages = Vec::new();
+    let mut close_stream = false;
+    for element in elements {
+        match element.name.as_str() {
+            "StartTracking" | "StopTracking" => {}
+            "CloseKillStream" => close_stream = true,
+            _ => match parse_incoming_message_with_drivesuma_mode(&element, command_mode) {
+                Ok(Some(message)) => messages.push(message),
+                Ok(None) => {
+                    if verbose {
+                        eprintln!("sumaru DriveSuma: ignored NIML element {}", element.name);
+                    }
+                }
+                Err(error) => {
+                    let _ = event_sender.send(DriveSumaServerEvent::Error(format!(
+                        "failed to route DriveSuma element {}: {error:#}",
+                        element.name
+                    )));
+                    wake_gui(wake);
+                }
+            },
+        }
+    }
+    pending.clear();
+    if !messages.is_empty() {
+        event_sender
+            .send(DriveSumaServerEvent::Messages(messages))
+            .map_err(|_| anyhow::anyhow!("DriveSuma event receiver has stopped"))?;
+        wake_gui(wake);
+    }
+    Ok(Some(close_stream))
+}
+
 pub fn resolve_afni_port_config(
     host: impl Into<String>,
     port: Option<u16>,
@@ -1082,6 +1398,36 @@ pub fn resolve_afni_port_config(
         port: DEFAULT_AFNI_NIML_PORT,
         port_offset: None,
         port_bloc: None,
+    })
+}
+
+pub fn resolve_drivesuma_port_config(
+    host: impl Into<String>,
+    port: Option<u16>,
+    port_offset: Option<u16>,
+    port_bloc: Option<u16>,
+    environ: &BTreeMap<String, String>,
+) -> Result<AfniPortConfig> {
+    let host = host.into();
+    if let Some(port) = port {
+        return Ok(AfniPortConfig {
+            host,
+            port,
+            port_offset,
+            port_bloc,
+        });
+    }
+
+    let effective_offset = resolve_port_offset(port_offset, port_bloc, environ)?;
+    let offset = effective_offset.unwrap_or(DEFAULT_AFNI_NIML_PORT);
+    let port = offset
+        .checked_add(port_index(SUMA_DRIVESUMA_NIML_PORT_NAME)?)
+        .context("DriveSuma NIML port exceeds 65535")?;
+    Ok(AfniPortConfig {
+        host,
+        port,
+        port_offset: effective_offset,
+        port_bloc: effective_offset.and_then(port_offset_to_bloc),
     })
 }
 
@@ -1204,6 +1550,13 @@ fn afni_surface_volume_driver_target(info: &AfniSurfaceInfo) -> Option<String> {
 }
 
 pub fn parse_incoming_message(element: &NimlElement) -> Result<Option<AfniIncomingMessage>> {
+    parse_incoming_message_with_drivesuma_mode(element, DriveSumaCommandMode::Sumaru)
+}
+
+pub fn parse_incoming_message_with_drivesuma_mode(
+    element: &NimlElement,
+    drivesuma_mode: DriveSumaCommandMode,
+) -> Result<Option<AfniIncomingMessage>> {
     match element.name.as_str() {
         "SUMA_irgba" => Ok(Some(AfniIncomingMessage::RgbaOverlay(
             AfniRgbaOverlay::from_element(element)?,
@@ -1229,7 +1582,7 @@ pub fn parse_incoming_message(element: &NimlElement) -> Result<Option<AfniIncomi
         "SUMARU_roi_state" => Ok(Some(AfniIncomingMessage::RoiUpdate(
             roi_update_from_element(element),
         ))),
-        "EngineCommand" => Ok(engine_command_from_element(element)),
+        "EngineCommand" => Ok(engine_command_from_element(element, drivesuma_mode)),
         _ => Ok(None),
     }
 }
@@ -1340,6 +1693,44 @@ pub fn route_incoming_message(
                     .actions
                     .push(AfniRouteAction::ViewerCommand(command));
             }
+            outcome.applied_state = true;
+        }
+        AfniIncomingMessage::DriveSumaCommands(commands) => {
+            for command in &commands {
+                match command {
+                    DriveSumaAction::SetSurfaceControllerVisible(visible) => {
+                        controller.panels.surface_controller_visible = *visible;
+                    }
+                    DriveSumaAction::LoadDataset(path) => {
+                        controller.surface.current_overlay_path = Some(path.clone());
+                        controller.overlay.visible = true;
+                    }
+                    DriveSumaAction::SetOverlayVisible(visible) => {
+                        controller.overlay.visible = *visible;
+                    }
+                    DriveSumaAction::SelectSurface(_)
+                    | DriveSumaAction::SelectDataset(_)
+                    | DriveSumaAction::SetColorMap(_)
+                    | DriveSumaAction::SetIntensityColumn(_)
+                    | DriveSumaAction::SetIntensityRange { .. }
+                    | DriveSumaAction::SetBrightnessColumn(_)
+                    | DriveSumaAction::SetBrightnessRange { .. }
+                    | DriveSumaAction::SetBrightnessScale { .. }
+                    | DriveSumaAction::SetThresholdColumn(_)
+                    | DriveSumaAction::SetThresholdValue(_)
+                    | DriveSumaAction::SetDim(_)
+                    | DriveSumaAction::SetOpacity(_)
+                    | DriveSumaAction::SetDisplayMode(_)
+                    | DriveSumaAction::SetClusterParams { .. }
+                    | DriveSumaAction::SetClusterEnabled(_)
+                    | DriveSumaAction::SetShowZero(_)
+                    | DriveSumaAction::SetOneOnly(_)
+                    | DriveSumaAction::Quit => {}
+                }
+            }
+            outcome
+                .actions
+                .push(AfniRouteAction::DriveSumaCommands(commands));
             outcome.applied_state = true;
         }
         AfniIncomingMessage::RoiUpdate(update) => {
@@ -1961,14 +2352,19 @@ fn controller_command_from_element(element: &NimlElement) -> Option<AfniControll
     }
 }
 
-fn engine_command_from_element(element: &NimlElement) -> Option<AfniIncomingMessage> {
+fn engine_command_from_element(
+    element: &NimlElement,
+    mode: DriveSumaCommandMode,
+) -> Option<AfniIncomingMessage> {
     match attr(element, "Command")? {
         "viewer_cont" => {
-            let viewer_commands = drivesuma_viewer_commands_from_element(element);
+            let viewer_commands = drivesuma_viewer_commands_from_element(element, mode);
             if !viewer_commands.is_empty() {
                 return Some(AfniIncomingMessage::ViewerCommands(viewer_commands));
             }
-            if let Some(value) = attr(element, "bkg_col") {
+            if mode == DriveSumaCommandMode::Sumaru
+                && let Some(value) = attr(element, "bkg_col")
+            {
                 let is_white = value
                     .split_whitespace()
                     .filter_map(|piece| piece.parse::<f32>().ok())
@@ -1985,7 +2381,10 @@ fn engine_command_from_element(element: &NimlElement) -> Option<AfniIncomingMess
             }
             None
         }
-        "surf_cont" => {
+        "surf_cont" if mode == DriveSumaCommandMode::SumaCompatibility => {
+            drivesuma_surface_commands_from_element(element)
+        }
+        "surf_cont" if mode == DriveSumaCommandMode::Sumaru => {
             if parse_attr::<bool>(element, "view_dset") == Some(false) {
                 Some(AfniIncomingMessage::ControllerCommand(
                     AfniControllerCommand::ToggleOverlay,
@@ -1994,11 +2393,200 @@ fn engine_command_from_element(element: &NimlElement) -> Option<AfniIncomingMess
                 None
             }
         }
+        "kill_suma" if mode == DriveSumaCommandMode::SumaCompatibility => {
+            Some(AfniIncomingMessage::DriveSumaCommands(vec![
+                DriveSumaAction::Quit,
+            ]))
+        }
         _ => None,
     }
 }
 
-fn drivesuma_viewer_commands_from_element(element: &NimlElement) -> Vec<ViewerCommand> {
+fn drivesuma_surface_commands_from_element(element: &NimlElement) -> Option<AfniIncomingMessage> {
+    let mut commands = Vec::new();
+
+    if let Some(label) = attr(element, "SO_label").filter(|label| !label.trim().is_empty()) {
+        commands.push(DriveSumaAction::SelectSurface(label.to_string()));
+    }
+    if let Some(visible) = parse_attr::<bool>(element, "View_Surf_Cont")
+        .or_else(|| parse_attr::<bool>(element, "view_surf_cont"))
+    {
+        commands.push(DriveSumaAction::SetSurfaceControllerVisible(visible));
+    }
+    if let Some(path) = drivesuma_dataset_path(element) {
+        commands.push(DriveSumaAction::LoadDataset(path));
+    }
+    if let Some(label) = attr(element, "switch_dset").filter(|label| !label.trim().is_empty()) {
+        commands.push(DriveSumaAction::SelectDataset(label.to_string()));
+    }
+    if let Some(colormap) = attr(element, "switch_cmap").and_then(drivesuma_colormap) {
+        commands.push(DriveSumaAction::SetColorMap(colormap));
+    }
+    if let Some(index) = parse_attr::<usize>(element, "I_sb") {
+        commands.push(DriveSumaAction::SetIntensityColumn(index));
+    }
+    if let Some((min, max, symmetric)) = attr(element, "I_range").and_then(drivesuma_range) {
+        commands.push(DriveSumaAction::SetIntensityRange {
+            min,
+            max,
+            symmetric,
+        });
+    }
+    if let Some(column) = attr(element, "B_sb").and_then(drivesuma_optional_column) {
+        commands.push(DriveSumaAction::SetBrightnessColumn(column));
+    }
+    if let Some((min, max, _)) = attr(element, "B_range").and_then(drivesuma_range) {
+        commands.push(DriveSumaAction::SetBrightnessRange { min, max });
+    }
+    if let Some((low, high)) = attr(element, "B_scale").and_then(drivesuma_ordered_pair) {
+        commands.push(DriveSumaAction::SetBrightnessScale { low, high });
+    }
+    if let Some(column) = attr(element, "T_sb").and_then(drivesuma_threshold_column) {
+        commands.push(DriveSumaAction::SetThresholdColumn(column));
+    }
+    if let Some(value) = attr(element, "T_val").and_then(drivesuma_threshold_value) {
+        commands.push(DriveSumaAction::SetThresholdValue(value));
+    }
+    if let Some(dim) = parse_attr::<f32>(element, "Dim").filter(|dim| dim.is_finite()) {
+        commands.push(DriveSumaAction::SetDim(dim));
+    }
+    if let Some(opacity) = parse_attr::<f32>(element, "Opa").filter(|opacity| opacity.is_finite()) {
+        commands.push(DriveSumaAction::SetOpacity(opacity));
+    }
+    if let Some(mode) = attr(element, "Dsp").and_then(drivesuma_display_mode) {
+        commands.push(DriveSumaAction::SetDisplayMode(mode));
+    }
+    if let Some((radius, minimum)) = attr(element, "Clst").and_then(drivesuma_ordered_pair) {
+        commands.push(DriveSumaAction::SetClusterParams { radius, minimum });
+    }
+    if let Some(enabled) = parse_attr::<bool>(element, "UseClst") {
+        commands.push(DriveSumaAction::SetClusterEnabled(enabled));
+    }
+    if let Some(show) = parse_attr::<bool>(element, "shw_0") {
+        commands.push(DriveSumaAction::SetShowZero(show));
+    }
+    if let Some(one_only) = parse_attr::<bool>(element, "1_only") {
+        commands.push(DriveSumaAction::SetOneOnly(one_only));
+    }
+    if let Some(visible) = parse_attr::<bool>(element, "view_dset") {
+        commands.push(DriveSumaAction::SetOverlayVisible(visible));
+    }
+
+    (!commands.is_empty()).then_some(AfniIncomingMessage::DriveSumaCommands(commands))
+}
+
+fn drivesuma_dataset_path(element: &NimlElement) -> Option<PathBuf> {
+    let path = path_attr(element, "Dset_FileName").or_else(|| path_attr(element, "load_dset"))?;
+    if path.is_absolute() {
+        return Some(path);
+    }
+    path_attr(element, "Caller_Working_Dir")
+        .map(|working_dir| working_dir.join(&path))
+        .or(Some(path))
+}
+
+fn drivesuma_colormap(value: &str) -> Option<DriveSumaColorMap> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "amber_monochrome" => Some(DriveSumaColorMap::AmberMonochrome),
+        "roi_i32" => Some(DriveSumaColorMap::RoiI32),
+        _ => None,
+    }
+}
+
+fn drivesuma_display_mode(value: &str) -> Option<DriveSumaDisplayMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "xxx" => Some(DriveSumaDisplayMode::Hidden),
+        "col" => Some(DriveSumaDisplayMode::Color),
+        "con" => Some(DriveSumaDisplayMode::Contour),
+        "c&c" => Some(DriveSumaDisplayMode::ColorAndContour),
+        _ => None,
+    }
+}
+
+fn drivesuma_range(value: &str) -> Option<(f32, f32, bool)> {
+    let values = value
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|piece| !piece.is_empty())
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+
+    match values.as_slice() {
+        [extent] => {
+            let extent = extent.abs();
+            Some((-extent, extent, true))
+        }
+        [first, second] => {
+            let (min, max) = if first <= second {
+                (*first, *second)
+            } else {
+                (*second, *first)
+            };
+            Some((min, max, max == -min))
+        }
+        _ => None,
+    }
+}
+
+fn drivesuma_threshold_column(value: &str) -> Option<Option<usize>> {
+    drivesuma_optional_column(value)
+}
+
+fn drivesuma_optional_column(value: &str) -> Option<Option<usize>> {
+    match value.trim().parse::<i64>().ok()? {
+        -1 => Some(None),
+        index if index >= 0 => usize::try_from(index).ok().map(Some),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn drivesuma_pair(value: &str) -> Option<(f32, f32)> {
+    let (first, second, _) = drivesuma_range(value)?;
+    let count = value
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|piece| !piece.is_empty())
+        .count();
+    (count == 2).then_some((first, second))
+}
+
+fn drivesuma_ordered_pair(value: &str) -> Option<(f32, f32)> {
+    let values: Vec<f32> = value
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|piece| !piece.is_empty())
+        .map(str::parse::<f32>)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (values.len() == 2 && values.iter().all(|value| value.is_finite()))
+        .then_some((values[0], values[1]))
+}
+
+fn drivesuma_threshold_value(value: &str) -> Option<DriveSumaThresholdValue> {
+    let value = value.trim();
+    if let Some(number) = value.strip_suffix("%%").or_else(|| value.strip_suffix('%')) {
+        let percentile = number.trim().parse::<f32>().ok()?;
+        return (percentile.is_finite() && (0.0..=100.0).contains(&percentile))
+            .then_some(DriveSumaThresholdValue::Percentile(percentile));
+    }
+    if let Some(number) = value.strip_suffix(['p', 'P']) {
+        let p_value = number.trim().parse::<f64>().ok()?;
+        return (p_value.is_finite() && (0.0..=1.0).contains(&p_value))
+            .then_some(DriveSumaThresholdValue::PValue(p_value));
+    }
+
+    let numeric = value.parse::<f32>().ok()?;
+    numeric
+        .is_finite()
+        .then_some(DriveSumaThresholdValue::Numeric(numeric))
+}
+
+fn drivesuma_viewer_commands_from_element(
+    element: &NimlElement,
+    mode: DriveSumaCommandMode,
+) -> Vec<ViewerCommand> {
     let key_count = parse_attr::<usize>(element, "N_Key").unwrap_or(0);
     let mut commands = Vec::new();
     for index in 0..key_count {
@@ -2009,20 +2597,65 @@ fn drivesuma_viewer_commands_from_element(element: &NimlElement) -> Vec<ViewerCo
             .unwrap_or(1)
             .max(1);
         let key_value = attr(element, &format!("Key_strval_{index}"));
-        if let Some(command) = drivesuma_key_viewer_command(key, key_value) {
+        if let Some(command) = drivesuma_key_viewer_command(key, key_value, mode) {
             commands.extend(std::iter::repeat_n(command, repeat));
         }
     }
     commands
 }
 
-fn drivesuma_key_viewer_command(key: &str, value: Option<&str>) -> Option<ViewerCommand> {
+fn drivesuma_key_viewer_command(
+    key: &str,
+    value: Option<&str>,
+    mode: DriveSumaCommandMode,
+) -> Option<ViewerCommand> {
     if value.is_some() {
         return None;
     }
 
+    match mode {
+        DriveSumaCommandMode::Sumaru => sumaru_key_viewer_command(key),
+        DriveSumaCommandMode::SumaCompatibility => suma_compat_key_viewer_command(key),
+    }
+}
+
+fn sumaru_key_viewer_command(key: &str) -> Option<ViewerCommand> {
     match key {
-        "R" | "space" | "Space" => Some(ViewerCommand::ResetCamera),
+        "space" | "Space" => Some(ViewerCommand::ResetCamera),
+        "up" | "Up" => Some(ViewerCommand::NudgeCamera(ViewNudge::Up)),
+        "down" | "Down" => Some(ViewerCommand::NudgeCamera(ViewNudge::Down)),
+        "left" | "Left" => Some(ViewerCommand::NudgeCamera(ViewNudge::Left)),
+        "right" | "Right" => Some(ViewerCommand::NudgeCamera(ViewNudge::Right)),
+        "alt+left" | "alt+Left" => Some(ViewerCommand::Preset(ViewPreset::Left)),
+        "alt+right" | "alt+Right" => Some(ViewerCommand::Preset(ViewPreset::Right)),
+        "alt+up" | "alt+Up" => Some(ViewerCommand::Preset(ViewPreset::Top)),
+        "alt+down" | "alt+Down" => Some(ViewerCommand::Preset(ViewPreset::Bottom)),
+        "F5" => Some(ViewerCommand::ToggleBackground),
+        "p" => Some(ViewerCommand::ToggleSurfaceRenderStyle),
+        "P" => Some(ViewerCommand::ReverseSurfaceRenderStyle),
+        "o" => Some(ViewerCommand::CycleSurfaceOpacity),
+        "O" => Some(ViewerCommand::RaiseSurfaceOpacity),
+        "m" => Some(ViewerCommand::ToggleCameraMomentum),
+        "r" => Some(ViewerCommand::SaveScreenshot),
+        "R" | "shift+r" => Some(ViewerCommand::SaveMontage),
+        "ctrl+r" => Some(ViewerCommand::SetRoiControllerOpen(true)),
+        "g" | "G" => Some(ViewerCommand::OpenGraphForPick),
+        "t" => Some(ViewerCommand::ToggleAfniTalk),
+        "[" | "bracketleft" => Some(ViewerCommand::ToggleHemisphereVisibility(
+            crate::surface::SurfaceSide::Left,
+        )),
+        "]" | "bracketright" => Some(ViewerCommand::ToggleHemisphereVisibility(
+            crate::surface::SurfaceSide::Right,
+        )),
+        "comma" | "," => Some(ViewerCommand::CycleSceneSurface(-1)),
+        "period" | "." => Some(ViewerCommand::CycleSceneSurface(1)),
+        _ => None,
+    }
+}
+
+fn suma_compat_key_viewer_command(key: &str) -> Option<ViewerCommand> {
+    match key {
+        "space" | "Space" => Some(ViewerCommand::ResetCamera),
         "up" | "Up" => Some(ViewerCommand::NudgeCamera(ViewNudge::Up)),
         "down" | "Down" => Some(ViewerCommand::NudgeCamera(ViewNudge::Down)),
         "left" | "Left" => Some(ViewerCommand::NudgeCamera(ViewNudge::Left)),
@@ -2031,15 +2664,24 @@ fn drivesuma_key_viewer_command(key: &str, value: Option<&str>) -> Option<Viewer
         "ctrl+right" | "ctrl+Right" => Some(ViewerCommand::Preset(ViewPreset::Right)),
         "ctrl+up" | "ctrl+Up" => Some(ViewerCommand::Preset(ViewPreset::Top)),
         "ctrl+down" | "ctrl+Down" => Some(ViewerCommand::Preset(ViewPreset::Bottom)),
-        "F5" | "b" => Some(ViewerCommand::ToggleBackground),
+        "m" => Some(ViewerCommand::ToggleCameraMomentum),
         "p" => Some(ViewerCommand::ToggleSurfaceRenderStyle),
         "P" => Some(ViewerCommand::ReverseSurfaceRenderStyle),
         "o" => Some(ViewerCommand::CycleSurfaceOpacity),
         "O" => Some(ViewerCommand::RaiseSurfaceOpacity),
-        "m" => Some(ViewerCommand::ToggleCameraMomentum),
+        "F5" => Some(ViewerCommand::ToggleBackground),
         "r" => Some(ViewerCommand::SaveScreenshot),
-        "ctrl+r" => Some(ViewerCommand::SaveMontage),
-        "G" => Some(ViewerCommand::OpenGraphForPick),
+        // SUMA's Ctrl+r saves a captured frame to disk. Sumaru's equivalent
+        // outcome is its ordinary screenshot action; local Ctrl+r remains ROI.
+        "ctrl+r" => Some(ViewerCommand::SaveScreenshot),
+        "g" | "G" => Some(ViewerCommand::OpenGraphForPick),
+        "t" => Some(ViewerCommand::ToggleAfniTalk),
+        "[" | "bracketleft" => Some(ViewerCommand::ToggleSumaComponentVisibility(
+            crate::surface::SurfaceSide::Left,
+        )),
+        "]" | "bracketright" => Some(ViewerCommand::ToggleSumaComponentVisibility(
+            crate::surface::SurfaceSide::Right,
+        )),
         "comma" | "," => Some(ViewerCommand::CycleSceneSurface(-1)),
         "period" | "." => Some(ViewerCommand::CycleSceneSurface(1)),
         _ => None,
@@ -2053,7 +2695,41 @@ pub fn drivesuma_unsupported_attributes(element: &NimlElement) -> Vec<String> {
 
     match attr(element, "Command") {
         Some("viewer_cont") => drivesuma_unsupported_viewer_attrs(element),
-        Some("surf_cont") => drivesuma_unsupported_attrs_except(element, &["Command", "view_dset"]),
+        Some("surf_cont") => drivesuma_unsupported_attrs_except(
+            element,
+            &[
+                "Command",
+                "SO_label",
+                "view_surf_cont",
+                "View_Surf_Cont",
+                "load_dset",
+                "Dset_FileName",
+                "dset_label",
+                "switch_dset",
+                "switch_cmap",
+                "I_sb",
+                "I_range",
+                "B_sb",
+                "B_range",
+                "B_scale",
+                "T_sb",
+                "T_val",
+                "Dim",
+                "Opa",
+                "Dsp",
+                "Clst",
+                "UseClst",
+                "shw_0",
+                "1_only",
+                "view_dset",
+                "Caller_Working_Dir",
+                "Tracking_ID",
+                "ni_form",
+            ],
+        ),
+        Some("kill_suma") => {
+            drivesuma_unsupported_attrs_except(element, &["Command", "Tracking_ID", "ni_form"])
+        }
         Some(command) => vec![format!("Command={command}")],
         None => vec!["Command=<missing>".to_string()],
     }
@@ -2080,7 +2756,7 @@ fn drivesuma_unsupported_viewer_attrs(element: &NimlElement) -> Vec<String> {
             continue;
         };
         let value = attr(element, &format!("Key_strval_{index}"));
-        if drivesuma_key_viewer_command(key, value).is_none() {
+        if drivesuma_key_viewer_command(key, value, DriveSumaCommandMode::Sumaru).is_none() {
             if let Some(value) = value {
                 unsupported.push(format!("{key_attr}={key} value={value}"));
             } else {
@@ -2205,6 +2881,8 @@ mod tests {
     use super::*;
     use crate::command::SurfacePick;
     use crate::io::{NimlData, parse_niml_str, serialize_niml_ascii};
+    use crate::surface::SurfaceSide;
+    use std::time::Instant;
 
     #[test]
     fn afni_port_config_matches_pysuma_bloc_logic() {
@@ -2214,6 +2892,120 @@ mod tests {
         assert_eq!(config.port_offset, Some(1048));
         assert_eq!(config.port, 1048);
         assert_eq!(config.port_bloc, Some(1));
+    }
+
+    #[test]
+    fn drivesuma_port_config_uses_named_port_index() {
+        let default =
+            resolve_drivesuma_port_config("127.0.0.1", None, None, None, &BTreeMap::new()).unwrap();
+        assert_eq!(default.port, DEFAULT_DRIVESUMA_NIML_PORT);
+
+        let bloc =
+            resolve_drivesuma_port_config("127.0.0.1", None, None, Some(1), &BTreeMap::new())
+                .unwrap();
+        assert_eq!(bloc.port_offset, Some(1048));
+        assert_eq!(bloc.port, 1056);
+        assert_eq!(bloc.port_bloc, Some(1));
+    }
+
+    #[test]
+    fn drivesuma_server_delivers_commands_and_closes_kill_stream() {
+        let config = AfniPortConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            port_offset: None,
+            port_bloc: None,
+        };
+        let mut server =
+            DriveSumaServer::bind(&config, DriveSumaCommandMode::Sumaru, false, None, || {})
+                .unwrap();
+        let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let mut command_attrs = BTreeMap::new();
+        command_attrs.insert("Command".to_string(), "viewer_cont".to_string());
+        command_attrs.insert("N_Key".to_string(), "1".to_string());
+        command_attrs.insert("Key_0".to_string(), ".".to_string());
+        command_attrs.insert("Key_rep_0".to_string(), "1".to_string());
+        let elements = vec![
+            NimlElement::text("StartTracking", BTreeMap::new(), ""),
+            NimlElement::group("EngineCommand", command_attrs, Vec::new()),
+            NimlElement::text("StopTracking", BTreeMap::new(), ""),
+            NimlElement::text("CloseKillStream", BTreeMap::new(), ""),
+        ];
+        stream
+            .write_all(serialize_niml_ascii(&elements).as_bytes())
+            .unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let messages = loop {
+            match server.try_recv() {
+                Some(DriveSumaServerEvent::Messages(messages)) => break messages,
+                Some(DriveSumaServerEvent::Error(error)) => panic!("{error}"),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => panic!("timed out waiting for DriveSuma command"),
+            }
+        };
+        assert_eq!(
+            messages,
+            vec![AfniIncomingMessage::ViewerCommands(vec![
+                ViewerCommand::CycleSceneSurface(1)
+            ])]
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn drivesuma_server_routes_real_kill_stream_without_close_kill_element() {
+        let config = AfniPortConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            port_offset: None,
+            port_bloc: None,
+        };
+        let mut server = DriveSumaServer::bind(
+            &config,
+            DriveSumaCommandMode::SumaCompatibility,
+            false,
+            None,
+            || {},
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(include_bytes!("../tests/fixtures/drivesuma/kill_suma.niml"))
+            .unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let messages = loop {
+            match server.try_recv() {
+                Some(DriveSumaServerEvent::Messages(messages)) => break messages,
+                Some(DriveSumaServerEvent::Error(error)) => panic!("{error}"),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => panic!("timed out waiting for DriveSuma kill command"),
+            }
+        };
+        assert_eq!(
+            messages,
+            vec![AfniIncomingMessage::DriveSumaCommands(vec![
+                DriveSumaAction::Quit
+            ])]
+        );
+        server.stop();
     }
 
     #[test]
@@ -2378,7 +3170,12 @@ mod tests {
             attrs,
             data: NimlData::None,
         };
-        let message = parse_incoming_message(&element).unwrap().unwrap();
+        let message = parse_incoming_message_with_drivesuma_mode(
+            &element,
+            DriveSumaCommandMode::SumaCompatibility,
+        )
+        .unwrap()
+        .unwrap();
 
         let mut controller = ControllerState::default();
         let outcome = route_incoming_message(&mut controller, message);
@@ -2423,7 +3220,12 @@ mod tests {
             .unwrap(),
         );
 
-        let message = parse_incoming_message(&element).unwrap().unwrap();
+        let message = parse_incoming_message_with_drivesuma_mode(
+            &element,
+            DriveSumaCommandMode::SumaCompatibility,
+        )
+        .unwrap()
+        .unwrap();
         let mut controller = ControllerState::default();
         let outcome = route_incoming_message(&mut controller, message);
 
@@ -2704,15 +3506,19 @@ mod tests {
     fn drivesuma_viewer_cont_key_commands_route_to_viewer_actions() {
         let mut attrs = BTreeMap::new();
         attrs.insert("Command".to_string(), "viewer_cont".to_string());
-        attrs.insert("N_Key".to_string(), "4".to_string());
-        attrs.insert("Key_0".to_string(), "R".to_string());
+        attrs.insert("N_Key".to_string(), "6".to_string());
+        attrs.insert("Key_0".to_string(), "space".to_string());
         attrs.insert("Key_rep_0".to_string(), "1".to_string());
         attrs.insert("Key_1".to_string(), "right".to_string());
         attrs.insert("Key_rep_1".to_string(), "3".to_string());
-        attrs.insert("Key_2".to_string(), "ctrl+left".to_string());
+        attrs.insert("Key_2".to_string(), "alt+left".to_string());
         attrs.insert("Key_rep_2".to_string(), "1".to_string());
         attrs.insert("Key_3".to_string(), "comma".to_string());
         attrs.insert("Key_rep_3".to_string(), "1".to_string());
+        attrs.insert("Key_4".to_string(), "R".to_string());
+        attrs.insert("Key_rep_4".to_string(), "1".to_string());
+        attrs.insert("Key_5".to_string(), "ctrl+r".to_string());
+        attrs.insert("Key_rep_5".to_string(), "1".to_string());
         let element = NimlElement::group("EngineCommand", attrs, Vec::new());
 
         let message = parse_incoming_message(&element).unwrap().unwrap();
@@ -2729,9 +3535,110 @@ mod tests {
                 AfniRouteAction::ViewerCommand(ViewerCommand::NudgeCamera(ViewNudge::Right)),
                 AfniRouteAction::ViewerCommand(ViewerCommand::Preset(ViewPreset::Left)),
                 AfniRouteAction::ViewerCommand(ViewerCommand::CycleSceneSurface(-1)),
+                AfniRouteAction::ViewerCommand(ViewerCommand::SaveMontage),
+                AfniRouteAction::ViewerCommand(ViewerCommand::SetRoiControllerOpen(true)),
             ]
         );
         assert!(drivesuma_unsupported_attributes(&element).is_empty());
+    }
+
+    #[test]
+    fn native_niml_keeps_sumaru_surf_cont_toggle_behavior() {
+        let attrs = BTreeMap::from([
+            ("Command".to_string(), "surf_cont".to_string()),
+            ("view_dset".to_string(), "n".to_string()),
+        ]);
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        assert_eq!(
+            parse_incoming_message(&element).unwrap(),
+            Some(AfniIncomingMessage::ControllerCommand(
+                AfniControllerCommand::ToggleOverlay
+            ))
+        );
+    }
+
+    #[test]
+    fn native_niml_does_not_translate_suma_dataset_controls() {
+        let attrs = BTreeMap::from([
+            ("Command".to_string(), "surf_cont".to_string()),
+            ("I_sb".to_string(), "2".to_string()),
+            ("I_range".to_string(), "-3, 3".to_string()),
+            ("B_sb".to_string(), "4".to_string()),
+            ("B_range".to_string(), "0, 1".to_string()),
+            ("B_scale".to_string(), "0.3, 0.8".to_string()),
+            ("T_sb".to_string(), "3".to_string()),
+            ("T_val".to_string(), "0.05p".to_string()),
+        ]);
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        assert_eq!(parse_incoming_message(&element).unwrap(), None);
+    }
+
+    #[test]
+    fn suma_compat_mode_only_translates_agreed_keys() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("Command".to_string(), "viewer_cont".to_string());
+        let keys = [
+            "space",
+            "ctrl+left",
+            "m",
+            "p",
+            "P",
+            "o",
+            "O",
+            "F5",
+            "r",
+            "ctrl+r",
+            "G",
+            "b",
+            "R",
+            ".",
+        ];
+        attrs.insert("N_Key".to_string(), keys.len().to_string());
+        for (index, key) in keys.into_iter().enumerate() {
+            attrs.insert(format!("Key_{index}"), key.to_string());
+            attrs.insert(format!("Key_rep_{index}"), "1".to_string());
+        }
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        let message = parse_incoming_message_with_drivesuma_mode(
+            &element,
+            DriveSumaCommandMode::SumaCompatibility,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            message,
+            AfniIncomingMessage::ViewerCommands(vec![
+                ViewerCommand::ResetCamera,
+                ViewerCommand::Preset(ViewPreset::Left),
+                ViewerCommand::ToggleCameraMomentum,
+                ViewerCommand::ToggleSurfaceRenderStyle,
+                ViewerCommand::ReverseSurfaceRenderStyle,
+                ViewerCommand::CycleSurfaceOpacity,
+                ViewerCommand::RaiseSurfaceOpacity,
+                ViewerCommand::ToggleBackground,
+                ViewerCommand::SaveScreenshot,
+                ViewerCommand::SaveScreenshot,
+                ViewerCommand::OpenGraphForPick,
+                ViewerCommand::CycleSceneSurface(1),
+            ])
+        );
+    }
+
+    #[test]
+    fn suma_compat_brackets_use_component_visibility_without_changing_native_mapping() {
+        assert_eq!(
+            drivesuma_key_viewer_command("[", None, DriveSumaCommandMode::Sumaru),
+            Some(ViewerCommand::ToggleHemisphereVisibility(SurfaceSide::Left))
+        );
+        assert_eq!(
+            drivesuma_key_viewer_command("]", None, DriveSumaCommandMode::SumaCompatibility),
+            Some(ViewerCommand::ToggleSumaComponentVisibility(
+                SurfaceSide::Right
+            ))
+        );
     }
 
     #[test]
@@ -2753,13 +3660,18 @@ mod tests {
     }
 
     #[test]
-    fn drivesuma_surf_cont_view_dset_false_still_toggles_overlay() {
+    fn drivesuma_surf_cont_view_dset_sets_overlay_visibility_absolutely() {
         let mut attrs = BTreeMap::new();
         attrs.insert("Command".to_string(), "surf_cont".to_string());
         attrs.insert("view_dset".to_string(), "n".to_string());
         let element = NimlElement::group("EngineCommand", attrs, Vec::new());
 
-        let message = parse_incoming_message(&element).unwrap().unwrap();
+        let message = parse_incoming_message_with_drivesuma_mode(
+            &element,
+            DriveSumaCommandMode::SumaCompatibility,
+        )
+        .unwrap()
+        .unwrap();
         let mut controller = ControllerState::default();
         controller.overlay.visible = true;
         let outcome = route_incoming_message(&mut controller, message);
@@ -2768,11 +3680,207 @@ mod tests {
         assert!(!controller.overlay.visible);
         assert_eq!(
             outcome.actions,
-            vec![AfniRouteAction::ViewerCommand(
-                ViewerCommand::SetOverlayVisible(false)
-            )]
+            vec![AfniRouteAction::DriveSumaCommands(vec![
+                DriveSumaAction::SetOverlayVisible(false)
+            ])]
         );
         assert!(drivesuma_unsupported_attributes(&element).is_empty());
+    }
+
+    #[test]
+    fn drivesuma_surf_cont_parses_fatcat_actions_in_application_order() {
+        let attrs = BTreeMap::from([
+            ("Command".to_string(), "surf_cont".to_string()),
+            ("SO_label".to_string(), "Net_000.gii".to_string()),
+            ("view_surf_cont".to_string(), "y".to_string()),
+            (
+                "load_dset".to_string(),
+                "Net_000.cols.niml.dset".to_string(),
+            ),
+            (
+                "dset_label".to_string(),
+                "Net_000.cols.niml.dset".to_string(),
+            ),
+            (
+                "switch_dset".to_string(),
+                "Net_000.cols.niml.dset".to_string(),
+            ),
+            ("switch_cmap".to_string(), "ROI_i32".to_string()),
+            ("I_sb".to_string(), "2".to_string()),
+            ("I_range".to_string(), "-4, 6".to_string()),
+            ("B_sb".to_string(), "4".to_string()),
+            ("B_range".to_string(), "8, 2".to_string()),
+            ("B_scale".to_string(), "0.2, 0.9".to_string()),
+            ("T_sb".to_string(), "3".to_string()),
+            ("T_val".to_string(), "0.05p".to_string()),
+            ("Dim".to_string(), "0.3".to_string()),
+            ("Opa".to_string(), "0.65".to_string()),
+            ("view_dset".to_string(), "n".to_string()),
+            (
+                "Caller_Working_Dir".to_string(),
+                "/tmp/fatcat-demo".to_string(),
+            ),
+        ]);
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        let message = parse_incoming_message_with_drivesuma_mode(
+            &element,
+            DriveSumaCommandMode::SumaCompatibility,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            message,
+            AfniIncomingMessage::DriveSumaCommands(vec![
+                DriveSumaAction::SelectSurface("Net_000.gii".to_string()),
+                DriveSumaAction::SetSurfaceControllerVisible(true),
+                DriveSumaAction::LoadDataset(PathBuf::from(
+                    "/tmp/fatcat-demo/Net_000.cols.niml.dset"
+                )),
+                DriveSumaAction::SelectDataset("Net_000.cols.niml.dset".to_string()),
+                DriveSumaAction::SetColorMap(DriveSumaColorMap::RoiI32),
+                DriveSumaAction::SetIntensityColumn(2),
+                DriveSumaAction::SetIntensityRange {
+                    min: -4.0,
+                    max: 6.0,
+                    symmetric: false,
+                },
+                DriveSumaAction::SetBrightnessColumn(Some(4)),
+                DriveSumaAction::SetBrightnessRange { min: 2.0, max: 8.0 },
+                DriveSumaAction::SetBrightnessScale {
+                    low: 0.2,
+                    high: 0.9,
+                },
+                DriveSumaAction::SetThresholdColumn(Some(3)),
+                DriveSumaAction::SetThresholdValue(DriveSumaThresholdValue::PValue(0.05)),
+                DriveSumaAction::SetDim(0.3),
+                DriveSumaAction::SetOpacity(0.65),
+                DriveSumaAction::SetOverlayVisible(false),
+            ])
+        );
+        assert!(drivesuma_unsupported_attributes(&element).is_empty());
+    }
+
+    #[test]
+    fn drivesuma_surf_cont_parses_display_and_cluster_controls() {
+        let element = NimlElement::group(
+            "EngineCommand",
+            BTreeMap::from([
+                ("Command".to_string(), "surf_cont".to_string()),
+                ("Dsp".to_string(), "C&C".to_string()),
+                ("Clst".to_string(), "-2, -12".to_string()),
+                ("UseClst".to_string(), "y".to_string()),
+                ("shw_0".to_string(), "n".to_string()),
+                ("1_only".to_string(), "n".to_string()),
+            ]),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            parse_incoming_message_with_drivesuma_mode(
+                &element,
+                DriveSumaCommandMode::SumaCompatibility,
+            )
+            .unwrap(),
+            Some(AfniIncomingMessage::DriveSumaCommands(vec![
+                DriveSumaAction::SetDisplayMode(DriveSumaDisplayMode::ColorAndContour),
+                DriveSumaAction::SetClusterParams {
+                    radius: -2.0,
+                    minimum: -12.0,
+                },
+                DriveSumaAction::SetClusterEnabled(true),
+                DriveSumaAction::SetShowZero(false),
+                DriveSumaAction::SetOneOnly(false),
+            ]))
+        );
+        assert!(drivesuma_unsupported_attributes(&element).is_empty());
+    }
+
+    #[test]
+    fn drivesuma_display_modes_match_suma_tokens() {
+        assert_eq!(
+            drivesuma_display_mode("XXX"),
+            Some(DriveSumaDisplayMode::Hidden)
+        );
+        assert_eq!(
+            drivesuma_display_mode("Col"),
+            Some(DriveSumaDisplayMode::Color)
+        );
+        assert_eq!(
+            drivesuma_display_mode("Con"),
+            Some(DriveSumaDisplayMode::Contour)
+        );
+        assert_eq!(
+            drivesuma_display_mode("C&C"),
+            Some(DriveSumaDisplayMode::ColorAndContour)
+        );
+        assert_eq!(drivesuma_display_mode("bogus"), None);
+    }
+
+    #[test]
+    fn drivesuma_range_matches_suma_one_and_two_value_rules() {
+        assert_eq!(drivesuma_range("5"), Some((-5.0, 5.0, true)));
+        assert_eq!(drivesuma_range("6, -4"), Some((-4.0, 6.0, false)));
+        assert_eq!(drivesuma_range("3  -3"), Some((-3.0, 3.0, true)));
+        assert_eq!(drivesuma_range("1, 2, 3"), None);
+    }
+
+    #[test]
+    fn drivesuma_threshold_selectors_parse_suma_units() {
+        assert_eq!(drivesuma_threshold_column("-1"), Some(None));
+        assert_eq!(drivesuma_threshold_column("7"), Some(Some(7)));
+        assert_eq!(drivesuma_threshold_column("-2"), None);
+        assert_eq!(
+            drivesuma_threshold_value("2.5"),
+            Some(DriveSumaThresholdValue::Numeric(2.5))
+        );
+        assert_eq!(
+            drivesuma_threshold_value("0.01p"),
+            Some(DriveSumaThresholdValue::PValue(0.01))
+        );
+        assert_eq!(
+            drivesuma_threshold_value("95%%"),
+            Some(DriveSumaThresholdValue::Percentile(95.0))
+        );
+        assert_eq!(
+            drivesuma_threshold_value("90%"),
+            Some(DriveSumaThresholdValue::Percentile(90.0))
+        );
+    }
+
+    #[test]
+    fn drivesuma_brightness_controls_parse_suma_rules() {
+        assert_eq!(drivesuma_optional_column("-1"), Some(None));
+        assert_eq!(drivesuma_optional_column("4"), Some(Some(4)));
+        assert_eq!(drivesuma_range("3"), Some((-3.0, 3.0, true)));
+        assert_eq!(drivesuma_pair("0.9, 0.2"), Some((0.2, 0.9)));
+        assert_eq!(drivesuma_pair("0.5"), None);
+    }
+
+    #[test]
+    fn drivesuma_surf_cont_keeps_absolute_dataset_paths_and_maps_amber() {
+        let attrs = BTreeMap::from([
+            ("Command".to_string(), "surf_cont".to_string()),
+            ("load_dset".to_string(), "/data/stat.niml.dset".to_string()),
+            ("switch_cmap".to_string(), "amber_monochrome".to_string()),
+            ("Dim".to_string(), "1.0".to_string()),
+            ("Caller_Working_Dir".to_string(), "/ignored".to_string()),
+        ]);
+        let element = NimlElement::group("EngineCommand", attrs, Vec::new());
+
+        assert_eq!(
+            parse_incoming_message_with_drivesuma_mode(
+                &element,
+                DriveSumaCommandMode::SumaCompatibility,
+            )
+            .unwrap(),
+            Some(AfniIncomingMessage::DriveSumaCommands(vec![
+                DriveSumaAction::LoadDataset(PathBuf::from("/data/stat.niml.dset")),
+                DriveSumaAction::SetColorMap(DriveSumaColorMap::AmberMonochrome),
+                DriveSumaAction::SetDim(1.0),
+            ]))
+        );
     }
 
     #[test]

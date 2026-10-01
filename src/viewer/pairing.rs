@@ -12,6 +12,47 @@ impl ViewerState {
             .is_some_and(|scene| scene.hemisphere == SpecHemisphere::Both)
     }
 
+    /// True when the active display state is composed from multiple source
+    /// surfaces. This includes SUMA-style `-onestate` groups as well as the
+    /// purpose-built paired-hemisphere scene.
+    pub(super) fn has_component_surface(&self) -> bool {
+        self.surface_scene
+            .as_ref()
+            .and_then(|scene| scene.surfaces.get(scene.active_index))
+            .is_some_and(|surface| surface.components.len() > 1)
+    }
+
+    /// One GPU model matrix per active source component, in component order.
+    /// Paired scenes keep their open-book transforms; ordinary `-onestate`
+    /// groups share the combined surface's normalization transform.
+    pub(super) fn active_component_model_matrices(&self) -> Vec<Mat4> {
+        let Some(scene) = self.surface_scene.as_ref() else {
+            return Vec::new();
+        };
+        let Some(surface) = scene.surfaces.get(scene.active_index) else {
+            return Vec::new();
+        };
+        if scene.hemisphere == SpecHemisphere::Both {
+            let by_side = pair_hemisphere_matrices(
+                &surface.components,
+                self.controller.display.pair_state,
+                self.controller.display.pair_visibility,
+            );
+            return surface
+                .components
+                .iter()
+                .map(|component| {
+                    by_side
+                        .iter()
+                        .find(|(side, _)| *side == component.side)
+                        .map_or(Mat4::IDENTITY, |(_, matrix)| *matrix)
+                })
+                .collect();
+        }
+
+        vec![self.scene_object_model(); surface.components.len()]
+    }
+
     /// The two scene components of the active pair, if both are present.
     pub(super) fn active_paired_components(
         &self,
@@ -229,6 +270,64 @@ impl ViewerState {
         self.log_status(format!(
             "{} hemisphere toggled; visible hemispheres: {}.",
             surface_side_label(&side),
+            self.controller.display.pair_visibility.label()
+        ));
+
+        Ok(())
+    }
+
+    /// SUMA compatibility form of `[`/`]`: toggle every component on the
+    /// requested side independently. Unlike Sumaru's paired-scene shortcut,
+    /// SUMA permits both hemispheres to be hidden; unknown/bilateral
+    /// components are never affected.
+    pub(super) fn toggle_suma_component_visibility(&mut self, side: SurfaceSide) -> Result<()> {
+        if !matches!(side, SurfaceSide::Left | SurfaceSide::Right) {
+            return Ok(());
+        }
+        let matching_components = self
+            .surface_scene
+            .as_ref()
+            .and_then(|scene| scene.surfaces.get(scene.active_index))
+            .map_or(0, |surface| {
+                surface
+                    .components
+                    .iter()
+                    .filter(|component| component.side == side)
+                    .count()
+            });
+        if matching_components == 0 {
+            self.log_status(format!(
+                "No {}-hemisphere components in the active state.",
+                surface_side_label(&side)
+            ));
+            return Ok(());
+        }
+
+        self.controller.display.pair_visibility = self
+            .controller
+            .display
+            .pair_visibility
+            .toggled_independently(side.clone())
+            .expect("side was validated above");
+
+        // A pre-existing pick may belong to the component just hidden. Clear
+        // it so selection highlighting and graph state cannot outlive the
+        // visible/pickable geometry.
+        self.controller.interaction.set_pick(None);
+        self.selection_instance = None;
+        self.graph_snapshot = None;
+        if self.has_both_scene() {
+            self.refresh_active_pair_render_geometry()?;
+        } else {
+            let camera = self.camera.clone();
+            self.update_render_uniforms_for_camera(&camera);
+        }
+        self.view.window.request_redraw();
+        self.control.window.request_redraw();
+        self.log_status(format!(
+            "SUMA compatibility: toggled {matching_components} {} component{}; visible hemispheres: {}.",
+            surface_side_label(&side),
+            if matching_components == 1 { "" } else { "s" },
             self.controller.display.pair_visibility.label()
         ));
 

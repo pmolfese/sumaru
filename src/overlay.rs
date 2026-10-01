@@ -13,6 +13,11 @@ pub struct Overlay {
     pub columns: OverlayColumns,
     pub colormap: ColorMap,
     pub intensity_range: RangeSelection,
+    /// Input range used by the optional brightness-modulation column. `Auto`
+    /// uses that column's numeric range.
+    pub brightness_range: RangeSelection,
+    /// RGB multipliers at the low and high ends of `brightness_range`.
+    pub brightness_scale: [f32; 2],
     pub threshold: Threshold,
     pub mask_mode: MaskMode,
     /// Per-node cluster labels from [`crate::cluster::label_clusters`], zero
@@ -23,6 +28,9 @@ pub struct Overlay {
     pub cluster_labels: Option<Arc<Vec<u32>>>,
     pub clip_mode: ClipMode,
     pub symmetric_range: bool,
+    /// Whether an intensity value of exactly zero receives a color. SUMA's
+    /// `shw_0` switch controls this independently of thresholding.
+    pub show_zero: bool,
     pub opacity: f32,
     pub plane_order: i32,
     pub layer_role: OverlayLayerRole,
@@ -241,11 +249,14 @@ impl Overlay {
             columns,
             colormap: ColorMap::blue_white_red(),
             intensity_range: RangeSelection::Auto,
+            brightness_range: RangeSelection::Auto,
+            brightness_scale: [0.0, 1.0],
             threshold: Threshold::off(),
             mask_mode: MaskMode::None,
             cluster_labels: None,
             clip_mode: ClipMode::ClampToIntensityRange,
             symmetric_range: false,
+            show_zero: true,
             opacity: 1.0,
             plane_order: 0,
             layer_role: OverlayLayerRole::Foreground,
@@ -277,11 +288,14 @@ impl Overlay {
             columns: OverlayColumns::new(0),
             colormap: ColorMap::blue_white_red(),
             intensity_range: RangeSelection::Auto,
+            brightness_range: RangeSelection::Auto,
+            brightness_scale: [0.0, 1.0],
             threshold: Threshold::off(),
             mask_mode: MaskMode::None,
             cluster_labels: None,
             clip_mode: ClipMode::ClampToIntensityRange,
             symmetric_range: false,
+            show_zero: true,
             opacity: 1.0,
             plane_order: 0,
             layer_role: OverlayLayerRole::Foreground,
@@ -315,8 +329,13 @@ impl Overlay {
             .map(|selection| selected_numeric_column(dataset, selection))
             .transpose()
             .context("overlay brightness column is invalid")?;
-        let brightness_range: Option<ColumnRange> =
-            brightness_column.and_then(|column| column.range);
+        ensure!(
+            self.brightness_scale.iter().all(|value| value.is_finite()),
+            "brightness scale must contain finite values"
+        );
+        let brightness_range = brightness_column
+            .map(|column| self.resolved_brightness_range(column))
+            .transpose()?;
         self.threshold.validate()?;
         let intensity_mapping = match &self.colormap {
             ColorMap::Continuous(colormap) => IntensityColorMapping::Continuous {
@@ -364,7 +383,9 @@ impl Overlay {
             if let (Some(column), Some(range)) = (brightness_column, brightness_range)
                 && let Some(brightness) = numeric_value(column, row)
             {
-                let factor = range.normalized(brightness).clamp(0.0, 1.0) as f32;
+                let position = range.normalized(brightness).clamp(0.0, 1.0) as f32;
+                let factor = self.brightness_scale[0]
+                    + position * (self.brightness_scale[1] - self.brightness_scale[0]);
                 color[0] *= factor;
                 color[1] *= factor;
                 color[2] *= factor;
@@ -374,6 +395,10 @@ impl Overlay {
                 color[3] = 0.0;
             } else {
                 color[3] = color[3].clamp(0.0, 1.0) * opacity;
+            }
+
+            if !self.show_zero && value == 0.0 {
+                color[3] = 0.0;
             }
 
             if passes_threshold {
@@ -434,6 +459,16 @@ impl Overlay {
         self
     }
 
+    pub fn with_brightness_range(mut self, brightness_range: RangeSelection) -> Self {
+        self.brightness_range = brightness_range;
+        self
+    }
+
+    pub fn with_brightness_scale(mut self, low: f32, high: f32) -> Self {
+        self.brightness_scale = [low, high];
+        self
+    }
+
     /// Restricts the overlay to surviving clusters. `None` clears the
     /// restriction.
     pub fn with_cluster_labels(mut self, labels: Option<Arc<Vec<u32>>>) -> Self {
@@ -454,6 +489,11 @@ impl Overlay {
 
     pub fn with_opacity(mut self, opacity: f32) -> Self {
         self.opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn with_show_zero(mut self, show_zero: bool) -> Self {
+        self.show_zero = show_zero;
         self
     }
 
@@ -484,6 +524,17 @@ impl Overlay {
             };
         }
 
+        Ok(range)
+    }
+
+    fn resolved_brightness_range(&self, column: &DataColumn) -> Result<ColumnRange> {
+        let range = match self.brightness_range {
+            RangeSelection::Auto => column
+                .range
+                .with_context(|| format!("column {} has no numeric range", column.label))?,
+            RangeSelection::Manual(range) => range,
+        };
+        range.validate("brightness range")?;
         Ok(range)
     }
 }
@@ -958,6 +1009,34 @@ mod tests {
             overlay.color_cache.colors[2],
             [1.0, 242.0 / 255.0, 0.0, 1.0],
         );
+    }
+
+    #[test]
+    fn show_zero_masks_exact_zero_on_continuous_overlays() {
+        let domain = triangle_domain();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "effect",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![-1.0, 0.0, 1.0]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut overlay = Overlay::from_dataset(&dataset, &domain, OverlayColumns::new(0))
+            .unwrap()
+            .with_show_zero(false);
+
+        overlay.rebuild_color_cache(&dataset, &domain).unwrap();
+
+        assert_ne!(overlay.color_cache.colors[0][3], 0.0);
+        assert_eq!(overlay.color_cache.colors[1][3], 0.0);
+        assert_ne!(overlay.color_cache.colors[2][3], 0.0);
     }
 
     #[test]
@@ -1519,6 +1598,44 @@ mod tests {
 
         assert_color_close(overlay.color_cache.colors[0], [0.0, 0.0, 0.0, 1.0]);
         assert!(overlay.color_cache.colors[2][0] > overlay.color_cache.colors[1][0]);
+    }
+
+    #[test]
+    fn overlay_brightness_range_and_scale_match_suma_modulation() {
+        let domain = triangle_domain();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "effect",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![1.0, 1.0, 1.0]),
+                )
+                .unwrap(),
+                DataColumn::new(
+                    "brightness",
+                    ColumnRole::Brightness,
+                    None,
+                    ColumnData::Float32(vec![0.0, 5.0, 10.0]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut overlay =
+            Overlay::from_dataset(&dataset, &domain, OverlayColumns::new(0).with_brightness(1))
+                .unwrap()
+                .with_colormap(ColorMap::grayscale())
+                .with_brightness_range(RangeSelection::Manual(ColumnRange { min: 2.0, max: 8.0 }))
+                .with_brightness_scale(0.2, 0.8);
+
+        overlay.rebuild_color_cache(&dataset, &domain).unwrap();
+
+        assert_color_close(overlay.color_cache.colors[0], [0.1, 0.1, 0.1, 1.0]);
+        assert_color_close(overlay.color_cache.colors[1], [0.25, 0.25, 0.25, 1.0]);
+        assert_color_close(overlay.color_cache.colors[2], [0.4, 0.4, 0.4, 1.0]);
     }
 
     #[test]

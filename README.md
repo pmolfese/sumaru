@@ -296,6 +296,46 @@ settings, controller commands, and ROI state. Those messages route through
 shared controller/command state rather than directly mutating viewer-only
 fields, so they can be tested without launching the GUI.
 
+## DriveSuma
+
+Sumaru can listen for the NIML `EngineCommand` messages produced by AFNI's
+`DriveSuma` program. There are two intentionally different command modes:
+
+- `-niml` / `--niml` uses Sumaru's native key meanings. For example, remote
+  `Control+R` opens the ROI controller and `R` saves a montage.
+- `-niml-suma` / `--niml-suma` translates the supported SUMA subset.
+  `-niml-compat` / `--niml-compat` is an alias. In this mode SUMA-style dataset
+  controls, key translations, clustering, and `kill_suma` are enabled.
+
+Start Sumaru first, using the same port bloc that will be passed to DriveSuma:
+
+```sh
+sumaru -spec Demo.spec -sv Demo_SurfVol+orig. -niml-suma -npb 1000
+
+DriveSuma -npb 1000 \
+  -com surf_cont -surf_label Net_000.gii \
+  -load_dset Net_000.cols.niml.dset \
+  -switch_cmap ROI_i32 -Dim 0.3
+```
+
+Compatibility mode currently supports selecting an already loaded surface,
+loading and switching overlay datasets, intensity/threshold/brightness
+sub-bricks and ranges, numeric/p-value/percentile thresholds, brightness scale,
+dim and opacity, dataset visibility and display modes, zero masking, and
+SUMA-style cluster settings. The translated key subset covers camera movement
+and presets, render style and opacity, background, screenshots, graph opening,
+component visibility, and surface/state cycling.
+
+Sumaru deliberately uses one view per process instead of SUMA's several
+lettered viewers in one application. Start separate Sumaru processes with
+different `-npb` values for independently scripted views. Likewise, Sumaru
+renders only the active overlay: `1_only=y` is its natural behavior, while
+`1_only=n` is accepted but does not enable simultaneous overlay compositing.
+
+See [DriveSuma compatibility](docs/DRIVESUMA.md) for the full command table,
+key translations, cluster sign conventions, native-versus-compatibility
+differences, examples, diagnostics, and known limitations.
+
 ## Viewer Controls
 
 - Launch with `cargo run` to open an empty viewer and a separate controls
@@ -399,6 +439,9 @@ the completed-work ledger.
 - `.gitignore` keeps Cargo build output in `target/` out of version control.
 - `README.md` is the project-facing quickstart: scope, commands, controls,
   overlays, design direction, and this file guide.
+- `docs/DRIVESUMA.md` documents the inbound DriveSuma listener, native and SUMA
+  compatibility modes, supported controller commands, and intentional
+  architectural differences from SUMA.
 - `docs/ROADMAP.md` is the active to-do plan, grouped by shared foundations
   such as AFNI interop, command state, everyday viewer use, GPU work, and
   volume support.

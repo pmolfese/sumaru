@@ -88,6 +88,9 @@ pub(super) struct VolumeView {
     scene_model: Mat4,
     /// Display window: (low, high) intensity mapped to black..white.
     window: (f32, f32),
+    /// Alpha applied to the sampled grayscale interior of every slice. Borders
+    /// and grab tabs remain opaque so transparent slices stay interactive.
+    opacity: f32,
     /// All slice planes in the scene; several may share an orientation.
     slices: Vec<Slice>,
     /// Index into `slices` the user has selected (right-click) for left-drag
@@ -258,7 +261,7 @@ impl VolumeView {
                 entry_point: Some("slice_fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: color_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -272,7 +275,9 @@ impl VolumeView {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
+                // Slice translucency is an x-ray aid for internal tracts and
+                // graphs. Do not leave an invisible depth wall behind it.
+                depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -305,6 +310,7 @@ impl VolumeView {
             world_max,
             scene_model,
             window: (0.0, 0.0),
+            opacity: 1.0,
             slices,
             selected: None,
             pipeline,
@@ -502,6 +508,19 @@ impl VolumeView {
             .unwrap_or_else(|| self.path.display().to_string())
     }
 
+    pub(super) fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    pub(super) fn set_opacity(&mut self, opacity: f32) -> bool {
+        let opacity = opacity.clamp(0.0, 1.0);
+        if self.opacity == opacity {
+            return false;
+        }
+        self.opacity = opacity;
+        true
+    }
+
     /// Rebuild the combined vertex buffer for all enabled planes. Vertices are
     /// stored as flat `[x, y, z]` floats to match the codebase's bytemuck-free
     /// buffer style.
@@ -603,7 +622,7 @@ impl VolumeView {
             .into_iter()
             .chain(world_to_voxel.to_cols_array())
             .chain([1.0 / nx as f32, 1.0 / ny as f32, 1.0 / nz as f32, 0.0])
-            .chain([self.window.0, self.window.1, 0.0, 0.0])
+            .chain([self.window.0, self.window.1, self.opacity, 0.0])
             .collect();
         queue.write_buffer(&self.uniform_buffer, 0, &super::f32_bytes(&floats));
 

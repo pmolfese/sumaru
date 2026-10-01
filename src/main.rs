@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use sumaru::afni::{DEFAULT_AFNI_HOST, resolve_afni_port_config};
+use sumaru::afni::DriveSumaCommandMode;
+use sumaru::afni::{DEFAULT_AFNI_HOST, resolve_afni_port_config, resolve_drivesuma_port_config};
 use sumaru::inspect::inspect_path;
 use sumaru::niml_debug::{
     NimlSendCommand, inspect_debug_path, replay_debug_path, send_debug_command,
@@ -126,6 +127,18 @@ struct Cli {
     /// toggle the same connection interactively.
     #[arg(long = "talk-afni")]
     talk_afni: bool,
+
+    /// Listen for NIML commands using Sumaru's native key semantics.
+    #[arg(long = "niml", conflicts_with = "niml_suma")]
+    niml: bool,
+
+    /// Listen for DriveSuma commands and translate the supported SUMA subset.
+    #[arg(
+        long = "niml-suma",
+        visible_alias = "niml-compat",
+        conflicts_with = "niml"
+    )]
+    niml_suma: bool,
 
     /// Record every live AFNI/SUMA NIML message sent and received by Sumaru.
     #[arg(long = "niml-record", value_name = "PATH")]
@@ -262,6 +275,8 @@ fn main() -> Result<()> {
     let niml_record_path = cli.niml_record;
     let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
     let afni_requested = cli.talk_afni
+        || cli.niml
+        || cli.niml_suma
         || cli.afni_port.is_some()
         || cli.np.is_some()
         || cli.npb.is_some()
@@ -276,6 +291,19 @@ fn main() -> Result<()> {
             cli.npb,
             &environ,
         )?,
+        listen_for_drivesuma: cli.niml || cli.niml_suma,
+        drivesuma_port_config: resolve_drivesuma_port_config(
+            DEFAULT_AFNI_HOST,
+            None,
+            cli.np,
+            cli.npb,
+            &environ,
+        )?,
+        drivesuma_command_mode: if cli.niml_suma {
+            DriveSumaCommandMode::SumaCompatibility
+        } else {
+            DriveSumaCommandMode::Sumaru
+        },
     };
 
     let surface_paths = cli.surface_paths;
@@ -738,8 +766,16 @@ fn normalize_afni_style_arg(arg: OsString) -> OsString {
         OsString::from("--gdset")
     } else if arg == "-grid" {
         OsString::from("--grid")
+    } else if arg == "-tract" {
+        OsString::from("--tract")
     } else if arg == "-onestate" {
         OsString::from("--onestate")
+    } else if arg == "-niml" {
+        OsString::from("--niml")
+    } else if arg == "-niml-suma" {
+        OsString::from("--niml-suma")
+    } else if arg == "-niml-compat" {
+        OsString::from("--niml-compat")
     } else if matches!(
         arg.to_str(),
         Some("-i_gii" | "-i_GII" | "-i_gifti" | "-i_GIFTI")
@@ -1359,6 +1395,41 @@ mod tests {
     }
 
     #[test]
+    fn suma_niml_listener_flag_parses() {
+        let cli = Cli::parse_from(["sumaru", "--surface", "surface.gii", "--niml"]);
+        assert!(cli.niml);
+        assert!(!cli.niml_suma);
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-niml")),
+            OsString::from("--niml")
+        );
+
+        for flag in ["--niml-suma", "--niml-compat"] {
+            let cli = Cli::parse_from(["sumaru", "--surface", "surface.gii", flag]);
+            assert!(!cli.niml);
+            assert!(cli.niml_suma);
+        }
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-niml-suma")),
+            OsString::from("--niml-suma")
+        );
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-niml-compat")),
+            OsString::from("--niml-compat")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sumaru",
+                "--surface",
+                "surface.gii",
+                "--niml",
+                "--niml-suma",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn tract_and_graph_launch_options_repeat() {
         let cli = Cli::parse_from([
             "sumaru",
@@ -1393,12 +1464,20 @@ mod tests {
             ("-vol", "--vol"),
             ("-gdset", "--gdset"),
             ("-grid", "--grid"),
+            ("-tract", "--tract"),
         ] {
             assert_eq!(
                 normalize_afni_style_arg(OsString::from(suma_flag)),
                 OsString::from(long_flag)
             );
         }
+
+        let cli = Cli::parse_from([
+            OsString::from("sumaru"),
+            normalize_afni_style_arg(OsString::from("-tract")),
+            OsString::from("bundles.niml.tract"),
+        ]);
+        assert_eq!(cli.tract_paths, vec![PathBuf::from("bundles.niml.tract")]);
     }
 
     #[test]

@@ -739,11 +739,29 @@ impl ViewerState {
                 self.overlay.render.appearance.range,
             )))
             .with_symmetric_range(self.overlay.render.appearance.symmetric_range)
+            .with_brightness_range(
+                self.overlay
+                    .render
+                    .appearance
+                    .brightness_range
+                    .map(|range| RangeSelection::Manual(overlay_range_from_value_range(range)))
+                    .unwrap_or(RangeSelection::Auto),
+            )
+            .with_brightness_scale(
+                self.overlay.render.appearance.brightness_scale[0],
+                self.overlay.render.appearance.brightness_scale[1],
+            )
             .with_threshold(threshold, mask_mode)
             .with_cluster_labels(cluster_labels)
+            .with_show_zero(self.overlay.render.appearance.show_zero)
             .with_opacity(self.overlay.render.appearance.opacity);
 
         overlay.rebuild_color_cache(dataset, domain)?;
+        if !self.overlay.render.appearance.display_mode.shows_color() {
+            for color in &mut overlay.color_cache.colors {
+                color[3] = 0.0;
+            }
+        }
         self.overlay.render.render_model = Some(overlay);
 
         Ok(())

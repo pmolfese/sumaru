@@ -209,6 +209,11 @@ impl SelectionHighlight {
 pub(super) struct OverlayAppearance {
     pub(super) range: ValueRange,
     pub(super) symmetric_range: bool,
+    pub(super) brightness_range: Option<ValueRange>,
+    pub(super) brightness_scale: [f32; 2],
+    pub(super) brightness_compat_initialized: bool,
+    pub(super) display_mode: OverlayDisplayMode,
+    pub(super) show_zero: bool,
     pub(super) colormap: OverlayColorMap,
     pub(super) threshold: OverlayThreshold,
     pub(super) transparent_threshold: bool,
@@ -222,8 +227,36 @@ pub(super) struct OverlayAppearance {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OverlayDisplayMode {
+    Hidden,
+    Color,
+    Contour,
+    ColorAndContour,
+}
+
+impl OverlayDisplayMode {
+    pub(super) fn shows_color(self) -> bool {
+        matches!(self, Self::Color | Self::ColorAndContour)
+    }
+
+    pub(super) fn shows_contour(self) -> bool {
+        matches!(self, Self::Contour | Self::ColorAndContour)
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Hidden => "Hidden",
+            Self::Color => "Color",
+            Self::Contour => "Contour",
+            Self::ColorAndContour => "Color + contour",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OverlayColorMap {
     DiscreteLabels,
+    AmberMonochrome,
     SpectrumRedToBlue,
     SpectrumRedToBlueGap,
     SpectrumYellowToRed,
@@ -479,6 +512,34 @@ impl PreparedThresholdContour {
     ) -> Self {
         let segments =
             threshold_contour_segments(geometry, threshold_values, threshold, cluster_labels);
+        Self::from_segments(geometry, segments, boundary_luminances)
+    }
+
+    /// Builds ordinary dataset/color-band contours at the supplied scalar
+    /// levels. This is distinct from the threshold outline controlled by `B`:
+    /// SUMA's `Dsp Con` and `Dsp C&C` contour the displayed dataset itself.
+    pub(super) fn from_geometry_levels(
+        geometry: &PreparedGeometry,
+        values: &[f32],
+        levels: &[f64],
+        boundary_luminances: &[f32],
+    ) -> Self {
+        let mut segments = Vec::new();
+        for (level_index, level) in levels.iter().copied().enumerate() {
+            segments.extend(
+                threshold_contour_segments(geometry, values, Threshold::above(level), None)
+                    .into_iter()
+                    .map(|(_, segment)| (level_index, segment)),
+            );
+        }
+        Self::from_segments(geometry, segments, boundary_luminances)
+    }
+
+    fn from_segments(
+        geometry: &PreparedGeometry,
+        segments: Vec<(usize, ThresholdContourSegment)>,
+        boundary_luminances: &[f32],
+    ) -> Self {
         let normal_offset = contour_normal_offset(geometry);
         let mut vertices = Vec::with_capacity(segments.len() * 4);
         let mut indices = Vec::with_capacity(segments.len() * 6);
@@ -991,6 +1052,11 @@ impl OverlayAppearance {
         Self {
             range: super::symmetric_value_range(range),
             symmetric_range: true,
+            brightness_range: None,
+            brightness_scale: [0.0, 1.0],
+            brightness_compat_initialized: false,
+            display_mode: OverlayDisplayMode::Color,
+            show_zero: true,
             colormap: OverlayColorMap::SpectrumRedToBlue,
             threshold: OverlayThreshold {
                 enabled: false,
@@ -1011,8 +1077,9 @@ impl OverlayAppearance {
 }
 
 impl OverlayColorMap {
-    pub(super) const ALL: [Self; 14] = [
+    pub(super) const ALL: [Self; 15] = [
         Self::DiscreteLabels,
+        Self::AmberMonochrome,
         Self::SpectrumRedToBlue,
         Self::SpectrumRedToBlueGap,
         Self::SpectrumYellowToRed,
@@ -1031,6 +1098,7 @@ impl OverlayColorMap {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::DiscreteLabels => "discrete labels",
+            Self::AmberMonochrome => "amber_monochrome",
             Self::SpectrumRedToBlue => "Spectrum:red_to_blue",
             Self::SpectrumRedToBlueGap => "Spectrum:red_to_blue+gap",
             Self::SpectrumYellowToRed => "Spectrum:yellow_to_red",
@@ -1050,6 +1118,7 @@ impl OverlayColorMap {
     pub(super) fn continuous_color_map(self) -> Option<ColorMap> {
         match self {
             Self::DiscreteLabels => None,
+            Self::AmberMonochrome => Some(ColorMap::amber_monochrome()),
             Self::SpectrumRedToBlue => Some(ColorMap::spectrum_red_to_blue()),
             Self::SpectrumRedToBlueGap => Some(ColorMap::spectrum_red_to_blue_gap()),
             Self::SpectrumYellowToRed => Some(ColorMap::spectrum_yellow_to_red()),
@@ -1643,6 +1712,22 @@ mod tests {
             contour.vertex_bytes().len(),
             contour.vertices.len() * CONTOUR_VERTEX_FLOATS * 4
         );
+    }
+
+    #[test]
+    fn prepared_dataset_contour_builds_one_line_per_color_band_boundary() {
+        let geometry = PreparedGeometry::from_surface(&triangle_mesh());
+        let contour = PreparedThresholdContour::from_geometry_levels(
+            &geometry,
+            &[0.0, 1.0, 2.0],
+            &[0.5, 1.5],
+            &[0.25, 0.75],
+        );
+
+        assert_eq!(contour.vertices.len(), 8);
+        assert_eq!(contour.indices.len(), 12);
+        assert_eq!(contour.vertices[0].params[2], 0.25);
+        assert_eq!(contour.vertices[4].params[2], 0.75);
     }
 
     #[test]

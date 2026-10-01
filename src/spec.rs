@@ -259,7 +259,7 @@ fn parse_spec_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn infer_surface_side(value: &str) -> SurfaceSide {
+pub(crate) fn infer_surface_side(value: &str) -> SurfaceSide {
     let lower = value.to_ascii_lowercase();
     let tokens = lower
         .split(|c: char| !(c.is_ascii_alphanumeric()))
