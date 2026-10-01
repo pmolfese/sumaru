@@ -1188,7 +1188,7 @@ impl ViewerState {
                 ui.label("Open:");
                 if ui
                     .button("Surf")
-                    .on_hover_text("Open GIFTI surface")
+                    .on_hover_text("Open GIFTI or FreeSurfer surface")
                     .clicked()
                 {
                     actions.push(ViewerCommand::PickSurface);

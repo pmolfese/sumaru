@@ -124,6 +124,7 @@ pub(super) struct TimeCourseState {
     cursor_full_range: ValueRange,
     cursor_robust_range: ValueRange,
     cursor_scale_dirty: bool,
+    projection_neighbors: Option<Vec<Vec<u32>>>,
     pub(super) controls: TimeCourseControls,
     next_frame_at: Instant,
     frame_interval: Duration,
@@ -165,7 +166,7 @@ impl TimeCourseState {
             .collect::<Vec<_>>();
         ensure!(
             !time_columns.is_empty(),
-            "timecourse mode requires GIFTI time-point data arrays"
+            "timecourse mode requires time-point data (for example GIFTI or STC)"
         );
 
         let step = datasets[0].1.time_step_seconds.unwrap_or(1.0);
@@ -269,6 +270,7 @@ impl TimeCourseState {
             cursor_full_range,
             cursor_robust_range,
             cursor_scale_dirty: false,
+            projection_neighbors: None,
             controls,
             next_frame_at: Instant::now() + frame_interval,
             frame_interval,
@@ -483,7 +485,28 @@ impl ViewerState {
             );
             conditions.push((overlay.display_text(), dataset));
         }
-        self.timecourse = Some(TimeCourseState::from_conditions(conditions, active)?);
+        let needs_projection = self.sparse_timecourse_display != SparseTimecourseDisplay::Sparse
+            && conditions.iter().any(|(_, dataset)| {
+                dataset.is_sparse()
+                    && self
+                        .mesh
+                        .as_ref()
+                        .is_some_and(|mesh| dataset.row_count < mesh.domain.node_count)
+            });
+        let projection_neighbors = if needs_projection {
+            Some(
+                self.mesh
+                    .as_ref()
+                    .context("load a surface before displaying a sparse timecourse")?
+                    .topology()
+                    .node_neighbors,
+            )
+        } else {
+            None
+        };
+        let mut timecourse = TimeCourseState::from_conditions(conditions, active)?;
+        timecourse.projection_neighbors = projection_neighbors;
+        self.timecourse = Some(timecourse);
         self.set_graph_window_open(true);
         self.apply_timecourse_overlay()?;
         let state = self
@@ -584,7 +607,21 @@ impl ViewerState {
             .domain
             .node_count;
         let columns = OverlayColumnSelections::default();
-        let node_values = overlay_dataset_from_canonical_dataset(&dataset, node_count, columns)?;
+        let mut node_values =
+            overlay_dataset_from_canonical_dataset(&dataset, node_count, columns)?;
+        if dataset.is_sparse()
+            && dataset.row_count < node_count
+            && self.sparse_timecourse_display != SparseTimecourseDisplay::Sparse
+        {
+            node_values = project_sparse_timecourse_overlay(
+                node_values,
+                self.sparse_timecourse_display,
+                state
+                    .projection_neighbors
+                    .as_deref()
+                    .context("sparse timecourse projection topology is unavailable")?,
+            )?;
+        }
         let range = node_values.range;
         let display_range = match controls.display {
             TimeCourseDisplay::Cursor => state.cursor_color_range(),
@@ -1095,9 +1132,104 @@ fn summarize_response(
     })
 }
 
+const DEFAULT_SPARSE_SMOOTHING_STEPS: usize = 10;
+
+fn project_sparse_timecourse_overlay(
+    mut overlay: OverlayDataset,
+    display: SparseTimecourseDisplay,
+    neighbors: &[Vec<u32>],
+) -> Result<OverlayDataset> {
+    if display == SparseTimecourseDisplay::Sparse {
+        return Ok(overlay);
+    }
+
+    let project = |values: &[f32]| match display {
+        SparseTimecourseDisplay::Smooth => {
+            smooth_sparse_values(values, neighbors, DEFAULT_SPARSE_SMOOTHING_STEPS)
+        }
+        SparseTimecourseDisplay::Nearest => nearest_sparse_values(values, neighbors),
+        SparseTimecourseDisplay::Sparse => unreachable!("handled above"),
+    };
+
+    overlay.values = project(&overlay.values);
+    overlay.range = ValueRange::from_values(&overlay.values)?;
+    if let Some(threshold_values) = overlay.threshold_values.as_mut() {
+        *threshold_values = project(threshold_values);
+    }
+    Ok(overlay)
+}
+
+fn smooth_sparse_values(values: &[f32], neighbors: &[Vec<u32>], iterations: usize) -> Vec<f32> {
+    let mut current = values.to_vec();
+    for _ in 0..iterations {
+        let mut next = current.clone();
+        let mut changed = false;
+        for (node, node_neighbors) in neighbors.iter().enumerate() {
+            let mut sum = 0.0_f32;
+            let mut count = 0_usize;
+            if current[node].is_finite() {
+                sum += current[node];
+                count += 1;
+            }
+            for neighbor in node_neighbors {
+                let value = current[*neighbor as usize];
+                if value.is_finite() {
+                    sum += value;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let value = sum / count as f32;
+                changed |= !current[node].is_finite() || current[node] != value;
+                next[node] = value;
+            }
+        }
+        current = next;
+        if !changed {
+            break;
+        }
+    }
+    current
+}
+
+fn nearest_sparse_values(values: &[f32], neighbors: &[Vec<u32>]) -> Vec<f32> {
+    let mut projected = values.to_vec();
+    let mut queue = VecDeque::new();
+    for (node, value) in values.iter().enumerate() {
+        if value.is_finite() {
+            queue.push_back(node);
+        }
+    }
+    while let Some(node) = queue.pop_front() {
+        let value = projected[node];
+        for neighbor in &neighbors[node] {
+            let neighbor = *neighbor as usize;
+            if !projected[neighbor].is_finite() {
+                projected[neighbor] = value;
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    projected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_smoothing_spreads_values_over_mesh_neighbors() {
+        let neighbors = vec![vec![1], vec![0, 2], vec![1]];
+        let projected = smooth_sparse_values(&[1.0, f32::NAN, 3.0], &neighbors, 1);
+        assert_eq!(projected, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn nearest_sparse_projection_builds_topological_patches() {
+        let neighbors = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let projected = nearest_sparse_values(&[1.0, f32::NAN, f32::NAN, 4.0], &neighbors);
+        assert_eq!(projected, vec![1.0, 1.0, 4.0, 4.0]);
+    }
 
     fn event_locked_dataset() -> Dataset {
         let domain = SurfaceDomain::from_triangles(2, vec![[0, 1, 1]]).unwrap();

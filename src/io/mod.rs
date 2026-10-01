@@ -12,15 +12,19 @@ use crate::dataset::{
 use crate::roi::{Roi, RoiBrushAction, RoiDatum, RoiDrawingType, RoiElementKind, RoiSource};
 use crate::surface::{SurfaceDomain, SurfaceSide};
 
+mod freesurfer;
 mod gifti;
 mod niml;
 mod roi;
+mod stc;
 
 // The public face of `io`: read/write entry points and the NIML data model,
 // re-exported from the topical submodules so callers keep using `crate::io::*`.
+pub use freesurfer::*;
 pub use gifti::*;
 pub use niml::*;
 pub use roi::*;
+pub use stc::*;
 
 const MINIMAL_DSET_SAMPLE: &str = r#"
 <AFNI_dataset

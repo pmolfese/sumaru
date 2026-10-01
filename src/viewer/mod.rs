@@ -45,7 +45,8 @@ use crate::graph_dataset::read_graph_bucket;
 use crate::instacorr::{InstaCorrOptions, PreparedInstaCorr, prepare_dataset};
 use crate::io::{
     NimlElement, read_gifti_dataset, read_gifti_dataset_with_auto_qcalc, read_gifti_image,
-    read_niml_dataset, read_niml_dataset_with_label_table, read_niml_roi, write_niml_roi,
+    read_niml_dataset, read_niml_dataset_with_label_table, read_niml_roi, read_stc_dataset,
+    write_niml_roi,
 };
 use crate::niml_debug::NimlRecorder;
 use crate::overlay::{
@@ -362,6 +363,17 @@ const WHITE_BACKGROUND: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SparseTimecourseDisplay {
+    /// Iteratively spread and average source values over the display mesh.
+    #[default]
+    Smooth,
+    /// Color only the vertices explicitly present in the source estimate.
+    Sparse,
+    /// Assign every mesh vertex the value of its closest source along topology.
+    Nearest,
+}
+
 #[derive(Debug, Default)]
 pub struct LaunchOptions {
     pub surface_paths: Vec<PathBuf>,
@@ -392,6 +404,8 @@ pub struct LaunchOptions {
     pub niml_record_path: Option<PathBuf>,
     /// Start in the compact interactive surface-timecourse workflow.
     pub timecourse_mode: bool,
+    /// Projection used when a timecourse contains only a subset of mesh nodes.
+    pub sparse_timecourse_display: SparseTimecourseDisplay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,6 +501,7 @@ struct ViewerApp {
     afni: AfniViewerOptions,
     niml_record_path: Option<PathBuf>,
     initial_timecourse_mode: bool,
+    initial_sparse_timecourse_display: SparseTimecourseDisplay,
     event_proxy: EventLoopProxy<ViewerEvent>,
     state: Option<ViewerState>,
     setup_error: Option<anyhow::Error>,
@@ -519,6 +534,7 @@ impl ViewerApp {
             afni: options.afni,
             niml_record_path: options.niml_record_path,
             initial_timecourse_mode: options.timecourse_mode,
+            initial_sparse_timecourse_display: options.sparse_timecourse_display,
             event_proxy,
             state: None,
             setup_error: None,
@@ -601,6 +617,7 @@ impl ViewerApp {
                 overlay_subs: self.initial_overlay_subs.take(),
                 overlay_p_value: self.initial_overlay_p_value.take(),
                 timecourse_mode: self.initial_timecourse_mode,
+                sparse_timecourse_display: self.initial_sparse_timecourse_display,
             },
             self.verbose,
             self.preload,
@@ -1362,6 +1379,7 @@ struct InitialScene {
     overlay_subs: Option<Vec<String>>,
     overlay_p_value: Option<f64>,
     timecourse_mode: bool,
+    sparse_timecourse_display: SparseTimecourseDisplay,
 }
 
 struct SurfaceRenderPipelines {
@@ -1523,6 +1541,7 @@ struct ViewerState {
     roi_workspace: RoiWorkspace,
     graph_snapshot: Option<GraphSnapshot>,
     timecourse: Option<TimeCourseState>,
+    sparse_timecourse_display: SparseTimecourseDisplay,
     surface_volume_path: Option<PathBuf>,
     surface_volume_idcode: Option<String>,
     /// Loaded display volume and its slice-plane render state (`--volume` mode).
@@ -1624,6 +1643,7 @@ impl ViewerState {
             overlay_subs: initial_overlay_subs,
             overlay_p_value: initial_overlay_p_value,
             timecourse_mode: initial_timecourse_mode,
+            sparse_timecourse_display,
         } = scene;
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
@@ -2072,6 +2092,7 @@ impl ViewerState {
             roi_workspace: RoiWorkspace::default(),
             graph_snapshot: None,
             timecourse: None,
+            sparse_timecourse_display,
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             volume_view: None,
@@ -3822,7 +3843,7 @@ impl ViewerState {
     }
 
     fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
-        let mut mesh = SurfaceMesh::from_gifti_path(&path)
+        let mut mesh = SurfaceMesh::from_path(&path)
             .with_context(|| format!("failed to load surface {}", path.display()))?;
         apply_surface_volume_parent(&mut mesh, self.surface_volume_idcode.as_deref());
         let node_count = mesh.vertices.len();
@@ -3983,7 +4004,7 @@ impl ViewerState {
 
         ensure!(
             !surfaces.is_empty(),
-            "SUMA spec {} did not contain any loadable GIFTI surfaces",
+            "SUMA spec {} did not contain any loadable GIFTI or FreeSurfer surfaces",
             spec.path.display()
         );
 
@@ -6805,7 +6826,7 @@ fn load_spec_component_mesh(
     surface: &SpecSurface,
     surface_volume_idcode: Option<&str>,
 ) -> Result<SurfaceMesh> {
-    let mut mesh = SurfaceMesh::from_gifti_path(&surface.path)
+    let mut mesh = SurfaceMesh::from_path(&surface.path)
         .with_context(|| format!("failed to load spec surface {}", surface.path.display()))?;
     apply_spec_surface_metadata(&mut mesh, spec, surface, surface_volume_idcode);
 
@@ -7442,9 +7463,12 @@ fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
 
 fn pick_surface_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     let dialog = dialog_with_start_directory(
-        rfd::FileDialog::new()
-            .set_title("Open surface")
-            .add_filter("GIFTI surface", &["gii"]),
+        rfd::FileDialog::new().set_title("Open surface").add_filter(
+            "Surface",
+            &[
+                "gii", "white", "pial", "inflated", "sphere", "orig", "smoothwm",
+            ],
+        ),
         current_path,
     );
 
@@ -7475,7 +7499,7 @@ fn pick_overlay_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     let dialog = dialog_with_start_directory(
         rfd::FileDialog::new()
             .set_title("Open overlay")
-            .add_filter("GIFTI or SUMA dataset", &["gii", "dset", "niml.dset"]),
+            .add_filter("Surface dataset", &["gii", "stc", "dset", "niml.dset"]),
         current_path,
     );
 
@@ -7619,6 +7643,11 @@ struct HemisphereFilePattern {
 }
 
 const HEMISPHERE_FILE_PATTERNS: &[HemisphereFilePattern] = &[
+    HemisphereFilePattern {
+        left: "-lh.",
+        right: "-rh.",
+        wildcard: "-?h.",
+    },
     HemisphereFilePattern {
         left: "lh.",
         right: "rh.",
@@ -7819,7 +7848,9 @@ fn load_dataset_from_path(
     mesh: &SurfaceMesh,
     gifti_dset_auto_qcalc: bool,
 ) -> Result<Dataset> {
-    if is_niml_dset_path(path) {
+    if is_stc_path(path) {
+        read_stc_dataset(path, &mesh.domain)
+    } else if is_niml_dset_path(path) {
         read_niml_dataset(path, &mesh.domain)
     } else if is_gifti_path(path) {
         read_gifti_dataset_with_auto_qcalc(path, &mesh.domain, gifti_dset_auto_qcalc).or_else(
@@ -8099,7 +8130,7 @@ fn direct_anatomical_shading_colors(mesh: &SurfaceMesh) -> Vec<[f32; 4]> {
         return anatomical_shading_colors(mesh);
     }
 
-    let Ok(parent_mesh) = SurfaceMesh::from_gifti_path(&parent_path) else {
+    let Ok(parent_mesh) = SurfaceMesh::from_path(&parent_path) else {
         return anatomical_shading_colors(mesh);
     };
 
@@ -8148,7 +8179,7 @@ fn component_anatomical_shading_colors(
         return anatomical_shading_colors(mesh);
     }
 
-    let Ok(parent_mesh) = SurfaceMesh::from_gifti_path(&parent_path) else {
+    let Ok(parent_mesh) = SurfaceMesh::from_path(&parent_path) else {
         return anatomical_shading_colors(mesh);
     };
 
@@ -8751,6 +8782,12 @@ fn is_niml_dset_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".niml.dset"))
+}
+
+fn is_stc_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("stc"))
 }
 
 fn is_gifti_path(path: &Path) -> bool {

@@ -411,6 +411,54 @@ impl SurfaceMesh {
         })
     }
 
+    /// Load either a GIFTI surface or a native triangular FreeSurfer surface.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name.ends_with(".gii")
+            || name.ends_with(".gii.gz")
+            || name.ends_with(".gii.dset")
+            || name.ends_with(".gii.dset.gz")
+        {
+            Self::from_gifti_path(path)
+        } else {
+            Self::from_freesurfer_path(path)
+        }
+    }
+
+    pub fn from_freesurfer_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            bail!("{} does not exist", path.display());
+        }
+        let surface = crate::io::read_freesurfer_surface(path)?;
+        let domain =
+            SurfaceDomain::from_triangles(surface.vertices.len(), surface.triangles.clone())?;
+        let bounds = Bounds::from_vertices(&surface.vertices)?;
+        let source_file = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let metadata = SurfaceMetadata::from_geometry(
+            Some(source_file.clone()),
+            label_from_path(&source_file),
+            &surface.vertices,
+            &domain,
+            bounds,
+            3,
+            3,
+        );
+
+        Ok(Self {
+            vertices: surface.vertices,
+            triangles: surface.triangles,
+            domain,
+            bounds,
+            metadata,
+        })
+    }
+
     pub fn vertex_normals(&self) -> Vec<[f32; 3]> {
         let mut normals = vec![Vec3::ZERO; self.vertices.len()];
 

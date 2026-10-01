@@ -16,7 +16,8 @@ AFNI/SUMA.
 `sumaru` is not SUMA, and it is not trying to replace the full AFNI ecosystem.
 It started as an experiment. The nice surprise is that it has become functional
 enough to use like a partial SUMA-style drop-in for common 3D viewing tasks:
-opening GIFTI surfaces, loading `.niml.dset`/`.gii.dset` overlays, stepping
+opening GIFTI or native FreeSurfer surfaces, loading `.niml.dset`/`.gii.dset`
+overlays, stepping
 through `.spec` scenes, drawing or reading `.niml.roi` regions, checking NIfTI
 slice planes, and talking to a running AFNI/SUMA session over NIML.
 
@@ -93,14 +94,15 @@ refreshed as the viewer changes.
 
 ## What Works Right Now
 
-- GIFTI surface/shape/dataset I/O through `gifti-rs` from `PennLINC/gifti-rs`.
+- GIFTI surface/shape/dataset I/O through `gifti-rs` from `PennLINC/gifti-rs`,
+  plus native triangular FreeSurfer surface and MNE STC readers.
 - NIfTI volume I/O through `nifti` from `Enet4/nifti-rs`, plus native AFNI
   HEAD/BRIK volume loading.
 - SUMA `.spec` parsing for the common single-hemisphere and paired-hemisphere
   viewer cases I have been testing.
 - A surface viewer through `winit`, `wgpu`, and `egui`, with overlays, drawn
   ROIs, and paired-hemisphere layouts.
-- A `tc` timecourse mode for MNE-style 3D+time GIFTI overlays, with playback,
+- A `tc` timecourse mode for MNE-style 3D+time GIFTI or STC overlays, with playback,
   baseline correction, response windows, peak/mean/AUC maps, and activation
   thresholds.
 - A `--volume` mode that renders orthogonal NIfTI slice planes in the 3D scene.
@@ -215,6 +217,13 @@ Launch a surface timecourse directly with:
 sumaru tc -i underlay-lh.gii --overlay stc-lh.gii
 ```
 
+Native FreeSurfer geometry and classic MNE STC pairs can be used directly:
+
+```sh
+sumaru tc -i subjects/sample/surf/lh.inflated \
+  --overlay sample-audvis-meg-lh.stc
+```
+
 Use `--overlay-multi` to compare several conditions on the same surfaces:
 
 ```sh
@@ -230,6 +239,12 @@ the partners explicitly; repeat `--overlay-rh` in the same condition order.
 A single hemisphere works normally. `-onestate` controls how multiple surface
 geometry files are grouped and is not needed for multiple timecourse
 conditions.
+
+Sparse STC values are smoothed over the full display mesh by default (10
+topological steps), so a low-resolution source estimate can be viewed on the
+subject's high-resolution FreeSurfer geometry without changing vertex
+numbering. The advanced hidden flags `--stc-sparse` and `--stc-nearest` instead
+show only source vertices or nearest-source patches, respectively.
 
 The bottom timecourse dock drives the existing surface renderer. Move the time
 slider, click the graph, or press **Play** to display each sample's vertex
@@ -528,8 +543,8 @@ the completed-work ledger.
 - `src/spec.rs` parses SUMA `.spec` files into surface groups, states,
   hemisphere labels, resolved surface paths, local domain/curvature parents,
   anatomical flags, and label-dataset references.
-- `src/surface.rs` contains the current surface data model and GIFTI surface
-  adapter. It loads vertices/triangles, validates indices, computes bounds and
+- `src/surface.rs` contains the current surface data model and GIFTI/FreeSurfer
+  surface adapters. It loads vertices/triangles, validates indices, computes bounds and
   normals, records SUMA-inspired domain/metadata/lineage, and stores scalar
   overlay values/ranges without depending on viewer rendering details.
 - `src/viewer/mod.rs` is the viewer core. It sets up the `winit` event loop,
