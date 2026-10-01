@@ -1649,11 +1649,15 @@ impl ViewerState {
                     |ui| {
                         ui.label("Thresh");
                         let threshold_range = self.selected_threshold_range();
-                        changed |= vertical_threshold_bar(
+                        let threshold_interaction = vertical_threshold_bar(
                             ui,
                             &mut self.overlay.render.appearance,
                             threshold_range,
                         );
+                        changed |= threshold_interaction.changed;
+                        if self.timecourse.is_some() {
+                            self.timecourse_threshold_dragging = threshold_interaction.dragging;
+                        }
                         let threshold_detail_available = self.overlay.data.is_loaded()
                             && self.overlay.render.appearance.threshold.enabled;
                         let button_row_size = egui::vec2(

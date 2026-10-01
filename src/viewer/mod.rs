@@ -44,9 +44,9 @@ use crate::dataset::{
 use crate::graph_dataset::read_graph_bucket;
 use crate::instacorr::{InstaCorrOptions, PreparedInstaCorr, prepare_dataset};
 use crate::io::{
-    NimlElement, read_gifti_dataset, read_gifti_dataset_with_auto_qcalc, read_gifti_image,
-    read_niml_dataset, read_niml_dataset_with_label_table, read_niml_roi, read_stc_dataset,
-    write_niml_roi,
+    NimlElement, dataset_is_stc, mark_dataset_as_paired_stc, read_gifti_dataset,
+    read_gifti_dataset_with_auto_qcalc, read_gifti_image, read_niml_dataset,
+    read_niml_dataset_with_label_table, read_niml_roi, read_stc_dataset, write_niml_roi,
 };
 use crate::niml_debug::NimlRecorder;
 use crate::overlay::{
@@ -72,7 +72,7 @@ use mesh::{
     CONTOUR_VERTEX_FLOATS, ContourColorMode, OverlayAppearance, OverlayColorMap,
     OverlayDisplayMode, PreparedGeometry, PreparedGeometryVertex, PreparedSurface,
     PreparedThresholdContour, RoiAppearance, SelectionHighlight, cell_color_chunk_ranges,
-    luminance, sample_colormap, threshold_boundary_luminances,
+    composed_node_color_bytes, luminance, sample_colormap, threshold_boundary_luminances,
 };
 use overlay_load::*;
 use pick::{pick_surface, pick_surface_with_model, screen_ray};
@@ -1541,6 +1541,8 @@ struct ViewerState {
     roi_workspace: RoiWorkspace,
     graph_snapshot: Option<GraphSnapshot>,
     timecourse: Option<TimeCourseState>,
+    /// Enables a color-only preview while the `tc` threshold rail is dragged.
+    timecourse_threshold_dragging: bool,
     sparse_timecourse_display: SparseTimecourseDisplay,
     surface_volume_path: Option<PathBuf>,
     surface_volume_idcode: Option<String>,
@@ -2092,6 +2094,7 @@ impl ViewerState {
             roi_workspace: RoiWorkspace::default(),
             graph_snapshot: None,
             timecourse: None,
+            timecourse_threshold_dragging: false,
             sparse_timecourse_display,
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
@@ -5480,6 +5483,102 @@ impl ViewerState {
         self.refresh_threshold_contour_buffers();
     }
 
+    /// Recolor resident surface buffers without rebuilding geometry or GPU
+    /// resources. Used only for the live `tc` threshold preview.
+    fn upload_timecourse_threshold_colors(&mut self) -> bool {
+        if self.timecourse.is_none() || self.afni_live_overlay_active {
+            return false;
+        }
+
+        let surface_colors = self.visible_anatomical_shading_colors();
+        let overlay_colors = self
+            .visible_overlay()
+            .map(|overlay| overlay.color_cache.colors.clone());
+        let roi_colors = self
+            .visible_roi_layer()
+            .map(|layer| layer.appearance.node_colors.clone());
+        let dim = self.overlay.render.appearance.dim;
+
+        if self.has_component_surface() {
+            let component_info = {
+                let Some(scene) = self.surface_scene.as_ref() else {
+                    return false;
+                };
+                let Some(surface) = scene.surfaces.get(scene.active_index) else {
+                    return false;
+                };
+                let mut node_offset = 0usize;
+                let mut info = Vec::with_capacity(surface.components.len());
+                for component in &surface.components {
+                    let Some(mesh) = component.mesh.as_ref() else {
+                        return false;
+                    };
+                    info.push((component.side.clone(), node_offset, mesh.vertices.len()));
+                    node_offset += mesh.vertices.len();
+                }
+                info
+            };
+            let Some(render_set) = self.surface_render_set.as_ref() else {
+                return false;
+            };
+            if render_set.instances.len() != component_info.len() {
+                return false;
+            }
+
+            let mut writes = Vec::with_capacity(component_info.len());
+            for (instance, (side, node_start, node_count)) in
+                render_set.instances.iter().zip(component_info)
+            {
+                if instance.side != side {
+                    return false;
+                }
+                let node_end = node_start + node_count;
+                let colors = composed_node_color_bytes(
+                    node_count,
+                    surface_colors
+                        .as_deref()
+                        .and_then(|colors| colors.get(node_start..node_end)),
+                    overlay_colors
+                        .as_deref()
+                        .and_then(|colors| colors.get(node_start..node_end)),
+                    dim,
+                    roi_colors
+                        .as_deref()
+                        .and_then(|colors| colors.get(node_start..node_end)),
+                );
+                // Selection vertices, when present, trail the base mesh. Keep
+                // their existing colors while updating this base-node prefix.
+                if colors.len() > instance.color_bytes_len {
+                    return false;
+                }
+                writes.push((instance.color_buffer.clone(), colors));
+            }
+            for (buffer, colors) in writes {
+                self.queue.write_buffer(&buffer, 0, &colors);
+            }
+            return true;
+        }
+
+        let Some(mesh) = self.mesh.as_ref() else {
+            return false;
+        };
+        let Some(buffers) = self.surface_buffers.as_ref() else {
+            return false;
+        };
+        let colors = composed_node_color_bytes(
+            mesh.vertices.len(),
+            surface_colors.as_deref().map(Vec::as_slice),
+            overlay_colors.as_deref(),
+            dim,
+            roi_colors.as_deref(),
+        );
+        if colors.len() > buffers.color_bytes_len {
+            return false;
+        }
+        self.queue.write_buffer(&buffers.color_buffer, 0, &colors);
+        true
+    }
+
     fn upload_surface_buffers_inner(&mut self) {
         self.pending_cell_color_upload = None;
         let underlay = self.visible_anatomical_shading_colors();
@@ -7691,6 +7790,12 @@ fn paired_overlay_dataset(
     domain: &SurfaceDomain,
     right_node_offset: u32,
 ) -> Result<Dataset> {
+    let left_is_stc = dataset_is_stc(&left);
+    let right_is_stc = dataset_is_stc(&right);
+    ensure!(
+        left_is_stc == right_is_stc,
+        "paired time-series overlays cannot mix STC and non-STC data"
+    );
     ensure!(
         left.columns.len() == right.columns.len(),
         "paired overlays have different column counts: {} vs {}",
@@ -7723,13 +7828,18 @@ fn paired_overlay_dataset(
         && left_row_count as u32 == right_node_offset
         && left_row_count + right_row_count == domain.node_count
     {
-        return Dataset::dense(kind, domain, columns)
+        let dataset = Dataset::dense(kind, domain, columns)
             .map(|dataset| {
                 dataset
                     .with_time_step_seconds(time_step_seconds)
                     .with_time_start_seconds(time_start_seconds)
             })
-            .context("failed to build paired dense overlay dataset");
+            .context("failed to build paired dense overlay dataset")?;
+        return Ok(if left_is_stc {
+            mark_dataset_as_paired_stc(dataset)
+        } else {
+            dataset
+        });
     }
 
     let mut node_indices = Vec::with_capacity(left_row_count + right_row_count);
@@ -7744,13 +7854,18 @@ fn paired_overlay_dataset(
         node_indices.extend((0..right_row_count as u32).map(|node| node + right_node_offset));
     }
 
-    Dataset::sparse(kind, domain, node_indices, columns)
+    let dataset = Dataset::sparse(kind, domain, node_indices, columns)
         .map(|dataset| {
             dataset
                 .with_time_step_seconds(time_step_seconds)
                 .with_time_start_seconds(time_start_seconds)
         })
-        .context("failed to build paired overlay dataset")
+        .context("failed to build paired overlay dataset")?;
+    Ok(if left_is_stc {
+        mark_dataset_as_paired_stc(dataset)
+    } else {
+        dataset
+    })
 }
 
 fn paired_time_step(left: Option<f64>, right: Option<f64>) -> Result<Option<f64>> {
@@ -9437,11 +9552,17 @@ fn column_option_label(options: &[OverlayColumnOption], selection: Option<usize>
         .map_or_else(|| "none".to_string(), |option| option.label.clone())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ThresholdBarInteraction {
+    changed: bool,
+    dragging: bool,
+}
+
 fn vertical_threshold_bar(
     ui: &mut egui::Ui,
     appearance: &mut OverlayAppearance,
     threshold_range: ValueRange,
-) -> bool {
+) -> ThresholdBarInteraction {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(54.0, OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS),
         egui::Sense::click_and_drag(),
@@ -9449,7 +9570,10 @@ fn vertical_threshold_bar(
     let painter = ui.painter_at(rect);
     let bar_rect = rect.shrink2(egui::vec2(12.0, 4.0));
     let steps = 80;
-    let mut changed = false;
+    let mut interaction = ThresholdBarInteraction {
+        dragging: response.dragged(),
+        ..Default::default()
+    };
 
     for step in 0..steps {
         let t0 = step as f32 / steps as f32;
@@ -9480,8 +9604,11 @@ fn vertical_threshold_bar(
         let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
         appearance.threshold.value = threshold_value_from_bar_y(bar_rect, min, max, position.y);
         appearance.threshold.enabled = true;
-        changed = true;
+        interaction.changed = true;
     }
+    // Always issue a commit event on release. The live timecourse preview uses
+    // it to perform the deferred contour/cluster refresh through the full path.
+    interaction.changed |= response.drag_stopped();
 
     let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
     let value = appearance.threshold.value.clamp(min, max);
@@ -9502,7 +9629,7 @@ fn vertical_threshold_bar(
         egui::Stroke::new(1.0_f32, marker_color),
     );
 
-    changed
+    interaction
 }
 
 fn file_display(path: Option<&PathBuf>) -> String {

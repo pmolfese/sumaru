@@ -6,6 +6,8 @@ use anyhow::{Context, Result, ensure};
 use crate::dataset::{ColumnData, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds};
 use crate::surface::SurfaceDomain;
 
+const STC_ORIGINATOR_PREFIX: &str = "MNE_STC:";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StcData {
     pub tmin_seconds: f64,
@@ -41,7 +43,8 @@ pub fn read_stc_dataset(path: impl AsRef<Path>, domain: &SurfaceDomain) -> Resul
         .collect::<Result<Vec<_>>>()?;
     let source_name = path
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned());
+        .map(|name| format!("{STC_ORIGINATOR_PREFIX}{}", name.to_string_lossy()))
+        .or_else(|| Some(STC_ORIGINATOR_PREFIX.to_string()));
     let parent_ids = DatasetParentIds {
         originator_id: source_name,
         ..DatasetParentIds::default()
@@ -59,6 +62,20 @@ pub fn read_stc_dataset(path: impl AsRef<Path>, domain: &SurfaceDomain) -> Resul
             .with_time_step_seconds(Some(stc.tstep_seconds))
             .with_parent_ids(parent_ids)
     })
+}
+
+pub fn dataset_is_stc(dataset: &Dataset) -> bool {
+    dataset
+        .parent_ids
+        .originator_id
+        .as_deref()
+        .is_some_and(|originator| originator.starts_with(STC_ORIGINATOR_PREFIX))
+}
+
+pub fn mark_dataset_as_paired_stc(dataset: Dataset) -> Dataset {
+    let mut parent_ids = dataset.parent_ids.clone();
+    parent_ids.originator_id = Some(format!("{STC_ORIGINATOR_PREFIX}paired"));
+    dataset.with_parent_ids(parent_ids)
 }
 
 pub fn parse_stc(bytes: &[u8]) -> Result<StcData> {
