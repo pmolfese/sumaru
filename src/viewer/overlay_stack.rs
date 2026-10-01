@@ -110,6 +110,10 @@ impl ViewerState {
         if let Some(transfer) = transfer {
             self.apply_overlay_threshold_transfer(transfer);
         }
+        if let Some(timecourse) = self.timecourse.as_mut() {
+            timecourse.activate_condition(index)?;
+            self.apply_timecourse_overlay()?;
+        }
         self.finish_overlay_switch()?;
         Ok(true)
     }
@@ -183,6 +187,56 @@ impl ViewerState {
             })
     }
 
+    /// Resolve SUMA's `switch_dset` label against the ordered overlay stack.
+    /// Exact display/path matches outrank filenames, which outrank the common
+    /// dataset suffix-free form. Equal best matches are rejected as ambiguous.
+    pub(super) fn overlay_index_for_drivesuma_label(&self, label: &str) -> Result<Option<usize>> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Ok(None);
+        }
+
+        let mut best_score = 0_u8;
+        let mut best_indices = Vec::new();
+        for index in 0..self.overlay_stack.slots.len() {
+            let overlay = if self.overlay_stack.active == Some(index) {
+                Some(&self.overlay)
+            } else {
+                self.overlay_stack.slots[index].as_ref()
+            };
+            let score = overlay.map_or(0, |overlay| drivesuma_dataset_match_score(overlay, label));
+            if score > best_score {
+                best_score = score;
+                best_indices.clear();
+                best_indices.push(index);
+            } else if score != 0 && score == best_score {
+                best_indices.push(index);
+            }
+        }
+
+        if best_indices.len() > 1 {
+            bail!(
+                "DriveSuma dataset label {label:?} matches multiple loaded overlays ({})",
+                best_indices
+                    .iter()
+                    .map(|index| (index + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Ok(best_indices.into_iter().next())
+    }
+
+    pub(super) fn select_overlay_by_drivesuma_label(
+        &mut self,
+        label: &str,
+    ) -> Result<Option<bool>> {
+        let Some(index) = self.overlay_index_for_drivesuma_label(label)? else {
+            return Ok(None);
+        };
+        self.select_overlay(index).map(Some)
+    }
+
     fn swap_active_overlay(&mut self, index: usize) {
         if self.overlay_stack.active == Some(index) {
             return;
@@ -245,6 +299,43 @@ impl ViewerState {
             Err(error) => format!("Could not save {}: {error}", path.display()),
         });
     }
+}
+
+fn drivesuma_dataset_match_score(overlay: &ViewerOverlayState, label: &str) -> u8 {
+    if overlay.source.display_name.as_deref() == Some(label) {
+        return 4;
+    }
+
+    let mut score = 0_u8;
+    let paths = overlay.source.path.iter().chain(
+        overlay
+            .source
+            .pair_paths
+            .iter()
+            .flat_map(|pair| pair.left_path.iter().chain(pair.right_path.iter())),
+    );
+    for path in paths {
+        if path == Path::new(label) || path.to_string_lossy() == label {
+            score = score.max(4);
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name == label {
+            score = score.max(3);
+        } else if drivesuma_dataset_stem(file_name) == label {
+            score = score.max(2);
+        }
+    }
+    score
+}
+
+fn drivesuma_dataset_stem(file_name: &str) -> &str {
+    [".niml.dset", ".1D.dset", ".dset"]
+        .into_iter()
+        .find_map(|suffix| file_name.strip_suffix(suffix))
+        .unwrap_or(file_name)
 }
 
 fn overlay_threshold_after_switch(
@@ -336,5 +427,27 @@ mod tests {
             None,
         );
         assert_eq!(transferred.value, 7.0);
+    }
+
+    #[test]
+    fn drivesuma_dataset_matching_accepts_labels_paths_filenames_and_suma_stems() {
+        let mut overlay = ViewerOverlayState::default();
+        overlay.source.display_name = Some("Friendly overlay".to_string());
+        overlay.source.path = Some(PathBuf::from("/data/Net_000.cols.niml.dset"));
+
+        assert_eq!(
+            drivesuma_dataset_match_score(&overlay, "Friendly overlay"),
+            4
+        );
+        assert_eq!(
+            drivesuma_dataset_match_score(&overlay, "/data/Net_000.cols.niml.dset"),
+            4
+        );
+        assert_eq!(
+            drivesuma_dataset_match_score(&overlay, "Net_000.cols.niml.dset"),
+            3
+        );
+        assert_eq!(drivesuma_dataset_match_score(&overlay, "Net_000.cols"), 2);
+        assert_eq!(drivesuma_dataset_match_score(&overlay, "missing"), 0);
     }
 }

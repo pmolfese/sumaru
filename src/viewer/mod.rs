@@ -24,7 +24,9 @@ use winit::window::{Window, WindowId};
 use crate::afni::{
     AfniConnection, AfniConnectionEvent, AfniIncomingMessage, AfniNimlSession, AfniOverlayState,
     AfniPortConfig, AfniRgbaOverlay, AfniRouteAction, AfniSurfaceCrosshair, AfniSurfaceInfo,
-    DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, surface_crosshair_element,
+    DEFAULT_AFNI_HOST, DEFAULT_AFNI_NIML_PORT, DEFAULT_DRIVESUMA_NIML_PORT, DriveSumaAction,
+    DriveSumaColorMap, DriveSumaCommandMode, DriveSumaDisplayMode, DriveSumaServer,
+    DriveSumaServerEvent, DriveSumaThresholdValue, surface_crosshair_element,
 };
 use crate::cluster::{
     ClusterInput, ClusterParams, ClusterSizeMetric, ClusterSummary, ClusterTails, label_clusters,
@@ -54,7 +56,7 @@ use crate::preferences::{AppPreferences, OverlayThresholdSync, default_preferenc
 use crate::roi::{
     Roi, RoiBrushAction, RoiDatum, RoiDrawStatus, RoiDrawingType, RoiElementKind, RoiSource,
 };
-use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, read_spec};
+use crate::spec::{SpecFile, SpecHemisphere, SpecSurface, infer_surface_side, read_spec};
 use crate::stats::AfniStatSpec;
 use crate::surface::{
     AnatomicalCorrectness, NodeMask, NormalDirection, OverlayDataset, SmoothingWeights,
@@ -66,9 +68,10 @@ use gpu::{
     DEPTH_FORMAT, DepthBuffer, choose_alpha_mode, choose_present_mode, choose_surface_format,
 };
 use mesh::{
-    CONTOUR_VERTEX_FLOATS, ContourColorMode, OverlayAppearance, OverlayColorMap, PreparedGeometry,
-    PreparedGeometryVertex, PreparedSurface, PreparedThresholdContour, RoiAppearance,
-    SelectionHighlight, cell_color_chunk_ranges, sample_colormap, threshold_boundary_luminances,
+    CONTOUR_VERTEX_FLOATS, ContourColorMode, OverlayAppearance, OverlayColorMap,
+    OverlayDisplayMode, PreparedGeometry, PreparedGeometryVertex, PreparedSurface,
+    PreparedThresholdContour, RoiAppearance, SelectionHighlight, cell_color_chunk_ranges,
+    luminance, sample_colormap, threshold_boundary_luminances,
 };
 use overlay_load::*;
 use pick::{pick_surface, pick_surface_with_model, screen_ray};
@@ -94,6 +97,7 @@ mod roi;
 mod scene;
 mod scene_objects;
 mod screenshot;
+mod timecourse;
 mod transform;
 mod ui;
 mod volume_view;
@@ -104,6 +108,10 @@ use scene_objects::{
     SceneObject, SceneObjectGpu, SceneObjectPayload, SceneObjectPick, SceneObjectRenderer,
     normalization_model, pick_scene_objects,
 };
+pub use timecourse::{
+    TimeCourseBaseline, TimeCourseControls, TimeCourseDisplay, TimeCourseMeasure,
+};
+use timecourse::{TimeCoursePlotInteraction, TimeCoursePlotMarkers, TimeCourseState};
 use volume_view::{SlicePlane, VolumeView};
 
 impl From<CameraMode> for CameraControlMode {
@@ -369,6 +377,9 @@ pub struct LaunchOptions {
     pub graph_paths: Vec<PathBuf>,
     pub overlay_path: Option<PathBuf>,
     pub overlay_pair_paths: Option<ExplicitOverlayPair>,
+    /// Additional startup overlays, used by multi-condition timecourse mode.
+    pub overlay_paths: Vec<PathBuf>,
+    pub overlay_pair_paths_list: Vec<ExplicitOverlayPair>,
     pub roi_path: Option<PathBuf>,
     pub auto_color_niml: bool,
     pub overlay_subs: Option<Vec<String>>,
@@ -379,6 +390,8 @@ pub struct LaunchOptions {
     pub gpu: bool,
     pub afni: AfniViewerOptions,
     pub niml_record_path: Option<PathBuf>,
+    /// Start in the compact interactive surface-timecourse workflow.
+    pub timecourse_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,6 +418,9 @@ impl ExplicitOverlayPair {
 pub struct AfniViewerOptions {
     pub connect_on_launch: bool,
     pub port_config: AfniPortConfig,
+    pub listen_for_drivesuma: bool,
+    pub drivesuma_port_config: AfniPortConfig,
+    pub drivesuma_command_mode: DriveSumaCommandMode,
 }
 
 impl Default for AfniViewerOptions {
@@ -417,6 +433,14 @@ impl Default for AfniViewerOptions {
                 port_offset: None,
                 port_bloc: None,
             },
+            listen_for_drivesuma: false,
+            drivesuma_port_config: AfniPortConfig {
+                host: DEFAULT_AFNI_HOST.to_string(),
+                port: DEFAULT_DRIVESUMA_NIML_PORT,
+                port_offset: None,
+                port_bloc: None,
+            },
+            drivesuma_command_mode: DriveSumaCommandMode::Sumaru,
         }
     }
 }
@@ -450,6 +474,8 @@ struct ViewerApp {
     initial_graph_paths: Vec<PathBuf>,
     initial_overlay_path: Option<PathBuf>,
     initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
+    initial_overlay_paths: Vec<PathBuf>,
+    initial_overlay_pair_paths_list: Vec<ExplicitOverlayPair>,
     initial_roi_path: Option<PathBuf>,
     initial_auto_color_niml: bool,
     initial_overlay_subs: Option<Vec<String>>,
@@ -460,6 +486,7 @@ struct ViewerApp {
     gpu: bool,
     afni: AfniViewerOptions,
     niml_record_path: Option<PathBuf>,
+    initial_timecourse_mode: bool,
     event_proxy: EventLoopProxy<ViewerEvent>,
     state: Option<ViewerState>,
     setup_error: Option<anyhow::Error>,
@@ -479,6 +506,8 @@ impl ViewerApp {
             initial_graph_paths: options.graph_paths,
             initial_overlay_path: options.overlay_path,
             initial_overlay_pair_paths: options.overlay_pair_paths,
+            initial_overlay_paths: options.overlay_paths,
+            initial_overlay_pair_paths_list: options.overlay_pair_paths_list,
             initial_roi_path: options.roi_path,
             initial_auto_color_niml: options.auto_color_niml,
             initial_overlay_subs: options.overlay_subs,
@@ -489,6 +518,7 @@ impl ViewerApp {
             gpu: options.gpu,
             afni: options.afni,
             niml_record_path: options.niml_record_path,
+            initial_timecourse_mode: options.timecourse_mode,
             event_proxy,
             state: None,
             setup_error: None,
@@ -496,10 +526,15 @@ impl ViewerApp {
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let view_title = if self.initial_timecourse_mode {
+            "sumaru tc".to_string()
+        } else {
+            window_title(self.initial_surface_paths.first())
+        };
         let view_window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
-                    .with_title(window_title(self.initial_surface_paths.first()))
+                    .with_title(view_title)
                     .with_inner_size(PhysicalSize::new(1280, 900)),
             )?,
         );
@@ -559,10 +594,13 @@ impl ViewerApp {
                 graph_paths: std::mem::take(&mut self.initial_graph_paths),
                 overlay_path: self.initial_overlay_path.take(),
                 overlay_pair_paths: self.initial_overlay_pair_paths.take(),
+                overlay_paths: std::mem::take(&mut self.initial_overlay_paths),
+                overlay_pair_paths_list: std::mem::take(&mut self.initial_overlay_pair_paths_list),
                 roi_path: self.initial_roi_path.take(),
                 auto_color_niml: self.initial_auto_color_niml,
                 overlay_subs: self.initial_overlay_subs.take(),
                 overlay_p_value: self.initial_overlay_p_value.take(),
+                timecourse_mode: self.initial_timecourse_mode,
             },
             self.verbose,
             self.preload,
@@ -777,7 +815,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ViewerEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ViewerEvent) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -800,6 +838,28 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                         state.view_window().request_redraw();
                     }
                     state.view_window().request_redraw();
+                }
+            }
+            ViewerEvent::DriveSumaCommandsReady => {
+                state
+                    .drivesuma_work_scheduled
+                    .store(false, Ordering::Release);
+                let changed = state.drain_drivesuma_events();
+                if state.drivesuma_quit_requested {
+                    event_loop.exit();
+                    return;
+                }
+                if changed {
+                    state.control_window().request_redraw();
+                    if !state.view.occluded {
+                        state.view_window().request_redraw();
+                    }
+                    if state.controller.panels.roi_controller_open {
+                        state.roi_control_window().request_redraw();
+                    }
+                    if state.graph_matrix_window_open() {
+                        state.graph_window().request_redraw();
+                    }
                 }
             }
             ViewerEvent::SceneStatsReady => {
@@ -1295,10 +1355,13 @@ struct InitialScene {
     graph_paths: Vec<PathBuf>,
     overlay_path: Option<PathBuf>,
     overlay_pair_paths: Option<ExplicitOverlayPair>,
+    overlay_paths: Vec<PathBuf>,
+    overlay_pair_paths_list: Vec<ExplicitOverlayPair>,
     roi_path: Option<PathBuf>,
     auto_color_niml: bool,
     overlay_subs: Option<Vec<String>>,
     overlay_p_value: Option<f64>,
+    timecourse_mode: bool,
 }
 
 struct SurfaceRenderPipelines {
@@ -1331,13 +1394,68 @@ struct ThresholdContourCacheKey {
     scene_generation: u64,
     surface_id: Option<SurfaceId>,
     overlay_data_generation: u64,
-    threshold: Threshold,
+    threshold: Option<Threshold>,
+    display_mode: OverlayDisplayMode,
+    dataset_inputs: Option<(OverlayColorMap, ValueRange)>,
     pair_layout: HemisphereLayoutState,
     pair_visibility: PairVisibility,
     contrast_inputs: Option<(OverlayColorMap, ValueRange)>,
     /// Present when C is active, so changing cluster parameters regenerates the
     /// contour rather than leaving it outlining rejected blobs.
     cluster_params: Option<ClusterParams>,
+}
+
+/// Scalar boundaries used for SUMA-style dataset contours.
+///
+/// Continuous maps in Sumaru are interpolated rather than pane-based, so they
+/// do not have SUMA's intrinsic palette-row boundaries. Ten evenly spaced
+/// bands give `Dsp Con` a stable, useful equivalent. Label maps instead use
+/// the midpoints between their actual integer keys, preserving region edges.
+fn dataset_contour_levels(
+    values: &[f32],
+    range: ValueRange,
+    colormap: OverlayColorMap,
+) -> (Vec<f64>, Vec<f32>) {
+    let levels = if colormap == OverlayColorMap::DiscreteLabels {
+        let mut unique: Vec<f32> = values
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        unique.sort_by(f32::total_cmp);
+        unique.dedup_by(|a, b| *a == *b);
+        unique
+            .windows(2)
+            .take(256)
+            .map(|pair| f64::from(pair[0]) + f64::from(pair[1] - pair[0]) * 0.5)
+            .collect()
+    } else {
+        let low = range.min.min(range.max);
+        let high = range.min.max(range.max);
+        let span = high - low;
+        if !span.is_finite() || span <= f32::EPSILON {
+            Vec::new()
+        } else {
+            (1..10)
+                .map(|band| f64::from(low + span * band as f32 / 10.0))
+                .collect()
+        }
+    };
+
+    let span = range.max - range.min;
+    let luminances = levels
+        .iter()
+        .map(|level| {
+            let t = if span.is_finite() && span.abs() > f32::EPSILON {
+                ((*level as f32 - range.min) / span).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            let color = sample_colormap(colormap, t);
+            luminance([color[0], color[1], color[2]])
+        })
+        .collect();
+    (levels, luminances)
 }
 
 struct ViewerState {
@@ -1404,6 +1522,7 @@ struct ViewerState {
     roi_layer: Option<RoiLayer>,
     roi_workspace: RoiWorkspace,
     graph_snapshot: Option<GraphSnapshot>,
+    timecourse: Option<TimeCourseState>,
     surface_volume_path: Option<PathBuf>,
     surface_volume_idcode: Option<String>,
     /// Loaded display volume and its slice-plane render state (`--volume` mode).
@@ -1432,6 +1551,7 @@ struct ViewerState {
     event_proxy: EventLoopProxy<ViewerEvent>,
     afni_options: AfniViewerOptions,
     afni_connection: Option<AfniConnection>,
+    drivesuma_server: Option<DriveSumaServer>,
     afni_session: AfniNimlSession,
     afni_recorder: Option<NimlRecorder>,
     pending_afni_surface_registrations: VecDeque<PendingAfniSurfaceRegistration>,
@@ -1441,6 +1561,8 @@ struct ViewerState {
     pending_cell_color_upload: Option<PendingCellColorUpload>,
     deferred_afni_rgba_overlays: Vec<AfniRgbaOverlay>,
     afni_work_scheduled: Arc<AtomicBool>,
+    drivesuma_work_scheduled: Arc<AtomicBool>,
+    drivesuma_quit_requested: bool,
     afni_live_overlay_active: bool,
     /// Last applied `SUMA_irgba` payload hash per source surface idcode. AFNI
     /// resends identical colorizations on every redraw; this lets us skip the
@@ -1495,10 +1617,13 @@ impl ViewerState {
             graph_paths: initial_graph_paths,
             overlay_path: initial_overlay_path,
             overlay_pair_paths: initial_overlay_pair_paths,
+            overlay_paths: initial_overlay_paths,
+            overlay_pair_paths_list: initial_overlay_pair_paths_list,
             roi_path: initial_roi_path,
             auto_color_niml: initial_auto_color_niml,
             overlay_subs: initial_overlay_subs,
             overlay_p_value: initial_overlay_p_value,
+            timecourse_mode: initial_timecourse_mode,
         } = scene;
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
@@ -1946,6 +2071,7 @@ impl ViewerState {
             roi_layer: None,
             roi_workspace: RoiWorkspace::default(),
             graph_snapshot: None,
+            timecourse: None,
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             volume_view: None,
@@ -1962,6 +2088,7 @@ impl ViewerState {
             event_proxy,
             afni_options,
             afni_connection: None,
+            drivesuma_server: None,
             afni_session: AfniNimlSession::new(),
             afni_recorder,
             pending_afni_surface_registrations: VecDeque::new(),
@@ -1971,6 +2098,8 @@ impl ViewerState {
             pending_cell_color_upload: None,
             deferred_afni_rgba_overlays: Vec::new(),
             afni_work_scheduled: Arc::new(AtomicBool::new(false)),
+            drivesuma_work_scheduled: Arc::new(AtomicBool::new(false)),
+            drivesuma_quit_requested: false,
             afni_live_overlay_active: false,
             afni_rgba_signatures: HashMap::new(),
             sent_crosshair_node: None,
@@ -2029,11 +2158,26 @@ impl ViewerState {
         } else if initial_auto_color_niml {
             state.load_auto_niml_overlay_for_active_surface()?;
         }
+        for path in initial_overlay_paths {
+            state.load_overlay_path(path)?;
+        }
+        for pair in initial_overlay_pair_paths_list {
+            state.load_overlay_pair_paths(pair)?;
+        }
+        if initial_timecourse_mode {
+            if state.overlay_count() > 1 {
+                state.select_overlay(0)?;
+            }
+            state.initialize_timecourse_mode()?;
+        }
         if let Some(path) = initial_roi_path {
             state.load_roi_path(path)?;
         }
         state.arm_startup_redraw_guard();
         state.log_status("Viewer initialized.");
+        if state.afni_options.listen_for_drivesuma {
+            state.start_drivesuma_server()?;
+        }
         if state.afni_options.connect_on_launch
             && let Err(error) = state.connect_afni_talk()
         {
@@ -2150,6 +2294,7 @@ impl ViewerState {
 
     fn update(&mut self) {
         let now = Instant::now();
+        self.update_timecourse_playback(now);
         let elapsed = now.saturating_duration_since(self.camera_tick_at);
         self.camera_tick_at = now;
         if self.camera.tick_momentum(elapsed) {
@@ -2872,21 +3017,41 @@ impl ViewerState {
             range.max = range.min + 1.0;
         }
 
+        if let Some(brightness_range) = self.overlay.render.appearance.brightness_range.as_mut() {
+            if !brightness_range.min.is_finite() || !brightness_range.max.is_finite() {
+                self.overlay.render.appearance.brightness_range = None;
+            } else if brightness_range.max < brightness_range.min {
+                std::mem::swap(&mut brightness_range.min, &mut brightness_range.max);
+            }
+        }
+        let brightness_scale = &mut self.overlay.render.appearance.brightness_scale;
+        if brightness_scale.iter().any(|value| !value.is_finite()) {
+            *brightness_scale = [0.0, 1.0];
+        } else if brightness_scale[1] < brightness_scale[0] {
+            brightness_scale.swap(0, 1);
+        }
+
         self.overlay.render.appearance.dim = self.overlay.render.appearance.dim.clamp(0.0, 1.5);
         self.overlay.render.appearance.opacity =
             self.overlay.render.appearance.opacity.clamp(0.0, 1.0);
 
-        let (threshold_min, threshold_max) = threshold_bounds(
-            self.selected_threshold_range(),
-            self.overlay.render.appearance.threshold.absolute,
-        );
-        self.overlay.render.appearance.threshold.value = self
-            .overlay
-            .render
-            .appearance
-            .threshold
-            .value
-            .clamp(threshold_min, threshold_max);
+        // A timecourse threshold is global across samples. Do not clamp it to
+        // the value range of the current sample: doing so would silently move
+        // the threshold during playback (and make an intentionally empty map
+        // impossible at a quiet time point).
+        if self.timecourse.is_none() {
+            let (threshold_min, threshold_max) = threshold_bounds(
+                self.selected_threshold_range(),
+                self.overlay.render.appearance.threshold.absolute,
+            );
+            self.overlay.render.appearance.threshold.value = self
+                .overlay
+                .render
+                .appearance
+                .threshold
+                .value
+                .clamp(threshold_min, threshold_max);
+        }
     }
 
     fn fit_control_window(
@@ -3219,6 +3384,16 @@ impl ViewerState {
                         self.set_error(error);
                     }
                 }
+                ViewerCommand::SetTimeCourseControls(controls) => {
+                    if let Err(error) = self.set_timecourse_controls(controls) {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::PreviewTimeCourseControls(controls) => {
+                    if let Err(error) = self.preview_timecourse_controls(controls) {
+                        self.set_error(error);
+                    }
+                }
                 ViewerCommand::SelectOverlay(index) => {
                     if let Err(error) = self.select_overlay(index) {
                         self.set_error(error);
@@ -3264,6 +3439,21 @@ impl ViewerState {
                 }
                 ViewerCommand::ToggleCameraMomentum => self.toggle_camera_momentum(),
                 ViewerCommand::ToggleBackground => self.controller.display.background.toggle(),
+                ViewerCommand::ToggleAfniTalk => {
+                    if let Err(error) = self.toggle_afni_talk() {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::ToggleHemisphereVisibility(side) => {
+                    if let Err(error) = self.toggle_pair_hemisphere_visibility(side) {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::ToggleSumaComponentVisibility(side) => {
+                    if let Err(error) = self.toggle_suma_component_visibility(side) {
+                        self.set_error(error);
+                    }
+                }
                 ViewerCommand::SetAnatomicalShadingVisible(visible) => {
                     self.controller.display.anatomical_shading_visible = visible;
                     self.upload_surface_buffers();
@@ -3515,6 +3705,17 @@ impl ViewerState {
                 ViewerCommand::AddVolumeCoronal => self.add_volume_slice(SlicePlane::Coronal),
                 ViewerCommand::AddVolumeSagittal => self.add_volume_slice(SlicePlane::Sagittal),
                 ViewerCommand::RemoveSelectedVolumeSlice => self.remove_selected_volume_slice(),
+                ViewerCommand::SetVolumeSliceOpacity(opacity) => {
+                    if let Some(view) = self.volume_view.as_mut()
+                        && view.set_opacity(opacity)
+                    {
+                        self.view.window.request_redraw();
+                        self.log_status(format!(
+                            "Volume slice opacity: {:.0}%.",
+                            opacity.clamp(0.0, 1.0) * 100.0
+                        ));
+                    }
+                }
                 ViewerCommand::CopyVertexIndex => self.copy_vertex_index(),
                 ViewerCommand::CopyXyzRas => self.copy_picked_xyz(CoordConvention::Ras),
                 ViewerCommand::CopyXyzRai => self.copy_picked_xyz(CoordConvention::Rai),
@@ -4518,7 +4719,7 @@ impl ViewerState {
         {
             return None;
         }
-        if let Some(pick) = self.pick_active_pair_surface_at_cursor(cursor) {
+        if let Some(pick) = self.pick_active_component_surface_at_cursor(cursor) {
             return Some(pick);
         }
 
@@ -4532,30 +4733,26 @@ impl ViewerState {
         )
     }
 
-    fn pick_active_pair_surface_at_cursor(&self, cursor: (f64, f64)) -> Option<SurfacePick> {
-        if !self.has_both_scene() {
+    fn pick_active_component_surface_at_cursor(&self, cursor: (f64, f64)) -> Option<SurfacePick> {
+        if !self.has_component_surface() {
             return None;
         }
         let scene = self.surface_scene.as_ref()?;
         let surface = scene.surfaces.get(scene.active_index)?;
-        let matrices = pair_hemisphere_matrices(
-            &surface.components,
-            self.controller.display.pair_state,
-            self.controller.display.pair_visibility,
-        );
+        let matrices = self.active_component_model_matrices();
         let mut best = None;
         let mut best_distance = f32::INFINITY;
         let mut node_offset = 0u32;
         let mut face_offset = 0usize;
 
-        for component in &surface.components {
+        for (component_index, component) in surface.components.iter().enumerate() {
             let mesh = component.mesh.as_ref()?;
             if self
                 .controller
                 .display
                 .pair_visibility
                 .is_visible(&component.side)
-                && let Some((_, matrix)) = matrices.iter().find(|(side, _)| *side == component.side)
+                && let Some(matrix) = matrices.get(component_index)
                 && let Some((pick, distance)) = pick_surface_with_model(
                     mesh,
                     self.overlay.data.node_values(),
@@ -4805,12 +5002,13 @@ impl ViewerState {
                 node_offset: *node_offset,
                 side,
                 neighbors: topology.node_neighbors,
+                positions: mesh.vertices.clone(),
                 node_areas: mesh.node_areas(),
             });
             *node_offset += mesh.vertices.len();
         };
 
-        if self.has_both_scene() {
+        if self.has_component_surface() {
             if let Some(surface) = self
                 .surface_scene
                 .as_ref()
@@ -4911,6 +5109,7 @@ impl ViewerState {
                     passes: &passes,
                     tail_values: component_thresholds,
                     neighbors: &component.neighbors,
+                    positions: &component.positions,
                     node_areas: &component.node_areas,
                     values: component_values,
                 },
@@ -4944,8 +5143,10 @@ impl ViewerState {
 
     fn refresh_threshold_contour_buffers(&mut self) {
         let appearance = self.overlay.render.appearance;
-        if !appearance.boxed_threshold
-            || !appearance.threshold.enabled
+        let draw_threshold = appearance.boxed_threshold && appearance.threshold.enabled;
+        let draw_dataset = appearance.display_mode.shows_contour();
+        if (!draw_threshold && !draw_dataset)
+            || appearance.display_mode == OverlayDisplayMode::Hidden
             || !self.controller.overlay.visible
             || self.afni_live_overlay_active
             || !self.overlay.data.is_loaded()
@@ -4955,12 +5156,14 @@ impl ViewerState {
             return;
         }
 
-        let (threshold, _) = threshold_and_mask_from_appearance(appearance);
+        let threshold = draw_threshold.then(|| threshold_and_mask_from_appearance(appearance).0);
         let key = ThresholdContourCacheKey {
             scene_generation: self.scene_generation,
             surface_id: self.mesh.as_ref().map(|mesh| mesh.metadata.id.clone()),
             overlay_data_generation: self.overlay_data_generation,
             threshold,
+            display_mode: appearance.display_mode,
+            dataset_inputs: draw_dataset.then_some((appearance.colormap, appearance.range)),
             pair_layout: self.controller.display.pair_state,
             pair_visibility: self.controller.display.pair_visibility,
             contrast_inputs: (appearance.contour.color_mode == ContourColorMode::AutoContrast)
@@ -4970,25 +5173,43 @@ impl ViewerState {
         if self.threshold_contour_key.as_ref() == Some(&key) {
             return;
         }
-        let Some(threshold_values) = self.active_threshold_scalar_values() else {
+        let Some(intensity_values) = self
+            .overlay
+            .data
+            .node_values()
+            .map(|values| values.values.clone())
+        else {
             self.threshold_contour_instances.clear();
             self.threshold_contour_key = Some(key);
             return;
         };
+        let threshold_values = draw_threshold
+            .then(|| self.active_threshold_scalar_values())
+            .flatten();
+        if draw_threshold && threshold_values.is_none() {
+            self.threshold_contour_instances.clear();
+            self.threshold_contour_key = Some(key);
+            return;
+        }
         // Auto-contrast needs to know the overlay color the line will sit on,
         // which is the colormap sampled at each threshold boundary.
-        let boundary_luminances =
-            threshold_boundary_luminances(threshold, appearance.range, appearance.colormap);
+        let boundary_luminances = threshold
+            .map(|threshold| {
+                threshold_boundary_luminances(threshold, appearance.range, appearance.colormap)
+            })
+            .unwrap_or_default();
+        let (dataset_levels, dataset_luminances) = if draw_dataset {
+            dataset_contour_levels(&intensity_values, appearance.range, appearance.colormap)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         // With C active the contour follows surviving clusters, not the raw
         // threshold crossing.
         let cluster_labels = self.cluster_labels.clone();
 
         let mut prepared = Vec::new();
-        if self.has_both_scene() {
-            let matrices = self.active_pair_matrices_for_layout(
-                self.controller.display.pair_state,
-                self.controller.display.pair_visibility,
-            );
+        if self.has_component_surface() {
+            let matrices = self.active_component_model_matrices();
             let Some(scene) = self.surface_scene.as_ref() else {
                 self.threshold_contour_instances.clear();
                 self.threshold_contour_key = Some(key);
@@ -5001,52 +5222,82 @@ impl ViewerState {
             };
             let mut node_offset = 0usize;
             let mut components_complete = true;
-            for component in &surface.components {
+            for (component_index, component) in surface.components.iter().enumerate() {
                 let Some(mesh) = component.mesh.as_ref() else {
                     components_complete = false;
                     break;
                 };
                 let node_end = node_offset.saturating_add(mesh.vertices.len());
-                let Some(component_values) = threshold_values.get(node_offset..node_end) else {
+                let Some(component_intensities) = intensity_values.get(node_offset..node_end)
+                else {
                     components_complete = false;
                     break;
                 };
                 let normals = mesh.vertex_normals();
                 let geometry =
                     prepared_geometry_from_raw_component(&mesh.vertices, &normals, &mesh.triangles);
-                let contour = PreparedThresholdContour::from_geometry(
-                    &geometry,
-                    component_values,
-                    threshold,
-                    &boundary_luminances,
-                    cluster_labels
-                        .as_ref()
-                        .and_then(|labels| labels.get(node_offset..node_end)),
-                );
-                if !contour.is_empty() {
-                    let model_matrix = matrices
-                        .iter()
-                        .find(|(side, _)| *side == component.side)
-                        .map(|(_, matrix)| *matrix)
-                        .unwrap_or(Mat4::IDENTITY);
-                    prepared.push((contour, component.side.clone(), model_matrix));
+                let model_matrix = matrices
+                    .get(component_index)
+                    .copied()
+                    .unwrap_or(Mat4::IDENTITY);
+                if draw_dataset {
+                    let contour = PreparedThresholdContour::from_geometry_levels(
+                        &geometry,
+                        component_intensities,
+                        &dataset_levels,
+                        &dataset_luminances,
+                    );
+                    if !contour.is_empty() {
+                        prepared.push((contour, component.side.clone(), model_matrix));
+                    }
+                }
+                if let (Some(threshold), Some(threshold_values)) = (threshold, &threshold_values) {
+                    let Some(component_values) = threshold_values.get(node_offset..node_end) else {
+                        components_complete = false;
+                        break;
+                    };
+                    let contour = PreparedThresholdContour::from_geometry(
+                        &geometry,
+                        component_values,
+                        threshold,
+                        &boundary_luminances,
+                        cluster_labels
+                            .as_ref()
+                            .and_then(|labels| labels.get(node_offset..node_end)),
+                    );
+                    if !contour.is_empty() {
+                        prepared.push((contour, component.side.clone(), model_matrix));
+                    }
                 }
                 node_offset = node_end;
             }
-            if !components_complete || node_offset != threshold_values.len() {
+            if !components_complete || node_offset != intensity_values.len() {
                 prepared.clear();
             }
         } else if let Some(mesh) = self.mesh.as_ref() {
             let geometry = PreparedGeometry::from_surface(mesh);
-            let contour = PreparedThresholdContour::from_geometry(
-                &geometry,
-                &threshold_values,
-                threshold,
-                &boundary_luminances,
-                cluster_labels.as_deref().map(Vec::as_slice),
-            );
-            if !contour.is_empty() {
-                prepared.push((contour, SurfaceSide::Unknown, Mat4::IDENTITY));
+            if draw_dataset {
+                let contour = PreparedThresholdContour::from_geometry_levels(
+                    &geometry,
+                    &intensity_values,
+                    &dataset_levels,
+                    &dataset_luminances,
+                );
+                if !contour.is_empty() {
+                    prepared.push((contour, SurfaceSide::Unknown, Mat4::IDENTITY));
+                }
+            }
+            if let (Some(threshold), Some(threshold_values)) = (threshold, &threshold_values) {
+                let contour = PreparedThresholdContour::from_geometry(
+                    &geometry,
+                    threshold_values,
+                    threshold,
+                    &boundary_luminances,
+                    cluster_labels.as_deref().map(Vec::as_slice),
+                );
+                if !contour.is_empty() {
+                    prepared.push((contour, SurfaceSide::Unknown, Mat4::IDENTITY));
+                }
             }
         }
 
@@ -5243,8 +5494,9 @@ impl ViewerState {
             return;
         }
 
-        if self.has_both_scene()
-            && self.upload_paired_surface_render_set(surface_colors.as_deref().map(Vec::as_slice))
+        if self.has_component_surface()
+            && self
+                .upload_component_surface_render_set(surface_colors.as_deref().map(Vec::as_slice))
         {
             return;
         }
@@ -5513,7 +5765,7 @@ impl ViewerState {
         self.upload_selection_highlight_buffer();
     }
 
-    fn upload_paired_surface_render_set(&mut self, surface_colors: Option<&[[f32; 4]]>) -> bool {
+    fn upload_component_surface_render_set(&mut self, surface_colors: Option<&[[f32; 4]]>) -> bool {
         struct RawRenderComponent {
             side: SurfaceSide,
             node_offset: u32,
@@ -5527,12 +5779,12 @@ impl ViewerState {
             let Some(scene) = self.surface_scene.as_mut() else {
                 return false;
             };
-            if scene.hemisphere != SpecHemisphere::Both {
-                return false;
-            }
             let Some(surface) = scene.surfaces.get_mut(scene.active_index) else {
                 return false;
             };
+            if surface.components.len() <= 1 {
+                return false;
+            }
 
             let mut raw = Vec::with_capacity(surface.components.len());
             let mut node_offset = 0u32;
@@ -5560,10 +5812,6 @@ impl ViewerState {
             }
             raw
         };
-        if raw.len() != 2 {
-            return false;
-        }
-
         let visible_overlay = (!self.afni_live_overlay_active)
             .then(|| self.visible_overlay())
             .flatten();
@@ -5574,13 +5822,11 @@ impl ViewerState {
             .map(|layer| layer.appearance.node_colors.clone());
         let selection = self.controller.interaction.pick;
         let dim = self.overlay.render.appearance.dim;
-        let layout = self.controller.display.pair_state;
-        let visibility = self.controller.display.pair_visibility;
-        let matrices = self.active_pair_matrices_for_layout(layout, visibility);
+        let matrices = self.active_component_model_matrices();
         let selection_scale = selection_scale_from_model_matrices(&matrices);
 
         let mut instances = Vec::with_capacity(raw.len());
-        for component in raw {
+        for (component_index, component) in raw.into_iter().enumerate() {
             let node_start = component.node_offset as usize;
             let node_end = node_start + component.positions.len();
             let surface_color_slice =
@@ -5604,9 +5850,8 @@ impl ViewerState {
                 &component.triangles,
             );
             let model_matrix = matrices
-                .iter()
-                .find(|(side, _)| *side == component.side)
-                .map(|(_, matrix)| *matrix)
+                .get(component_index)
+                .copied()
                 .unwrap_or(Mat4::IDENTITY);
             if use_afni_cell_colors
                 && afni_cell_color_needs_chunking(
@@ -5725,7 +5970,7 @@ impl ViewerState {
     }
 
     fn upload_selection_highlight_buffer(&mut self) {
-        if self.has_both_scene() {
+        if self.has_component_surface() {
             self.selection_instance = None;
             return;
         }
@@ -6109,10 +6354,10 @@ fn selection_for_component(
     ))
 }
 
-fn selection_scale_from_model_matrices(matrices: &[(SurfaceSide, Mat4)]) -> f32 {
+fn selection_scale_from_model_matrices(matrices: &[Mat4]) -> f32 {
     matrices
         .iter()
-        .find_map(|(_, matrix)| {
+        .find_map(|matrix| {
             let inv_radius = matrix.transform_vector3(Vec3::X).length();
             (inv_radius.is_finite() && inv_radius > f32::EPSILON).then_some(1.0 / inv_radius)
         })
@@ -6208,6 +6453,7 @@ struct ControlUiOutput {
 #[derive(Debug, Clone, Copy)]
 enum ViewerEvent {
     AfniMessagesReady,
+    DriveSumaCommandsReady,
     SceneStatsReady,
     InstaCorrComputed,
 }
@@ -6254,7 +6500,16 @@ struct GraphSnapshot {
     surface_label: String,
     overlay_label: String,
     points: Vec<GraphPoint>,
+    active_series_index: usize,
+    comparison_series: Vec<GraphSeries>,
     y_range: ValueRange,
+}
+
+#[derive(Debug, Clone)]
+struct GraphSeries {
+    label: String,
+    color_index: usize,
+    points: Vec<GraphPoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -6467,6 +6722,7 @@ fn synthetic_surface_spec(paths: &[PathBuf], onestate: bool) -> SpecFile {
                 states.push(state.clone());
             }
             let name = file_name_display(path);
+            let side = infer_surface_side(&name);
             SpecSurface {
                 name: name.clone(),
                 path: path.clone(),
@@ -6476,7 +6732,7 @@ fn synthetic_surface_spec(paths: &[PathBuf], onestate: bool) -> SpecFile {
                 state: Some(state.clone()),
                 raw_state: Some(state),
                 anatomical: Some(true),
-                side: SurfaceSide::Unknown,
+                side,
                 local_domain_parent: None,
                 local_curvature_parent: None,
                 label_dataset: None,
@@ -7303,6 +7559,7 @@ fn single_hemisphere_overlay_dataset(
 ) -> Result<Dataset> {
     let kind = dataset.kind.clone();
     let time_step_seconds = dataset.time_step_seconds;
+    let time_start_seconds = dataset.time_start_seconds;
     let columns = dataset.columns;
     let parent_ids = dataset.parent_ids;
     let row_count = dataset.row_count;
@@ -7322,6 +7579,7 @@ fn single_hemisphere_overlay_dataset(
             dataset
                 .with_parent_ids(parent_ids)
                 .with_time_step_seconds(time_step_seconds)
+                .with_time_start_seconds(time_start_seconds)
         })
         .context("failed to remap hemisphere overlay into the active paired surface")
 }
@@ -7422,6 +7680,7 @@ fn paired_overlay_dataset(
         DatasetKind::Unknown
     };
     let time_step_seconds = paired_time_step(left.time_step_seconds, right.time_step_seconds)?;
+    let time_start_seconds = paired_time_start(left.time_start_seconds, right.time_start_seconds)?;
 
     let columns = left
         .columns
@@ -7436,7 +7695,11 @@ fn paired_overlay_dataset(
         && left_row_count + right_row_count == domain.node_count
     {
         return Dataset::dense(kind, domain, columns)
-            .map(|dataset| dataset.with_time_step_seconds(time_step_seconds))
+            .map(|dataset| {
+                dataset
+                    .with_time_step_seconds(time_step_seconds)
+                    .with_time_start_seconds(time_start_seconds)
+            })
             .context("failed to build paired dense overlay dataset");
     }
 
@@ -7453,7 +7716,11 @@ fn paired_overlay_dataset(
     }
 
     Dataset::sparse(kind, domain, node_indices, columns)
-        .map(|dataset| dataset.with_time_step_seconds(time_step_seconds))
+        .map(|dataset| {
+            dataset
+                .with_time_step_seconds(time_step_seconds)
+                .with_time_start_seconds(time_start_seconds)
+        })
         .context("failed to build paired overlay dataset")
 }
 
@@ -7462,6 +7729,16 @@ fn paired_time_step(left: Option<f64>, right: Option<f64>) -> Result<Option<f64>
         ensure!(
             (left - right).abs() <= 1.0e-9 * left.abs().max(right.abs()).max(1.0),
             "paired time-series overlays have different TR values: {left} vs {right} seconds"
+        );
+    }
+    Ok(left.or(right))
+}
+
+fn paired_time_start(left: Option<f64>, right: Option<f64>) -> Result<Option<f64>> {
+    if let (Some(left), Some(right)) = (left, right) {
+        ensure!(
+            (left - right).abs() <= 1.0e-9 * left.abs().max(right.abs()).max(1.0),
+            "paired time-series overlays have different start times: {left} vs {right} seconds"
         );
     }
     Ok(left.or(right))
@@ -8608,7 +8885,8 @@ fn draw_graph_snapshot(
     ui: &mut egui::Ui,
     snapshot: &GraphSnapshot,
     columns: OverlayColumnSelections,
-) {
+    timecourse: Option<TimeCoursePlotMarkers>,
+) -> Option<TimeCoursePlotInteraction> {
     let available_height = ui.available_height();
     let plot_height = (available_height - 32.0).clamp(
         GRAPH_MIN_PLOT_HEIGHT_POINTS,
@@ -8618,7 +8896,12 @@ fn draw_graph_snapshot(
         ui.available_width().max(GRAPH_MIN_PLOT_WIDTH_POINTS),
         plot_height,
     );
-    let (rect, _) = ui.allocate_exact_size(plot_size, egui::Sense::hover());
+    let sense = if timecourse.is_some() {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(plot_size, sense);
     let painter = ui.painter_at(rect);
     let plot_rect = egui::Rect::from_min_max(
         rect.min + egui::vec2(54.0, 14.0),
@@ -8626,7 +8909,9 @@ fn draw_graph_snapshot(
     );
     let axis_color = egui::Color32::from_rgb(92, 103, 122);
     let grid_color = egui::Color32::from_rgb(43, 50, 62);
-    let line_color = egui::Color32::from_rgb(123, 184, 226);
+    let line_color = timecourse_series_color(snapshot.active_series_index);
+    let threshold_color = egui::Color32::from_rgb(246, 199, 94);
+    let plot_y_range = graph_plot_y_range(snapshot, timecourse);
 
     painter.rect_filled(rect, egui::CornerRadius::same(6), panel_fill_color());
     painter.rect_stroke(
@@ -8635,6 +8920,38 @@ fn draw_graph_snapshot(
         egui::Stroke::new(1.0_f32, border_color()),
         egui::StrokeKind::Outside,
     );
+
+    if let Some(markers) = timecourse {
+        let count = snapshot.points.len().max(1);
+        let sample_x = |sample: usize| {
+            let denominator = count.saturating_sub(1).max(1) as f32;
+            egui::lerp(
+                plot_rect.left()..=plot_rect.right(),
+                sample.min(count - 1) as f32 / denominator,
+            )
+        };
+        let band = |range: [usize; 2], color: egui::Color32| {
+            let half_sample = plot_rect.width() / count.saturating_sub(1).max(1) as f32 * 0.5;
+            let left = (sample_x(range[0]) - half_sample).max(plot_rect.left());
+            let right = (sample_x(range[1]) + half_sample).min(plot_rect.right());
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(left, plot_rect.top()),
+                    egui::pos2(right, plot_rect.bottom()),
+                ),
+                0.0,
+                color,
+            );
+        };
+        band(
+            markers.baseline,
+            egui::Color32::from_rgba_unmultiplied(72, 126, 176, 38),
+        );
+        band(
+            markers.response,
+            egui::Color32::from_rgba_unmultiplied(232, 154, 64, 38),
+        );
+    }
 
     for step in 0..=4 {
         let t = step as f32 / 4.0;
@@ -8662,8 +8979,8 @@ fn draw_graph_snapshot(
         egui::Stroke::new(1.0_f32, axis_color),
     );
 
-    let y_min = snapshot.y_range.min;
-    let y_max = snapshot.y_range.max;
+    let y_min = plot_y_range.min;
+    let y_max = plot_y_range.max;
     painter.text(
         egui::pos2(rect.left() + 8.0, plot_rect.top() - 6.0),
         egui::Align2::LEFT_TOP,
@@ -8679,11 +8996,61 @@ fn draw_graph_snapshot(
         muted_color(),
     );
 
-    let points = graph_plot_positions(snapshot, plot_rect);
+    if let Some(markers) = timecourse {
+        for threshold in timecourse_threshold_lines(markers) {
+            let y = graph_plot_y(threshold, plot_y_range, plot_rect);
+            draw_dashed_horizontal_line(
+                &painter,
+                plot_rect,
+                y,
+                egui::Stroke::new(1.5_f32, threshold_color),
+            );
+        }
+    }
+
+    for series in &snapshot.comparison_series {
+        let series_points = graph_series_plot_positions(&series.points, plot_rect, plot_y_range);
+        for pair in series_points.windows(2) {
+            painter.line_segment(
+                [pair[0].1, pair[1].1],
+                egui::Stroke::new(1.6_f32, timecourse_series_color(series.color_index)),
+            );
+        }
+    }
+    let points = graph_plot_positions(snapshot, plot_rect, plot_y_range);
     for pair in points.windows(2) {
         painter.line_segment(
             [pair[0].1, pair[1].1],
             egui::Stroke::new(2.0_f32, line_color),
+        );
+    }
+
+    if let Some(markers) = timecourse {
+        let denominator = snapshot.points.len().saturating_sub(1).max(1) as f32;
+        let cursor_x = egui::lerp(
+            plot_rect.left()..=plot_rect.right(),
+            markers.cursor.min(snapshot.points.len().saturating_sub(1)) as f32 / denominator,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(cursor_x, plot_rect.top()),
+                egui::pos2(cursor_x, plot_rect.bottom()),
+            ],
+            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+        );
+        painter.text(
+            egui::pos2(plot_rect.left(), plot_rect.bottom() + 8.0),
+            egui::Align2::LEFT_TOP,
+            format!("{:.1} ms", markers.start_seconds * 1000.0),
+            egui::FontId::monospace(10.0),
+            muted_color(),
+        );
+        painter.text(
+            egui::pos2(plot_rect.right(), plot_rect.bottom() + 8.0),
+            egui::Align2::RIGHT_TOP,
+            format!("{:.1} ms", markers.end_seconds * 1000.0),
+            egui::FontId::monospace(10.0),
+            muted_color(),
         );
     }
 
@@ -8698,16 +9065,62 @@ fn draw_graph_snapshot(
         );
     }
 
-    for (index, position) in points.iter().step_by(graph_label_stride(points.len())) {
-        let label = &snapshot.points[*index].label;
-        draw_rotated_graph_label(
-            &painter,
-            egui::pos2(position.x, plot_rect.bottom() + 8.0),
-            &truncate_middle(label, 18),
-        );
+    if timecourse.is_none() {
+        for (index, position) in points.iter().step_by(graph_label_stride(points.len())) {
+            let label = &snapshot.points[*index].label;
+            draw_rotated_graph_label(
+                &painter,
+                egui::pos2(position.x, plot_rect.bottom() + 8.0),
+                &truncate_middle(label, 18),
+            );
+        }
     }
 
     ui.horizontal_wrapped(|ui| {
+        if timecourse.is_some() {
+            if snapshot.comparison_series.is_empty() {
+                graph_legend_chip(
+                    ui,
+                    &truncate_middle(&snapshot.overlay_label, 28),
+                    line_color,
+                )
+                .on_hover_text(&snapshot.overlay_label);
+            } else {
+                ui.label(egui::RichText::new("conditions").color(muted_color()));
+                let condition_count = snapshot.comparison_series.len() + 1;
+                for condition_index in 0..condition_count {
+                    let (label, active) = if condition_index == snapshot.active_series_index {
+                        (snapshot.overlay_label.as_str(), true)
+                    } else if let Some(series) = snapshot
+                        .comparison_series
+                        .iter()
+                        .find(|series| series.color_index == condition_index)
+                    {
+                        (series.label.as_str(), false)
+                    } else {
+                        continue;
+                    };
+                    graph_condition_legend_chip(
+                        ui,
+                        condition_index,
+                        label,
+                        timecourse_series_color(condition_index),
+                        active,
+                    );
+                }
+            }
+            ui.separator();
+            graph_legend_chip(ui, "baseline", egui::Color32::from_rgb(72, 126, 176));
+            graph_legend_chip(ui, "response", egui::Color32::from_rgb(232, 154, 64));
+            ui.label(egui::RichText::new("white line = surface time").color(muted_color()));
+            if timecourse.and_then(|markers| markers.threshold).is_some() {
+                ui.label(
+                    egui::RichText::new("dashed gold = activation threshold")
+                        .color(threshold_color),
+                );
+            }
+            return;
+        }
         graph_legend_chip(ui, "I", egui::Color32::from_rgb(123, 184, 226));
         graph_legend_chip(ui, "T", egui::Color32::from_rgb(246, 199, 94));
         graph_legend_chip(ui, "B", egui::Color32::from_rgb(170, 132, 255));
@@ -8749,6 +9162,49 @@ fn draw_graph_snapshot(
             ));
         }
     });
+
+    timecourse?;
+    let pointer = response.interact_pointer_pos()?;
+    let sample_for_x = |x: f32| {
+        let fraction = ((x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 1.0);
+        (fraction * snapshot.points.len().saturating_sub(1) as f32).round() as usize
+    };
+    let drag_state_id = response.id.with("timecourse_selection_drag");
+    if response.drag_started() {
+        let current = sample_for_x(pointer.x);
+        let start = response
+            .total_drag_delta()
+            .map(|delta| sample_for_x(pointer.x - delta.x))
+            .unwrap_or(current);
+        let baseline = ui.input(|input| input.modifiers.shift);
+        ui.memory_mut(|memory| {
+            memory.data.insert_temp(drag_state_id, (start, baseline));
+        });
+    }
+    if response.dragged() || response.drag_stopped() {
+        let current = sample_for_x(pointer.x);
+        let (start, baseline) = ui
+            .memory(|memory| memory.data.get_temp::<(usize, bool)>(drag_state_id))
+            .unwrap_or((current, ui.input(|input| input.modifiers.shift)));
+        let range = [start.min(current), start.max(current)];
+        if response.drag_stopped() {
+            ui.memory_mut(|memory| {
+                memory.data.remove_temp::<(usize, bool)>(drag_state_id);
+            });
+        }
+        if baseline {
+            Some(TimeCoursePlotInteraction::Baseline {
+                range,
+                commit: response.drag_stopped(),
+            })
+        } else {
+            Some(TimeCoursePlotInteraction::Response(range))
+        }
+    } else if response.clicked() {
+        Some(TimeCoursePlotInteraction::Cursor(sample_for_x(pointer.x)))
+    } else {
+        None
+    }
 }
 
 fn draw_rotated_graph_label(painter: &egui::Painter, anchor: egui::Pos2, label: &str) {
@@ -8762,23 +9218,102 @@ fn draw_rotated_graph_label(painter: &egui::Painter, anchor: egui::Pos2, label: 
     painter.add(egui::Shape::Text(text_shape));
 }
 
-fn graph_plot_positions(snapshot: &GraphSnapshot, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
-    let count = snapshot.points.len();
+fn graph_plot_positions(
+    snapshot: &GraphSnapshot,
+    rect: egui::Rect,
+    y_range: ValueRange,
+) -> Vec<(usize, egui::Pos2)> {
+    graph_series_plot_positions(&snapshot.points, rect, y_range)
+}
+
+fn graph_series_plot_positions(
+    points: &[GraphPoint],
+    rect: egui::Rect,
+    y_range: ValueRange,
+) -> Vec<(usize, egui::Pos2)> {
+    let count = points.len();
     let denominator = count.saturating_sub(1).max(1) as f32;
-    snapshot
-        .points
+    points
         .iter()
         .enumerate()
         .map(|(index, point)| {
             let x_t = index as f32 / denominator;
-            let y_t = ((point.value - snapshot.y_range.min)
-                / (snapshot.y_range.max - snapshot.y_range.min))
-                .clamp(0.0, 1.0);
             let x = egui::lerp(rect.left()..=rect.right(), x_t);
-            let y = egui::lerp(rect.bottom()..=rect.top(), y_t);
+            let y = graph_plot_y(point.value, y_range, rect);
             (index, egui::pos2(x, y))
         })
         .collect()
+}
+
+fn timecourse_series_color(index: usize) -> egui::Color32 {
+    const COLORS: [egui::Color32; 8] = [
+        egui::Color32::from_rgb(123, 184, 226),
+        egui::Color32::from_rgb(239, 148, 65),
+        egui::Color32::from_rgb(111, 207, 151),
+        egui::Color32::from_rgb(202, 142, 230),
+        egui::Color32::from_rgb(240, 206, 92),
+        egui::Color32::from_rgb(235, 112, 143),
+        egui::Color32::from_rgb(88, 207, 211),
+        egui::Color32::from_rgb(180, 180, 190),
+    ];
+    COLORS[index % COLORS.len()]
+}
+
+fn graph_plot_y(value: f32, range: ValueRange, rect: egui::Rect) -> f32 {
+    let position = ((value - range.min) / (range.max - range.min)).clamp(0.0, 1.0);
+    egui::lerp(rect.bottom()..=rect.top(), position)
+}
+
+fn timecourse_threshold_lines(markers: TimeCoursePlotMarkers) -> Vec<f32> {
+    let Some(threshold) = markers.threshold else {
+        return Vec::new();
+    };
+    if threshold.absolute {
+        let extent = threshold.value.abs();
+        if extent == 0.0 {
+            vec![0.0]
+        } else {
+            vec![-extent, extent]
+        }
+    } else {
+        vec![threshold.value]
+    }
+}
+
+fn graph_plot_y_range(
+    snapshot: &GraphSnapshot,
+    timecourse: Option<TimeCoursePlotMarkers>,
+) -> ValueRange {
+    let Some(markers) = timecourse else {
+        return snapshot.y_range;
+    };
+    let mut min = snapshot.y_range.min;
+    let mut max = snapshot.y_range.max;
+    for threshold in timecourse_threshold_lines(markers) {
+        min = min.min(threshold);
+        max = max.max(threshold);
+    }
+    if min == snapshot.y_range.min && max == snapshot.y_range.max {
+        snapshot.y_range
+    } else {
+        graph::padded_graph_y_range(min, max)
+    }
+}
+
+fn draw_dashed_horizontal_line(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    y: f32,
+    stroke: egui::Stroke,
+) {
+    const DASH_POINTS: f32 = 7.0;
+    const GAP_POINTS: f32 = 5.0;
+    let mut x = rect.left();
+    while x < rect.right() {
+        let end = (x + DASH_POINTS).min(rect.right());
+        painter.line_segment([egui::pos2(x, y), egui::pos2(end, y)], stroke);
+        x += DASH_POINTS + GAP_POINTS;
+    }
 }
 
 fn graph_point_style(
@@ -8800,11 +9335,41 @@ fn graph_label_stride(point_count: usize) -> usize {
     (point_count / 8).max(1)
 }
 
-fn graph_legend_chip(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+fn graph_legend_chip(ui: &mut egui::Ui, label: &str, color: egui::Color32) -> egui::Response {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 4.0, color);
         ui.label(label);
+    })
+    .response
+}
+
+fn graph_condition_legend_chip(
+    ui: &mut egui::Ui,
+    condition_index: usize,
+    full_label: &str,
+    color: egui::Color32,
+    active: bool,
+) {
+    let response = ui
+        .horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, color);
+            if active {
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    6.0,
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                );
+            }
+            let label = egui::RichText::new(format!("C{}", condition_index + 1));
+            ui.label(if active { label.strong() } else { label });
+        })
+        .response;
+    response.on_hover_text(if active {
+        format!("Active condition mapped on the brain\n{full_label}")
+    } else {
+        format!("Condition C{}\n{full_label}", condition_index + 1)
     });
 }
 
@@ -8987,7 +9552,16 @@ fn float_color_channel(value: f32) -> u8 {
 }
 
 fn range_drag_speed(range: ValueRange) -> f32 {
-    ((range.max - range.min).abs() / 200.0).max(0.001)
+    let span = (range.max - range.min).abs();
+    if span.is_finite() && span > 0.0 {
+        return span / 200.0;
+    }
+    let magnitude = range.min.abs().max(range.max.abs());
+    if magnitude.is_finite() && magnitude > 0.0 {
+        magnitude / 200.0
+    } else {
+        0.01
+    }
 }
 
 fn repaint_delay_to_instant(full_output: &egui::FullOutput) -> Option<Instant> {
@@ -9100,7 +9674,12 @@ pub(super) fn symmetric_value_range(range: ValueRange) -> ValueRange {
 
 fn threshold_bounds(range: ValueRange, absolute: bool) -> (f32, f32) {
     if absolute {
-        let extent = range.min.abs().max(range.max.abs()).max(0.0001);
+        let extent = range.min.abs().max(range.max.abs());
+        let extent = if extent.is_finite() && extent > 0.0 {
+            extent
+        } else {
+            1.0
+        };
         (0.0, extent)
     } else {
         ordered_range(range)
@@ -9150,7 +9729,12 @@ fn threshold_q_value_display(qvalue: Option<f64>) -> String {
 }
 
 fn threshold_bar_y_for_value(rect: egui::Rect, min: f32, max: f32, value: f32) -> f32 {
-    let span = (max - min).abs().max(f32::EPSILON);
+    let span = (max - min).abs();
+    let span = if span.is_finite() && span > 0.0 {
+        span
+    } else {
+        1.0
+    };
     let t = ((value - min) / span).clamp(0.0, 1.0);
     rect.bottom() - rect.height() * t
 }
@@ -9225,8 +9809,8 @@ mod tests {
         scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
         selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
         spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
-        threshold_and_mask_from_appearance, timestamped_png_name_from_unix_seconds,
-        viewer_required_wgpu_limits,
+        synthetic_surface_spec, threshold_and_mask_from_appearance,
+        timestamped_png_name_from_unix_seconds, viewer_required_wgpu_limits,
     };
     use crate::afni::{AfniRgbaOverlay, AfniRouteAction};
     use crate::color::{LabelEntry, LabelTable, LabelTableSource, Rgba, stable_label_color};
@@ -9525,6 +10109,47 @@ mod tests {
         assert_eq!(super::scalar_value_label(0.0), "0.0000");
         assert!(super::scalar_value_label(1.2e-10).contains('e'));
         assert!(super::overlay_value_label(Some(-3.4e-8)).contains('e'));
+    }
+
+    #[test]
+    fn tiny_overlay_ranges_keep_scientific_threshold_precision() {
+        let range = ValueRange {
+            min: -8.0e-11,
+            max: 1.7e-10,
+        };
+
+        let speed = super::range_drag_speed(range);
+        assert!(speed > 0.0 && speed < 1.0e-11);
+        assert_eq!(super::threshold_bounds(range, true), (0.0, 1.7e-10));
+        assert_eq!(super::threshold_bounds(range, false), (-8.0e-11, 1.7e-10));
+    }
+
+    #[test]
+    fn threshold_bar_uses_the_full_rail_for_meg_sized_values() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(20.0, 100.0));
+        let min = 0.0;
+        let max = 2.0e-10;
+        let midpoint = 1.0e-10;
+
+        let y = super::threshold_bar_y_for_value(rect, min, max, midpoint);
+        assert!((y - rect.center().y).abs() < 1.0e-4);
+        let round_trip = super::threshold_value_from_bar_y(rect, min, max, y);
+        assert!((round_trip - midpoint).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn threshold_bar_keeps_ordinary_overlay_linear_mapping() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(20.0, 100.0));
+
+        assert_eq!(super::threshold_bar_y_for_value(rect, 0.0, 10.0, 2.5), 75.0);
+        assert_eq!(
+            super::threshold_value_from_bar_y(rect, 0.0, 10.0, 75.0),
+            2.5
+        );
+        assert_eq!(
+            super::threshold_bar_y_for_value(rect, -10.0, 10.0, 0.0),
+            50.0
+        );
     }
 
     #[test]
@@ -10561,6 +11186,27 @@ mod tests {
     }
 
     #[test]
+    fn command_line_onestate_infers_component_sides_and_keeps_unknown_surfaces() {
+        let spec = synthetic_surface_spec(
+            &[
+                PathBuf::from("lh.pial.gii"),
+                PathBuf::from("rh.pial.gii"),
+                PathBuf::from("Net_000.gii"),
+            ],
+            true,
+        );
+
+        assert_eq!(spec.surfaces[0].side, SurfaceSide::Left);
+        assert_eq!(spec.surfaces[1].side, SurfaceSide::Right);
+        assert_eq!(spec.surfaces[2].side, SurfaceSide::Unknown);
+        assert!(
+            spec.surfaces
+                .iter()
+                .all(|surface| surface.state.as_deref() == Some("iS"))
+        );
+    }
+
+    #[test]
     fn command_line_default_components_keep_separate_states() {
         let spec = SpecFile {
             path: PathBuf::from("i_surfaces"),
@@ -10715,10 +11361,7 @@ mod tests {
             threshold_value: Some(2.5),
         };
         let positions = vec![[10.0, 0.0, 0.0], [11.0, 2.0, 3.0], [12.0, 0.0, 0.0]];
-        let matrices = vec![(
-            SurfaceSide::Right,
-            Mat4::from_scale(Vec3::splat(1.0 / 100.0)),
-        )];
+        let matrices = vec![Mat4::from_scale(Vec3::splat(1.0 / 100.0))];
         let scale = selection_scale_from_model_matrices(&matrices);
 
         let highlight = selection_for_component(Some(pick), 3, 7, &positions, scale).unwrap();

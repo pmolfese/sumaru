@@ -84,6 +84,29 @@ pub(super) fn afni_gpu_color_upload_plan(
 }
 
 impl ViewerState {
+    pub(super) fn start_drivesuma_server(&mut self) -> Result<()> {
+        if self.drivesuma_server.is_some() {
+            return Ok(());
+        }
+
+        let config = self.afni_options.drivesuma_port_config.clone();
+        let event_proxy = self.event_proxy.clone();
+        let drivesuma_work_scheduled = Arc::clone(&self.drivesuma_work_scheduled);
+        let server = DriveSumaServer::bind(
+            &config,
+            self.afni_options.drivesuma_command_mode,
+            self.verbose,
+            self.afni_recorder.clone(),
+            move || request_drivesuma_event_once(&event_proxy, &drivesuma_work_scheduled),
+        )?;
+        let address = server.local_addr();
+        self.drivesuma_server = Some(server);
+        self.log_status(format!(
+            "Listening for DriveSuma NIML commands at {address}."
+        ));
+        Ok(())
+    }
+
     fn reset_afni_surface_registration_state(&mut self) {
         self.afni_session = AfniNimlSession::new();
         self.pending_afni_surface_registrations.clear();
@@ -588,6 +611,58 @@ impl ViewerState {
         changed
     }
 
+    /// Drain the ordered, low-volume DriveSuma command stream independently
+    /// from AFNI's live color traffic. Unlike AFNI GPU updates, these commands
+    /// must still execute while the render window is occluded.
+    pub(super) fn drain_drivesuma_events(&mut self) -> bool {
+        let mut event_count = 0usize;
+        let mut messages = Vec::new();
+        while event_count < AFNI_EVENTS_PER_DRAIN {
+            let event = self
+                .drivesuma_server
+                .as_ref()
+                .and_then(DriveSumaServer::try_recv);
+            let Some(event) = event else {
+                break;
+            };
+            match event {
+                DriveSumaServerEvent::Messages(batch) => messages.extend(batch),
+                DriveSumaServerEvent::Error(message) => {
+                    self.log_status(format!("DriveSuma NIML error: {message}"));
+                }
+            }
+            event_count += 1;
+        }
+
+        let changed = if messages.is_empty() {
+            false
+        } else {
+            if self.verbose {
+                self.log_status(format!(
+                    "DriveSuma handling {} ordered command message{}.",
+                    messages.len(),
+                    if messages.len() == 1 { "" } else { "s" }
+                ));
+            }
+            match self.handle_afni_messages(messages) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.set_error(error);
+                    false
+                }
+            }
+        };
+
+        if event_count == AFNI_EVENTS_PER_DRAIN {
+            self.request_drivesuma_work();
+        }
+        changed
+    }
+
+    fn request_drivesuma_work(&self) {
+        request_drivesuma_event_once(&self.event_proxy, &self.drivesuma_work_scheduled);
+    }
+
     /// Route a batch of parsed incoming AFNI messages to their handlers.
     pub(super) fn handle_afni_messages(
         &mut self,
@@ -655,7 +730,345 @@ impl ViewerState {
                 }
                 Ok(true)
             }
+            AfniRouteAction::DriveSumaCommands(commands) => self.apply_drivesuma_commands(commands),
         }
+    }
+
+    fn apply_drivesuma_commands(&mut self, commands: Vec<DriveSumaAction>) -> Result<bool> {
+        let mut changed = false;
+        for command in commands {
+            match command {
+                DriveSumaAction::SelectSurface(label) => {
+                    let matching_index = self.surface_scene.as_ref().and_then(|scene| {
+                        scene.surfaces.iter().position(|surface| {
+                            surface.name == label
+                                || surface.path.file_name().and_then(|name| name.to_str())
+                                    == Some(label.as_str())
+                                || surface.components.iter().any(|component| {
+                                    component.name == label
+                                        || component.path.file_name().and_then(|name| name.to_str())
+                                            == Some(label.as_str())
+                                })
+                        })
+                    });
+                    if let Some(index) = matching_index {
+                        let already_active = self
+                            .surface_scene
+                            .as_ref()
+                            .is_some_and(|scene| scene.active_index == index);
+                        if !already_active {
+                            self.activate_scene_surface(index)?;
+                            changed = true;
+                        }
+                    } else if self.verbose {
+                        self.log_status(format!(
+                            "DriveSuma surface label {label} does not select another surface in this process."
+                        ));
+                    }
+                }
+                DriveSumaAction::SetSurfaceControllerVisible(visible) => {
+                    changed |= self.controller.panels.surface_controller_visible != visible;
+                    self.set_surface_controller_visible(visible);
+                }
+                DriveSumaAction::LoadDataset(path) => {
+                    self.load_overlay_path(path)?;
+                    changed = true;
+                }
+                DriveSumaAction::SelectDataset(label) => {
+                    match self.select_overlay_by_drivesuma_label(&label)? {
+                        Some(selected) => changed |= selected,
+                        None => self.log_status(format!(
+                            "DriveSuma dataset label {label:?} did not match a loaded overlay."
+                        )),
+                    }
+                }
+                DriveSumaAction::SetColorMap(colormap) => {
+                    let colormap = match colormap {
+                        DriveSumaColorMap::AmberMonochrome => OverlayColorMap::AmberMonochrome,
+                        DriveSumaColorMap::RoiI32 => OverlayColorMap::DiscreteLabels,
+                    };
+                    if self.overlay.render.appearance.colormap != colormap {
+                        self.overlay.render.appearance.colormap = colormap;
+                        self.refresh_overlay_appearance()?;
+                        changed = true;
+                    }
+                }
+                DriveSumaAction::SetIntensityColumn(index) => {
+                    let selectable = self.overlay.data.dataset().is_some_and(|dataset| {
+                        dataset.columns.get(index).is_some_and(column_is_numeric)
+                    });
+                    if !selectable {
+                        self.log_status(format!(
+                            "DriveSuma intensity sub-brick #{index} is missing or non-numeric."
+                        ));
+                        continue;
+                    }
+                    let mut columns = self.overlay.data.columns();
+                    if columns.intensity != index {
+                        columns.intensity = index;
+                        self.overlay.data.set_columns(columns);
+                        self.refresh_overlay_columns()?;
+                        changed = true;
+                    }
+                }
+                DriveSumaAction::SetIntensityRange {
+                    min,
+                    max,
+                    symmetric,
+                } => {
+                    if self.overlay.is_loaded() {
+                        let range = ValueRange { min, max };
+                        if self.overlay.render.appearance.range != range
+                            || self.overlay.render.appearance.symmetric_range != symmetric
+                        {
+                            self.overlay.render.appearance.range = range;
+                            self.overlay.render.appearance.symmetric_range = symmetric;
+                            self.refresh_overlay_appearance()?;
+                            self.log_status(format!(
+                                "DriveSuma intensity range: {min:.4} to {max:.4}."
+                            ));
+                            changed = true;
+                        }
+                    }
+                }
+                DriveSumaAction::SetBrightnessColumn(brightness) => {
+                    let selectable = brightness.is_none_or(|index| {
+                        self.overlay.data.dataset().is_some_and(|dataset| {
+                            dataset.columns.get(index).is_some_and(column_is_numeric)
+                        })
+                    });
+                    if !selectable {
+                        self.log_status(format!(
+                            "DriveSuma brightness sub-brick #{} is missing or non-numeric.",
+                            brightness.unwrap_or_default()
+                        ));
+                        continue;
+                    }
+                    let mut columns = self.overlay.data.columns();
+                    let column_changed = columns.brightness != brightness;
+                    let defaults_changed = brightness.is_some()
+                        && !self.overlay.render.appearance.brightness_compat_initialized;
+                    if defaults_changed {
+                        // SUMA initializes BrightMap to 0.3..0.8. Keep
+                        // Sumaru's native 0..1 default until a compatibility
+                        // command actually enables brightness modulation.
+                        self.overlay.render.appearance.brightness_scale = [0.3, 0.8];
+                        self.overlay.render.appearance.brightness_compat_initialized = true;
+                    }
+                    if column_changed {
+                        columns.brightness = brightness;
+                        self.overlay.data.set_columns(columns);
+                        self.refresh_overlay_columns()?;
+                    } else if defaults_changed {
+                        self.refresh_overlay_appearance()?;
+                    }
+                    changed |= column_changed || defaults_changed;
+                }
+                DriveSumaAction::SetBrightnessRange { min, max } => {
+                    if self.overlay.is_loaded() {
+                        let range = Some(ValueRange { min, max });
+                        if self.overlay.render.appearance.brightness_range != range {
+                            self.overlay.render.appearance.brightness_range = range;
+                            self.refresh_overlay_appearance()?;
+                            self.log_status(format!(
+                                "DriveSuma brightness range: {min:.4} to {max:.4}."
+                            ));
+                            changed = true;
+                        }
+                    }
+                }
+                DriveSumaAction::SetBrightnessScale { low, high } => {
+                    if self.overlay.is_loaded() {
+                        let scale = [low, high];
+                        let scale_changed =
+                            self.overlay.render.appearance.brightness_scale != scale;
+                        let initialized_changed =
+                            !self.overlay.render.appearance.brightness_compat_initialized;
+                        if scale_changed || initialized_changed {
+                            self.overlay.render.appearance.brightness_scale = scale;
+                            self.overlay.render.appearance.brightness_compat_initialized = true;
+                            self.refresh_overlay_appearance()?;
+                            self.log_status(format!(
+                                "DriveSuma brightness scale: {low:.4} to {high:.4}."
+                            ));
+                            changed = true;
+                        }
+                    }
+                }
+                DriveSumaAction::SetThresholdColumn(threshold) => {
+                    let selectable = threshold.is_none_or(|index| {
+                        self.overlay.data.dataset().is_some_and(|dataset| {
+                            dataset.columns.get(index).is_some_and(column_is_numeric)
+                        })
+                    });
+                    if !selectable {
+                        self.log_status(format!(
+                            "DriveSuma threshold sub-brick #{} is missing or non-numeric.",
+                            threshold.unwrap_or_default()
+                        ));
+                        continue;
+                    }
+                    let mut columns = self.overlay.data.columns();
+                    let column_changed = columns.threshold != threshold;
+                    let enabled = threshold.is_some();
+                    let enabled_changed =
+                        self.overlay.render.appearance.threshold.enabled != enabled;
+                    if column_changed {
+                        columns.threshold = threshold;
+                        self.overlay.data.set_columns(columns);
+                        self.refresh_overlay_columns()?;
+                    }
+                    if enabled_changed {
+                        self.overlay.render.appearance.threshold.enabled = enabled;
+                        self.refresh_overlay_appearance()?;
+                    }
+                    changed |= column_changed || enabled_changed;
+                }
+                DriveSumaAction::SetThresholdValue(requested) => {
+                    let value = match requested {
+                        DriveSumaThresholdValue::Numeric(value) => Some(value),
+                        DriveSumaThresholdValue::PValue(p_value) => self
+                            .selected_threshold_stat_spec()
+                            .and_then(|stat| stat.statistic_for_p_value(p_value))
+                            .map(|value| value as f32),
+                        DriveSumaThresholdValue::Percentile(percentile) => {
+                            self.overlay.data.dataset().and_then(|dataset| {
+                                let index = self.overlay.data.columns().threshold?;
+                                drivesuma_threshold_percentile(
+                                    dataset.columns.get(index)?,
+                                    percentile,
+                                )
+                            })
+                        }
+                    };
+                    let Some(value) = value else {
+                        self.log_status(format!(
+                            "DriveSuma threshold value {requested:?} could not be resolved for the selected threshold sub-brick."
+                        ));
+                        continue;
+                    };
+                    let threshold = &mut self.overlay.render.appearance.threshold;
+                    if threshold.value != value || !threshold.enabled {
+                        threshold.value = value;
+                        threshold.enabled = true;
+                        self.refresh_overlay_appearance()?;
+                        self.log_status(format!("DriveSuma threshold value: {value:.4}."));
+                        changed = true;
+                    }
+                }
+                DriveSumaAction::SetDim(dim) => {
+                    let dim = dim.clamp(0.0, 1.5);
+                    if self.overlay.render.appearance.dim != dim {
+                        self.overlay.render.appearance.dim = dim;
+                        self.refresh_overlay_appearance()?;
+                        changed = true;
+                    }
+                }
+                DriveSumaAction::SetOpacity(opacity) => {
+                    let opacity = opacity.clamp(0.0, 1.0);
+                    if self.overlay.is_loaded() && self.overlay.render.appearance.opacity != opacity
+                    {
+                        self.overlay.render.appearance.opacity = opacity;
+                        self.refresh_overlay_appearance()?;
+                        self.log_status(format!(
+                            "DriveSuma overlay opacity: {:.0}%.",
+                            opacity * 100.0
+                        ));
+                        changed = true;
+                    }
+                }
+                DriveSumaAction::SetDisplayMode(mode) => {
+                    let display_mode = match mode {
+                        DriveSumaDisplayMode::Hidden => OverlayDisplayMode::Hidden,
+                        DriveSumaDisplayMode::Color => OverlayDisplayMode::Color,
+                        DriveSumaDisplayMode::Contour => OverlayDisplayMode::Contour,
+                        DriveSumaDisplayMode::ColorAndContour => {
+                            OverlayDisplayMode::ColorAndContour
+                        }
+                    };
+                    if self.overlay.is_loaded()
+                        && self.overlay.render.appearance.display_mode != display_mode
+                    {
+                        self.overlay.render.appearance.display_mode = display_mode;
+                        self.refresh_overlay_appearance()?;
+                        self.log_status(format!(
+                            "DriveSuma dataset display: {}.",
+                            display_mode.label()
+                        ));
+                        changed = true;
+                    }
+                }
+                DriveSumaAction::SetClusterParams { radius, minimum } => {
+                    let status = {
+                        let cluster = &mut self.overlay.render.appearance.cluster;
+                        if radius < 0.0 {
+                            cluster.radius_mm = None;
+                            cluster.rings = radius.abs().trunc().max(1.0) as u32;
+                        } else {
+                            cluster.radius_mm = Some(radius);
+                        }
+                        if minimum < 0.0 {
+                            cluster.metric = ClusterSizeMetric::Nodes;
+                            cluster.min_nodes = minimum.abs().ceil() as u32;
+                        } else {
+                            cluster.metric = ClusterSizeMetric::Area;
+                            cluster.min_area = minimum;
+                        }
+                        if let Some(radius_mm) = cluster.radius_mm {
+                            format!("DriveSuma clustering: {radius_mm:.3} mm surface radius.")
+                        } else {
+                            format!("DriveSuma clustering: {} edge ring(s).", cluster.rings)
+                        }
+                    };
+                    if self.overlay.is_loaded() {
+                        self.refresh_overlay_appearance()?;
+                    }
+                    self.log_status(status);
+                    changed = true;
+                }
+                DriveSumaAction::SetClusterEnabled(enabled) => {
+                    if self.overlay.render.appearance.clusterize != enabled {
+                        self.overlay.render.appearance.clusterize = enabled;
+                        if self.overlay.is_loaded() {
+                            self.refresh_overlay_appearance()?;
+                        }
+                        changed = true;
+                    }
+                }
+                DriveSumaAction::SetShowZero(show) => {
+                    if self.overlay.render.appearance.show_zero != show {
+                        self.overlay.render.appearance.show_zero = show;
+                        if self.overlay.is_loaded() {
+                            self.refresh_overlay_appearance()?;
+                        }
+                        changed = true;
+                    }
+                }
+                DriveSumaAction::SetOneOnly(one_only) => {
+                    if one_only {
+                        self.log_status(
+                            "DriveSuma 1_only enabled; Sumaru already renders only the active overlay.",
+                        );
+                    } else {
+                        self.log_status(
+                            "DriveSuma 1_only=n requested multiple simultaneous overlays; this process remains active-overlay-only.",
+                        );
+                    }
+                }
+                DriveSumaAction::SetOverlayVisible(visible) => {
+                    if self.overlay.is_loaded() {
+                        changed |= self.controller.overlay.visible != visible;
+                        self.apply_commands(vec![ViewerCommand::SetOverlayVisible(visible)]);
+                    }
+                }
+                DriveSumaAction::Quit => {
+                    self.drivesuma_quit_requested = true;
+                    self.log_status("DriveSuma requested that this Sumaru process close.");
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
     }
 
     /// Apply an AFNI overlay/threshold settings update to the active overlay.
@@ -1184,6 +1597,62 @@ impl ViewerState {
     }
 }
 
+/// Match SUMA's threshold-percentile lookup: ignore zero values, quantize the
+/// requested percentile down to its 0.1% lookup table, then choose the nearest
+/// ranked sample.
+fn drivesuma_threshold_percentile(column: &DataColumn, percentile: f32) -> Option<f32> {
+    if !percentile.is_finite() || !(0.0..=100.0).contains(&percentile) {
+        return None;
+    }
+    let mut values = (0..column.values.len())
+        .filter_map(|row| numeric_column_value_as_f32(column, row))
+        .filter(|value| *value != 0.0)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    let quantized_percentile = (percentile * 10.0).trunc() / 10.0;
+    let index = (((values.len() - 1) as f32 * quantized_percentile / 100.0).round_ties_even()
+        as usize)
+        .min(values.len() - 1);
+    values.get(index).copied()
+}
+
+#[cfg(test)]
+mod drivesuma_value_tests {
+    use super::*;
+
+    fn threshold_column(values: Vec<f32>) -> DataColumn {
+        DataColumn {
+            label: "threshold".to_string(),
+            role: ColumnRole::Threshold,
+            units: None,
+            stat: None,
+            fdr_curve: None,
+            range: None,
+            values: ColumnData::Float32(values),
+        }
+    }
+
+    #[test]
+    fn threshold_percentile_matches_suma_zero_exclusion_and_nearest_rank() {
+        let column = threshold_column(vec![0.0, 1.0, 2.0, 3.0, 4.0, f32::NAN]);
+
+        assert_eq!(drivesuma_threshold_percentile(&column, 0.0), Some(1.0));
+        assert_eq!(drivesuma_threshold_percentile(&column, 50.0), Some(3.0));
+        assert_eq!(drivesuma_threshold_percentile(&column, 100.0), Some(4.0));
+    }
+
+    #[test]
+    fn threshold_percentile_rejects_invalid_or_empty_input() {
+        let column = threshold_column(vec![0.0, f32::NAN]);
+
+        assert_eq!(drivesuma_threshold_percentile(&column, 50.0), None);
+        assert_eq!(drivesuma_threshold_percentile(&column, 101.0), None);
+    }
+}
+
 impl ViewerState {
     pub(super) fn request_afni_work(&self) {
         request_afni_event_once(&self.event_proxy, &self.afni_work_scheduled);
@@ -1340,6 +1809,21 @@ fn request_afni_event_once(
     }
 }
 
+fn request_drivesuma_event_once(
+    event_proxy: &EventLoopProxy<ViewerEvent>,
+    work_scheduled: &AtomicBool,
+) {
+    if work_scheduled
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && event_proxy
+            .send_event(ViewerEvent::DriveSumaCommandsReady)
+            .is_err()
+    {
+        work_scheduled.store(false, Ordering::Release);
+    }
+}
+
 fn afni_incoming_message_label(message: &AfniIncomingMessage) -> &'static str {
     match message {
         AfniIncomingMessage::RgbaOverlay(_) => "rgba_overlay",
@@ -1350,6 +1834,7 @@ fn afni_incoming_message_label(message: &AfniIncomingMessage) -> &'static str {
         AfniIncomingMessage::OverlayState(_) => "overlay_state",
         AfniIncomingMessage::ControllerCommand(_) => "controller_command",
         AfniIncomingMessage::ViewerCommands(_) => "viewer_commands",
+        AfniIncomingMessage::DriveSumaCommands(_) => "drivesuma_commands",
         AfniIncomingMessage::RoiUpdate(_) => "roi_update",
     }
 }
@@ -1362,6 +1847,7 @@ fn afni_route_action_label(action: &AfniRouteAction) -> &'static str {
         AfniRouteAction::OverlayState(_) => "overlay_state",
         AfniRouteAction::SurfaceCrosshair(_) => "surface_crosshair",
         AfniRouteAction::RoiUpdate(_) => "roi_update",
+        AfniRouteAction::DriveSumaCommands(_) => "drivesuma_commands",
     }
 }
 

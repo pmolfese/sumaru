@@ -124,6 +124,10 @@ impl ColorMap {
         Self::Continuous(ContinuousColorMap::grayscale())
     }
 
+    pub fn amber_monochrome() -> Self {
+        Self::Continuous(ContinuousColorMap::amber_monochrome())
+    }
+
     pub fn labels(label_table: LabelTable) -> Self {
         Self::Labels(label_table)
     }
@@ -420,6 +424,23 @@ impl ContinuousColorMap {
                 ColorStop {
                     position: 1.0,
                     color: Rgba::new_unchecked(1.0, 1.0, 1.0, 1.0),
+                },
+            ],
+        }
+    }
+
+    /// AFNI/SUMA's `amber_monochrome` palette from `pbardefs.h`.
+    pub fn amber_monochrome() -> Self {
+        Self {
+            name: "amber_monochrome".to_string(),
+            stops: vec![
+                ColorStop {
+                    position: 0.0,
+                    color: Rgba::from_u8(1, 1, 0, 255),
+                },
+                ColorStop {
+                    position: 1.0,
+                    color: Rgba::from_u8(255, 191, 0, 255),
                 },
             ],
         }
@@ -845,6 +866,15 @@ mod tests {
             ColorMap::fire().as_continuous().unwrap().sample(1.0),
             Rgba::new(1.0, 1.0, 0.88, 1.0).unwrap()
         );
+    }
+
+    #[test]
+    fn amber_monochrome_matches_afni_endpoints() {
+        let amber = ColorMap::amber_monochrome();
+        let amber = amber.as_continuous().unwrap();
+
+        assert_bytes_close(amber.sample(0.0), [1, 1, 0]);
+        assert_bytes_close(amber.sample(1.0), [255, 191, 0]);
     }
 
     fn assert_bytes_close(actual: Rgba, expected: [u8; 3]) {

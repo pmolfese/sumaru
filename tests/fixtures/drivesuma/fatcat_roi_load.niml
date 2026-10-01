@@ -1,0 +1,18 @@
+<StartTracking
+  ni_stream_name="tcp:127.0.0.1:25032"
+  Tracking_ID="1" />
+<EngineCommand
+  Command="surf_cont"
+  SO_label="Net_000.gii"
+  Dset_FileName="/Users/molfesepj/FATCAT_DEMO/Net_000.cols.niml.dset"
+  switch_cmap="ROI_i32"
+  Dim="0.3"
+  Caller_Working_Dir="/Users/molfesepj/FATCAT_DEMO"
+  Tracking_ID="2"
+  ni_form="ni_group" >
+</EngineCommand>
+<StopTracking
+  ni_stream_name="tcp:127.0.0.1:25032" />
+<CloseKillStream
+  ni_stream_name="tcp:127.0.0.1:25032" />
+<?ni_do ni_verb='close_this' ?>

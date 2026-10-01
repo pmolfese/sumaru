@@ -165,7 +165,58 @@ impl ViewerState {
     /// Build the per-column value series plotted for a given node pick.
     pub(super) fn graph_snapshot_for_pick(&self, pick: SurfacePick) -> Option<GraphSnapshot> {
         let mut points = Vec::new();
-        if let Some(dataset) = self.overlay.data.dataset()
+        let mut comparison_series = Vec::new();
+        if let Some(timecourse) = self.timecourse.as_ref()
+            && let Some(row) = dataset_row_for_node(&timecourse.source_dataset, pick.node_index)
+        {
+            for sample_index in 0..timecourse.time_columns.len() {
+                let Some(value) = timecourse.sample_value(row, sample_index) else {
+                    continue;
+                };
+                points.push(GraphPoint {
+                    column_index: sample_index,
+                    label: format!("{:.1} ms", timecourse.sample_time(sample_index) * 1000.0),
+                    value,
+                });
+            }
+            for condition_index in 0..timecourse.condition_count() {
+                if condition_index == timecourse.active_condition() {
+                    continue;
+                }
+                let Some(dataset) = timecourse.condition_dataset(condition_index) else {
+                    continue;
+                };
+                let Some(condition_row) = dataset_row_for_node(dataset, pick.node_index) else {
+                    continue;
+                };
+                let condition_points = (0..timecourse.sample_count())
+                    .filter_map(|sample_index| {
+                        Some(GraphPoint {
+                            column_index: sample_index,
+                            label: format!(
+                                "{:.1} ms",
+                                timecourse.sample_time(sample_index) * 1000.0
+                            ),
+                            value: timecourse.condition_sample_value(
+                                condition_index,
+                                condition_row,
+                                sample_index,
+                            )?,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if !condition_points.is_empty() {
+                    comparison_series.push(GraphSeries {
+                        label: timecourse
+                            .condition_label(condition_index)
+                            .unwrap_or("Condition")
+                            .to_string(),
+                        color_index: condition_index,
+                        points: condition_points,
+                    });
+                }
+            }
+        } else if let Some(dataset) = self.overlay.data.dataset()
             && let Some(row) = dataset_row_for_node(dataset, pick.node_index)
         {
             for (column_index, column) in dataset.columns.iter().enumerate() {
@@ -201,7 +252,7 @@ impl ViewerState {
             return None;
         }
 
-        let y_range = graph_y_range_for_points(&points)?;
+        let y_range = graph_y_range_for_series(&points, &comparison_series)?;
 
         Some(GraphSnapshot {
             node_index: pick.node_index,
@@ -209,11 +260,41 @@ impl ViewerState {
             surface_label: self.pick_surface_display_text(),
             overlay_label: self.pick_overlay_display_text(),
             points,
+            active_series_index: self
+                .timecourse
+                .as_ref()
+                .map_or(0, TimeCourseState::active_condition),
+            comparison_series,
             y_range,
         })
     }
 }
 
+fn graph_y_range_for_series(
+    points: &[GraphPoint],
+    comparison_series: &[GraphSeries],
+) -> Option<ValueRange> {
+    let mut min = points
+        .iter()
+        .map(|point| point.value)
+        .fold(f32::INFINITY, f32::min);
+    let mut max = points
+        .iter()
+        .map(|point| point.value)
+        .fold(f32::NEG_INFINITY, f32::max);
+    for series in comparison_series {
+        for point in &series.points {
+            min = min.min(point.value);
+            max = max.max(point.value);
+        }
+    }
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    Some(padded_graph_y_range(min, max))
+}
+
+#[cfg(test)]
 fn graph_y_range_for_points(points: &[GraphPoint]) -> Option<ValueRange> {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
@@ -228,7 +309,7 @@ fn graph_y_range_for_points(points: &[GraphPoint]) -> Option<ValueRange> {
     Some(padded_graph_y_range(min, max))
 }
 
-fn padded_graph_y_range(min: f32, max: f32) -> ValueRange {
+pub(super) fn padded_graph_y_range(min: f32, max: f32) -> ValueRange {
     let span = max - min;
     let magnitude = min.abs().max(max.abs());
     let padding = if span > 0.0 {

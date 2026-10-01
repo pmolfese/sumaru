@@ -1,0 +1,32 @@
+<StartTracking
+  ni_stream_name="tcp:127.0.0.1:25056"
+  Tracking_ID="1" />
+<EngineCommand
+  Command="surf_cont"
+  SO_label="Net_000.gii"
+  switch_cmap="amber_monochrome"
+  Dim="1.0"
+  Caller_Working_Dir="/Users/molfesepj/FATCAT_DEMO"
+  Tracking_ID="2"
+  ni_form="ni_group" >
+</EngineCommand>
+<EngineCommand
+  Command="viewer_cont"
+  N_Key="2"
+  Key_0="."
+  Key_rep_0="1"
+  Key_pause_0="0.000000"
+  Key_redis_0="0"
+  Key_1="t"
+  Key_rep_1="1"
+  Key_pause_1="0.000000"
+  Key_redis_1="0"
+  Caller_Working_Dir="/Users/molfesepj/FATCAT_DEMO"
+  Tracking_ID="3"
+  ni_form="ni_group" >
+</EngineCommand>
+<StopTracking
+  ni_stream_name="tcp:127.0.0.1:25056" />
+<CloseKillStream
+  ni_stream_name="tcp:127.0.0.1:25056" />
+<?ni_do ni_verb='close_this' ?>

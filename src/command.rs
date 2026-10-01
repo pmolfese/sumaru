@@ -320,6 +320,18 @@ impl PairVisibility {
         (next.left || next.right).then_some(next)
     }
 
+    /// SUMA's ShowLeft/ShowRight flags are independent, so compatibility mode
+    /// must permit both hemispheres to be hidden at once.
+    pub fn toggled_independently(self, side: SurfaceSide) -> Option<Self> {
+        let mut next = self;
+        match side {
+            SurfaceSide::Left => next.left = !next.left,
+            SurfaceSide::Right => next.right = !next.right,
+            _ => return None,
+        }
+        Some(next)
+    }
+
     pub fn label(self) -> &'static str {
         match (self.left, self.right) {
             (true, true) => "left+right",
@@ -533,6 +545,8 @@ pub enum ViewerCommand {
     RemoveSceneObject(usize),
     RefreshOverlayColumns,
     RefreshOverlayAppearance,
+    SetTimeCourseControls(crate::viewer::TimeCourseControls),
+    PreviewTimeCourseControls(crate::viewer::TimeCourseControls),
     SelectOverlay(usize),
     CycleOverlay(isize),
     RemoveActiveOverlay,
@@ -545,6 +559,11 @@ pub enum ViewerCommand {
     RaiseSurfaceOpacity,
     ToggleCameraMomentum,
     ToggleBackground,
+    ToggleAfniTalk,
+    ToggleHemisphereVisibility(SurfaceSide),
+    /// SUMA compatibility: independently toggle every active component on one
+    /// hemisphere while leaving bilateral/unknown components visible.
+    ToggleSumaComponentVisibility(SurfaceSide),
     SetAnatomicalShadingVisible(bool),
     ToggleAfniUncoloredTransparency,
     SetOverlayVisible(bool),
@@ -586,6 +605,8 @@ pub enum ViewerCommand {
     AddVolumeSagittal,
     /// Remove the currently selected slice in `--volume` mode.
     RemoveSelectedVolumeSlice,
+    /// Set the opacity shared by all volume slice interiors.
+    SetVolumeSliceOpacity(f32),
     /// Copy the picked vertex index to the clipboard.
     CopyVertexIndex,
     /// Copy the picked vertex coordinate in RAS (paper/MNI) convention.
@@ -703,6 +724,18 @@ mod tests {
 
         assert_eq!(visibility.label(), "right only");
         assert!(visibility.toggled(SurfaceSide::Right).is_none());
+    }
+
+    #[test]
+    fn suma_component_visibility_allows_both_hemispheres_hidden() {
+        let visibility = PairVisibility::both()
+            .toggled_independently(SurfaceSide::Left)
+            .unwrap()
+            .toggled_independently(SurfaceSide::Right)
+            .unwrap();
+
+        assert_eq!(visibility.label(), "none");
+        assert!(visibility.is_visible(&SurfaceSide::Unknown));
     }
 
     #[test]

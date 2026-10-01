@@ -257,6 +257,9 @@ pub fn replay_records(records: &[NimlDebugRecord]) -> Result<NimlReplayReport> {
                             AfniRouteAction::OverlayState(_) => report.viewer_commands += 1,
                             AfniRouteAction::SurfaceCrosshair(_) => report.surface_crosshairs += 1,
                             AfniRouteAction::RoiUpdate(_) => report.roi_updates += 1,
+                            AfniRouteAction::DriveSumaCommands(commands) => {
+                                report.viewer_commands += commands.len()
+                            }
                         }
                     }
                 }

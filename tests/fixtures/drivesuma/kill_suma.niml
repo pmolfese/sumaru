@@ -1,0 +1,9 @@
+<StartTracking
+  ni_stream_name="tcp:127.0.0.1:25104"
+  Tracking_ID="1" />
+<EngineCommand
+  Command="kill_suma"
+  Tracking_ID="2"
+  ni_form="ni_group" >
+</EngineCommand>
+<?ni_do ni_verb='close_this' ?>

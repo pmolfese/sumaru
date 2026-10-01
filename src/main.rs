@@ -1,11 +1,12 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
-use sumaru::afni::{DEFAULT_AFNI_HOST, resolve_afni_port_config};
+use clap::{Args, Parser, Subcommand};
+use sumaru::afni::DriveSumaCommandMode;
+use sumaru::afni::{DEFAULT_AFNI_HOST, resolve_afni_port_config, resolve_drivesuma_port_config};
 use sumaru::inspect::inspect_path;
 use sumaru::niml_debug::{
     NimlSendCommand, inspect_debug_path, replay_debug_path, send_debug_command,
@@ -127,6 +128,18 @@ struct Cli {
     #[arg(long = "talk-afni")]
     talk_afni: bool,
 
+    /// Listen for NIML commands using Sumaru's native key semantics.
+    #[arg(long = "niml", conflicts_with = "niml_suma")]
+    niml: bool,
+
+    /// Listen for DriveSuma commands and translate the supported SUMA subset.
+    #[arg(
+        long = "niml-suma",
+        visible_alias = "niml-compat",
+        conflicts_with = "niml"
+    )]
+    niml_suma: bool,
+
     /// Record every live AFNI/SUMA NIML message sent and received by Sumaru.
     #[arg(long = "niml-record", value_name = "PATH")]
     niml_record: Option<PathBuf>,
@@ -153,6 +166,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Launch the surface timecourse viewer for a 3D+time GIFTI overlay.
+    Tc(TimeCourseArgs),
     /// Read a supported neuroimaging file and print a short summary.
     Inspect {
         /// Path to a GIFTI or NIFTI file.
@@ -163,6 +178,47 @@ enum Commands {
         #[command(subcommand)]
         command: NimlCommands,
     },
+}
+
+#[derive(Debug, Args)]
+struct TimeCourseArgs {
+    /// GIFTI surface underlay. A matching opposite hemisphere is loaded when present.
+    #[arg(short = 'i', long = "surface", value_name = "PATH")]
+    surface: PathBuf,
+
+    /// One or more 3D+time GIFTI surface overlays. Repeat for multiple conditions.
+    #[arg(
+        long = "overlay",
+        visible_alias = "overaly",
+        value_name = "PATH",
+        required_unless_present = "overlay_multi"
+    )]
+    overlay: Vec<PathBuf>,
+
+    /// Load several timecourse conditions from one compact argument.
+    #[arg(
+        long = "overlay-multi",
+        value_name = "PATH",
+        num_args = 1..,
+        required_unless_present = "overlay"
+    )]
+    overlay_multi: Vec<PathBuf>,
+
+    /// Explicit right-hemisphere surface (disables automatic surface pairing).
+    #[arg(long = "surface-rh", value_name = "PATH")]
+    surface_rh: Option<PathBuf>,
+
+    /// Explicit right-hemisphere timecourse overlay. Repeat in condition order.
+    #[arg(long = "overlay-rh", value_name = "PATH")]
+    overlay_rh: Vec<PathBuf>,
+
+    /// Print viewer status messages to the terminal.
+    #[arg(long = "verbose")]
+    verbose: bool,
+
+    /// Request the GPU adapter's native maximum buffer size.
+    #[arg(long = "big-mem")]
+    big_mem: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,6 +289,8 @@ fn main() -> Result<()> {
     let niml_record_path = cli.niml_record;
     let overlay_pair = explicit_overlay_pair(cli.overlay_lh, cli.overlay_rh);
     let afni_requested = cli.talk_afni
+        || cli.niml
+        || cli.niml_suma
         || cli.afni_port.is_some()
         || cli.np.is_some()
         || cli.npb.is_some()
@@ -247,6 +305,19 @@ fn main() -> Result<()> {
             cli.npb,
             &environ,
         )?,
+        listen_for_drivesuma: cli.niml || cli.niml_suma,
+        drivesuma_port_config: resolve_drivesuma_port_config(
+            DEFAULT_AFNI_HOST,
+            None,
+            cli.np,
+            cli.npb,
+            &environ,
+        )?,
+        drivesuma_command_mode: if cli.niml_suma {
+            DriveSumaCommandMode::SumaCompatibility
+        } else {
+            DriveSumaCommandMode::Sumaru
+        },
     };
 
     let surface_paths = cli.surface_paths;
@@ -289,6 +360,8 @@ fn main() -> Result<()> {
                 graph_paths,
                 overlay_path: overlay,
                 overlay_pair_paths: overlay_pair,
+                overlay_paths: Vec::new(),
+                overlay_pair_paths_list: Vec::new(),
                 roi_path: roi,
                 auto_color_niml,
                 overlay_subs: subs,
@@ -299,6 +372,92 @@ fn main() -> Result<()> {
                 gpu,
                 afni,
                 niml_record_path,
+                timecourse_mode: false,
+            })?;
+        }
+        Some(Commands::Tc(args)) => {
+            validate_no_viewer_launch_options(
+                &surface_paths,
+                &spec,
+                &surface_lh,
+                &surface_rh,
+                &surface_volume,
+                &overlay,
+                &overlay_pair,
+                &roi,
+                auto_color_niml,
+                &subs,
+                &p_value,
+                &niml_record_path,
+                &tract_paths,
+                &graph_paths,
+                onestate,
+                big_mem,
+                gpu,
+            )?;
+            if afni_requested {
+                bail!("AFNI connection flags do not apply to `sumaru tc`");
+            }
+
+            let mut condition_overlays = args.overlay;
+            condition_overlays.extend(args.overlay_multi);
+            let (surface_lh_path, surface_rh_path) = if let Some(right) = args.surface_rh {
+                (Some(args.surface.clone()), Some(right))
+            } else if let Some((left, right)) = discover_hemisphere_pair(&args.surface) {
+                (Some(left), Some(right))
+            } else {
+                (None, None)
+            };
+            let paired_scene = surface_lh_path.is_some();
+            if !args.overlay_rh.is_empty() && !paired_scene {
+                bail!("--overlay-rh requires a paired surface in `sumaru tc`");
+            }
+            if !args.overlay_rh.is_empty() && args.overlay_rh.len() != condition_overlays.len() {
+                bail!(
+                    "repeat --overlay-rh once for each condition ({} left, {} right)",
+                    condition_overlays.len(),
+                    args.overlay_rh.len()
+                );
+            }
+
+            let (surface_paths, overlay_paths, overlay_pair_paths) = if paired_scene {
+                let pairs = condition_overlays
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, overlay)| {
+                        if let Some(right) = args.overlay_rh.get(index) {
+                            ExplicitOverlayPair {
+                                left_path: Some(overlay),
+                                right_path: Some(right.clone()),
+                            }
+                        } else if let Some((left, right)) = discover_hemisphere_pair(&overlay) {
+                            ExplicitOverlayPair {
+                                left_path: Some(left),
+                                right_path: Some(right),
+                            }
+                        } else {
+                            ExplicitOverlayPair {
+                                left_path: Some(overlay),
+                                right_path: None,
+                            }
+                        }
+                    })
+                    .collect();
+                (Vec::new(), Vec::new(), pairs)
+            } else {
+                (vec![args.surface], condition_overlays, Vec::new())
+            };
+
+            viewer::run(viewer::LaunchOptions {
+                surface_paths,
+                surface_lh_path,
+                surface_rh_path,
+                overlay_paths,
+                overlay_pair_paths_list: overlay_pair_paths,
+                verbose: verbose || args.verbose,
+                big_mem: big_mem || args.big_mem,
+                timecourse_mode: true,
+                ..viewer::LaunchOptions::default()
             })?;
         }
         Some(Commands::Inspect { path }) => {
@@ -507,6 +666,37 @@ fn explicit_overlay_pair(
     }
 }
 
+/// Resolve common MNE/SUMA hemisphere filename pairs without adding a new
+/// surface-loading path. Pairing is opportunistic: a lone hemisphere remains a
+/// perfectly valid timecourse launch.
+fn discover_hemisphere_pair(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    const TOKENS: [(&str, &str); 6] = [
+        ("-lh.", "-rh."),
+        ("_lh.", "_rh."),
+        (".lh.", ".rh."),
+        ("lh.", "rh."),
+        ("-lh-", "-rh-"),
+        ("_lh_", "_rh_"),
+    ];
+    for (left_token, right_token) in TOKENS {
+        let (left_name, right_name) = if name.contains(left_token) {
+            (name.to_string(), name.replacen(left_token, right_token, 1))
+        } else if name.contains(right_token) {
+            (name.replacen(right_token, left_token, 1), name.to_string())
+        } else {
+            continue;
+        };
+        let left = parent.join(left_name);
+        let right = parent.join(right_name);
+        if left.exists() && right.exists() {
+            return Some((left, right));
+        }
+    }
+    None
+}
+
 fn validate_onestate_order(args: &[OsString]) -> Result<()> {
     let mut saw_surface = false;
     for arg in args.iter().skip(1) {
@@ -608,8 +798,16 @@ fn normalize_afni_style_arg(arg: OsString) -> OsString {
         OsString::from("--gdset")
     } else if arg == "-grid" {
         OsString::from("--grid")
+    } else if arg == "-tract" {
+        OsString::from("--tract")
     } else if arg == "-onestate" {
         OsString::from("--onestate")
+    } else if arg == "-niml" {
+        OsString::from("--niml")
+    } else if arg == "-niml-suma" {
+        OsString::from("--niml-suma")
+    } else if arg == "-niml-compat" {
+        OsString::from("--niml-compat")
     } else if matches!(
         arg.to_str(),
         Some("-i_gii" | "-i_GII" | "-i_gifti" | "-i_GIFTI")
@@ -661,6 +859,69 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn timecourse_subcommand_parses_compact_launch_syntax() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "tc",
+            "-i",
+            "underlay-lh.gii",
+            "--overlay",
+            "stc-lh.gii",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tc(args))
+                if args.surface == PathBuf::from("underlay-lh.gii")
+                    && args.overlay == vec![PathBuf::from("stc-lh.gii")]
+        ));
+    }
+
+    #[test]
+    fn timecourse_subcommand_accepts_multiple_conditions() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "tc",
+            "-i",
+            "underlay-lh.gii",
+            "--overlay",
+            "condition-a-lh.gii",
+            "--overlay",
+            "condition-b-lh.gii",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tc(args))
+                if args.overlay == vec![
+                    PathBuf::from("condition-a-lh.gii"),
+                    PathBuf::from("condition-b-lh.gii"),
+                ]
+        ));
+    }
+
+    #[test]
+    fn timecourse_subcommand_accepts_overlay_multi_shortcut() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "tc",
+            "-i",
+            "underlay-lh.gii",
+            "--overlay-multi",
+            "condition-a-lh.gii",
+            "condition-b-lh.gii",
+            "condition-c-lh.gii",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tc(args))
+                if args.overlay_multi == vec![
+                    PathBuf::from("condition-a-lh.gii"),
+                    PathBuf::from("condition-b-lh.gii"),
+                    PathBuf::from("condition-c-lh.gii"),
+                ]
+        ));
     }
 
     #[test]
@@ -1211,6 +1472,41 @@ mod tests {
     }
 
     #[test]
+    fn suma_niml_listener_flag_parses() {
+        let cli = Cli::parse_from(["sumaru", "--surface", "surface.gii", "--niml"]);
+        assert!(cli.niml);
+        assert!(!cli.niml_suma);
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-niml")),
+            OsString::from("--niml")
+        );
+
+        for flag in ["--niml-suma", "--niml-compat"] {
+            let cli = Cli::parse_from(["sumaru", "--surface", "surface.gii", flag]);
+            assert!(!cli.niml);
+            assert!(cli.niml_suma);
+        }
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-niml-suma")),
+            OsString::from("--niml-suma")
+        );
+        assert_eq!(
+            normalize_afni_style_arg(OsString::from("-niml-compat")),
+            OsString::from("--niml-compat")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sumaru",
+                "--surface",
+                "surface.gii",
+                "--niml",
+                "--niml-suma",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn tract_and_graph_launch_options_repeat() {
         let cli = Cli::parse_from([
             "sumaru",
@@ -1245,12 +1541,20 @@ mod tests {
             ("-vol", "--vol"),
             ("-gdset", "--gdset"),
             ("-grid", "--grid"),
+            ("-tract", "--tract"),
         ] {
             assert_eq!(
                 normalize_afni_style_arg(OsString::from(suma_flag)),
                 OsString::from(long_flag)
             );
         }
+
+        let cli = Cli::parse_from([
+            OsString::from("sumaru"),
+            normalize_afni_style_arg(OsString::from("-tract")),
+            OsString::from("bundles.niml.tract"),
+        ]);
+        assert_eq!(cli.tract_paths, vec![PathBuf::from("bundles.niml.tract")]);
     }
 
     #[test]

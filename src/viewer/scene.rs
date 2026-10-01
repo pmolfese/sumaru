@@ -170,6 +170,7 @@ pub(super) struct ClusterComponentTopology {
     /// attached to the right surface with hemisphere-local node indices.
     pub(super) side: SurfaceSide,
     pub(super) neighbors: Vec<Vec<u32>>,
+    pub(super) positions: Vec<[f32; 3]>,
     pub(super) node_areas: Vec<f32>,
 }
 

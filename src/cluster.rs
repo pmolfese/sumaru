@@ -6,7 +6,10 @@
 //! dataset types — it takes a mask plus adjacency and returns labels — so it can
 //! be tested directly.
 
-use std::collections::VecDeque;
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, VecDeque},
+};
 
 use crate::overlay::{Threshold, ThresholdMode};
 
@@ -51,6 +54,10 @@ pub struct ClusterParams {
     /// setting and the same as `SurfClust -rmm -1`. Larger values bridge gaps,
     /// at the cost of a bounded search per node instead of a single hop.
     pub rings: u32,
+    /// Geodesic search radius in millimeters. When present this takes
+    /// precedence over `rings`, matching a positive `SurfClust -rmm` value.
+    /// `None` retains edge-ring connectivity (`SurfClust -rmm -N`).
+    pub radius_mm: Option<f32>,
 }
 
 impl ClusterParams {
@@ -61,6 +68,7 @@ impl ClusterParams {
             min_nodes: 20,
             tails: ClusterTails::Bisided,
             rings: 1,
+            radius_mm: None,
         }
     }
 }
@@ -130,6 +138,9 @@ pub struct ClusterInput<'a> {
     pub tail_values: &'a [f32],
     /// Adjacency, one neighbor list per node.
     pub neighbors: &'a [Vec<u32>],
+    /// Per-node surface coordinates, used to accumulate edge lengths for a
+    /// positive millimeter radius.
+    pub positions: &'a [[f32; 3]],
     /// Per-node surface area in mm^2, as produced by `SurfaceMesh::node_areas`.
     pub node_areas: &'a [f32],
     /// Intensity values, used only for the reported peak and range.
@@ -147,6 +158,7 @@ impl ClusterInput<'_> {
         let count = self.node_count();
         self.tail_values.len() == count
             && self.neighbors.len() == count
+            && self.positions.len() == count
             && self.node_areas.len() == count
             && self.values.len() == count
     }
@@ -163,7 +175,6 @@ pub fn label_clusters(input: ClusterInput<'_>, params: ClusterParams) -> Cluster
         return ClusterLabels::empty(node_count);
     }
 
-    let rings = params.rings.max(1);
     let mut visited = vec![false; node_count];
     let mut found: Vec<(Vec<u32>, ClusterSummary)> = Vec::new();
 
@@ -179,7 +190,17 @@ pub fn label_clusters(input: ClusterInput<'_>, params: ClusterParams) -> Cluster
 
         while let Some(node) = queue.pop_front() {
             members.push(node as u32);
-            for neighbor in reachable_within(node, rings, input.neighbors) {
+            let reachable = if let Some(radius_mm) = params.radius_mm {
+                reachable_within_distance(
+                    node,
+                    radius_mm.max(0.0),
+                    input.neighbors,
+                    input.positions,
+                )
+            } else {
+                reachable_within(node, params.rings.max(1), input.neighbors)
+            };
+            for neighbor in reachable {
                 let neighbor = neighbor as usize;
                 if visited[neighbor] || !input.passes[neighbor] {
                     continue;
@@ -254,6 +275,89 @@ fn reachable_within(node: usize, rings: u32, neighbors: &[Vec<u32>]) -> Vec<u32>
     }
     seen.remove(0);
     seen
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DistanceState {
+    distance: f32,
+    node: usize,
+}
+
+impl Eq for DistanceState {}
+
+impl Ord for DistanceState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse the distance comparison so BinaryHeap behaves as a min-heap.
+        other
+            .distance
+            .total_cmp(&self.distance)
+            .then_with(|| self.node.cmp(&other.node))
+    }
+}
+
+impl PartialOrd for DistanceState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Nodes reachable within `radius_mm` of `node` along mesh edges.
+///
+/// The accumulated length is a graph approximation to surface geodesic
+/// distance, which is the convention used by a positive SUMA/SurfClust
+/// radius. Intermediate nodes need not be suprathreshold.
+fn reachable_within_distance(
+    node: usize,
+    radius_mm: f32,
+    neighbors: &[Vec<u32>],
+    positions: &[[f32; 3]],
+) -> Vec<u32> {
+    if radius_mm <= 0.0 || node >= neighbors.len() || positions.len() != neighbors.len() {
+        return Vec::new();
+    }
+
+    let mut distances = vec![f32::INFINITY; neighbors.len()];
+    distances[node] = 0.0;
+    let mut heap = BinaryHeap::from([DistanceState {
+        distance: 0.0,
+        node,
+    }]);
+    let mut reachable = Vec::new();
+
+    while let Some(DistanceState {
+        distance,
+        node: current,
+    }) = heap.pop()
+    {
+        if distance > distances[current] || distance > radius_mm {
+            continue;
+        }
+        if current != node {
+            reachable.push(current as u32);
+        }
+        for neighbor in &neighbors[current] {
+            let neighbor = *neighbor as usize;
+            let Some(position) = positions.get(neighbor) else {
+                continue;
+            };
+            let edge_length = position
+                .iter()
+                .zip(positions[current])
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                .sqrt();
+            let candidate = distance + edge_length;
+            if candidate <= radius_mm && candidate < distances[neighbor] {
+                distances[neighbor] = candidate;
+                heap.push(DistanceState {
+                    distance: candidate,
+                    node: neighbor,
+                });
+            }
+        }
+    }
+
+    reachable
 }
 
 fn summarize(members: &[u32], input: &ClusterInput<'_>) -> ClusterSummary {
@@ -342,9 +446,13 @@ pub fn surfclust_command(
         dataset.unwrap_or("DATASET")
     ));
 
-    // The GUI's ring count is edge connectivity, which SurfClust spells as a
-    // negative radius.
-    command.push_str(&format!(" -rmm -{}", params.rings.max(1)));
+    if let Some(radius_mm) = params.radius_mm {
+        command.push_str(&format!(" -rmm {}", radius_mm.max(0.0)));
+    } else {
+        // The GUI's ring count is edge connectivity, which SurfClust spells as
+        // a negative radius.
+        command.push_str(&format!(" -rmm -{}", params.rings.max(1)));
+    }
 
     match params.metric {
         ClusterSizeMetric::Area => command.push_str(&format!(" -amm2 {}", params.min_area)),
@@ -448,6 +556,10 @@ mod tests {
             .collect()
     }
 
+    fn path_positions(count: usize) -> Vec<[f32; 3]> {
+        (0..count).map(|node| [node as f32, 0.0, 0.0]).collect()
+    }
+
     #[test]
     fn separates_disconnected_blobs_and_drops_the_small_one() {
         // Nodes 0,1,2 form one blob; node 5 is an isolated singleton. With a
@@ -463,6 +575,7 @@ mod tests {
                 passes: &passes,
                 tail_values: &tails,
                 neighbors: &neighbors,
+                positions: &path_positions(neighbors.len()),
                 node_areas: &areas,
                 values: &values,
             },
@@ -503,6 +616,7 @@ mod tests {
                 passes: &passes,
                 tail_values: &tails,
                 neighbors: &neighbors,
+                positions: &path_positions(neighbors.len()),
                 node_areas: &areas,
                 values: &values,
             },
@@ -535,6 +649,7 @@ mod tests {
                 passes: &passes,
                 tail_values: &tails,
                 neighbors: &neighbors,
+                positions: &path_positions(neighbors.len()),
                 node_areas: &areas,
                 values: &values,
             },
@@ -556,6 +671,7 @@ mod tests {
                 passes: &passes,
                 tail_values: &tails,
                 neighbors: &neighbors,
+                positions: &path_positions(neighbors.len()),
                 node_areas: &areas,
                 values: &values,
             },
@@ -581,10 +697,12 @@ mod tests {
         let areas = vec![1.0; 5];
         let values = vec![1.0; 5];
         let tails = vec![1.0; 5];
+        let positions = path_positions(5);
         let input = || ClusterInput {
             passes: &passes,
             tail_values: &tails,
             neighbors: &neighbors,
+            positions: &positions,
             node_areas: &areas,
             values: &values,
         };
@@ -616,6 +734,46 @@ mod tests {
     }
 
     #[test]
+    fn millimeter_radius_uses_accumulated_surface_edge_distance() {
+        let neighbors = path_neighbors(3);
+        let positions = vec![[0.0, 0.0, 0.0], [0.6, 0.0, 0.0], [1.2, 0.0, 0.0]];
+        let passes = vec![true, false, true];
+        let values = vec![1.0; 3];
+        let areas = vec![1.0; 3];
+        let input = || ClusterInput {
+            passes: &passes,
+            tail_values: &values,
+            neighbors: &neighbors,
+            positions: &positions,
+            node_areas: &areas,
+            values: &values,
+        };
+
+        let separate = label_clusters(
+            input(),
+            ClusterParams {
+                metric: ClusterSizeMetric::Nodes,
+                min_nodes: 1,
+                radius_mm: Some(0.9),
+                ..ClusterParams::new()
+            },
+        );
+        assert_eq!(separate.clusters.len(), 2);
+
+        let joined = label_clusters(
+            input(),
+            ClusterParams {
+                metric: ClusterSizeMetric::Nodes,
+                min_nodes: 1,
+                radius_mm: Some(1.3),
+                ..ClusterParams::new()
+            },
+        );
+        assert_eq!(joined.clusters.len(), 1);
+        assert_eq!(joined.labels, vec![1, 0, 1]);
+    }
+
+    #[test]
     fn clusters_are_labeled_largest_first() {
         // 0,1,2 is larger than 4,5. Label 1 must be the larger, matching
         // SurfClust's default area sort.
@@ -630,6 +788,7 @@ mod tests {
                 passes: &passes,
                 tail_values: &tails,
                 neighbors: &neighbors,
+                positions: &path_positions(neighbors.len()),
                 node_areas: &areas,
                 values: &values,
             },
@@ -662,6 +821,7 @@ mod tests {
                 passes: &[false; 4],
                 tail_values: &tails,
                 neighbors: &neighbors,
+                positions: &path_positions(neighbors.len()),
                 node_areas: &areas,
                 values: &values,
             },
@@ -676,6 +836,7 @@ mod tests {
                 passes: &[true; 4],
                 tail_values: &tails[..2],
                 neighbors: &neighbors,
+                positions: &path_positions(neighbors.len()),
                 node_areas: &areas,
                 values: &values,
             },
@@ -714,6 +875,23 @@ mod tests {
         assert!(command.contains("-sort_area"));
         // Merged clustering is what SurfClust does natively, so no caveat.
         assert!(!command.contains("# note:"));
+    }
+
+    #[test]
+    fn surfclust_command_preserves_positive_millimeter_radius() {
+        let command = surfclust_command(
+            None,
+            None,
+            0,
+            None,
+            Threshold::off(),
+            ClusterParams {
+                radius_mm: Some(2.5),
+                ..ClusterParams::new()
+            },
+            false,
+        );
+        assert!(command.contains(" -rmm 2.5"));
     }
 
     #[test]

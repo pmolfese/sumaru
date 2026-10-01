@@ -107,11 +107,17 @@ pub(crate) fn gifti_image_to_dataset(
         .find_map(|key| gifti_meta_value(&image.meta, key))
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0);
+    let time_start_seconds = ["TimeStart", "AFNI_TimeStart", "ni_tstart"]
+        .iter()
+        .find_map(|key| gifti_meta_value(&image.meta, key))
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite());
 
     Dataset::dense(kind, domain, columns).map(|dataset| {
         dataset
             .with_parent_ids(parent_ids)
             .with_time_step_seconds(time_step_seconds)
+            .with_time_start_seconds(time_start_seconds)
     })
 }
 
@@ -357,7 +363,10 @@ mod tests {
         let image = GiftiImage {
             version: "1.0".to_string(),
             num_data_arrays: 3,
-            meta: vec![("TimeStep".to_string(), "0.8".to_string())],
+            meta: vec![
+                ("TimeStart".to_string(), "-0.2".to_string()),
+                ("TimeStep".to_string(), "0.8".to_string()),
+            ],
             label_table: None,
             data_arrays: vec![
                 float_array(gifti_rs::intent::POINTSET, vec![3], vec![1.0, 2.0, 3.0]),
@@ -372,6 +381,7 @@ mod tests {
 
         assert_eq!(dataset.kind, DatasetKind::SurfaceTimeSeries);
         assert_eq!(dataset.time_step_seconds, Some(0.8));
+        assert_eq!(dataset.time_start_seconds, Some(-0.2));
         assert_eq!(dataset.columns.len(), 2);
         assert!(
             dataset

@@ -670,8 +670,15 @@ impl ViewerState {
         }
 
         self.sanitize_overlay_appearance();
+        if let Some(timecourse) = self.timecourse.as_mut() {
+            let threshold = self.overlay.render.appearance.threshold;
+            timecourse.controls.threshold_enabled = threshold.enabled;
+            timecourse.controls.threshold_absolute = threshold.absolute;
+            timecourse.controls.threshold_value = threshold.value;
+        }
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
+        self.refresh_graph_snapshot_if_open();
         self.upload_surface_buffers();
         self.update_scene_stats();
 
@@ -739,11 +746,29 @@ impl ViewerState {
                 self.overlay.render.appearance.range,
             )))
             .with_symmetric_range(self.overlay.render.appearance.symmetric_range)
+            .with_brightness_range(
+                self.overlay
+                    .render
+                    .appearance
+                    .brightness_range
+                    .map(|range| RangeSelection::Manual(overlay_range_from_value_range(range)))
+                    .unwrap_or(RangeSelection::Auto),
+            )
+            .with_brightness_scale(
+                self.overlay.render.appearance.brightness_scale[0],
+                self.overlay.render.appearance.brightness_scale[1],
+            )
             .with_threshold(threshold, mask_mode)
             .with_cluster_labels(cluster_labels)
+            .with_show_zero(self.overlay.render.appearance.show_zero)
             .with_opacity(self.overlay.render.appearance.opacity);
 
         overlay.rebuild_color_cache(dataset, domain)?;
+        if !self.overlay.render.appearance.display_mode.shows_color() {
+            for color in &mut overlay.color_cache.colors {
+                color[3] = 0.0;
+            }
+        }
         self.overlay.render.render_model = Some(overlay);
 
         Ok(())
@@ -807,6 +832,7 @@ fn append_sparse_overlay_dataset(
         DatasetKind::Unknown
     };
     let time_step_seconds = paired_time_step(left.time_step_seconds, right.time_step_seconds)?;
+    let time_start_seconds = paired_time_start(left.time_start_seconds, right.time_start_seconds)?;
     let parent_ids = if left.parent_ids == right.parent_ids {
         left.parent_ids.clone()
     } else {
@@ -839,6 +865,7 @@ fn append_sparse_overlay_dataset(
             dataset
                 .with_parent_ids(parent_ids)
                 .with_time_step_seconds(time_step_seconds)
+                .with_time_start_seconds(time_start_seconds)
         })
         .context("failed to combine auto NIML overlay datasets")
 }
