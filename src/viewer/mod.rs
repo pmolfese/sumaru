@@ -377,6 +377,9 @@ pub struct LaunchOptions {
     pub graph_paths: Vec<PathBuf>,
     pub overlay_path: Option<PathBuf>,
     pub overlay_pair_paths: Option<ExplicitOverlayPair>,
+    /// Additional startup overlays, used by multi-condition timecourse mode.
+    pub overlay_paths: Vec<PathBuf>,
+    pub overlay_pair_paths_list: Vec<ExplicitOverlayPair>,
     pub roi_path: Option<PathBuf>,
     pub auto_color_niml: bool,
     pub overlay_subs: Option<Vec<String>>,
@@ -471,6 +474,8 @@ struct ViewerApp {
     initial_graph_paths: Vec<PathBuf>,
     initial_overlay_path: Option<PathBuf>,
     initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
+    initial_overlay_paths: Vec<PathBuf>,
+    initial_overlay_pair_paths_list: Vec<ExplicitOverlayPair>,
     initial_roi_path: Option<PathBuf>,
     initial_auto_color_niml: bool,
     initial_overlay_subs: Option<Vec<String>>,
@@ -501,6 +506,8 @@ impl ViewerApp {
             initial_graph_paths: options.graph_paths,
             initial_overlay_path: options.overlay_path,
             initial_overlay_pair_paths: options.overlay_pair_paths,
+            initial_overlay_paths: options.overlay_paths,
+            initial_overlay_pair_paths_list: options.overlay_pair_paths_list,
             initial_roi_path: options.roi_path,
             initial_auto_color_niml: options.auto_color_niml,
             initial_overlay_subs: options.overlay_subs,
@@ -587,6 +594,8 @@ impl ViewerApp {
                 graph_paths: std::mem::take(&mut self.initial_graph_paths),
                 overlay_path: self.initial_overlay_path.take(),
                 overlay_pair_paths: self.initial_overlay_pair_paths.take(),
+                overlay_paths: std::mem::take(&mut self.initial_overlay_paths),
+                overlay_pair_paths_list: std::mem::take(&mut self.initial_overlay_pair_paths_list),
                 roi_path: self.initial_roi_path.take(),
                 auto_color_niml: self.initial_auto_color_niml,
                 overlay_subs: self.initial_overlay_subs.take(),
@@ -1346,6 +1355,8 @@ struct InitialScene {
     graph_paths: Vec<PathBuf>,
     overlay_path: Option<PathBuf>,
     overlay_pair_paths: Option<ExplicitOverlayPair>,
+    overlay_paths: Vec<PathBuf>,
+    overlay_pair_paths_list: Vec<ExplicitOverlayPair>,
     roi_path: Option<PathBuf>,
     auto_color_niml: bool,
     overlay_subs: Option<Vec<String>>,
@@ -1606,6 +1617,8 @@ impl ViewerState {
             graph_paths: initial_graph_paths,
             overlay_path: initial_overlay_path,
             overlay_pair_paths: initial_overlay_pair_paths,
+            overlay_paths: initial_overlay_paths,
+            overlay_pair_paths_list: initial_overlay_pair_paths_list,
             roi_path: initial_roi_path,
             auto_color_niml: initial_auto_color_niml,
             overlay_subs: initial_overlay_subs,
@@ -2145,7 +2158,16 @@ impl ViewerState {
         } else if initial_auto_color_niml {
             state.load_auto_niml_overlay_for_active_surface()?;
         }
+        for path in initial_overlay_paths {
+            state.load_overlay_path(path)?;
+        }
+        for pair in initial_overlay_pair_paths_list {
+            state.load_overlay_pair_paths(pair)?;
+        }
         if initial_timecourse_mode {
+            if state.overlay_count() > 1 {
+                state.select_overlay(0)?;
+            }
             state.initialize_timecourse_mode()?;
         }
         if let Some(path) = initial_roi_path {
@@ -3013,17 +3035,23 @@ impl ViewerState {
         self.overlay.render.appearance.opacity =
             self.overlay.render.appearance.opacity.clamp(0.0, 1.0);
 
-        let (threshold_min, threshold_max) = threshold_bounds(
-            self.selected_threshold_range(),
-            self.overlay.render.appearance.threshold.absolute,
-        );
-        self.overlay.render.appearance.threshold.value = self
-            .overlay
-            .render
-            .appearance
-            .threshold
-            .value
-            .clamp(threshold_min, threshold_max);
+        // A timecourse threshold is global across samples. Do not clamp it to
+        // the value range of the current sample: doing so would silently move
+        // the threshold during playback (and make an intentionally empty map
+        // impossible at a quiet time point).
+        if self.timecourse.is_none() {
+            let (threshold_min, threshold_max) = threshold_bounds(
+                self.selected_threshold_range(),
+                self.overlay.render.appearance.threshold.absolute,
+            );
+            self.overlay.render.appearance.threshold.value = self
+                .overlay
+                .render
+                .appearance
+                .threshold
+                .value
+                .clamp(threshold_min, threshold_max);
+        }
     }
 
     fn fit_control_window(
@@ -3358,6 +3386,11 @@ impl ViewerState {
                 }
                 ViewerCommand::SetTimeCourseControls(controls) => {
                     if let Err(error) = self.set_timecourse_controls(controls) {
+                        self.set_error(error);
+                    }
+                }
+                ViewerCommand::PreviewTimeCourseControls(controls) => {
+                    if let Err(error) = self.preview_timecourse_controls(controls) {
                         self.set_error(error);
                     }
                 }
@@ -6467,7 +6500,16 @@ struct GraphSnapshot {
     surface_label: String,
     overlay_label: String,
     points: Vec<GraphPoint>,
+    active_series_index: usize,
+    comparison_series: Vec<GraphSeries>,
     y_range: ValueRange,
+}
+
+#[derive(Debug, Clone)]
+struct GraphSeries {
+    label: String,
+    color_index: usize,
+    points: Vec<GraphPoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -8867,7 +8909,9 @@ fn draw_graph_snapshot(
     );
     let axis_color = egui::Color32::from_rgb(92, 103, 122);
     let grid_color = egui::Color32::from_rgb(43, 50, 62);
-    let line_color = egui::Color32::from_rgb(123, 184, 226);
+    let line_color = timecourse_series_color(snapshot.active_series_index);
+    let threshold_color = egui::Color32::from_rgb(246, 199, 94);
+    let plot_y_range = graph_plot_y_range(snapshot, timecourse);
 
     painter.rect_filled(rect, egui::CornerRadius::same(6), panel_fill_color());
     painter.rect_stroke(
@@ -8935,8 +8979,8 @@ fn draw_graph_snapshot(
         egui::Stroke::new(1.0_f32, axis_color),
     );
 
-    let y_min = snapshot.y_range.min;
-    let y_max = snapshot.y_range.max;
+    let y_min = plot_y_range.min;
+    let y_max = plot_y_range.max;
     painter.text(
         egui::pos2(rect.left() + 8.0, plot_rect.top() - 6.0),
         egui::Align2::LEFT_TOP,
@@ -8952,7 +8996,28 @@ fn draw_graph_snapshot(
         muted_color(),
     );
 
-    let points = graph_plot_positions(snapshot, plot_rect);
+    if let Some(markers) = timecourse {
+        for threshold in timecourse_threshold_lines(markers) {
+            let y = graph_plot_y(threshold, plot_y_range, plot_rect);
+            draw_dashed_horizontal_line(
+                &painter,
+                plot_rect,
+                y,
+                egui::Stroke::new(1.5_f32, threshold_color),
+            );
+        }
+    }
+
+    for series in &snapshot.comparison_series {
+        let series_points = graph_series_plot_positions(&series.points, plot_rect, plot_y_range);
+        for pair in series_points.windows(2) {
+            painter.line_segment(
+                [pair[0].1, pair[1].1],
+                egui::Stroke::new(1.6_f32, timecourse_series_color(series.color_index)),
+            );
+        }
+    }
+    let points = graph_plot_positions(snapshot, plot_rect, plot_y_range);
     for pair in points.windows(2) {
         painter.line_segment(
             [pair[0].1, pair[1].1],
@@ -9013,9 +9078,47 @@ fn draw_graph_snapshot(
 
     ui.horizontal_wrapped(|ui| {
         if timecourse.is_some() {
+            if snapshot.comparison_series.is_empty() {
+                graph_legend_chip(
+                    ui,
+                    &truncate_middle(&snapshot.overlay_label, 28),
+                    line_color,
+                )
+                .on_hover_text(&snapshot.overlay_label);
+            } else {
+                ui.label(egui::RichText::new("conditions").color(muted_color()));
+                let condition_count = snapshot.comparison_series.len() + 1;
+                for condition_index in 0..condition_count {
+                    let (label, active) = if condition_index == snapshot.active_series_index {
+                        (snapshot.overlay_label.as_str(), true)
+                    } else if let Some(series) = snapshot
+                        .comparison_series
+                        .iter()
+                        .find(|series| series.color_index == condition_index)
+                    {
+                        (series.label.as_str(), false)
+                    } else {
+                        continue;
+                    };
+                    graph_condition_legend_chip(
+                        ui,
+                        condition_index,
+                        label,
+                        timecourse_series_color(condition_index),
+                        active,
+                    );
+                }
+            }
+            ui.separator();
             graph_legend_chip(ui, "baseline", egui::Color32::from_rgb(72, 126, 176));
             graph_legend_chip(ui, "response", egui::Color32::from_rgb(232, 154, 64));
             ui.label(egui::RichText::new("white line = surface time").color(muted_color()));
+            if timecourse.and_then(|markers| markers.threshold).is_some() {
+                ui.label(
+                    egui::RichText::new("dashed gold = activation threshold")
+                        .color(threshold_color),
+                );
+            }
             return;
         }
         graph_legend_chip(ui, "I", egui::Color32::from_rgb(123, 184, 226));
@@ -9066,12 +9169,34 @@ fn draw_graph_snapshot(
         let fraction = ((x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 1.0);
         (fraction * snapshot.points.len().saturating_sub(1) as f32).round() as usize
     };
-    if response.dragged() {
+    let drag_state_id = response.id.with("timecourse_selection_drag");
+    if response.drag_started() {
         let current = sample_for_x(pointer.x);
-        let start = sample_for_x(pointer.x - response.drag_delta().x);
+        let start = response
+            .total_drag_delta()
+            .map(|delta| sample_for_x(pointer.x - delta.x))
+            .unwrap_or(current);
+        let baseline = ui.input(|input| input.modifiers.shift);
+        ui.memory_mut(|memory| {
+            memory.data.insert_temp(drag_state_id, (start, baseline));
+        });
+    }
+    if response.dragged() || response.drag_stopped() {
+        let current = sample_for_x(pointer.x);
+        let (start, baseline) = ui
+            .memory(|memory| memory.data.get_temp::<(usize, bool)>(drag_state_id))
+            .unwrap_or((current, ui.input(|input| input.modifiers.shift)));
         let range = [start.min(current), start.max(current)];
-        if ui.input(|input| input.modifiers.shift) {
-            Some(TimeCoursePlotInteraction::Baseline(range))
+        if response.drag_stopped() {
+            ui.memory_mut(|memory| {
+                memory.data.remove_temp::<(usize, bool)>(drag_state_id);
+            });
+        }
+        if baseline {
+            Some(TimeCoursePlotInteraction::Baseline {
+                range,
+                commit: response.drag_stopped(),
+            })
         } else {
             Some(TimeCoursePlotInteraction::Response(range))
         }
@@ -9093,23 +9218,102 @@ fn draw_rotated_graph_label(painter: &egui::Painter, anchor: egui::Pos2, label: 
     painter.add(egui::Shape::Text(text_shape));
 }
 
-fn graph_plot_positions(snapshot: &GraphSnapshot, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
-    let count = snapshot.points.len();
+fn graph_plot_positions(
+    snapshot: &GraphSnapshot,
+    rect: egui::Rect,
+    y_range: ValueRange,
+) -> Vec<(usize, egui::Pos2)> {
+    graph_series_plot_positions(&snapshot.points, rect, y_range)
+}
+
+fn graph_series_plot_positions(
+    points: &[GraphPoint],
+    rect: egui::Rect,
+    y_range: ValueRange,
+) -> Vec<(usize, egui::Pos2)> {
+    let count = points.len();
     let denominator = count.saturating_sub(1).max(1) as f32;
-    snapshot
-        .points
+    points
         .iter()
         .enumerate()
         .map(|(index, point)| {
             let x_t = index as f32 / denominator;
-            let y_t = ((point.value - snapshot.y_range.min)
-                / (snapshot.y_range.max - snapshot.y_range.min))
-                .clamp(0.0, 1.0);
             let x = egui::lerp(rect.left()..=rect.right(), x_t);
-            let y = egui::lerp(rect.bottom()..=rect.top(), y_t);
+            let y = graph_plot_y(point.value, y_range, rect);
             (index, egui::pos2(x, y))
         })
         .collect()
+}
+
+fn timecourse_series_color(index: usize) -> egui::Color32 {
+    const COLORS: [egui::Color32; 8] = [
+        egui::Color32::from_rgb(123, 184, 226),
+        egui::Color32::from_rgb(239, 148, 65),
+        egui::Color32::from_rgb(111, 207, 151),
+        egui::Color32::from_rgb(202, 142, 230),
+        egui::Color32::from_rgb(240, 206, 92),
+        egui::Color32::from_rgb(235, 112, 143),
+        egui::Color32::from_rgb(88, 207, 211),
+        egui::Color32::from_rgb(180, 180, 190),
+    ];
+    COLORS[index % COLORS.len()]
+}
+
+fn graph_plot_y(value: f32, range: ValueRange, rect: egui::Rect) -> f32 {
+    let position = ((value - range.min) / (range.max - range.min)).clamp(0.0, 1.0);
+    egui::lerp(rect.bottom()..=rect.top(), position)
+}
+
+fn timecourse_threshold_lines(markers: TimeCoursePlotMarkers) -> Vec<f32> {
+    let Some(threshold) = markers.threshold else {
+        return Vec::new();
+    };
+    if threshold.absolute {
+        let extent = threshold.value.abs();
+        if extent == 0.0 {
+            vec![0.0]
+        } else {
+            vec![-extent, extent]
+        }
+    } else {
+        vec![threshold.value]
+    }
+}
+
+fn graph_plot_y_range(
+    snapshot: &GraphSnapshot,
+    timecourse: Option<TimeCoursePlotMarkers>,
+) -> ValueRange {
+    let Some(markers) = timecourse else {
+        return snapshot.y_range;
+    };
+    let mut min = snapshot.y_range.min;
+    let mut max = snapshot.y_range.max;
+    for threshold in timecourse_threshold_lines(markers) {
+        min = min.min(threshold);
+        max = max.max(threshold);
+    }
+    if min == snapshot.y_range.min && max == snapshot.y_range.max {
+        snapshot.y_range
+    } else {
+        graph::padded_graph_y_range(min, max)
+    }
+}
+
+fn draw_dashed_horizontal_line(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    y: f32,
+    stroke: egui::Stroke,
+) {
+    const DASH_POINTS: f32 = 7.0;
+    const GAP_POINTS: f32 = 5.0;
+    let mut x = rect.left();
+    while x < rect.right() {
+        let end = (x + DASH_POINTS).min(rect.right());
+        painter.line_segment([egui::pos2(x, y), egui::pos2(end, y)], stroke);
+        x += DASH_POINTS + GAP_POINTS;
+    }
 }
 
 fn graph_point_style(
@@ -9131,11 +9335,41 @@ fn graph_label_stride(point_count: usize) -> usize {
     (point_count / 8).max(1)
 }
 
-fn graph_legend_chip(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+fn graph_legend_chip(ui: &mut egui::Ui, label: &str, color: egui::Color32) -> egui::Response {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 4.0, color);
         ui.label(label);
+    })
+    .response
+}
+
+fn graph_condition_legend_chip(
+    ui: &mut egui::Ui,
+    condition_index: usize,
+    full_label: &str,
+    color: egui::Color32,
+    active: bool,
+) {
+    let response = ui
+        .horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, color);
+            if active {
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    6.0,
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                );
+            }
+            let label = egui::RichText::new(format!("C{}", condition_index + 1));
+            ui.label(if active { label.strong() } else { label });
+        })
+        .response;
+    response.on_hover_text(if active {
+        format!("Active condition mapped on the brain\n{full_label}")
+    } else {
+        format!("Condition C{}\n{full_label}", condition_index + 1)
     });
 }
 
@@ -9318,7 +9552,16 @@ fn float_color_channel(value: f32) -> u8 {
 }
 
 fn range_drag_speed(range: ValueRange) -> f32 {
-    ((range.max - range.min).abs() / 200.0).max(0.001)
+    let span = (range.max - range.min).abs();
+    if span.is_finite() && span > 0.0 {
+        return span / 200.0;
+    }
+    let magnitude = range.min.abs().max(range.max.abs());
+    if magnitude.is_finite() && magnitude > 0.0 {
+        magnitude / 200.0
+    } else {
+        0.01
+    }
 }
 
 fn repaint_delay_to_instant(full_output: &egui::FullOutput) -> Option<Instant> {
@@ -9431,7 +9674,12 @@ pub(super) fn symmetric_value_range(range: ValueRange) -> ValueRange {
 
 fn threshold_bounds(range: ValueRange, absolute: bool) -> (f32, f32) {
     if absolute {
-        let extent = range.min.abs().max(range.max.abs()).max(0.0001);
+        let extent = range.min.abs().max(range.max.abs());
+        let extent = if extent.is_finite() && extent > 0.0 {
+            extent
+        } else {
+            1.0
+        };
         (0.0, extent)
     } else {
         ordered_range(range)
@@ -9481,7 +9729,12 @@ fn threshold_q_value_display(qvalue: Option<f64>) -> String {
 }
 
 fn threshold_bar_y_for_value(rect: egui::Rect, min: f32, max: f32, value: f32) -> f32 {
-    let span = (max - min).abs().max(f32::EPSILON);
+    let span = (max - min).abs();
+    let span = if span.is_finite() && span > 0.0 {
+        span
+    } else {
+        1.0
+    };
     let t = ((value - min) / span).clamp(0.0, 1.0);
     rect.bottom() - rect.height() * t
 }
@@ -9856,6 +10109,47 @@ mod tests {
         assert_eq!(super::scalar_value_label(0.0), "0.0000");
         assert!(super::scalar_value_label(1.2e-10).contains('e'));
         assert!(super::overlay_value_label(Some(-3.4e-8)).contains('e'));
+    }
+
+    #[test]
+    fn tiny_overlay_ranges_keep_scientific_threshold_precision() {
+        let range = ValueRange {
+            min: -8.0e-11,
+            max: 1.7e-10,
+        };
+
+        let speed = super::range_drag_speed(range);
+        assert!(speed > 0.0 && speed < 1.0e-11);
+        assert_eq!(super::threshold_bounds(range, true), (0.0, 1.7e-10));
+        assert_eq!(super::threshold_bounds(range, false), (-8.0e-11, 1.7e-10));
+    }
+
+    #[test]
+    fn threshold_bar_uses_the_full_rail_for_meg_sized_values() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(20.0, 100.0));
+        let min = 0.0;
+        let max = 2.0e-10;
+        let midpoint = 1.0e-10;
+
+        let y = super::threshold_bar_y_for_value(rect, min, max, midpoint);
+        assert!((y - rect.center().y).abs() < 1.0e-4);
+        let round_trip = super::threshold_value_from_bar_y(rect, min, max, y);
+        assert!((round_trip - midpoint).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn threshold_bar_keeps_ordinary_overlay_linear_mapping() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(20.0, 100.0));
+
+        assert_eq!(super::threshold_bar_y_for_value(rect, 0.0, 10.0, 2.5), 75.0);
+        assert_eq!(
+            super::threshold_value_from_bar_y(rect, 0.0, 10.0, 75.0),
+            2.5
+        );
+        assert_eq!(
+            super::threshold_bar_y_for_value(rect, -10.0, 10.0, 0.0),
+            50.0
+        );
     }
 
     #[test]

@@ -186,17 +186,31 @@ struct TimeCourseArgs {
     #[arg(short = 'i', long = "surface", value_name = "PATH")]
     surface: PathBuf,
 
-    /// 3D+time GIFTI surface overlay.
-    #[arg(long = "overlay", visible_alias = "overaly", value_name = "PATH")]
-    overlay: PathBuf,
+    /// One or more 3D+time GIFTI surface overlays. Repeat for multiple conditions.
+    #[arg(
+        long = "overlay",
+        visible_alias = "overaly",
+        value_name = "PATH",
+        required_unless_present = "overlay_multi"
+    )]
+    overlay: Vec<PathBuf>,
+
+    /// Load several timecourse conditions from one compact argument.
+    #[arg(
+        long = "overlay-multi",
+        value_name = "PATH",
+        num_args = 1..,
+        required_unless_present = "overlay"
+    )]
+    overlay_multi: Vec<PathBuf>,
 
     /// Explicit right-hemisphere surface (disables automatic surface pairing).
     #[arg(long = "surface-rh", value_name = "PATH")]
     surface_rh: Option<PathBuf>,
 
-    /// Explicit right-hemisphere timecourse overlay.
+    /// Explicit right-hemisphere timecourse overlay. Repeat in condition order.
     #[arg(long = "overlay-rh", value_name = "PATH")]
-    overlay_rh: Option<PathBuf>,
+    overlay_rh: Vec<PathBuf>,
 
     /// Print viewer status messages to the terminal.
     #[arg(long = "verbose")]
@@ -346,6 +360,8 @@ fn main() -> Result<()> {
                 graph_paths,
                 overlay_path: overlay,
                 overlay_pair_paths: overlay_pair,
+                overlay_paths: Vec::new(),
+                overlay_pair_paths_list: Vec::new(),
                 roi_path: roi,
                 auto_color_niml,
                 overlay_subs: subs,
@@ -383,6 +399,8 @@ fn main() -> Result<()> {
                 bail!("AFNI connection flags do not apply to `sumaru tc`");
             }
 
+            let mut condition_overlays = args.overlay;
+            condition_overlays.extend(args.overlay_multi);
             let (surface_lh_path, surface_rh_path) = if let Some(right) = args.surface_rh {
                 (Some(args.surface.clone()), Some(right))
             } else if let Some((left, right)) = discover_hemisphere_pair(&args.surface) {
@@ -391,37 +409,51 @@ fn main() -> Result<()> {
                 (None, None)
             };
             let paired_scene = surface_lh_path.is_some();
-            let (surface_paths, overlay_path, overlay_pair_paths) = if paired_scene {
-                let overlay_pair = if let Some(right) = args.overlay_rh {
-                    ExplicitOverlayPair {
-                        left_path: Some(args.overlay),
-                        right_path: Some(right),
-                    }
-                } else if let Some((left, right)) = discover_hemisphere_pair(&args.overlay) {
-                    ExplicitOverlayPair {
-                        left_path: Some(left),
-                        right_path: Some(right),
-                    }
-                } else {
-                    ExplicitOverlayPair {
-                        left_path: Some(args.overlay),
-                        right_path: None,
-                    }
-                };
-                (Vec::new(), None, Some(overlay_pair))
+            if !args.overlay_rh.is_empty() && !paired_scene {
+                bail!("--overlay-rh requires a paired surface in `sumaru tc`");
+            }
+            if !args.overlay_rh.is_empty() && args.overlay_rh.len() != condition_overlays.len() {
+                bail!(
+                    "repeat --overlay-rh once for each condition ({} left, {} right)",
+                    condition_overlays.len(),
+                    args.overlay_rh.len()
+                );
+            }
+
+            let (surface_paths, overlay_paths, overlay_pair_paths) = if paired_scene {
+                let pairs = condition_overlays
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, overlay)| {
+                        if let Some(right) = args.overlay_rh.get(index) {
+                            ExplicitOverlayPair {
+                                left_path: Some(overlay),
+                                right_path: Some(right.clone()),
+                            }
+                        } else if let Some((left, right)) = discover_hemisphere_pair(&overlay) {
+                            ExplicitOverlayPair {
+                                left_path: Some(left),
+                                right_path: Some(right),
+                            }
+                        } else {
+                            ExplicitOverlayPair {
+                                left_path: Some(overlay),
+                                right_path: None,
+                            }
+                        }
+                    })
+                    .collect();
+                (Vec::new(), Vec::new(), pairs)
             } else {
-                if args.overlay_rh.is_some() {
-                    bail!("--overlay-rh requires a paired surface in `sumaru tc`");
-                }
-                (vec![args.surface], Some(args.overlay), None)
+                (vec![args.surface], condition_overlays, Vec::new())
             };
 
             viewer::run(viewer::LaunchOptions {
                 surface_paths,
                 surface_lh_path,
                 surface_rh_path,
-                overlay_path,
-                overlay_pair_paths,
+                overlay_paths,
+                overlay_pair_paths_list: overlay_pair_paths,
                 verbose: verbose || args.verbose,
                 big_mem: big_mem || args.big_mem,
                 timecourse_mode: true,
@@ -843,7 +875,52 @@ mod tests {
             cli.command,
             Some(Commands::Tc(args))
                 if args.surface == PathBuf::from("underlay-lh.gii")
-                    && args.overlay == PathBuf::from("stc-lh.gii")
+                    && args.overlay == vec![PathBuf::from("stc-lh.gii")]
+        ));
+    }
+
+    #[test]
+    fn timecourse_subcommand_accepts_multiple_conditions() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "tc",
+            "-i",
+            "underlay-lh.gii",
+            "--overlay",
+            "condition-a-lh.gii",
+            "--overlay",
+            "condition-b-lh.gii",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tc(args))
+                if args.overlay == vec![
+                    PathBuf::from("condition-a-lh.gii"),
+                    PathBuf::from("condition-b-lh.gii"),
+                ]
+        ));
+    }
+
+    #[test]
+    fn timecourse_subcommand_accepts_overlay_multi_shortcut() {
+        let cli = Cli::parse_from([
+            "sumaru",
+            "tc",
+            "-i",
+            "underlay-lh.gii",
+            "--overlay-multi",
+            "condition-a-lh.gii",
+            "condition-b-lh.gii",
+            "condition-c-lh.gii",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tc(args))
+                if args.overlay_multi == vec![
+                    PathBuf::from("condition-a-lh.gii"),
+                    PathBuf::from("condition-b-lh.gii"),
+                    PathBuf::from("condition-c-lh.gii"),
+                ]
         ));
     }
 

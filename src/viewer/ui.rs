@@ -1606,8 +1606,12 @@ impl ViewerState {
                         actions.push(ViewerCommand::CycleOverlay(1));
                     }
                     if ui
-                        .button("Remove")
-                        .on_hover_text("Unload the active overlay")
+                        .add_enabled(self.timecourse.is_none(), egui::Button::new("Remove"))
+                        .on_hover_text(if self.timecourse.is_some() {
+                            "Condition removal is disabled in timecourse mode"
+                        } else {
+                            "Unload the active overlay"
+                        })
                         .clicked()
                     {
                         actions.push(ViewerCommand::RemoveActiveOverlay);
@@ -2458,6 +2462,11 @@ impl ViewerState {
     }
 
     pub(super) fn selected_threshold_range(&self) -> ValueRange {
+        if let Some(timecourse) = self.timecourse.as_ref()
+            && timecourse.controls.display == TimeCourseDisplay::Cursor
+        {
+            return timecourse.threshold_range();
+        }
         self.overlay
             .data
             .dataset()

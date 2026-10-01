@@ -110,6 +110,10 @@ impl ViewerState {
         if let Some(transfer) = transfer {
             self.apply_overlay_threshold_transfer(transfer);
         }
+        if let Some(timecourse) = self.timecourse.as_mut() {
+            timecourse.activate_condition(index)?;
+            self.apply_timecourse_overlay()?;
+        }
         self.finish_overlay_switch()?;
         Ok(true)
     }

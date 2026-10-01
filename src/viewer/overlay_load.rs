@@ -670,8 +670,15 @@ impl ViewerState {
         }
 
         self.sanitize_overlay_appearance();
+        if let Some(timecourse) = self.timecourse.as_mut() {
+            let threshold = self.overlay.render.appearance.threshold;
+            timecourse.controls.threshold_enabled = threshold.enabled;
+            timecourse.controls.threshold_absolute = threshold.absolute;
+            timecourse.controls.threshold_value = threshold.value;
+        }
         self.rebuild_overlay_model()?;
         self.refresh_pick_overlay_value();
+        self.refresh_graph_snapshot_if_open();
         self.upload_surface_buffers();
         self.update_scene_stats();
 

@@ -546,6 +546,7 @@ pub enum ViewerCommand {
     RefreshOverlayColumns,
     RefreshOverlayAppearance,
     SetTimeCourseControls(crate::viewer::TimeCourseControls),
+    PreviewTimeCourseControls(crate::viewer::TimeCourseControls),
     SelectOverlay(usize),
     CycleOverlay(isize),
     RemoveActiveOverlay,

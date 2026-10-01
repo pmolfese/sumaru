@@ -215,21 +215,48 @@ Launch a surface timecourse directly with:
 sumaru tc -i underlay-lh.gii --overlay stc-lh.gii
 ```
 
+Use `--overlay-multi` to compare several conditions on the same surfaces:
+
+```sh
+sumaru tc -i underlay-lh.gii \
+  --overlay-multi condition-a-lh.time.gii condition-b-lh.time.gii
+```
+
+Repeating `--overlay` once per condition is equivalent.
+
 If matching `-rh` files exist beside the supplied `-lh` files, Sumaru loads
 both hemispheres automatically. `--surface-rh` and `--overlay-rh` can specify
-the partners explicitly. A single hemisphere works normally.
+the partners explicitly; repeat `--overlay-rh` in the same condition order.
+A single hemisphere works normally. `-onestate` controls how multiple surface
+geometry files are grouped and is not needed for multiple timecourse
+conditions.
 
 The bottom timecourse dock drives the existing surface renderer. Move the time
-slider or press **Play** to display successive samples. Select a baseline and
+slider, click the graph, or press **Play** to display each sample's vertex
+activation map. **Auto robust (99.5%)** uses one fixed color scale across the
+full timecourse so playback does not rescale or flicker; **Full range** includes
+the most extreme sample. These are display mappings and do not alter the data.
+Select a baseline and
 choose raw values, baseline subtraction, or baseline z-scores. Select a
 response window and show its mean, positive peak, negative peak, signed
 absolute peak, or trapezoidal area under the curve on the surface. The
-activation threshold can be signed or absolute and uses the normal overlay
+baseline and response fields are times in milliseconds and snap to the nearest
+sample. Dragging a baseline previews it immediately; the robust scale is
+recomputed when the drag ends. The activation threshold can be signed or
+absolute and uses the normal overlay
 masking path. Right-click any surface node to add its full timecourse to the
-dock; blue and orange bands mark the baseline and response windows, and the
-white cursor line is the time currently displayed on the surface. Click the
-graph to move the cursor, drag across it to select the response window, or
-Shift-drag to select the baseline window.
+dock. Every loaded condition is drawn on the same graph with a stable color;
+the active condition is emphasized and is the one mapped on the brain. Use the
+existing overlay Dataset selector (or its previous/next buttons) to change the
+active condition. Blue and orange bands mark the baseline and response windows,
+and the white cursor line is the time currently displayed on the surface. When the
+activation threshold is enabled, dashed gold lines show its boundary in the
+selected vertex's graph (two lines for an absolute threshold). Click the graph
+to move the cursor, drag across it to select the response window, or Shift-drag
+to select the baseline window. **Map window summary** switches away from the
+current time point and maps the chosen response-window measure across vertices;
+moving the time slider or clicking a time point switches back to the time-point
+map.
 
 MNE-style GIFTI metadata keys `TimeStart` and `TimeStep` are read in seconds.
 When absent, Sumaru falls back to a zero start and one-second spacing so the
