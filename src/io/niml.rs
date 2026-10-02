@@ -1084,7 +1084,19 @@ pub(crate) fn parse_element_data_bytes(
             NimlValueType::String | NimlValueType::CString
         )
     {
-        return Ok(NimlData::Text(unescape_niml(body.trim())));
+        // One string becomes Text; several (AFNI splits long attributes this
+        // way) become a one-column table.
+        let mut strings = split_niml_strings(body);
+        if strings.len() <= 1 {
+            return Ok(NimlData::Text(strings.pop().unwrap_or_default()));
+        }
+        let rows = strings.len();
+        let values = strings.into_iter().map(NimlValue::Text).collect();
+        return Ok(NimlData::Mixed(NimlMixedTable::new(
+            column_types,
+            rows,
+            values,
+        )?));
     }
 
     Ok(NimlData::Mixed(parse_mixed_table(
@@ -1092,6 +1104,55 @@ pub(crate) fn parse_element_data_bytes(
         column_types,
         rows,
     )?))
+}
+
+/// Split the body of a `String` column into its strings.
+///
+/// A quoted body follows AFNI's `NI_decode_one_string` (`niml_elemio.c`):
+/// each string runs from a `"` or `'` to the matching quote, or is a run of
+/// non-blank characters, and entities are decoded *after* splitting so an
+/// escaped `&quot;` never ends a string early. An unterminated quote runs to
+/// the end of the body.
+///
+/// A body that does not start with a quote is kept whole as one string.
+/// Before quoting was fixed, sumaru wrote multi-word strings unquoted
+/// (e.g. `HISTORY_NOTE`); AFNI would read only their first word, but sumaru
+/// should still read its own older files completely.
+pub(crate) fn split_niml_strings(body: &str) -> Vec<String> {
+    let trimmed = body.trim();
+    if !trimmed.starts_with(['"', '\'']) {
+        return if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            vec![unescape_niml(trimmed)]
+        };
+    }
+    let bytes = trimmed.as_bytes();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        let Some(&first) = bytes.get(pos) else {
+            break;
+        };
+        let (start, end, next) = if first == b'"' || first == b'\'' {
+            let start = pos + 1;
+            let end = trimmed[start..]
+                .find(first as char)
+                .map_or(trimmed.len(), |i| start + i);
+            (start, end, end + 1)
+        } else {
+            let end = trimmed[pos..]
+                .find(|c: char| c.is_ascii_whitespace())
+                .map_or(trimmed.len(), |i| pos + i);
+            (pos, end, end)
+        };
+        out.push(unescape_niml(&trimmed[start..end]));
+        pos = next;
+    }
+    out
 }
 
 pub(crate) fn parse_numeric_matrix(
@@ -1724,6 +1785,14 @@ pub(crate) fn serialize_element(element: &NimlElement, out: &mut String) {
         NimlData::None => {}
     }
 
+    // A String/CString body must be quoted: AFNI reads an unquoted string
+    // only up to the first blank (`NI_decode_one_string`), so multi-word
+    // labels and history notes would be truncated.
+    let quote_text = matches!(
+        attrs.get("ni_type").map(String::as_str),
+        Some("String" | "CString")
+    );
+
     out.push('<');
     out.push_str(&element.name);
     for (key, value) in attrs {
@@ -1805,7 +1874,13 @@ pub(crate) fn serialize_element(element: &NimlElement, out: &mut String) {
         }
         NimlData::Text(text) => {
             out.push('\n');
+            if quote_text {
+                out.push('"');
+            }
             out.push_str(&escape_niml(text));
+            if quote_text {
+                out.push('"');
+            }
             out.push('\n');
         }
         NimlData::None => {}
@@ -1984,10 +2059,47 @@ pub(crate) fn escape_niml(text: &str) -> String {
         .replace('<', "&lt;")
 }
 
+/// Reverse of [`escape_niml`] in one pass, following `unescape_inplace` in
+/// AFNI's `niml/niml_util.c`: the five named entities plus the numeric forms
+/// `&#ddd;` and `&#xhh;`. Anything else is copied unchanged.
 pub(crate) fn unescape_niml(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let decoded = rest.find(';').and_then(|end| {
+            let ch = match &rest[1..end] {
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                "amp" => '&',
+                name => {
+                    let code = if let Some(hex) = name.strip_prefix("#x") {
+                        u32::from_str_radix(hex, 16).ok()?
+                    } else {
+                        name.strip_prefix('#')?.parse().ok()?
+                    };
+                    char::from_u32(code)?
+                }
+            };
+            Some((ch, end))
+        });
+        match decoded {
+            Some((ch, end)) => {
+                out.push(ch);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }

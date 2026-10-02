@@ -556,6 +556,81 @@ mod tests {
     }
 
     #[test]
+    fn string_attributes_are_quoted_so_afni_reads_them_whole() {
+        // AFNI reads an unquoted String body only up to the first blank, so
+        // multi-word labels and history notes must be written quoted.
+        let mut payload = read_niml_dset_str(
+            r#"<AFNI_dataset dset_type="Node_Bucket" ni_form="ni_group" >
+<SPARSE_DATA ni_type="2*float" ni_dimen="1" >1 2</SPARSE_DATA>
+</AFNI_dataset>"#,
+        )
+        .unwrap();
+        payload.column_labels = vec![
+            "first column".to_string(),
+            r#"second 'col' & "x" <y>"#.to_string(),
+        ];
+        payload.history = Some("SurfClust -i lh.gii -thresh_col 1 -athresh 4.17".to_string());
+
+        let text = serialize_niml_ascii(&[payload.to_element().unwrap()]);
+        assert!(
+            text.contains(
+                "\n\"first column;second &apos;col&apos; &amp; &quot;x&quot; &lt;y&gt;;\"\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\n\"SurfClust -i lh.gii -thresh_col 1 -athresh 4.17\"\n"));
+
+        let back = read_niml_dset_str(&text).unwrap();
+        assert_eq!(back.column_labels, payload.column_labels);
+        assert_eq!(back.history, payload.history);
+    }
+
+    #[test]
+    fn string_bodies_split_before_decoding_entities() {
+        // An escaped quote inside a quoted string does not end it early.
+        let elements = parse_niml_str(
+            "<AFNI_atr ni_type=\"String\" ni_dimen=\"1\" >\n \"say &quot;hi&quot;&#x0a;now\"\n</AFNI_atr>",
+        )
+        .unwrap();
+        assert_eq!(elements[0].data, NimlData::Text("say \"hi\"\nnow".into()));
+        assert_eq!(
+            parse_niml_str(&serialize_niml_ascii(&elements)).unwrap(),
+            elements
+        );
+
+        // Several quoted strings in one column become one row each.
+        let elements = parse_niml_str(
+            "<AFNI_atr ni_type=\"String\" ni_dimen=\"2\" >\"part one \" 'part two'</AFNI_atr>",
+        )
+        .unwrap();
+        let NimlData::Mixed(table) = &elements[0].data else {
+            panic!("expected one row per string, got {:?}", elements[0].data);
+        };
+        assert_eq!(
+            table.values,
+            [
+                NimlValue::Text("part one ".into()),
+                NimlValue::Text("part two".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn unquoted_string_bodies_from_older_sumaru_files_read_whole() {
+        // Before quoting was fixed, sumaru wrote multi-word bodies unquoted.
+        // (Lines starting with `#` are a separate matter: the whole-file
+        // `strip_niml_comment_prefixes` pass removes their `# `.)
+        let elements = parse_niml_str(
+            "<AFNI_atr ni_type=\"String\" ni_dimen=\"1\" atr_name=\"HISTORY_NOTE\" >\nSurfClust -i a.gii -n 100\nsecond line\n</AFNI_atr>",
+        )
+        .unwrap();
+        assert_eq!(
+            elements[0].data,
+            NimlData::Text("SurfClust -i a.gii -n 100\nsecond line".into())
+        );
+    }
+
+    #[test]
     fn parser_preserves_unknown_text_elements() {
         let elements = parse_niml_str(
             r#"<AFNI_atr ni_type="String" ni_dimen="1" atr_name="NOTE" >hello &lt;sumaru&gt;</AFNI_atr>"#,
