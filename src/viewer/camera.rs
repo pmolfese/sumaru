@@ -258,8 +258,13 @@ impl Camera {
     fn view_projection(&self, aspect: f32) -> Mat4 {
         let (eye_direction, up) = self.view_axes();
         let eye = eye_direction * self.distance;
-        let view = Mat4::look_at_rh(eye, Vec3::ZERO, up);
-        let projection = Mat4::perspective_rh(CAMERA_FOV_Y_RADIANS, aspect.max(0.01), 0.01, 100.0);
+        let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, up);
+        let projection = glam::camera::rh::proj::directx::perspective(
+            CAMERA_FOV_Y_RADIANS,
+            aspect.max(0.01),
+            0.01,
+            100.0,
+        );
 
         projection * view
     }

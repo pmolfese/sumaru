@@ -989,26 +989,37 @@ impl EguiPane {
     ) -> (bool, egui::TexturesDelta) {
         let mut retained = egui::TexturesDelta::default();
         let mut needs_repaint = false;
-        for (id, image_delta) in &self.pending_textures.set {
-            if image_delta.pos.is_some() && !self.allocated_textures.contains(id) {
-                retained.set.push((*id, image_delta.clone()));
-                needs_repaint = true;
-                continue;
+        for (id, image_deltas) in std::mem::take(&mut self.pending_textures.set) {
+            for image_delta in image_deltas {
+                if image_delta.pos.is_some() && !self.allocated_textures.contains(&id) {
+                    retained.push(id, image_delta);
+                    needs_repaint = true;
+                    continue;
+                }
+                self.renderer
+                    .update_texture(device, queue, id, &image_delta);
+                self.allocated_textures.insert(id);
             }
-            self.renderer
-                .update_texture(device, queue, *id, image_delta);
-            self.allocated_textures.insert(*id);
         }
         (needs_repaint, retained)
     }
 
     /// Frees textures this pane marked for release on the previous frame.
     fn free_pending(&mut self) {
-        for id in &self.pending_textures.free {
-            if self.allocated_textures.remove(id) {
-                self.renderer.free_texture(id);
+        for id in std::mem::take(&mut self.pending_textures.free) {
+            if self.allocated_textures.remove(&id) {
+                self.renderer.free_texture(&id);
             }
         }
+    }
+}
+
+impl Drop for EguiPane {
+    fn drop(&mut self) {
+        // A window can close before its next render pass (or while its surface
+        // is unavailable). At that point there is nowhere useful to apply
+        // queued texture changes, so explicitly discard them as egui requires.
+        self.pending_textures.clear();
     }
 }
 
@@ -1170,7 +1181,7 @@ impl WindowPane {
         command_buffers.push(encoder.finish());
         queue.submit(command_buffers);
         let _ = device.poll(wgpu::PollType::Poll);
-        output.present();
+        queue.present(output);
 
         RenderStatus::Rendered
     }
@@ -1382,6 +1393,10 @@ struct InitialScene {
     sparse_timecourse_display: SparseTimecourseDisplay,
 }
 
+fn scene_objects_controller_starts_open(tract_paths: &[PathBuf], graph_paths: &[PathBuf]) -> bool {
+    !tract_paths.is_empty() || !graph_paths.is_empty()
+}
+
 struct SurfaceRenderPipelines {
     filled: wgpu::RenderPipeline,
     filled_flat: wgpu::RenderPipeline,
@@ -1495,6 +1510,9 @@ struct ViewerState {
     scene_object_gpu: Vec<SceneObjectGpu>,
     active_scene_object: Option<usize>,
     scene_object_pick: Option<SceneObjectPick>,
+    /// Initial state for the tracts/graphs controller. Egui remembers any
+    /// subsequent arrow clicks under the collapsing header's persistent ID.
+    scene_objects_controller_default_open: bool,
     surface_buffers: Option<SurfaceBuffers>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
@@ -1647,6 +1665,8 @@ impl ViewerState {
             timecourse_mode: initial_timecourse_mode,
             sparse_timecourse_display,
         } = scene;
+        let scene_objects_controller_default_open =
+            scene_objects_controller_starts_open(&initial_tract_paths, &initial_graph_paths);
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
         let roi_control_size = roi_control_window.inner_size();
@@ -1661,6 +1681,10 @@ impl ViewerState {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&view_surface),
                 force_fallback_adapter: false,
+                // Preserve the physical adapter limits because --big-mem uses
+                // them to size its GPU buffers. Bucketing is intended for
+                // fingerprinting resistance when exposing wgpu to untrusted code.
+                apply_limit_buckets: false,
             })
             .await
             .context("failed to find a compatible GPU adapter")?;
@@ -1716,6 +1740,7 @@ impl ViewerState {
         let view_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: view_size.width.max(1),
             height: view_size.height.max(1),
             present_mode,
@@ -1726,6 +1751,7 @@ impl ViewerState {
         let control_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: control_size.width.max(1),
             height: control_size.height.max(1),
             present_mode,
@@ -1736,6 +1762,7 @@ impl ViewerState {
         let roi_control_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: roi_control_size.width.max(1),
             height: roi_control_size.height.max(1),
             present_mode,
@@ -1746,6 +1773,7 @@ impl ViewerState {
         let graph_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: graph_size.width.max(1),
             height: graph_size.height.max(1),
             present_mode,
@@ -1811,16 +1839,16 @@ impl ViewerState {
                     module: &shader,
                     entry_point: Some(vertex_entry),
                     buffers: &[
-                        wgpu::VertexBufferLayout {
+                        Some(wgpu::VertexBufferLayout {
                             array_stride: VERTEX_STRIDE,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &VERTEX_ATTRIBUTES,
-                        },
-                        wgpu::VertexBufferLayout {
+                        }),
+                        Some(wgpu::VertexBufferLayout {
                             array_stride: COLOR_STRIDE,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &COLOR_ATTRIBUTES,
-                        },
+                        }),
                     ],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
@@ -1883,11 +1911,11 @@ impl ViewerState {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("contour_vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: CONTOUR_VERTEX_STRIDE,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &CONTOUR_VERTEX_ATTRIBUTES,
-                    }],
+                    })],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -2052,6 +2080,7 @@ impl ViewerState {
             scene_object_gpu: Vec::new(),
             active_scene_object: None,
             scene_object_pick: None,
+            scene_objects_controller_default_open,
             surface_buffers: None,
             uniform_buffer,
             uniform_bind_group,
@@ -2577,9 +2606,8 @@ impl ViewerState {
         let raw_input = self.view.egui.state.take_egui_input(&self.view.window);
         let egui_ctx = self.view.egui.ctx.clone();
         let mut ui_actions = Vec::new();
-        #[allow(deprecated)]
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            ui_actions = self.draw_view_overlay_ui(ctx);
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            ui_actions = self.draw_view_overlay_ui(ui);
         });
         self.view.repaint_at = repaint_delay_to_instant(&full_output);
         let actions_present = !ui_actions.is_empty();
@@ -2678,7 +2706,7 @@ impl ViewerState {
         command_buffers.push(encoder.finish());
         self.queue.submit(command_buffers);
         self.poll_device_for_cleanup();
-        output.present();
+        self.queue.present(output);
 
         RenderStatus::Rendered
     }
@@ -2853,9 +2881,8 @@ impl ViewerState {
         let egui_ctx = self.control.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         let mut desired_control_size_points = egui::Vec2::ZERO;
-        #[allow(deprecated)]
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            let output = self.draw_ui(ctx);
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let output = self.draw_ui(ui);
             ui_actions = output.actions;
             desired_control_size_points = output.desired_control_size_points;
         });
@@ -2915,9 +2942,8 @@ impl ViewerState {
         let egui_ctx = self.roi_control.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         let mut desired_roi_control_size_points = egui::Vec2::ZERO;
-        #[allow(deprecated)]
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            let output = self.draw_roi_control_ui(ctx);
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let output = self.draw_roi_control_ui(ui);
             ui_actions = output.actions;
             desired_roi_control_size_points = output.desired_control_size_points;
         });
@@ -2980,9 +3006,8 @@ impl ViewerState {
         let raw_input = self.graph.take_egui_input();
         let egui_ctx = self.graph.egui.ctx.clone();
         let mut ui_actions = Vec::new();
-        #[allow(deprecated)]
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            ui_actions = self.draw_graph_matrix_window_ui(ctx);
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            ui_actions = self.draw_graph_matrix_window_ui(ui);
         });
         self.graph.repaint_at = repaint_delay_to_instant(&full_output);
         let actions_present = !ui_actions.is_empty();
@@ -9969,8 +9994,9 @@ mod tests {
         paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
         paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
         resolved_overlay_color_map, roi_appearance_for_mesh, roi_edge_color_for_label,
-        roi_fill_color_for_label, roi_fill_nodes_from_seed, scene_surface_display_label,
-        scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
+        roi_fill_color_for_label, roi_fill_nodes_from_seed, scene_objects_controller_starts_open,
+        scene_surface_display_label, scene_surfaces_from_components,
+        scene_surfaces_grouped_by_state, selection_for_component,
         selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
         spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
         synthetic_surface_spec, threshold_and_mask_from_appearance,
@@ -10004,6 +10030,24 @@ mod tests {
             viewer_required_wgpu_limits(&adapter_limits, true).max_buffer_size,
             adapter_limits.max_buffer_size
         );
+    }
+
+    #[test]
+    fn tracts_graphs_controller_starts_collapsed_without_cli_objects() {
+        assert!(!scene_objects_controller_starts_open(&[], &[]));
+    }
+
+    #[test]
+    fn tracts_graphs_controller_starts_open_for_cli_tracts_or_graphs() {
+        let tract_paths = vec![PathBuf::from("bundle.niml.tract")];
+        let graph_paths = vec![PathBuf::from("network.niml.dset")];
+
+        assert!(scene_objects_controller_starts_open(&tract_paths, &[]));
+        assert!(scene_objects_controller_starts_open(&[], &graph_paths));
+        assert!(scene_objects_controller_starts_open(
+            &tract_paths,
+            &graph_paths
+        ));
     }
 
     #[test]

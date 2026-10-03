@@ -249,11 +249,11 @@ impl VolumeView {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("slice_vs"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: SLICE_VERTEX_STRIDE,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &SLICE_VERTEX_ATTRIBUTES,
-                }],
+                })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {

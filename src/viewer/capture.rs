@@ -409,7 +409,9 @@ impl ViewerState {
             .context("screenshot readback callback did not run")?
             .context("failed to map screenshot readback buffer")?;
 
-        let mapped = buffer_slice.get_mapped_range();
+        let mapped = buffer_slice
+            .get_mapped_range()
+            .context("failed to read mapped screenshot buffer")?;
         let rgba = screenshot::texture_bytes_to_rgba(
             &mapped,
             width,

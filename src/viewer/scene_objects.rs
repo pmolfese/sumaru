@@ -949,11 +949,11 @@ impl SceneObjectRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: SEGMENT_STRIDE,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &SEGMENT_ATTRIBUTES,
-                }],
+                })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -988,11 +988,11 @@ impl SceneObjectRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("node_vs"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: NODE_STRIDE,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &NODE_ATTRIBUTES,
-                }],
+                })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1446,6 +1446,7 @@ mod tests {
             edge_labels: vec!["weak".into(), "strong".into()],
             matrix_shape: GraphMatrixShape::Full,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: None,
         };
         let mut weak = Vec::new();
@@ -1515,6 +1516,7 @@ mod tests {
             edge_labels: vec!["weak".into(), "FA".into()],
             matrix_shape: GraphMatrixShape::Full,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: None,
         };
         let mut object = SceneObject::from_graph_with_linked_tracts(
@@ -1628,6 +1630,7 @@ mod tests {
             edge_labels: vec!["NT".into()],
             matrix_shape: GraphMatrixShape::Full,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: Some(PathBuf::from("tract.niml.tract")),
         };
         let tracts = TractographyDataset {

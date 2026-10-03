@@ -19,7 +19,7 @@ fn fade_width_seed(threshold_value: f32) -> f64 {
 }
 
 impl ViewerState {
-    pub(super) fn draw_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {
+    pub(super) fn draw_ui(&mut self, root_ui: &mut egui::Ui) -> ControlUiOutput {
         let mut actions = Vec::new();
         let panel_height = (self.control.size.height as f32 - 24.0).max(240.0);
         let mut desired_control_size_points = egui::vec2(
@@ -27,8 +27,7 @@ impl ViewerState {
             CONTROL_MIN_INNER_HEIGHT as f32,
         );
 
-        #[allow(deprecated)]
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             let scroll_output = egui::ScrollArea::vertical()
                 .max_height(panel_height)
                 // Shrink horizontally around the controls. Keeping horizontal
@@ -64,13 +63,12 @@ impl ViewerState {
         }
     }
 
-    pub(super) fn draw_view_overlay_ui(&mut self, ctx: &egui::Context) -> Vec<ViewerCommand> {
+    pub(super) fn draw_view_overlay_ui(&mut self, root_ui: &mut egui::Ui) -> Vec<ViewerCommand> {
         let mut actions = Vec::new();
 
-        #[allow(deprecated)]
-        egui::TopBottomPanel::top("main_menu_bar")
+        egui::Panel::top("main_menu_bar")
             .resizable(false)
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("File", |ui| {
                         if ui.button("Open Surface...").clicked() {
@@ -401,30 +399,34 @@ impl ViewerState {
             });
 
         if self.graph_matrix_dock_open() {
-            self.draw_graph_matrix_dock_ui(ctx, &mut actions);
+            self.draw_graph_matrix_dock_ui(root_ui, &mut actions);
         } else if self.controller.panels.graph_window_open {
-            self.draw_graph_dock_ui(ctx, &mut actions);
+            self.draw_graph_dock_ui(root_ui, &mut actions);
         }
 
-        self.draw_go_to_location(ctx, &mut actions);
-        self.draw_preferences_window(ctx);
-        self.draw_instacorr_window(ctx);
-        self.draw_scene_object_labels(ctx);
-        self.draw_view_transient_label(ctx);
+        let ctx = root_ui.ctx().clone();
+        self.draw_go_to_location(&ctx, &mut actions);
+        self.draw_preferences_window(&ctx);
+        self.draw_instacorr_window(&ctx);
+        self.draw_scene_object_labels(&ctx);
+        self.draw_view_transient_label(&ctx);
 
         actions
     }
 
-    fn draw_graph_matrix_dock_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<ViewerCommand>) {
+    fn draw_graph_matrix_dock_ui(
+        &mut self,
+        root_ui: &mut egui::Ui,
+        actions: &mut Vec<ViewerCommand>,
+    ) {
         let Some(index) = self.active_scene_object else {
             return;
         };
         let current_height = self.graph_dock_height_points;
-        #[allow(deprecated)]
-        let response = egui::TopBottomPanel::bottom("graph_matrix_dock")
+        let response = egui::Panel::bottom("graph_matrix_dock")
             .resizable(false)
-            .exact_height(current_height)
-            .show(ctx, |ui| {
+            .exact_size(current_height)
+            .show(root_ui, |ui| {
                 let mut next_height = current_height;
                 let full = ui.max_rect();
                 let handle_rect = egui::Rect::from_min_max(
@@ -479,7 +481,8 @@ impl ViewerState {
                 next_height
             });
 
-        let window_height_points = self.view.size.height as f32 / ctx.pixels_per_point().max(0.01);
+        let window_height_points =
+            self.view.size.height as f32 / root_ui.ctx().pixels_per_point().max(0.01);
         let max_height = (window_height_points - GRAPH_DOCK_MIN_SCENE_HEIGHT_POINTS)
             .max(GRAPH_DOCK_MIN_HEIGHT_POINTS);
         let clamped = response
@@ -491,10 +494,9 @@ impl ViewerState {
         }
     }
 
-    pub(super) fn draw_graph_matrix_window_ui(&self, ctx: &egui::Context) -> Vec<ViewerCommand> {
+    pub(super) fn draw_graph_matrix_window_ui(&self, root_ui: &mut egui::Ui) -> Vec<ViewerCommand> {
         let mut actions = Vec::new();
-        #[allow(deprecated)]
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             let Some(index) = self.active_scene_object else {
                 ui.centered_and_justified(|ui| ui.label("No graph matrix is open."));
                 return;
@@ -792,15 +794,14 @@ impl ViewerState {
 
     pub(super) fn draw_graph_dock_ui(
         &mut self,
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
         actions: &mut Vec<ViewerCommand>,
     ) {
         let current_height = self.graph_dock_height_points;
-        #[allow(deprecated)]
-        let response = egui::TopBottomPanel::bottom("graph_dock")
+        let response = egui::Panel::bottom("graph_dock")
             .resizable(false)
-            .exact_height(current_height)
-            .show(ctx, |ui| {
+            .exact_size(current_height)
+            .show(root_ui, |ui| {
                 let mut next_height = current_height;
 
                 // Self-managed resize handle along the dock's top edge. egui's own
@@ -860,7 +861,8 @@ impl ViewerState {
                 next_height
             });
 
-        let window_height_points = self.view.size.height as f32 / ctx.pixels_per_point().max(0.01);
+        let window_height_points =
+            self.view.size.height as f32 / root_ui.ctx().pixels_per_point().max(0.01);
         let max_height = (window_height_points - GRAPH_DOCK_MIN_SCENE_HEIGHT_POINTS)
             .max(GRAPH_DOCK_MIN_HEIGHT_POINTS);
         let clamped = response
@@ -903,7 +905,7 @@ impl ViewerState {
         }
     }
 
-    pub(super) fn draw_roi_control_ui(&mut self, ctx: &egui::Context) -> ControlUiOutput {
+    pub(super) fn draw_roi_control_ui(&mut self, root_ui: &mut egui::Ui) -> ControlUiOutput {
         let mut actions = Vec::new();
         let panel_height = (self.roi_control.size.height as f32 - 24.0).max(160.0);
         let mut desired_control_size_points = egui::vec2(
@@ -911,8 +913,7 @@ impl ViewerState {
             ROI_CONTROL_MIN_INNER_HEIGHT as f32,
         );
 
-        #[allow(deprecated)]
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             let scroll_output = egui::ScrollArea::vertical()
                 .max_height(panel_height)
                 .auto_shrink([false, true])
@@ -1284,7 +1285,8 @@ impl ViewerState {
         ui: &mut egui::Ui,
         actions: &mut Vec<ViewerCommand>,
     ) {
-        controller_section(ui, "TRACTS / GRAPHS", true, |ui| {
+        let default_open = self.scene_objects_controller_default_open;
+        controller_section(ui, "TRACTS / GRAPHS", default_open, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open tracts...").clicked() {
                     actions.push(ViewerCommand::PickTract);
