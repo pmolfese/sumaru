@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
 description = "A Rust rebuild of AFNI SUMA."
-license = "MIT OR Apache-2.0"
+license-file = "LICENSE"
 
 [dependencies]
 anyhow = "1"

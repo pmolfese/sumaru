@@ -56,6 +56,14 @@ At the moment, the project is most useful for people who are comfortable trying
 a source build, comparing behavior against tools they already trust, and filing
 small, concrete issues when real datasets expose rough edges.
 
+## License
+
+This software is a United States Government Work created as part of the
+author's official duties and is not subject to copyright protection in the
+United States. It is freely available for public use and reproduction. See
+[`LICENSE`](LICENSE) for the full public-domain notice, warranty disclaimer,
+and treatment of third-party material.
+
 ## Install
 
 This is currently a source build:
