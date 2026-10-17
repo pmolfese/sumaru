@@ -34,24 +34,25 @@ AFNI, SUMA, SUMAvista, and `sumaru`.
   `Do_09_VISdti_SUMA_visual_ex2.tcsh` walkthrough that launches Sumaru in
   explicit `-niml-suma` mode, preserves its AFNI/DriveSuma orchestration, and
   provides a non-GUI prerequisite check.
-- [x] Add the independent `drivesuma-rs` crate for FATCAT-compatible wire
-  commands and native prompts, plus a separate Rust-driver walkthrough variant
-  while retaining the legacy DriveSuma harness as a control.
+- [x] Add the independent `afni-drive` crate and its `suma-drive` alias for
+  FATCAT-compatible wire commands and native prompts, plus a separate
+  Rust-driver walkthrough variant while retaining the legacy DriveSuma harness
+  as a control.
 - [x] Make `get_label` output-compatible in Sumaru: emit the selected surface
   label, grouped I/T/B dataset values, and cluster membership from the viewer
   process, matching legacy SUMA's output ownership and layout.
 - [ ] Add driver-managed multi-instance compatibility without making Sumaru a
   multi-viewer process. One Sumaru process must continue to own exactly one
-  viewer; `drivesuma-rs` supplies the SUMA-style multi-viewer experience by
-  supervising multiple ordinary Sumaru processes.
-  - [ ] Add a `drivesuma-rs launch`/session command that starts one Sumaru child
+  viewer; `afni-drive session` supplies the SUMA-style multi-viewer experience
+  by supervising multiple ordinary Sumaru processes.
+  - [ ] Add an `afni-drive session launch` command that starts one Sumaru child
     per requested logical viewer, assigns each child a distinct AFNI port bloc,
     waits for its NIML listener to become ready, and reports the viewer-to-port
     mapping.
   - [ ] Maintain a small session registry containing logical viewer names
     (`A`–`F`), port blocs, process IDs, launch arguments, and ownership tokens so
-    later one-shot `drivesuma-rs` invocations can route commands reliably and
-    never terminate an unrelated Sumaru process.
+    later one-shot `afni-drive`/`suma-drive` invocations can route commands
+    reliably and never terminate an unrelated Sumaru process.
   - [ ] Route an explicit `-viewer` target to the corresponding Sumaru port;
     retain direct `-np`/`-npb` addressing for scripts such as FATCAT that
     already manage separate port blocs.

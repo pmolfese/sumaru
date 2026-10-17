@@ -228,7 +228,7 @@ cluster number when clustering is active. With no current selection it writes
 
 Consequently, `set_outplug` in a separate sender process cannot redirect this
 viewer-local text. Capture the Sumaru process's stdout (or the SUMA process's
-stdout when driving SUMA), just as a supervising `drivesuma-rs` session will be
+stdout when driving SUMA), just as a supervising `afni-drive session` will be
 able to do for child viewers it launches itself.
 
 ## Known limitations
@@ -293,7 +293,7 @@ MINIPROB tractograms, graph dataset, AFNI processes, and DriveSuma commands,
 while launching Sumaru with `-niml-suma`.
 
 [`scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh`](../scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh)
-is a separate test variant that uses `drivesuma-rs` for both wire commands and
+is a separate test variant that uses `suma-drive` for both wire commands and
 native prompts. The original adapted script remains available as the legacy
 DriveSuma/`prompt_user` control.
 
@@ -309,12 +309,13 @@ Then run the interactive walkthrough:
 scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh ~/FATCAT_DEMO
 ```
 
-For the Rust-driver variant, set `SUMARU_BIN` or `DRIVESUMA_BIN` when either
-executable is not on `PATH`, for example:
+For the Rust-driver variant, set `SUMARU_BIN` or `SUMA_DRIVE_BIN` when either
+executable is not on `PATH`. `DRIVESUMA_BIN` remains a compatibility fallback.
+For example:
 
 ```sh
 setenv SUMARU_BIN "$PWD/target/release/sumaru"
-setenv DRIVESUMA_BIN "$PWD/../drivesuma-rs/target/release/drivesuma-rs"
+setenv SUMA_DRIVE_BIN "$PWD/../afni-drive/target/release/suma-drive"
 scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh ~/FATCAT_DEMO
 ```
 

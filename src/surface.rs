@@ -414,7 +414,7 @@ impl SurfaceMesh {
     /// Load a GIFTI surface or any mesh supported by `afni-io`.
     ///
     /// GIFTI retains its richer metadata path here; other formats share the
-    /// same readers used by `drivesuma-rs`.
+    /// same readers used by `afni-drive`/`suma-drive`.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let name = path
