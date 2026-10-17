@@ -3494,12 +3494,12 @@ impl ViewerState {
                     }
                 }
                 ViewerCommand::ToggleHemisphereVisibility(side) => {
-                    if let Err(error) = self.toggle_pair_hemisphere_visibility(side) {
+                    if let Err(error) = self.toggle_hemisphere_visibility(side) {
                         self.set_error(error);
                     }
                 }
                 ViewerCommand::ToggleSumaComponentVisibility(side) => {
-                    if let Err(error) = self.toggle_suma_component_visibility(side) {
+                    if let Err(error) = self.toggle_component_hemisphere_visibility(side) {
                         self.set_error(error);
                     }
                 }

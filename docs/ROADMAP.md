@@ -28,6 +28,53 @@ AFNI, SUMA, SUMAvista, and `sumaru`.
   `/Users/molfesepj/Documents/Programming/afni_rust` crate before hardening
   public APIs.
 
+### FATCAT Driver Compatibility
+
+- [x] Add a checked-in adaptation of the four-example
+  `Do_09_VISdti_SUMA_visual_ex2.tcsh` walkthrough that launches Sumaru in
+  explicit `-niml-suma` mode, preserves its AFNI/DriveSuma orchestration, and
+  provides a non-GUI prerequisite check.
+- [x] Add the independent `drivesuma-rs` crate for FATCAT-compatible wire
+  commands and native prompts, plus a separate Rust-driver walkthrough variant
+  while retaining the legacy DriveSuma harness as a control.
+- [x] Make `get_label` output-compatible in Sumaru: emit the selected surface
+  label, grouped I/T/B dataset values, and cluster membership from the viewer
+  process, matching legacy SUMA's output ownership and layout.
+- [ ] Add driver-managed multi-instance compatibility without making Sumaru a
+  multi-viewer process. One Sumaru process must continue to own exactly one
+  viewer; `drivesuma-rs` supplies the SUMA-style multi-viewer experience by
+  supervising multiple ordinary Sumaru processes.
+  - [ ] Add a `drivesuma-rs launch`/session command that starts one Sumaru child
+    per requested logical viewer, assigns each child a distinct AFNI port bloc,
+    waits for its NIML listener to become ready, and reports the viewer-to-port
+    mapping.
+  - [ ] Maintain a small session registry containing logical viewer names
+    (`A`–`F`), port blocs, process IDs, launch arguments, and ownership tokens so
+    later one-shot `drivesuma-rs` invocations can route commands reliably and
+    never terminate an unrelated Sumaru process.
+  - [ ] Route an explicit `-viewer` target to the corresponding Sumaru port;
+    retain direct `-np`/`-npb` addressing for scripts such as FATCAT that
+    already manage separate port blocs.
+  - [ ] Add lifecycle commands for list/status, spawn, graceful close, and
+    cleanup of stale registry entries, with useful diagnostics for port
+    collisions and children that fail during startup.
+  - [ ] Preserve command ordering per child and define broadcast behavior for
+    commands with no viewer target. Default to one designated primary viewer;
+    require an explicit broadcast flag before sending mutating commands to all
+    instances.
+  - [ ] Add process-level integration tests using lightweight mock NIML
+    listeners, followed by acceptance tests that launch two real Sumaru
+    instances on different port blocs and drive them independently.
+  - [ ] Keep this compatibility supervisor separate from *Linked Sumaru
+    Sessions*: driver-launched viewers are independent by default, and linking
+    their crosshairs or controller state remains an explicit opt-in feature.
+- [ ] Run all four examples as a manual acceptance pass against the local
+  `FATCAT_DEMO`, recording any new wire messages and visual/spatial failures.
+- [ ] Add tract coordinate metadata validation before treating surface, volume,
+  and tract alignment as compatibility-complete.
+- [ ] Add InstaTract-style movable tract masks; surface prying remains a later,
+  separate interaction milestone.
+
 ### NIML Talk With AFNI
 
 - [x] Document the minimal AFNI/SUMA message subset for first interop: surface

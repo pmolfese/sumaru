@@ -34,6 +34,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "afni-core"
+version = "0.1.0"
+source = "git+https://github.com/pmolfese/afni-core?branch=main#0dfd694a77b584a8d65649e382d5443d75cb3505"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "afni-io"
+version = "0.1.0"
+dependencies = [
+ "afni-core",
+ "flate2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2708,6 +2725,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 name = "sumaru"
 version = "0.2.0"
 dependencies = [
+ "afni-io",
  "anyhow",
  "arboard",
  "clap",

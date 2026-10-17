@@ -422,8 +422,9 @@ differences, examples, diagnostics, and known limitations.
   persistently switch between the closed and acorn paired-hemisphere layouts.
   Hold Control and left-drag in the viewer to fine-tune the pair: left/right
   adjusts the open angle, and up/down adjusts the gap between hemispheres.
-- In a `both` spec scene, press `[` to show/hide the left hemisphere and `]` to
-  show/hide the right hemisphere.
+- In a `both` spec scene or a multi-surface `-onestate` group, press `[` to
+  show/hide left-hemisphere components and `]` to show/hide right-hemisphere
+  components. Components without an inferred hemisphere remain visible.
 - Press `r` to save the current view as a PNG, or Shift-`R` to save a 1x4
   montage. Single-surface scenes use left/right/top/bottom views; `both` spec
   scenes use closed top, closed bottom, open medial-in, and open outer-out

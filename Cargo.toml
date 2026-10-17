@@ -7,6 +7,7 @@ description = "A Rust rebuild of AFNI SUMA."
 license-file = "LICENSE"
 
 [dependencies]
+afni-io = { path = "../afni-io" }
 anyhow = "1"
 arboard = "3"
 clap = { version = "4", features = ["derive"] }

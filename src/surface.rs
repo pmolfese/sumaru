@@ -411,7 +411,10 @@ impl SurfaceMesh {
         })
     }
 
-    /// Load either a GIFTI surface or a native triangular FreeSurfer surface.
+    /// Load a GIFTI surface or any mesh supported by `afni-io`.
+    ///
+    /// GIFTI retains its richer metadata path here; other formats share the
+    /// same readers used by `drivesuma-rs`.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let name = path
@@ -426,8 +429,33 @@ impl SurfaceMesh {
         {
             Self::from_gifti_path(path)
         } else {
-            Self::from_freesurfer_path(path)
+            let surface = afni_io::surface_io::read_surface(path)
+                .with_context(|| format!("failed to read surface {}", path.display()))?;
+            Self::from_afni_io_surface(path, surface)
         }
+    }
+
+    fn from_afni_io_surface(path: &Path, surface: afni_io::surface::Surface) -> Result<Self> {
+        let domain = SurfaceDomain::from_triangles(surface.vertices.len(), surface.faces)?;
+        let bounds = Bounds::from_vertices(&surface.vertices)?;
+        let source_file = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let metadata = SurfaceMetadata::from_geometry(
+            Some(source_file.clone()),
+            label_from_path(&source_file),
+            &surface.vertices,
+            &domain,
+            bounds,
+            3,
+            3,
+        );
+
+        Ok(Self {
+            vertices: surface.vertices,
+            triangles: domain.triangles.clone(),
+            domain,
+            bounds,
+            metadata,
+        })
     }
 
     pub fn from_freesurfer_path(path: impl AsRef<Path>) -> Result<Self> {

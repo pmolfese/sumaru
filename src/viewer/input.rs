@@ -237,17 +237,13 @@ impl ViewerState {
                         true
                     }
                     PhysicalKey::Code(KeyCode::BracketLeft) => {
-                        if let Err(error) =
-                            self.toggle_pair_hemisphere_visibility(SurfaceSide::Left)
-                        {
+                        if let Err(error) = self.toggle_hemisphere_visibility(SurfaceSide::Left) {
                             self.set_error(error);
                         }
                         true
                     }
                     PhysicalKey::Code(KeyCode::BracketRight) => {
-                        if let Err(error) =
-                            self.toggle_pair_hemisphere_visibility(SurfaceSide::Right)
-                        {
+                        if let Err(error) = self.toggle_hemisphere_visibility(SurfaceSide::Right) {
                             self.set_error(error);
                         }
                         true

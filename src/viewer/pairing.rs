@@ -246,6 +246,22 @@ impl ViewerState {
         pair_hemisphere_matrices(&surface.components, layout, visibility)
     }
 
+    /// Route the normal hemisphere shortcut to either a purpose-built pair or
+    /// a multi-component command-line state.
+    pub(super) fn toggle_hemisphere_visibility(&mut self, side: SurfaceSide) -> Result<()> {
+        if self.has_both_scene() {
+            return self.toggle_pair_hemisphere_visibility(side);
+        }
+        if self.has_component_surface() {
+            return self.toggle_component_hemisphere_visibility(side);
+        }
+
+        self.log_status(
+            "Load a paired scene or a multi-surface -onestate group before toggling hemisphere visibility.",
+        );
+        Ok(())
+    }
+
     /// Show/hide one hemisphere of the active pair.
     pub(super) fn toggle_pair_hemisphere_visibility(&mut self, side: SurfaceSide) -> Result<()> {
         if !self.has_both_scene() {
@@ -276,11 +292,14 @@ impl ViewerState {
         Ok(())
     }
 
-    /// SUMA compatibility form of `[`/`]`: toggle every component on the
-    /// requested side independently. Unlike Sumaru's paired-scene shortcut,
-    /// SUMA permits both hemispheres to be hidden; unknown/bilateral
-    /// components are never affected.
-    pub(super) fn toggle_suma_component_visibility(&mut self, side: SurfaceSide) -> Result<()> {
+    /// Toggle every component on the requested side independently. This is
+    /// used for multi-surface `-onestate` groups and SUMA compatibility mode.
+    /// Both hemispheres may be hidden; unknown/bilateral components are never
+    /// affected.
+    pub(super) fn toggle_component_hemisphere_visibility(
+        &mut self,
+        side: SurfaceSide,
+    ) -> Result<()> {
         if !matches!(side, SurfaceSide::Left | SurfaceSide::Right) {
             return Ok(());
         }
@@ -325,7 +344,7 @@ impl ViewerState {
         self.view.window.request_redraw();
         self.control.window.request_redraw();
         self.log_status(format!(
-            "SUMA compatibility: toggled {matching_components} {} component{}; visible hemispheres: {}.",
+            "Toggled {matching_components} {} component{}; visible hemispheres: {}.",
             surface_side_label(&side),
             if matching_components == 1 { "" } else { "s" },
             self.controller.display.pair_visibility.label()
