@@ -823,6 +823,30 @@ fn prepared_vertex_color_bytes(colors: impl Iterator<Item = [f32; 4]>) -> Vec<u8
     super::f32_bytes(&floats)
 }
 
+/// Compose just the per-node color stream for an already-resident surface.
+pub(super) fn composed_node_color_bytes(
+    node_count: usize,
+    surface_colors: Option<&[[f32; 4]]>,
+    overlay_colors: Option<&[[f32; 4]]>,
+    overlay_dim: f32,
+    roi_colors: Option<&[Option<[f32; 4]>]>,
+) -> Vec<u8> {
+    prepared_vertex_color_bytes((0..node_count).map(|index| {
+        compose_vertex_color(
+            surface_colors
+                .and_then(|colors| colors.get(index))
+                .copied()
+                .unwrap_or(DEFAULT_SURFACE_COLOR),
+            overlay_colors.and_then(|colors| colors.get(index)).copied(),
+            overlay_dim,
+            roi_colors
+                .and_then(|colors| colors.get(index))
+                .copied()
+                .flatten(),
+        )
+    }))
+}
+
 pub(super) fn color_bytes(colors: impl Iterator<Item = [f32; 4]>) -> Vec<u8> {
     prepared_vertex_color_bytes(colors)
 }

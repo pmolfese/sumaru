@@ -17,6 +17,9 @@ pub struct GraphDataset {
     pub matrix_shape: GraphMatrixShape,
     /// Explicit `(edge index, first node, second node)` rows for sparse graphs.
     pub edge_indices: Vec<[i32; 3]>,
+    /// Sparse edges resolved to node positions: `edge_indices` name nodes by
+    /// their NODE_COORDS index, which need not equal the position in `nodes`.
+    pub edge_positions: Vec<(usize, usize)>,
     pub network_file: Option<PathBuf>,
 }
 
@@ -67,11 +70,7 @@ impl GraphDataset {
                 }
                 None
             }
-            GraphMatrixShape::Sparse => self.edge_indices.get(row).and_then(|indices| {
-                let source = usize::try_from(indices[1]).ok()?;
-                let target = usize::try_from(indices[2]).ok()?;
-                Some((source, target))
-            }),
+            GraphMatrixShape::Sparse => self.edge_positions.get(row).copied(),
         }
     }
 
@@ -126,11 +125,10 @@ impl GraphDataset {
                 self.edge_row(row_index)?.get(measure).copied()
             }
             GraphMatrixShape::Sparse => {
-                let row_index = self.edge_indices.iter().position(|indices| {
-                    usize::try_from(indices.get(1).copied().unwrap_or(-1)).ok() == Some(row)
-                        && usize::try_from(indices.get(2).copied().unwrap_or(-1)).ok()
-                            == Some(column)
-                })?;
+                let row_index = self
+                    .edge_positions
+                    .iter()
+                    .position(|&position| position == (row, column))?;
                 self.edge_row(row_index)?.get(measure).copied()
             }
         }
@@ -169,22 +167,16 @@ impl GraphDataset {
                 }
             }
             GraphMatrixShape::Sparse => {
-                for (edge_row, indices) in self.edge_indices.iter().enumerate() {
-                    let (Some(source), Some(target)) = (
-                        indices
-                            .get(1)
-                            .and_then(|value| usize::try_from(*value).ok()),
-                        indices
-                            .get(2)
-                            .and_then(|value| usize::try_from(*value).ok()),
-                    ) else {
-                        continue;
-                    };
+                for (edge_row, &(source, target)) in self.edge_positions.iter().enumerate() {
                     if source < count && target < count {
-                        values[source * count + target] = self
-                            .edge_row(edge_row)
-                            .and_then(|edge| edge.get(measure))
-                            .copied();
+                        // A repeated edge keeps its first listing, as matrix_value does.
+                        let cell = &mut values[source * count + target];
+                        if cell.is_none() {
+                            *cell = self
+                                .edge_row(edge_row)
+                                .and_then(|edge| edge.get(measure))
+                                .copied();
+                        }
                     }
                 }
             }
@@ -308,6 +300,28 @@ pub fn graph_from_element(root: &NimlElement, source_path: Option<&Path>) -> Res
             "sparse graph edge index count does not match data rows"
         );
     }
+    let mut edge_positions = Vec::new();
+    if matrix_shape == GraphMatrixShape::Sparse {
+        let mut position_of = std::collections::HashMap::with_capacity(nodes.len());
+        for (position, node) in nodes.iter().enumerate() {
+            ensure!(
+                position_of.insert(node.index, position).is_none(),
+                "NODE_COORDS repeats node index {}",
+                node.index
+            );
+        }
+        edge_positions = edge_indices
+            .iter()
+            .map(|[edge, first, second]| {
+                let resolve = |index: i32| {
+                    position_of.get(&index).copied().with_context(|| {
+                        format!("sparse edge {edge} names node index {index}, which no node has")
+                    })
+                };
+                Ok((resolve(*first)?, resolve(*second)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
     let edge_labels = children
         .iter()
         .find_map(|child| {
@@ -351,6 +365,7 @@ pub fn graph_from_element(root: &NimlElement, source_path: Option<&Path>) -> Res
         edge_labels,
         matrix_shape,
         edge_indices,
+        edge_positions,
         network_file,
     })
 }
@@ -399,6 +414,7 @@ mod tests {
             edge_labels: Vec::new(),
             matrix_shape: GraphMatrixShape::Triangle,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: None,
         };
         assert_eq!(graph.edge_endpoints(0), Some((1, 0)));
@@ -416,6 +432,7 @@ mod tests {
             edge_labels: vec!["first".into(), "second".into()],
             matrix_shape: GraphMatrixShape::Sparse,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: None,
         };
         assert_eq!(graph.column_range(0), Some((1.0, 3.0)));
@@ -439,6 +456,7 @@ mod tests {
             edge_labels: Vec::new(),
             matrix_shape: GraphMatrixShape::Full,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: None,
         };
         assert_eq!(graph.matrix_value(0, 1, 0), Some(3.0));
@@ -460,6 +478,91 @@ mod tests {
         graph.matrix_shape = GraphMatrixShape::Sparse;
         graph.edge_values = vec![9.0];
         graph.edge_indices = vec![[0, 1, 0]];
+        graph.edge_positions = vec![(1, 0)];
         assert_eq!(graph.matrix_values(0), vec![None, None, Some(9.0), None]);
+    }
+
+    fn sparse_text(nodes: &str, edges: &str, rows: usize) -> String {
+        format!(
+            r#"<AFNI_dataset ni_form="ni_group" dset_type="Graph_Bucket">
+<SPARSE_DATA ni_type="2*float" ni_dimen="{rows}" matrix_size="4 4" matrix_shape="sparse">1 10 2 20 3 30</SPARSE_DATA>
+<INDEX_LIST ni_type="3*int" ni_dimen="{rows}">{edges}</INDEX_LIST>
+<NODE_COORDS ni_type="int,3*float,String" ni_dimen="4">{nodes}</NODE_COORDS>
+</AFNI_dataset>"#
+        )
+    }
+
+    const NODES_5_8: &str = r#"5 0 0 0 "a" 6 1 0 0 "b" 7 2 0 0 "c" 8 3 0 0 "d""#;
+
+    fn parse_sparse(nodes: &str, edges: &str) -> Result<GraphDataset> {
+        let root = parse_niml_str(&sparse_text(
+            nodes,
+            edges,
+            edges.split_whitespace().count() / 3,
+        ))
+        .unwrap()
+        .remove(0);
+        graph_from_element(&root, None)
+    }
+
+    #[test]
+    fn sparse_edges_name_nodes_by_index_not_position() {
+        let graph = parse_sparse(NODES_5_8, "0 5 6 1 6 7 2 8 5").unwrap();
+        assert_eq!(graph.edge_indices, vec![[0, 5, 6], [1, 6, 7], [2, 8, 5]]);
+        assert_eq!(graph.edge_endpoints(0), Some((0, 1)));
+        assert_eq!(graph.edge_endpoints(1), Some((1, 2)));
+        assert_eq!(graph.edge_endpoints(2), Some((3, 0)));
+        assert_eq!(graph.edge_endpoints(3), None);
+        assert_eq!(graph.matrix_value(0, 1, 0), Some(1.0));
+        assert_eq!(graph.matrix_value(1, 2, 0), Some(2.0));
+        assert_eq!(graph.matrix_value(3, 0, 0), Some(3.0));
+        assert_eq!(graph.matrix_value(0, 3, 0), None);
+        assert_eq!(graph.matrix_value(5, 6, 0), None);
+        let values = graph.matrix_values(0);
+        assert_eq!(values.iter().flatten().count(), 3);
+        assert_eq!(values[1], Some(1.0));
+        assert_eq!(values[6], Some(2.0));
+        assert_eq!(values[12], Some(3.0));
+    }
+
+    #[test]
+    fn sparse_graph_rejects_missing_and_duplicate_node_indices() {
+        let missing = parse_sparse(NODES_5_8, "0 5 6 1 6 9 2 8 5").unwrap_err();
+        assert!(format!("{missing:#}").contains("index 9"), "{missing:#}");
+        let duplicate = parse_sparse(
+            r#"5 0 0 0 "a" 6 1 0 0 "b" 6 2 0 0 "c" 8 3 0 0 "d""#,
+            "0 5 6 1 6 8 2 8 5",
+        )
+        .unwrap_err();
+        assert!(format!("{duplicate:#}").contains("repeats node index 6"));
+    }
+
+    #[test]
+    fn sparse_zero_based_indices_and_repeated_edges() {
+        let nodes = r#"0 0 0 0 "a" 1 1 0 0 "b" 2 2 0 0 "c" 3 3 0 0 "d""#;
+        let graph = parse_sparse(nodes, "0 0 1 1 1 2 2 0 1").unwrap();
+        assert_eq!(graph.edge_endpoints(2), Some((0, 1)));
+        // First listing wins in both lookups.
+        assert_eq!(graph.matrix_value(0, 1, 0), Some(1.0));
+        assert_eq!(graph.matrix_values(0)[1], Some(1.0));
+    }
+
+    #[test]
+    fn reads_afni_written_sparse_graph() {
+        let graph = read_graph_bucket(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/graph/sparse.niml.dset"
+        ))
+        .unwrap();
+        assert_eq!(
+            graph.nodes.iter().map(|n| n.index).collect::<Vec<_>>(),
+            vec![5, 6, 7, 8]
+        );
+        assert_eq!(graph.edge_endpoints(0), Some((0, 1)));
+        assert_eq!(graph.edge_endpoints(1), Some((1, 2)));
+        assert_eq!(graph.edge_endpoints(2), Some((3, 0)));
+        assert_eq!(graph.matrix_value(3, 0, 0), Some(3.0));
+        assert_eq!(graph.matrix_value(3, 0, 1), Some(30.0));
+        assert_eq!(graph.matrix_value(0, 3, 0), None);
     }
 }

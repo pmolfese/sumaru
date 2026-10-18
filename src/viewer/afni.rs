@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::afni::switch_underlay_command_for_surface;
+use std::io::{self, Write};
 
 const AFNI_GPU_PATCH_MERGE_GAP_NODES: usize = 64;
 const AFNI_GPU_PATCH_MAX_WRITES: usize = 1024;
@@ -770,6 +771,12 @@ impl ViewerState {
                     changed |= self.controller.panels.surface_controller_visible != visible;
                     self.set_surface_controller_visible(visible);
                 }
+                DriveSumaAction::GetLabel => {
+                    let label = self.drivesuma_selection_label();
+                    let mut stdout = io::stdout().lock();
+                    writeln!(stdout, "{label}")?;
+                    stdout.flush()?;
+                }
                 DriveSumaAction::LoadDataset(path) => {
                     self.load_overlay_path(path)?;
                     changed = true;
@@ -1069,6 +1076,45 @@ impl ViewerState {
             }
         }
         Ok(changed)
+    }
+
+    /// Reproduce SUMA's `get_label` text for the current surface selection.
+    /// The legacy command writes in the viewer process rather than replying on
+    /// the DriveSuma socket, so this deliberately targets Sumaru's stdout.
+    fn drivesuma_selection_label(&self) -> String {
+        let Some(pick) = self.controller.interaction.pick else {
+            return "(null)".to_string();
+        };
+
+        let mut lines = Vec::new();
+        if let Some(region) = self.pick_region_display_text(pick) {
+            lines.push(region);
+        }
+        if let DatasetOverlayState::Loaded {
+            canonical_dataset,
+            columns,
+            ..
+        } = &self.overlay.data
+            && let Some(values) =
+                drivesuma_overlay_label(canonical_dataset, *columns, pick.node_index)
+        {
+            lines.push(values);
+        }
+        if let Some(cluster) = self
+            .cluster_labels
+            .as_deref()
+            .and_then(|labels| labels.get(pick.node_index as usize))
+            .copied()
+            .filter(|cluster| *cluster != 0)
+        {
+            lines.push(format!("In cluster {cluster}"));
+        }
+
+        if lines.is_empty() {
+            "(null)".to_string()
+        } else {
+            lines.join("\n")
+        }
     }
 
     /// Apply an AFNI overlay/threshold settings update to the active overlay.
@@ -1619,6 +1665,117 @@ fn drivesuma_threshold_percentile(column: &DataColumn, percentile: f32) -> Optio
     values.get(index).copied()
 }
 
+fn drivesuma_overlay_label(
+    dataset: &Dataset,
+    columns: OverlayColumnSelections,
+    node: u32,
+) -> Option<String> {
+    let row = dataset_row_for_node(dataset, node)?;
+    let indices = [
+        columns.intensity,
+        columns.threshold.unwrap_or(columns.intensity),
+        columns.brightness.unwrap_or(columns.intensity),
+    ];
+    let mut fields = Vec::with_capacity(3);
+    for index in indices {
+        let column = dataset.columns.get(index)?;
+        let value = numeric_column_value_as_f32(column, row)?;
+        fields.push((column.label.as_str(), drivesuma_value_label(value)));
+    }
+
+    let [intensity, threshold, brightness] = fields.as_slice() else {
+        unreachable!("the I/T/B field set always has three entries");
+    };
+    Some(
+        if intensity.1 == threshold.1 && threshold.1 == brightness.1 {
+            format!("(I,T,B){}={}", intensity.0, intensity.1)
+        } else if intensity.1 == threshold.1 {
+            format!(
+                "(I,T){}={} (B){}={}",
+                intensity.0, intensity.1, brightness.0, brightness.1
+            )
+        } else if threshold.1 == brightness.1 {
+            format!(
+                "(I){}={} (B,T){}={}",
+                intensity.0, intensity.1, brightness.0, brightness.1
+            )
+        } else if intensity.1 == brightness.1 {
+            format!(
+                "(I,B){}={} (T){}={}",
+                intensity.0, intensity.1, threshold.0, threshold.1
+            )
+        } else {
+            format!(
+                "{}={} {}={} {}={}",
+                intensity.0, intensity.1, threshold.0, threshold.1, brightness.0, brightness.1
+            )
+        },
+    )
+}
+
+/// Rust equivalent of the five-character `MV_format_fval2` formatting used by
+/// `SUMA_GetLabelsAtSelection_ADO`.
+fn drivesuma_value_label(value: f32) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if value.fract() == 0.0 && value.abs() < 100_000_000.0 {
+        return format!("{value:.0}");
+    }
+
+    let absolute = value.abs();
+    let mut formatted = if absolute < 0.0001 || absolute >= 10_000_000.0 {
+        drivesuma_scientific_label(value)
+    } else {
+        let decimals = if absolute < 10.0 {
+            6
+        } else if absolute < 100.0 {
+            5
+        } else if absolute < 1_000.0 {
+            4
+        } else if absolute < 10_000.0 {
+            3
+        } else if absolute < 100_000.0 {
+            2
+        } else if absolute < 1_000_000.0 {
+            1
+        } else {
+            0
+        };
+        let mut value = format!("{value:.decimals$}");
+        if value.contains('.') {
+            while value.ends_with('0') {
+                value.pop();
+            }
+            if value.ends_with('.') {
+                value.pop();
+            }
+        }
+        value
+    };
+
+    if !formatted.contains(['e', 'E']) && formatted.contains('.') && formatted.len() >= 5 {
+        formatted.truncate(5);
+        if formatted.ends_with('.') {
+            formatted.pop();
+        }
+    }
+    formatted
+}
+
+fn drivesuma_scientific_label(value: f32) -> String {
+    let decimals = usize::from(value.is_sign_positive()) + 5;
+    let raw = format!("{value:.decimals$e}");
+    let Some((mantissa, exponent)) = raw.split_once('e') else {
+        return raw;
+    };
+    let exponent = exponent.parse::<i32>().unwrap_or_default();
+    format!("{mantissa}e{exponent:+03}")
+}
+
 #[cfg(test)]
 mod drivesuma_value_tests {
     use super::*;
@@ -1650,6 +1807,54 @@ mod drivesuma_value_tests {
 
         assert_eq!(drivesuma_threshold_percentile(&column, 50.0), None);
         assert_eq!(drivesuma_threshold_percentile(&column, 101.0), None);
+    }
+
+    #[test]
+    fn get_label_groups_matching_suma_i_t_b_values() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "signal",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float32(vec![0.0, 12.34567, 0.0]),
+                )
+                .unwrap(),
+                DataColumn::new(
+                    "threshold",
+                    ColumnRole::Threshold,
+                    None,
+                    ColumnData::Float32(vec![0.0, 2.5, 0.0]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            drivesuma_overlay_label(
+                &dataset,
+                OverlayColumnSelections {
+                    intensity: 0,
+                    threshold: Some(1),
+                    brightness: Some(0),
+                },
+                1,
+            ),
+            Some("(I,B)signal=12.34 (T)threshold=2.5".to_string())
+        );
+    }
+
+    #[test]
+    fn get_label_value_format_matches_suma_five_character_style() {
+        assert_eq!(drivesuma_value_label(0.0), "0");
+        assert_eq!(drivesuma_value_label(3.0), "3");
+        assert_eq!(drivesuma_value_label(0.123456), "0.123");
+        assert_eq!(drivesuma_value_label(-12.34567), "-12.3");
+        assert_eq!(drivesuma_value_label(0.00001), "1.000000e-05");
     }
 }
 

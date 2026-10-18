@@ -676,10 +676,14 @@ impl ViewerState {
             timecourse.controls.threshold_absolute = threshold.absolute;
             timecourse.controls.threshold_value = threshold.value;
         }
-        self.rebuild_overlay_model()?;
+        let live_timecourse_preview =
+            self.timecourse.is_some() && self.timecourse_threshold_dragging;
+        self.rebuild_overlay_model_with_cluster_refresh(!live_timecourse_preview)?;
         self.refresh_pick_overlay_value();
         self.refresh_graph_snapshot_if_open();
-        self.upload_surface_buffers();
+        if !live_timecourse_preview || !self.upload_timecourse_threshold_colors() {
+            self.upload_surface_buffers();
+        }
         self.update_scene_stats();
 
         Ok(())
@@ -711,10 +715,20 @@ impl ViewerState {
 
     /// Rebuild the per-node overlay color model and re-upload colors.
     pub(super) fn rebuild_overlay_model(&mut self) -> Result<()> {
+        self.rebuild_overlay_model_with_cluster_refresh(true)
+    }
+
+    fn rebuild_overlay_model_with_cluster_refresh(&mut self, refresh_clusters: bool) -> Result<()> {
         // Labels have to be current before colors are built, since cluster
         // rejection is applied inside the color cache.
-        self.refresh_cluster_labels();
-        let cluster_labels = self.cluster_labels.clone();
+        if refresh_clusters {
+            self.refresh_cluster_labels();
+        }
+        // A live drag previews the raw threshold and leaves the previously
+        // committed cluster result alone. Release recomputes and reapplies it.
+        let cluster_labels = refresh_clusters
+            .then(|| self.cluster_labels.clone())
+            .flatten();
         let dataset = self
             .overlay
             .data

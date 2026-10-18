@@ -150,6 +150,7 @@ pub enum AfniIncomingMessage {
 pub enum DriveSumaAction {
     SelectSurface(String),
     SetSurfaceControllerVisible(bool),
+    GetLabel,
     LoadDataset(PathBuf),
     SelectDataset(String),
     SetColorMap(DriveSumaColorMap),
@@ -1709,6 +1710,7 @@ pub fn route_incoming_message(
                         controller.overlay.visible = *visible;
                     }
                     DriveSumaAction::SelectSurface(_)
+                    | DriveSumaAction::GetLabel
                     | DriveSumaAction::SelectDataset(_)
                     | DriveSumaAction::SetColorMap(_)
                     | DriveSumaAction::SetIntensityColumn(_)
@@ -2393,6 +2395,9 @@ fn engine_command_from_element(
                 None
             }
         }
+        "get_label" => Some(AfniIncomingMessage::DriveSumaCommands(vec![
+            DriveSumaAction::GetLabel,
+        ])),
         "kill_suma" if mode == DriveSumaCommandMode::SumaCompatibility => {
             Some(AfniIncomingMessage::DriveSumaCommands(vec![
                 DriveSumaAction::Quit,
@@ -2728,6 +2733,9 @@ pub fn drivesuma_unsupported_attributes(element: &NimlElement) -> Vec<String> {
             ],
         ),
         Some("kill_suma") => {
+            drivesuma_unsupported_attrs_except(element, &["Command", "Tracking_ID", "ni_form"])
+        }
+        Some("get_label") => {
             drivesuma_unsupported_attrs_except(element, &["Command", "Tracking_ID", "ni_form"])
         }
         Some(command) => vec![format!("Command={command}")],
@@ -3683,6 +3691,32 @@ mod tests {
             vec![AfniRouteAction::DriveSumaCommands(vec![
                 DriveSumaAction::SetOverlayVisible(false)
             ])]
+        );
+        assert!(drivesuma_unsupported_attributes(&element).is_empty());
+    }
+
+    #[test]
+    fn drivesuma_get_label_routes_in_both_command_modes() {
+        let element = NimlElement::group(
+            "EngineCommand",
+            BTreeMap::from([
+                ("Command".to_string(), "get_label".to_string()),
+                ("Tracking_ID".to_string(), "2".to_string()),
+            ]),
+            Vec::new(),
+        );
+        let expected = Some(AfniIncomingMessage::DriveSumaCommands(vec![
+            DriveSumaAction::GetLabel,
+        ]));
+
+        assert_eq!(parse_incoming_message(&element).unwrap(), expected);
+        assert_eq!(
+            parse_incoming_message_with_drivesuma_mode(
+                &element,
+                DriveSumaCommandMode::SumaCompatibility,
+            )
+            .unwrap(),
+            expected
         );
         assert!(drivesuma_unsupported_attributes(&element).is_empty());
     }

@@ -44,8 +44,9 @@ use crate::dataset::{
 use crate::graph_dataset::read_graph_bucket;
 use crate::instacorr::{InstaCorrOptions, PreparedInstaCorr, prepare_dataset};
 use crate::io::{
-    NimlElement, read_gifti_dataset, read_gifti_dataset_with_auto_qcalc, read_gifti_image,
-    read_niml_dataset, read_niml_dataset_with_label_table, read_niml_roi, write_niml_roi,
+    NimlElement, dataset_is_stc, mark_dataset_as_paired_stc, read_gifti_dataset,
+    read_gifti_dataset_with_auto_qcalc, read_gifti_image, read_niml_dataset,
+    read_niml_dataset_with_label_table, read_niml_roi, read_stc_dataset, write_niml_roi,
 };
 use crate::niml_debug::NimlRecorder;
 use crate::overlay::{
@@ -71,7 +72,7 @@ use mesh::{
     CONTOUR_VERTEX_FLOATS, ContourColorMode, OverlayAppearance, OverlayColorMap,
     OverlayDisplayMode, PreparedGeometry, PreparedGeometryVertex, PreparedSurface,
     PreparedThresholdContour, RoiAppearance, SelectionHighlight, cell_color_chunk_ranges,
-    luminance, sample_colormap, threshold_boundary_luminances,
+    composed_node_color_bytes, luminance, sample_colormap, threshold_boundary_luminances,
 };
 use overlay_load::*;
 use pick::{pick_surface, pick_surface_with_model, screen_ray};
@@ -103,10 +104,12 @@ mod ui;
 mod volume_view;
 use edit::{CoordConvention, GoToLocationState};
 use instacorr::{InstaCorrSession, InstaCorrWorkerResult};
-pub use scene_objects::{GraphColorMode, GraphEdgeGeometry, GraphMatrixPlacement, TractColorMode};
+pub use scene_objects::{
+    GraphColorMode, GraphEdgeGeometry, GraphMatrixPlacement, TractColorMode, TractMaskFilter,
+};
 use scene_objects::{
     SceneObject, SceneObjectGpu, SceneObjectPayload, SceneObjectPick, SceneObjectRenderer,
-    normalization_model, pick_scene_objects,
+    normalization_model, pick_scene_objects, pick_tract_masks, pick_tract_on_object_unfiltered,
 };
 pub use timecourse::{
     TimeCourseBaseline, TimeCourseControls, TimeCourseDisplay, TimeCourseMeasure,
@@ -311,6 +314,12 @@ const ROI_CONTROL_INNER_WIDTH: u32 = 430;
 const ROI_CONTROL_INNER_HEIGHT: u32 = 260;
 const ROI_CONTROL_MAX_INNER_WIDTH: u32 = 1100;
 const ROI_CONTROL_MIN_INNER_HEIGHT: u32 = 260;
+const MASK_CONTROL_CONTENT_WIDTH_POINTS: f32 = 430.0;
+const MASK_CONTROL_MIN_INNER_WIDTH: u32 = 500;
+const MASK_CONTROL_INNER_WIDTH: u32 = 500;
+const MASK_CONTROL_INNER_HEIGHT: u32 = 520;
+const MASK_CONTROL_MAX_INNER_WIDTH: u32 = 1300;
+const MASK_CONTROL_MIN_INNER_HEIGHT: u32 = 320;
 const GRAPH_WINDOW_INNER_WIDTH: u32 = 600;
 const GRAPH_WINDOW_INNER_HEIGHT: u32 = 400;
 const GRAPH_MIN_INITIAL_INNER_WIDTH: u32 = 420;
@@ -362,6 +371,17 @@ const WHITE_BACKGROUND: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SparseTimecourseDisplay {
+    /// Iteratively spread and average source values over the display mesh.
+    #[default]
+    Smooth,
+    /// Color only the vertices explicitly present in the source estimate.
+    Sparse,
+    /// Assign every mesh vertex the value of its closest source along topology.
+    Nearest,
+}
+
 #[derive(Debug, Default)]
 pub struct LaunchOptions {
     pub surface_paths: Vec<PathBuf>,
@@ -392,6 +412,8 @@ pub struct LaunchOptions {
     pub niml_record_path: Option<PathBuf>,
     /// Start in the compact interactive surface-timecourse workflow.
     pub timecourse_mode: bool,
+    /// Projection used when a timecourse contains only a subset of mesh nodes.
+    pub sparse_timecourse_display: SparseTimecourseDisplay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,6 +509,7 @@ struct ViewerApp {
     afni: AfniViewerOptions,
     niml_record_path: Option<PathBuf>,
     initial_timecourse_mode: bool,
+    initial_sparse_timecourse_display: SparseTimecourseDisplay,
     event_proxy: EventLoopProxy<ViewerEvent>,
     state: Option<ViewerState>,
     setup_error: Option<anyhow::Error>,
@@ -519,6 +542,7 @@ impl ViewerApp {
             afni: options.afni,
             niml_record_path: options.niml_record_path,
             initial_timecourse_mode: options.timecourse_mode,
+            initial_sparse_timecourse_display: options.sparse_timecourse_display,
             event_proxy,
             state: None,
             setup_error: None,
@@ -559,6 +583,17 @@ impl ViewerApp {
                     .with_visible(false),
             )?,
         );
+        let mask_control_window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("sumaru mask controls")
+                    .with_inner_size(PhysicalSize::new(
+                        MASK_CONTROL_INNER_WIDTH,
+                        MASK_CONTROL_INNER_HEIGHT,
+                    ))
+                    .with_visible(false),
+            )?,
+        );
         let graph_window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
@@ -573,6 +608,8 @@ impl ViewerApp {
             control_window.set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y));
             roi_control_window
                 .set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y + 760));
+            mask_control_window
+                .set_outer_position(PhysicalPosition::new(position.x + 1360, raised_y + 120));
             graph_window.set_outer_position(PhysicalPosition::new(position.x + 80, raised_y + 80));
         }
         self.state = Some(pollster::block_on(ViewerState::new(
@@ -580,6 +617,7 @@ impl ViewerApp {
                 view: view_window,
                 control: control_window,
                 roi_control: roi_control_window,
+                mask_control: mask_control_window,
                 graph: graph_window,
             },
             InitialScene {
@@ -601,6 +639,7 @@ impl ViewerApp {
                 overlay_subs: self.initial_overlay_subs.take(),
                 overlay_p_value: self.initial_overlay_p_value.take(),
                 timecourse_mode: self.initial_timecourse_mode,
+                sparse_timecourse_display: self.initial_sparse_timecourse_display,
             },
             self.verbose,
             self.preload,
@@ -770,6 +809,47 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             return;
         }
 
+        if window_id == state.mask_control_window().id() {
+            let input = state.mask_control_input(&event);
+            if input.repaint {
+                state.mask_control_window().request_redraw();
+            }
+            if input.consumed {
+                state.mask_control_window().request_redraw();
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested => {
+                    state.apply_commands(vec![ViewerCommand::SetMaskControllerOpen(false)]);
+                }
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::MaskControl, occluded);
+                }
+                WindowEvent::Resized(size) => {
+                    state.resize_mask_control(size);
+                    if !state.mask_control.occluded {
+                        state.mask_control_window().request_redraw();
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.mask_control.occluded {
+                        return;
+                    }
+                    match state.render_mask_control() {
+                        RenderStatus::Rendered => {}
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_mask_control(state.mask_control.size);
+                            state.mask_control_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("mask control validation error"),
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if window_id == state.graph_window().id() {
             let input = state.graph_input(&event);
             if input.repaint {
@@ -834,6 +914,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     if state.controller.panels.roi_controller_open {
                         state.roi_control_window().request_redraw();
                     }
+                    if state.controller.panels.mask_controller_open {
+                        state.mask_control_window().request_redraw();
+                    }
                     if state.controller.panels.graph_window_open {
                         state.view_window().request_redraw();
                     }
@@ -856,6 +939,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     }
                     if state.controller.panels.roi_controller_open {
                         state.roi_control_window().request_redraw();
+                    }
+                    if state.controller.panels.mask_controller_open {
+                        state.mask_control_window().request_redraw();
                     }
                     if state.graph_matrix_window_open() {
                         state.graph_window().request_redraw();
@@ -900,6 +986,12 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             .roi_controller_open
             .then_some(state.roi_control.repaint_at)
             .flatten();
+        let next_mask_control = state
+            .controller
+            .panels
+            .mask_controller_open
+            .then_some(state.mask_control.repaint_at)
+            .flatten();
         let next_graph = state
             .graph_matrix_window_open()
             .then_some(state.graph.repaint_at)
@@ -907,6 +999,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         let view_due = repaint_due(now, next_view, state.view.occluded);
         let control_due = repaint_due(now, next_control, state.control.occluded);
         let roi_control_due = repaint_due(now, next_roi_control, state.roi_control.occluded);
+        let mask_control_due = repaint_due(now, next_mask_control, state.mask_control.occluded);
         let graph_due = repaint_due(now, next_graph, state.graph.occluded);
         if view_due {
             state.view_window().request_redraw();
@@ -916,6 +1009,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         }
         if roi_control_due {
             state.roi_control_window().request_redraw();
+        }
+        if mask_control_due {
+            state.mask_control_window().request_redraw();
         }
         if graph_due {
             state.graph_window().request_redraw();
@@ -927,12 +1023,13 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 (next_view, state.view.occluded),
                 (next_control, state.control.occluded),
                 (next_roi_control, state.roi_control.occluded),
+                (next_mask_control, state.mask_control.occluded),
                 (next_graph, state.graph.occluded),
             ],
         );
         match next_wake {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None if view_due || control_due || roi_control_due || graph_due => {
+            None if view_due || control_due || roi_control_due || mask_control_due || graph_due => {
                 event_loop.set_control_flow(ControlFlow::Wait)
             }
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -940,8 +1037,8 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
     }
 }
 
-/// Per-window egui plumbing. Each of the four windows (view, control, ROI
-/// control, graph) owns one of these instead of five parallel fields on
+/// Per-window egui plumbing. Each application window owns one of these instead
+/// of maintaining parallel surface, renderer, input, and repaint fields on
 /// `ViewerState`.
 struct EguiPane {
     ctx: egui::Context,
@@ -972,26 +1069,37 @@ impl EguiPane {
     ) -> (bool, egui::TexturesDelta) {
         let mut retained = egui::TexturesDelta::default();
         let mut needs_repaint = false;
-        for (id, image_delta) in &self.pending_textures.set {
-            if image_delta.pos.is_some() && !self.allocated_textures.contains(id) {
-                retained.set.push((*id, image_delta.clone()));
-                needs_repaint = true;
-                continue;
+        for (id, image_deltas) in std::mem::take(&mut self.pending_textures.set) {
+            for image_delta in image_deltas {
+                if image_delta.pos.is_some() && !self.allocated_textures.contains(&id) {
+                    retained.push(id, image_delta);
+                    needs_repaint = true;
+                    continue;
+                }
+                self.renderer
+                    .update_texture(device, queue, id, &image_delta);
+                self.allocated_textures.insert(id);
             }
-            self.renderer
-                .update_texture(device, queue, *id, image_delta);
-            self.allocated_textures.insert(*id);
         }
         (needs_repaint, retained)
     }
 
     /// Frees textures this pane marked for release on the previous frame.
     fn free_pending(&mut self) {
-        for id in &self.pending_textures.free {
-            if self.allocated_textures.remove(id) {
-                self.renderer.free_texture(id);
+        for id in std::mem::take(&mut self.pending_textures.free) {
+            if self.allocated_textures.remove(&id) {
+                self.renderer.free_texture(&id);
             }
         }
+    }
+}
+
+impl Drop for EguiPane {
+    fn drop(&mut self) {
+        // A window can close before its next render pass (or while its surface
+        // is unavailable). At that point there is nowhere useful to apply
+        // queued texture changes, so explicitly discard them as egui requires.
+        self.pending_textures.clear();
     }
 }
 
@@ -1016,6 +1124,7 @@ struct WindowPane {
 enum AuxWindowPane {
     Control,
     RoiControl,
+    MaskControl,
     Graph,
 }
 
@@ -1153,7 +1262,7 @@ impl WindowPane {
         command_buffers.push(encoder.finish());
         queue.submit(command_buffers);
         let _ = device.poll(wgpu::PollType::Poll);
-        output.present();
+        queue.present(output);
 
         RenderStatus::Rendered
     }
@@ -1330,12 +1439,13 @@ impl ViewerOverlayState {
     }
 }
 
-/// The four application windows handed to [`ViewerState::new`]. Bundled so the
-/// constructor takes one argument for the window set instead of four.
+/// The application windows handed to [`ViewerState::new`]. Bundled so the
+/// constructor takes one argument for the complete window set.
 struct ViewerWindows {
     view: Arc<Window>,
     control: Arc<Window>,
     roi_control: Arc<Window>,
+    mask_control: Arc<Window>,
     graph: Arc<Window>,
 }
 
@@ -1362,6 +1472,11 @@ struct InitialScene {
     overlay_subs: Option<Vec<String>>,
     overlay_p_value: Option<f64>,
     timecourse_mode: bool,
+    sparse_timecourse_display: SparseTimecourseDisplay,
+}
+
+fn scene_objects_controller_starts_open(tract_paths: &[PathBuf], graph_paths: &[PathBuf]) -> bool {
+    !tract_paths.is_empty() || !graph_paths.is_empty()
 }
 
 struct SurfaceRenderPipelines {
@@ -1462,6 +1577,7 @@ struct ViewerState {
     view: WindowPane,
     control: WindowPane,
     roi_control: WindowPane,
+    mask_control: WindowPane,
     graph: WindowPane,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1477,6 +1593,9 @@ struct ViewerState {
     scene_object_gpu: Vec<SceneObjectGpu>,
     active_scene_object: Option<usize>,
     scene_object_pick: Option<SceneObjectPick>,
+    /// Initial state for the tracts/graphs controller. Egui remembers any
+    /// subsequent arrow clicks under the collapsing header's persistent ID.
+    scene_objects_controller_default_open: bool,
     surface_buffers: Option<SurfaceBuffers>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
@@ -1523,6 +1642,9 @@ struct ViewerState {
     roi_workspace: RoiWorkspace,
     graph_snapshot: Option<GraphSnapshot>,
     timecourse: Option<TimeCourseState>,
+    /// Enables a color-only preview while the `tc` threshold rail is dragged.
+    timecourse_threshold_dragging: bool,
+    sparse_timecourse_display: SparseTimecourseDisplay,
     surface_volume_path: Option<PathBuf>,
     surface_volume_idcode: Option<String>,
     /// Loaded display volume and its slice-plane render state (`--volume` mode).
@@ -1583,8 +1705,18 @@ struct ViewerState {
     pair_drag_changed: bool,
     /// Index of the volume slice currently being left-dragged, if any.
     volume_slice_drag: Option<usize>,
+    tract_mask_drag: Option<TractMaskDrag>,
     modifiers: ModifiersState,
     mode_label: Option<ModeLabel>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TractMaskDrag {
+    object_index: usize,
+    mask_index: usize,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+    grab_offset: Vec3,
 }
 
 impl ViewerState {
@@ -1603,6 +1735,7 @@ impl ViewerState {
             view: view_window,
             control: control_window,
             roi_control: roi_control_window,
+            mask_control: mask_control_window,
             graph: graph_window,
         } = windows;
         let InitialScene {
@@ -1624,21 +1757,30 @@ impl ViewerState {
             overlay_subs: initial_overlay_subs,
             overlay_p_value: initial_overlay_p_value,
             timecourse_mode: initial_timecourse_mode,
+            sparse_timecourse_display,
         } = scene;
+        let scene_objects_controller_default_open =
+            scene_objects_controller_starts_open(&initial_tract_paths, &initial_graph_paths);
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
         let roi_control_size = roi_control_window.inner_size();
+        let mask_control_size = mask_control_window.inner_size();
         let graph_size = graph_window.inner_size();
         let instance = wgpu::Instance::default();
         let view_surface = instance.create_surface(view_window.clone())?;
         let control_surface = instance.create_surface(control_window.clone())?;
         let roi_control_surface = instance.create_surface(roi_control_window.clone())?;
+        let mask_control_surface = instance.create_surface(mask_control_window.clone())?;
         let graph_surface = instance.create_surface(graph_window.clone())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&view_surface),
                 force_fallback_adapter: false,
+                // Preserve the physical adapter limits because --big-mem uses
+                // them to size its GPU buffers. Bucketing is intended for
+                // fingerprinting resistance when exposing wgpu to untrusted code.
+                apply_limit_buckets: false,
             })
             .await
             .context("failed to find a compatible GPU adapter")?;
@@ -1663,6 +1805,7 @@ impl ViewerState {
         let view_caps = view_surface.get_capabilities(&adapter);
         let control_caps = control_surface.get_capabilities(&adapter);
         let roi_control_caps = roi_control_surface.get_capabilities(&adapter);
+        let mask_control_caps = mask_control_surface.get_capabilities(&adapter);
         let graph_caps = graph_surface.get_capabilities(&adapter);
         let surface_format = choose_surface_format(&view_caps, &control_caps);
         let present_mode = choose_present_mode(&view_caps, &control_caps);
@@ -1680,6 +1823,18 @@ impl ViewerState {
             "ROI controller surface does not support selected alpha mode {alpha_mode:?}"
         );
         ensure!(
+            mask_control_caps.formats.contains(&surface_format),
+            "mask controller surface does not support selected format {surface_format:?}"
+        );
+        ensure!(
+            mask_control_caps.present_modes.contains(&present_mode),
+            "mask controller surface does not support selected present mode {present_mode:?}"
+        );
+        ensure!(
+            mask_control_caps.alpha_modes.contains(&alpha_mode),
+            "mask controller surface does not support selected alpha mode {alpha_mode:?}"
+        );
+        ensure!(
             graph_caps.formats.contains(&surface_format),
             "graph surface does not support selected format {surface_format:?}"
         );
@@ -1694,6 +1849,7 @@ impl ViewerState {
         let view_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: view_size.width.max(1),
             height: view_size.height.max(1),
             present_mode,
@@ -1704,6 +1860,7 @@ impl ViewerState {
         let control_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: control_size.width.max(1),
             height: control_size.height.max(1),
             present_mode,
@@ -1714,8 +1871,20 @@ impl ViewerState {
         let roi_control_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: roi_control_size.width.max(1),
             height: roi_control_size.height.max(1),
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        let mask_control_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: mask_control_size.width.max(1),
+            height: mask_control_size.height.max(1),
             present_mode,
             alpha_mode,
             view_formats: vec![],
@@ -1724,6 +1893,7 @@ impl ViewerState {
         let graph_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: graph_size.width.max(1),
             height: graph_size.height.max(1),
             present_mode,
@@ -1734,6 +1904,7 @@ impl ViewerState {
         view_surface.configure(&device, &view_config);
         control_surface.configure(&device, &control_config);
         roi_control_surface.configure(&device, &roi_control_config);
+        mask_control_surface.configure(&device, &mask_control_config);
         graph_surface.configure(&device, &graph_config);
 
         let camera = Camera::default();
@@ -1789,16 +1960,16 @@ impl ViewerState {
                     module: &shader,
                     entry_point: Some(vertex_entry),
                     buffers: &[
-                        wgpu::VertexBufferLayout {
+                        Some(wgpu::VertexBufferLayout {
                             array_stride: VERTEX_STRIDE,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &VERTEX_ATTRIBUTES,
-                        },
-                        wgpu::VertexBufferLayout {
+                        }),
+                        Some(wgpu::VertexBufferLayout {
                             array_stride: COLOR_STRIDE,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &COLOR_ATTRIBUTES,
-                        },
+                        }),
                     ],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
@@ -1861,11 +2032,11 @@ impl ViewerState {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("contour_vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: CONTOUR_VERTEX_STRIDE,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &CONTOUR_VERTEX_ATTRIBUTES,
-                    }],
+                    })],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1949,6 +2120,18 @@ impl ViewerState {
         );
         roi_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
         let roi_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
+        let mask_egui_ctx = egui::Context::default();
+        mask_egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut mask_egui_state = egui_winit::State::new(
+            mask_egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            mask_control_window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        mask_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
+        let mask_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
         let graph_egui_ctx = egui::Context::default();
         graph_egui_ctx.set_visuals(egui::Visuals::dark());
         let mut graph_egui_state = egui_winit::State::new(
@@ -2012,6 +2195,13 @@ impl ViewerState {
                 roi_control_size,
                 EguiPane::new(roi_egui_ctx, roi_egui_state, roi_egui_renderer),
             ),
+            mask_control: WindowPane::new(
+                mask_control_window,
+                mask_control_surface,
+                mask_control_config,
+                mask_control_size,
+                EguiPane::new(mask_egui_ctx, mask_egui_state, mask_egui_renderer),
+            ),
             graph: WindowPane::new(
                 graph_window,
                 graph_surface,
@@ -2030,6 +2220,7 @@ impl ViewerState {
             scene_object_gpu: Vec::new(),
             active_scene_object: None,
             scene_object_pick: None,
+            scene_objects_controller_default_open,
             surface_buffers: None,
             uniform_buffer,
             uniform_bind_group,
@@ -2072,6 +2263,8 @@ impl ViewerState {
             roi_workspace: RoiWorkspace::default(),
             graph_snapshot: None,
             timecourse: None,
+            timecourse_threshold_dragging: false,
+            sparse_timecourse_display,
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             volume_view: None,
@@ -2111,6 +2304,7 @@ impl ViewerState {
             pair_drag_last_cursor: None,
             pair_drag_changed: false,
             volume_slice_drag: None,
+            tract_mask_drag: None,
             modifiers: ModifiersState::empty(),
             mode_label: None,
         };
@@ -2199,6 +2393,10 @@ impl ViewerState {
         &self.roi_control.window
     }
 
+    fn mask_control_window(&self) -> &Window {
+        &self.mask_control.window
+    }
+
     fn graph_window(&self) -> &Window {
         &self.graph.window
     }
@@ -2251,6 +2449,9 @@ impl ViewerState {
         if self.controller.panels.roi_controller_open {
             self.roi_control.window.request_redraw();
         }
+        if self.controller.panels.mask_controller_open {
+            self.mask_control.window.request_redraw();
+        }
         if self.graph_matrix_window_open() {
             self.graph.window.request_redraw();
         }
@@ -2260,6 +2461,7 @@ impl ViewerState {
         let window = match pane {
             AuxWindowPane::Control => &mut self.control,
             AuxWindowPane::RoiControl => &mut self.roi_control,
+            AuxWindowPane::MaskControl => &mut self.mask_control,
             AuxWindowPane::Graph => &mut self.graph,
         };
         if window.occluded == occluded {
@@ -2286,6 +2488,10 @@ impl ViewerState {
 
     fn resize_roi_control(&mut self, size: PhysicalSize<u32>) {
         self.roi_control.resize(&self.device, size);
+    }
+
+    fn resize_mask_control(&mut self, size: PhysicalSize<u32>) {
+        self.mask_control.resize(&self.device, size);
     }
 
     fn resize_graph(&mut self, size: PhysicalSize<u32>) {
@@ -2406,6 +2612,9 @@ impl ViewerState {
         }
         self.view.window.request_redraw();
         self.control.window.request_redraw();
+        if self.controller.panels.mask_controller_open {
+            self.mask_control.window.request_redraw();
+        }
     }
 
     fn rebuild_scene_object_gpu(&mut self, index: usize) {
@@ -2413,6 +2622,238 @@ impl ViewerState {
             return;
         };
         self.scene_object_gpu[index] = self.scene_object_renderer.upload(&self.device, object);
+    }
+
+    fn refresh_scene_object_masks_gpu(&mut self, index: usize) {
+        let (Some(object), Some(gpu)) = (
+            self.scene_objects.get(index),
+            self.scene_object_gpu.get_mut(index),
+        ) else {
+            return;
+        };
+        self.scene_object_renderer
+            .refresh_masks(&self.device, &self.queue, gpu, object);
+        self.view.window.request_redraw();
+        self.control.window.request_redraw();
+    }
+
+    fn add_tract_mask(&mut self, object_index: usize) {
+        let center = self
+            .scene_object_pick
+            .as_ref()
+            .and_then(|pick| match pick {
+                SceneObjectPick::Tract {
+                    object_index: picked_object,
+                    position,
+                    ..
+                } if *picked_object == object_index => Some(*position),
+                _ => None,
+            })
+            .or_else(|| {
+                self.controller
+                    .interaction
+                    .pick
+                    .map(|pick| pick.surface_position)
+            })
+            .or_else(|| {
+                self.scene_objects
+                    .get(object_index)
+                    .map(|object| object.bounds.center)
+            });
+        let Some(center) = center else {
+            return;
+        };
+        self.clear_tract_mask_selection();
+        let added = self
+            .scene_objects
+            .get_mut(object_index)
+            .and_then(|object| object.add_tract_mask(center));
+        if let Some(mask_index) = added {
+            self.active_scene_object = Some(object_index);
+            self.refresh_scene_object_masks_gpu(object_index);
+            self.log_status(format!(
+                "Added Mask {}. Right-click it to select; left-drag to move; Shift-drag snaps to tracts.",
+                mask_index + 1
+            ));
+        }
+    }
+
+    fn clear_tract_mask_selection(&mut self) {
+        let changed = self
+            .scene_objects
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, object)| object.tract_mask_selected.take().map(|_| index))
+            .collect::<Vec<_>>();
+        for index in changed {
+            self.refresh_scene_object_masks_gpu(index);
+        }
+    }
+
+    fn select_tract_mask(&mut self, object_index: usize, mask_index: Option<usize>) {
+        self.clear_tract_mask_selection();
+        let selected = self
+            .scene_objects
+            .get_mut(object_index)
+            .is_some_and(|object| {
+                if let Some(mask_index) = mask_index {
+                    if mask_index >= object.tract_masks.len() {
+                        return false;
+                    }
+                    object.tract_mask_selected = Some(mask_index);
+                }
+                true
+            });
+        if selected {
+            self.active_scene_object = Some(object_index);
+            self.refresh_scene_object_masks_gpu(object_index);
+        }
+    }
+
+    fn select_tract_mask_at_cursor(&mut self) -> bool {
+        let Some(cursor) = self.view_cursor_position else {
+            return false;
+        };
+        let scene_size = self.scene_viewport_size();
+        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
+            return false;
+        };
+        let Some(pick) = pick_tract_masks(
+            &self.scene_objects,
+            self.scene_object_model(),
+            origin,
+            direction,
+        ) else {
+            self.clear_tract_mask_selection();
+            return false;
+        };
+        self.select_tract_mask(pick.object_index, Some(pick.mask_index));
+        if let Some(mask) = self.scene_objects[pick.object_index]
+            .tract_masks
+            .get(pick.mask_index)
+        {
+            self.log_status(format!(
+                "{} selected — left-drag to move, Shift-drag to snap to tracts, Ctrl+wheel to resize.",
+                mask.name
+            ));
+        }
+        true
+    }
+
+    fn selected_tract_mask(&self) -> Option<(usize, usize)> {
+        self.scene_objects
+            .iter()
+            .enumerate()
+            .find_map(|(object_index, object)| {
+                object
+                    .tract_mask_selected
+                    .map(|mask_index| (object_index, mask_index))
+            })
+    }
+
+    fn try_begin_tract_mask_drag(&mut self) -> bool {
+        let Some((object_index, mask_index)) = self.selected_tract_mask() else {
+            return false;
+        };
+        let Some(cursor) = self.view_cursor_position else {
+            return false;
+        };
+        let scene_size = self.scene_viewport_size();
+        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
+            return false;
+        };
+        let model = self.scene_object_model();
+        let hit = pick_tract_masks(&self.scene_objects, model, origin, direction);
+        if !hit.is_some_and(|hit| hit.object_index == object_index && hit.mask_index == mask_index)
+        {
+            return false;
+        }
+        let center = self.scene_objects[object_index].tract_masks[mask_index].center;
+        let plane_point = model.transform_point3(Vec3::from_array(center));
+        let plane_normal = self.camera.view_axes().0.normalize_or_zero();
+        let Some(grab_point) = ray_plane_intersection(origin, direction, plane_point, plane_normal)
+        else {
+            return false;
+        };
+        self.camera.stop_momentum();
+        self.tract_mask_drag = Some(TractMaskDrag {
+            object_index,
+            mask_index,
+            plane_point,
+            plane_normal,
+            grab_offset: plane_point - grab_point,
+        });
+        if self.modifiers.shift_key() {
+            self.update_tract_mask_drag();
+        }
+        true
+    }
+
+    fn update_tract_mask_drag(&mut self) {
+        let Some(drag) = self.tract_mask_drag else {
+            return;
+        };
+        let Some(cursor) = self.view_cursor_position else {
+            return;
+        };
+        let scene_size = self.scene_viewport_size();
+        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
+            return;
+        };
+        let model = self.scene_object_model();
+        let next_center = if self.modifiers.shift_key() {
+            let tolerance =
+                (2.0 * self.camera.distance * (camera::CAMERA_FOV_Y_RADIANS * 0.5).tan() * 18.0
+                    / scene_size.height.max(1) as f32)
+                    .clamp(0.006, 0.12);
+            match pick_tract_on_object_unfiltered(
+                &self.scene_objects,
+                drag.object_index,
+                model,
+                origin,
+                direction,
+                tolerance,
+            ) {
+                Some(SceneObjectPick::Tract {
+                    object_index,
+                    position,
+                    ..
+                }) if object_index == drag.object_index => Some(position),
+                _ => None,
+            }
+        } else {
+            ray_plane_intersection(origin, direction, drag.plane_point, drag.plane_normal).map(
+                |point| {
+                    model
+                        .inverse()
+                        .transform_point3(point + drag.grab_offset)
+                        .to_array()
+                },
+            )
+        };
+        let Some(next_center) = next_center else {
+            return;
+        };
+        let changed = self
+            .scene_objects
+            .get_mut(drag.object_index)
+            .is_some_and(|object| object.set_tract_mask_center(drag.mask_index, next_center));
+        if changed {
+            self.refresh_scene_object_masks_gpu(drag.object_index);
+        }
+    }
+
+    fn resize_selected_tract_mask(&mut self, scroll: f32) -> bool {
+        let Some((object_index, mask_index)) = self.selected_tract_mask() else {
+            return false;
+        };
+        let radius = self.scene_objects[object_index].tract_masks[mask_index].radius;
+        let changed = self.scene_objects[object_index]
+            .set_tract_mask_radius(mask_index, radius * 1.08_f32.powf(scroll));
+        if changed {
+            self.refresh_scene_object_masks_gpu(object_index);
+        }
+        true
     }
 
     fn clear_scene_object_pick_for(&mut self, index: usize) -> bool {
@@ -2553,9 +2994,8 @@ impl ViewerState {
         let raw_input = self.view.egui.state.take_egui_input(&self.view.window);
         let egui_ctx = self.view.egui.ctx.clone();
         let mut ui_actions = Vec::new();
-        #[allow(deprecated)]
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            ui_actions = self.draw_view_overlay_ui(ctx);
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            ui_actions = self.draw_view_overlay_ui(ui);
         });
         self.view.repaint_at = repaint_delay_to_instant(&full_output);
         let actions_present = !ui_actions.is_empty();
@@ -2569,6 +3009,9 @@ impl ViewerState {
             self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
                 self.roi_control.window.request_redraw();
+            }
+            if self.controller.panels.mask_controller_open {
+                self.mask_control.window.request_redraw();
             }
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
@@ -2654,7 +3097,7 @@ impl ViewerState {
         command_buffers.push(encoder.finish());
         self.queue.submit(command_buffers);
         self.poll_device_for_cleanup();
-        output.present();
+        self.queue.present(output);
 
         RenderStatus::Rendered
     }
@@ -2829,9 +3272,8 @@ impl ViewerState {
         let egui_ctx = self.control.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         let mut desired_control_size_points = egui::Vec2::ZERO;
-        #[allow(deprecated)]
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            let output = self.draw_ui(ctx);
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let output = self.draw_ui(ui);
             ui_actions = output.actions;
             desired_control_size_points = output.desired_control_size_points;
         });
@@ -2859,6 +3301,9 @@ impl ViewerState {
             self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
                 self.roi_control.window.request_redraw();
+            }
+            if self.controller.panels.mask_controller_open {
+                self.mask_control.window.request_redraw();
             }
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
@@ -2891,9 +3336,8 @@ impl ViewerState {
         let egui_ctx = self.roi_control.egui.ctx.clone();
         let mut ui_actions = Vec::new();
         let mut desired_roi_control_size_points = egui::Vec2::ZERO;
-        #[allow(deprecated)]
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            let output = self.draw_roi_control_ui(ctx);
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let output = self.draw_roi_control_ui(ui);
             ui_actions = output.actions;
             desired_roi_control_size_points = output.desired_control_size_points;
         });
@@ -2921,6 +3365,9 @@ impl ViewerState {
             self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
                 self.roi_control.window.request_redraw();
+            }
+            if self.controller.panels.mask_controller_open {
+                self.mask_control.window.request_redraw();
             }
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
@@ -2952,13 +3399,64 @@ impl ViewerState {
         )
     }
 
+    fn render_mask_control(&mut self) -> RenderStatus {
+        let raw_input = self.mask_control.take_egui_input();
+        let egui_ctx = self.mask_control.egui.ctx.clone();
+        let mut ui_actions = Vec::new();
+        let mut desired_size_points = egui::Vec2::ZERO;
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let output = self.draw_mask_control_ui(ui);
+            ui_actions = output.actions;
+            desired_size_points = output.desired_control_size_points;
+        });
+        self.mask_control.repaint_at = repaint_delay_to_instant(&full_output);
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        let actions_present = !ui_actions.is_empty();
+        self.mask_control
+            .egui
+            .state
+            .handle_platform_output(&self.mask_control.window, full_output.platform_output);
+        if repaint_delay != Duration::ZERO {
+            self.fit_mask_control_window(desired_size_points, full_output.pixels_per_point);
+        }
+        self.apply_commands(ui_actions);
+        if actions_present {
+            self.view.window.request_redraw();
+            self.control.window.request_redraw();
+            self.mask_control.window.request_redraw();
+        }
+
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [
+                self.mask_control.config.width,
+                self.mask_control.config.height,
+            ],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        self.mask_control
+            .egui
+            .pending_textures
+            .append(full_output.textures_delta);
+        self.mask_control.present_egui_frame(
+            &self.device,
+            &self.queue,
+            &paint_jobs,
+            &screen_descriptor,
+            "mask control render encoder",
+        )
+    }
+
     fn render_graph(&mut self) -> RenderStatus {
         let raw_input = self.graph.take_egui_input();
         let egui_ctx = self.graph.egui.ctx.clone();
         let mut ui_actions = Vec::new();
-        #[allow(deprecated)]
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            ui_actions = self.draw_graph_matrix_window_ui(ctx);
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            ui_actions = self.draw_graph_matrix_window_ui(ui);
         });
         self.graph.repaint_at = repaint_delay_to_instant(&full_output);
         let actions_present = !ui_actions.is_empty();
@@ -2972,6 +3470,9 @@ impl ViewerState {
             self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
                 self.roi_control.window.request_redraw();
+            }
+            if self.controller.panels.mask_controller_open {
+                self.mask_control.window.request_redraw();
             }
             if self.graph_matrix_window_open() {
                 self.graph.window.request_redraw();
@@ -3116,6 +3617,36 @@ impl ViewerState {
         self.roi_control.window.request_redraw();
     }
 
+    fn fit_mask_control_window(
+        &mut self,
+        desired_control_size_points: egui::Vec2,
+        pixels_per_point: f32,
+    ) {
+        let Some(desired_size) = desired_panel_size(
+            &self.mask_control.window,
+            desired_control_size_points,
+            pixels_per_point,
+            MASK_CONTROL_MIN_INNER_WIDTH,
+            MASK_CONTROL_MIN_INNER_HEIGHT,
+            0.7,
+            MASK_CONTROL_MAX_INNER_WIDTH,
+            0.75,
+            820,
+        ) else {
+            return;
+        };
+        if size_is_close(self.mask_control.size, desired_size)
+            || self.mask_control.last_requested_size == Some(desired_size)
+        {
+            return;
+        }
+        self.mask_control.last_requested_size = Some(desired_size);
+        if let Some(actual_size) = self.mask_control.window.request_inner_size(desired_size) {
+            self.resize_mask_control(actual_size);
+        }
+        self.mask_control.window.request_redraw();
+    }
+
     fn apply_commands(&mut self, actions: Vec<ViewerCommand>) {
         for action in actions {
             match action {
@@ -3253,6 +3784,36 @@ impl ViewerState {
                         appearance.opacity = opacity.clamp(0.0, 1.0);
                         self.rebuild_scene_object_gpu(index);
                         let _ = self.clear_scene_object_pick_for(index);
+                    }
+                }
+                ViewerCommand::AddTractMask(index) => self.add_tract_mask(index),
+                ViewerCommand::SelectTractMask(index, mask_index) => {
+                    self.select_tract_mask(index, mask_index);
+                }
+                ViewerCommand::RemoveTractMask(index, mask_index) => {
+                    let removed = self
+                        .scene_objects
+                        .get_mut(index)
+                        .is_some_and(|object| object.remove_tract_mask(mask_index));
+                    if removed {
+                        self.refresh_scene_object_masks_gpu(index);
+                    }
+                }
+                ViewerCommand::SetTractMaskRadius(index, mask_index, radius) => {
+                    let changed = self
+                        .scene_objects
+                        .get_mut(index)
+                        .is_some_and(|object| object.set_tract_mask_radius(mask_index, radius));
+                    if changed {
+                        self.refresh_scene_object_masks_gpu(index);
+                    }
+                }
+                ViewerCommand::SetTractMaskFilter(index, filter) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Tracts(_))
+                    {
+                        object.set_tract_mask_filter(filter);
+                        self.refresh_scene_object_masks_gpu(index);
                     }
                 }
                 ViewerCommand::SetGraphMeasure(index, measure) => {
@@ -3445,12 +4006,12 @@ impl ViewerState {
                     }
                 }
                 ViewerCommand::ToggleHemisphereVisibility(side) => {
-                    if let Err(error) = self.toggle_pair_hemisphere_visibility(side) {
+                    if let Err(error) = self.toggle_hemisphere_visibility(side) {
                         self.set_error(error);
                     }
                 }
                 ViewerCommand::ToggleSumaComponentVisibility(side) => {
-                    if let Err(error) = self.toggle_suma_component_visibility(side) {
+                    if let Err(error) = self.toggle_component_hemisphere_visibility(side) {
                         self.set_error(error);
                     }
                 }
@@ -3653,6 +4214,9 @@ impl ViewerState {
                 ViewerCommand::SetRoiControllerOpen(open) => {
                     self.set_roi_controller_open(open);
                 }
+                ViewerCommand::SetMaskControllerOpen(open) => {
+                    self.set_mask_controller_open(open);
+                }
                 ViewerCommand::OpenGraphForPick => {
                     if let Err(error) = self.open_graph_for_current_pick() {
                         self.set_error(error);
@@ -3822,7 +4386,7 @@ impl ViewerState {
     }
 
     fn load_surface_path(&mut self, path: PathBuf) -> Result<()> {
-        let mut mesh = SurfaceMesh::from_gifti_path(&path)
+        let mut mesh = SurfaceMesh::from_path(&path)
             .with_context(|| format!("failed to load surface {}", path.display()))?;
         apply_surface_volume_parent(&mut mesh, self.surface_volume_idcode.as_deref());
         let node_count = mesh.vertices.len();
@@ -3983,7 +4547,7 @@ impl ViewerState {
 
         ensure!(
             !surfaces.is_empty(),
-            "SUMA spec {} did not contain any loadable GIFTI surfaces",
+            "SUMA spec {} did not contain any loadable GIFTI or FreeSurfer surfaces",
             spec.path.display()
         );
 
@@ -4585,6 +5149,15 @@ impl ViewerState {
         self.roi_control.window.set_visible(open);
         if open {
             self.roi_control.window.request_redraw();
+        }
+        self.view.window.request_redraw();
+    }
+
+    fn set_mask_controller_open(&mut self, open: bool) {
+        self.controller.panels.mask_controller_open = open;
+        self.mask_control.window.set_visible(open);
+        if open {
+            self.mask_control.window.request_redraw();
         }
         self.view.window.request_redraw();
     }
@@ -5457,6 +6030,102 @@ impl ViewerState {
     fn upload_surface_buffers(&mut self) {
         self.upload_surface_buffers_inner();
         self.refresh_threshold_contour_buffers();
+    }
+
+    /// Recolor resident surface buffers without rebuilding geometry or GPU
+    /// resources. Used only for the live `tc` threshold preview.
+    fn upload_timecourse_threshold_colors(&mut self) -> bool {
+        if self.timecourse.is_none() || self.afni_live_overlay_active {
+            return false;
+        }
+
+        let surface_colors = self.visible_anatomical_shading_colors();
+        let overlay_colors = self
+            .visible_overlay()
+            .map(|overlay| overlay.color_cache.colors.clone());
+        let roi_colors = self
+            .visible_roi_layer()
+            .map(|layer| layer.appearance.node_colors.clone());
+        let dim = self.overlay.render.appearance.dim;
+
+        if self.has_component_surface() {
+            let component_info = {
+                let Some(scene) = self.surface_scene.as_ref() else {
+                    return false;
+                };
+                let Some(surface) = scene.surfaces.get(scene.active_index) else {
+                    return false;
+                };
+                let mut node_offset = 0usize;
+                let mut info = Vec::with_capacity(surface.components.len());
+                for component in &surface.components {
+                    let Some(mesh) = component.mesh.as_ref() else {
+                        return false;
+                    };
+                    info.push((component.side.clone(), node_offset, mesh.vertices.len()));
+                    node_offset += mesh.vertices.len();
+                }
+                info
+            };
+            let Some(render_set) = self.surface_render_set.as_ref() else {
+                return false;
+            };
+            if render_set.instances.len() != component_info.len() {
+                return false;
+            }
+
+            let mut writes = Vec::with_capacity(component_info.len());
+            for (instance, (side, node_start, node_count)) in
+                render_set.instances.iter().zip(component_info)
+            {
+                if instance.side != side {
+                    return false;
+                }
+                let node_end = node_start + node_count;
+                let colors = composed_node_color_bytes(
+                    node_count,
+                    surface_colors
+                        .as_deref()
+                        .and_then(|colors| colors.get(node_start..node_end)),
+                    overlay_colors
+                        .as_deref()
+                        .and_then(|colors| colors.get(node_start..node_end)),
+                    dim,
+                    roi_colors
+                        .as_deref()
+                        .and_then(|colors| colors.get(node_start..node_end)),
+                );
+                // Selection vertices, when present, trail the base mesh. Keep
+                // their existing colors while updating this base-node prefix.
+                if colors.len() > instance.color_bytes_len {
+                    return false;
+                }
+                writes.push((instance.color_buffer.clone(), colors));
+            }
+            for (buffer, colors) in writes {
+                self.queue.write_buffer(&buffer, 0, &colors);
+            }
+            return true;
+        }
+
+        let Some(mesh) = self.mesh.as_ref() else {
+            return false;
+        };
+        let Some(buffers) = self.surface_buffers.as_ref() else {
+            return false;
+        };
+        let colors = composed_node_color_bytes(
+            mesh.vertices.len(),
+            surface_colors.as_deref().map(Vec::as_slice),
+            overlay_colors.as_deref(),
+            dim,
+            roi_colors.as_deref(),
+        );
+        if colors.len() > buffers.color_bytes_len {
+            return false;
+        }
+        self.queue.write_buffer(&buffers.color_buffer, 0, &colors);
+        true
     }
 
     fn upload_surface_buffers_inner(&mut self) {
@@ -6805,7 +7474,7 @@ fn load_spec_component_mesh(
     surface: &SpecSurface,
     surface_volume_idcode: Option<&str>,
 ) -> Result<SurfaceMesh> {
-    let mut mesh = SurfaceMesh::from_gifti_path(&surface.path)
+    let mut mesh = SurfaceMesh::from_path(&surface.path)
         .with_context(|| format!("failed to load spec surface {}", surface.path.display()))?;
     apply_spec_surface_metadata(&mut mesh, spec, surface, surface_volume_idcode);
 
@@ -7442,9 +8111,12 @@ fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
 
 fn pick_surface_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     let dialog = dialog_with_start_directory(
-        rfd::FileDialog::new()
-            .set_title("Open surface")
-            .add_filter("GIFTI surface", &["gii"]),
+        rfd::FileDialog::new().set_title("Open surface").add_filter(
+            "Surface",
+            &[
+                "gii", "white", "pial", "inflated", "sphere", "orig", "smoothwm",
+            ],
+        ),
         current_path,
     );
 
@@ -7475,7 +8147,7 @@ fn pick_overlay_file(current_path: Option<&PathBuf>) -> Option<PathBuf> {
     let dialog = dialog_with_start_directory(
         rfd::FileDialog::new()
             .set_title("Open overlay")
-            .add_filter("GIFTI or SUMA dataset", &["gii", "dset", "niml.dset"]),
+            .add_filter("Surface dataset", &["gii", "stc", "dset", "niml.dset"]),
         current_path,
     );
 
@@ -7620,6 +8292,11 @@ struct HemisphereFilePattern {
 
 const HEMISPHERE_FILE_PATTERNS: &[HemisphereFilePattern] = &[
     HemisphereFilePattern {
+        left: "-lh.",
+        right: "-rh.",
+        wildcard: "-?h.",
+    },
+    HemisphereFilePattern {
         left: "lh.",
         right: "rh.",
         wildcard: "?h.",
@@ -7662,6 +8339,12 @@ fn paired_overlay_dataset(
     domain: &SurfaceDomain,
     right_node_offset: u32,
 ) -> Result<Dataset> {
+    let left_is_stc = dataset_is_stc(&left);
+    let right_is_stc = dataset_is_stc(&right);
+    ensure!(
+        left_is_stc == right_is_stc,
+        "paired time-series overlays cannot mix STC and non-STC data"
+    );
     ensure!(
         left.columns.len() == right.columns.len(),
         "paired overlays have different column counts: {} vs {}",
@@ -7694,13 +8377,18 @@ fn paired_overlay_dataset(
         && left_row_count as u32 == right_node_offset
         && left_row_count + right_row_count == domain.node_count
     {
-        return Dataset::dense(kind, domain, columns)
+        let dataset = Dataset::dense(kind, domain, columns)
             .map(|dataset| {
                 dataset
                     .with_time_step_seconds(time_step_seconds)
                     .with_time_start_seconds(time_start_seconds)
             })
-            .context("failed to build paired dense overlay dataset");
+            .context("failed to build paired dense overlay dataset")?;
+        return Ok(if left_is_stc {
+            mark_dataset_as_paired_stc(dataset)
+        } else {
+            dataset
+        });
     }
 
     let mut node_indices = Vec::with_capacity(left_row_count + right_row_count);
@@ -7715,13 +8403,18 @@ fn paired_overlay_dataset(
         node_indices.extend((0..right_row_count as u32).map(|node| node + right_node_offset));
     }
 
-    Dataset::sparse(kind, domain, node_indices, columns)
+    let dataset = Dataset::sparse(kind, domain, node_indices, columns)
         .map(|dataset| {
             dataset
                 .with_time_step_seconds(time_step_seconds)
                 .with_time_start_seconds(time_start_seconds)
         })
-        .context("failed to build paired overlay dataset")
+        .context("failed to build paired overlay dataset")?;
+    Ok(if left_is_stc {
+        mark_dataset_as_paired_stc(dataset)
+    } else {
+        dataset
+    })
 }
 
 fn paired_time_step(left: Option<f64>, right: Option<f64>) -> Result<Option<f64>> {
@@ -7819,7 +8512,9 @@ fn load_dataset_from_path(
     mesh: &SurfaceMesh,
     gifti_dset_auto_qcalc: bool,
 ) -> Result<Dataset> {
-    if is_niml_dset_path(path) {
+    if is_stc_path(path) {
+        read_stc_dataset(path, &mesh.domain)
+    } else if is_niml_dset_path(path) {
         read_niml_dataset(path, &mesh.domain)
     } else if is_gifti_path(path) {
         read_gifti_dataset_with_auto_qcalc(path, &mesh.domain, gifti_dset_auto_qcalc).or_else(
@@ -8099,7 +8794,7 @@ fn direct_anatomical_shading_colors(mesh: &SurfaceMesh) -> Vec<[f32; 4]> {
         return anatomical_shading_colors(mesh);
     }
 
-    let Ok(parent_mesh) = SurfaceMesh::from_gifti_path(&parent_path) else {
+    let Ok(parent_mesh) = SurfaceMesh::from_path(&parent_path) else {
         return anatomical_shading_colors(mesh);
     };
 
@@ -8148,7 +8843,7 @@ fn component_anatomical_shading_colors(
         return anatomical_shading_colors(mesh);
     }
 
-    let Ok(parent_mesh) = SurfaceMesh::from_gifti_path(&parent_path) else {
+    let Ok(parent_mesh) = SurfaceMesh::from_path(&parent_path) else {
         return anatomical_shading_colors(mesh);
     };
 
@@ -8751,6 +9446,12 @@ fn is_niml_dset_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".niml.dset"))
+}
+
+fn is_stc_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("stc"))
 }
 
 fn is_gifti_path(path: &Path) -> bool {
@@ -9400,11 +10101,17 @@ fn column_option_label(options: &[OverlayColumnOption], selection: Option<usize>
         .map_or_else(|| "none".to_string(), |option| option.label.clone())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ThresholdBarInteraction {
+    changed: bool,
+    dragging: bool,
+}
+
 fn vertical_threshold_bar(
     ui: &mut egui::Ui,
     appearance: &mut OverlayAppearance,
     threshold_range: ValueRange,
-) -> bool {
+) -> ThresholdBarInteraction {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(54.0, OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS),
         egui::Sense::click_and_drag(),
@@ -9412,7 +10119,10 @@ fn vertical_threshold_bar(
     let painter = ui.painter_at(rect);
     let bar_rect = rect.shrink2(egui::vec2(12.0, 4.0));
     let steps = 80;
-    let mut changed = false;
+    let mut interaction = ThresholdBarInteraction {
+        dragging: response.dragged(),
+        ..Default::default()
+    };
 
     for step in 0..steps {
         let t0 = step as f32 / steps as f32;
@@ -9443,8 +10153,11 @@ fn vertical_threshold_bar(
         let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
         appearance.threshold.value = threshold_value_from_bar_y(bar_rect, min, max, position.y);
         appearance.threshold.enabled = true;
-        changed = true;
+        interaction.changed = true;
     }
+    // Always issue a commit event on release. The live timecourse preview uses
+    // it to perform the deferred contour/cluster refresh through the full path.
+    interaction.changed |= response.drag_stopped();
 
     let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
     let value = appearance.threshold.value.clamp(min, max);
@@ -9465,7 +10178,7 @@ fn vertical_threshold_bar(
         egui::Stroke::new(1.0_f32, marker_color),
     );
 
-    changed
+    interaction
 }
 
 fn file_display(path: Option<&PathBuf>) -> String {
@@ -9660,6 +10373,20 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
     bytes
 }
 
+fn ray_plane_intersection(
+    origin: Vec3,
+    direction: Vec3,
+    point: Vec3,
+    normal: Vec3,
+) -> Option<Vec3> {
+    let denominator = direction.dot(normal);
+    if denominator.abs() <= 1.0e-6 {
+        return None;
+    }
+    let distance = (point - origin).dot(normal) / denominator;
+    (distance >= 0.0).then_some(origin + direction * distance)
+}
+
 pub(super) fn symmetric_value_range(range: ValueRange) -> ValueRange {
     if range.min < 0.0 && range.max > 0.0 {
         let extent = range.min.abs().max(range.max.abs());
@@ -9805,8 +10532,9 @@ mod tests {
         paired_component_for_node, paired_overlay_dataset, paired_overlay_path_for_side,
         paired_overlay_paths, paired_spec_montage_shots, resolve_overlay_subs,
         resolved_overlay_color_map, roi_appearance_for_mesh, roi_edge_color_for_label,
-        roi_fill_color_for_label, roi_fill_nodes_from_seed, scene_surface_display_label,
-        scene_surfaces_from_components, scene_surfaces_grouped_by_state, selection_for_component,
+        roi_fill_color_for_label, roi_fill_nodes_from_seed, scene_objects_controller_starts_open,
+        scene_surface_display_label, scene_surfaces_from_components,
+        scene_surfaces_grouped_by_state, selection_for_component,
         selection_scale_from_model_matrices, single_hemisphere_overlay_dataset,
         spec_label_dataset_for_surface, standard_montage_shots, surface_pick_for_mesh_node,
         synthetic_surface_spec, threshold_and_mask_from_appearance,
@@ -9840,6 +10568,24 @@ mod tests {
             viewer_required_wgpu_limits(&adapter_limits, true).max_buffer_size,
             adapter_limits.max_buffer_size
         );
+    }
+
+    #[test]
+    fn tracts_graphs_controller_starts_collapsed_without_cli_objects() {
+        assert!(!scene_objects_controller_starts_open(&[], &[]));
+    }
+
+    #[test]
+    fn tracts_graphs_controller_starts_open_for_cli_tracts_or_graphs() {
+        let tract_paths = vec![PathBuf::from("bundle.niml.tract")];
+        let graph_paths = vec![PathBuf::from("network.niml.dset")];
+
+        assert!(scene_objects_controller_starts_open(&tract_paths, &[]));
+        assert!(scene_objects_controller_starts_open(&[], &graph_paths));
+        assert!(scene_objects_controller_starts_open(
+            &tract_paths,
+            &graph_paths
+        ));
     }
 
     #[test]

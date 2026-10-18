@@ -6,8 +6,9 @@ struct Uniforms {
     appearance: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-struct SegmentInput { @location(0) start: vec3<f32>, @location(1) end: vec3<f32>, @location(2) color: vec4<f32>, }
-struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) @interpolate(linear) offset_px: f32, @location(1) @interpolate(flat) color: vec4<f32>, }
+@group(0) @binding(1) var<storage, read> tract_mask_flags: array<u32>;
+struct SegmentInput { @location(0) start: vec3<f32>, @location(1) end: vec3<f32>, @location(2) color: vec4<f32>, @location(3) tract_index: u32, }
+struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) @interpolate(linear) offset_px: f32, @location(1) @interpolate(flat) color: vec4<f32>, @location(2) @interpolate(flat) tract_index: u32, }
 
 @vertex
 fn vs_main(input: SegmentInput, @builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -25,17 +26,47 @@ fn vs_main(input: SegmentInput, @builtin(vertex_index) vertex_index: u32) -> Ver
     let half_width = (max(uniforms.widths.x, 0.0) + max(uniforms.widths.y, 0.0)) * 0.5;
     let offset_px = perpendicular * corner.y * half_width;
     clip = vec4<f32>(clip.xy + (offset_px / half_viewport) * clip.w, clip.zw);
-    var output: VertexOutput; output.clip_position = clip; output.offset_px = corner.y * half_width; output.color = input.color; return output;
+    var output: VertexOutput; output.clip_position = clip; output.offset_px = corner.y * half_width; output.color = input.color; output.tract_index = input.tract_index; return output;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    var mask_emphasis = 1.0;
+    if input.tract_index != 0xffffffffu && tract_mask_flags[input.tract_index] == 0u {
+        mask_emphasis = 0.16;
+    }
     let half_width = (max(uniforms.widths.x, 0.0) + max(uniforms.widths.y, 0.0)) * 0.5;
     let half_solid = max(uniforms.widths.x, 0.0) * 0.5;
     let feather = max(half_width - half_solid, 0.0001);
     let alpha = clamp((half_width - abs(input.offset_px)) / feather, 0.0, 1.0);
     if alpha <= 0.001 { discard; }
-    return vec4<f32>(input.color.rgb, input.color.a * uniforms.appearance.x * alpha);
+    return vec4<f32>(input.color.rgb, input.color.a * uniforms.appearance.x * alpha * mask_emphasis);
+}
+
+struct MaskVertexInput { @location(0) unit_position: vec3<f32>, }
+struct MaskInstanceInput { @location(1) center: vec3<f32>, @location(2) radius: f32, @location(3) color: vec4<f32>, @location(4) selected: f32, }
+struct MaskOutput { @builtin(position) clip_position: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) color: vec4<f32>, @location(2) selected: f32, }
+
+@vertex
+fn mask_vs(vertex: MaskVertexInput, instance: MaskInstanceInput) -> MaskOutput {
+    let local_position = instance.center + vertex.unit_position * instance.radius;
+    var output: MaskOutput;
+    output.clip_position = uniforms.view_projection * uniforms.model * vec4<f32>(local_position, 1.0);
+    output.normal = vertex.unit_position;
+    output.color = instance.color;
+    output.selected = instance.selected;
+    return output;
+}
+
+@fragment
+fn mask_fs(input: MaskOutput) -> @location(0) vec4<f32> {
+    let normal = normalize(input.normal);
+    let light = normalize(vec3<f32>(-0.35, 0.45, 1.0));
+    let shade = 0.35 + 0.65 * abs(dot(normal, light));
+    let selected_boost = select(0.0, 0.28, input.selected > 0.5);
+    let rgb = min(input.color.rgb * shade + vec3<f32>(selected_boost), vec3<f32>(1.0));
+    let alpha = select(0.24, 0.48, input.selected > 0.5);
+    return vec4<f32>(rgb, alpha);
 }
 
 struct NodeInput { @location(0) position: vec3<f32>, @location(1) color: vec4<f32>, }

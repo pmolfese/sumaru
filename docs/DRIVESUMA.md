@@ -213,6 +213,24 @@ behaviors do not surprise them.
 `DriveSuma -com kill_suma` requests a controlled close of the compatibility
 listener's Sumaru process. It is implemented only in compatibility mode.
 
+## Selection-label output
+
+`DriveSuma -com get_label` is supported in both native and compatibility
+listener modes. Like AFNI SUMA, Sumaru writes the result from the viewer
+process to the viewer's standard output; it is not a reply sent back over the
+short-lived DriveSuma TCP connection.
+
+For a selected surface node, the output includes the surface-region label when
+one is available, the active dataset's selected intensity/threshold/brightness
+sub-brick labels and values using SUMA's `(I,T,B)` grouping, and the surviving
+cluster number when clustering is active. With no current selection it writes
+`(null)`.
+
+Consequently, `set_outplug` in a separate sender process cannot redirect this
+viewer-local text. Capture the Sumaru process's stdout (or the SUMA process's
+stdout when driving SUMA), just as a supervising `afni-drive session` will be
+able to do for child viewers it launches itself.
+
 ## Known limitations
 
 The following SUMA facilities are not currently translated:
@@ -232,7 +250,9 @@ The following SUMA facilities are not currently translated:
   `-tract` / `--tract`);
 - `recorder_cont`, animation ranges, and autorecord. Use Sumaru's screenshot or
   montage actions instead;
-- `get_label`, `set_outplug`, help writers, and SUMA widget-snapshot commands.
+- `set_outplug`, help writers, and SUMA widget-snapshot commands. `set_outplug`
+  remains sender-local and cannot redirect output produced by a separately
+  running viewer.
 
 Window/viewer-placement options are intentionally outside the current design:
 automation should launch and address separate Sumaru processes rather than
@@ -263,3 +283,41 @@ The repository includes wire captures produced by the installed AFNI
 those captures, while parser and viewer tests cover command ordering, native
 versus compatibility key mappings, ranges, thresholds, brightness, clustering,
 display modes, and process shutdown.
+
+## FATCAT walkthrough harness
+
+[`scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2.tcsh`](../scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2.tcsh)
+adapts the four-example `Do_09_VISdti_SUMA_visual_ex2.tcsh` walkthrough from
+`FATCAT_DEMO`. It preserves the surfaces, anatomical volume, deterministic and
+MINIPROB tractograms, graph dataset, AFNI processes, and DriveSuma commands,
+while launching Sumaru with `-niml-suma`.
+
+[`scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh`](../scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh)
+is a separate test variant that uses `suma-drive` for both wire commands and
+native prompts. The original adapted script remains available as the legacy
+DriveSuma/`prompt_user` control.
+
+Check the local demo inputs and AFNI commands without opening any windows:
+
+```sh
+scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh --check ~/FATCAT_DEMO
+```
+
+Then run the interactive walkthrough:
+
+```sh
+scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh ~/FATCAT_DEMO
+```
+
+For the Rust-driver variant, set `SUMARU_BIN` or `SUMA_DRIVE_BIN` when either
+executable is not on `PATH`. `DRIVESUMA_BIN` remains a compatibility fallback.
+For example:
+
+```sh
+setenv SUMARU_BIN "$PWD/target/release/sumaru"
+setenv SUMA_DRIVE_BIN "$PWD/../afni-drive/target/release/suma-drive"
+scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh ~/FATCAT_DEMO
+```
+
+The adapted prompts call out features from the original walkthrough that are
+not implemented yet, notably tract masks and surface prying.

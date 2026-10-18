@@ -4,21 +4,61 @@ use super::*;
 use crate::graph_dataset::{GraphDataset, GraphMatrixShape};
 use crate::tractography::{SpatialBounds, TractographyDataset};
 
-const SEGMENT_FLOATS: usize = 10;
+const SEGMENT_FLOATS: usize = 11;
 const SEGMENT_STRIDE: wgpu::BufferAddress = (SEGMENT_FLOATS * 4) as u64;
-const SEGMENT_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
+const SEGMENT_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Uint32];
 const NODE_FLOATS: usize = 7;
 const NODE_STRIDE: wgpu::BufferAddress = (NODE_FLOATS * 4) as u64;
 const NODE_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
 const RIBBON_FEATHER_POINTS: f32 = 1.0;
+const MASK_INSTANCE_FLOATS: usize = 9;
+const MASK_INSTANCE_STRIDE: wgpu::BufferAddress = (MASK_INSTANCE_FLOATS * 4) as u64;
+const MASK_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+const MASK_INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![1 => Float32x3, 2 => Float32, 3 => Float32x4, 4 => Float32];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TractColorMode {
     LocalOrientation,
     MidpointOrientation,
     Bundle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TractMaskFilter {
+    AllTracts,
+    AnyMask,
+    Mask(usize),
+    Pair(usize, usize),
+}
+
+impl TractMaskFilter {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::AllTracts => "all tracts",
+            Self::AnyMask => "any mask",
+            Self::Mask(_) => "one mask",
+            Self::Pair(_, _) => "mask pair",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct TractMask {
+    pub(super) name: String,
+    pub(super) center: [f32; 3],
+    pub(super) radius: f32,
+    pub(super) color: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct TractMaskAnalysis {
+    pub(super) mask_counts: Vec<usize>,
+    pub(super) pair_counts: Vec<Vec<usize>>,
+    hits: Vec<Vec<bool>>,
+    display_flags: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +126,7 @@ struct TractPickIndex {
 struct TractPickEntry {
     bundle_index: u32,
     tract_index: u32,
+    flat_index: u32,
     min: [f32; 3],
     max: [f32; 3],
 }
@@ -127,6 +168,13 @@ pub(super) enum SceneObjectPick {
         length: f32,
         position: [f32; 3],
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct TractMaskPick {
+    pub(super) object_index: usize,
+    pub(super) mask_index: usize,
+    pub(super) distance: f32,
 }
 
 impl SceneObjectPick {
@@ -203,6 +251,10 @@ pub(super) struct SceneObject {
     pub(super) opacity: f32,
     pub(super) tract_color_mode: TractColorMode,
     pub(super) tract_bundles: Vec<TractBundleAppearance>,
+    pub(super) tract_masks: Vec<TractMask>,
+    pub(super) tract_mask_filter: TractMaskFilter,
+    pub(super) tract_mask_selected: Option<usize>,
+    pub(super) tract_mask_analysis: TractMaskAnalysis,
     pub(super) graph_measure: usize,
     pub(super) graph_threshold: f32,
     pub(super) graph_color_mode: GraphColorMode,
@@ -234,6 +286,7 @@ impl SceneObject {
                 opacity: 1.0,
             })
             .collect();
+        let tract_mask_analysis = TractMaskAnalysis::empty(data.tract_count());
         Self {
             path,
             name,
@@ -242,6 +295,10 @@ impl SceneObject {
             opacity: 1.0,
             tract_color_mode: TractColorMode::LocalOrientation,
             tract_bundles,
+            tract_masks: Vec::new(),
+            tract_mask_filter: TractMaskFilter::AllTracts,
+            tract_mask_selected: None,
+            tract_mask_analysis,
             graph_measure: 0,
             graph_threshold: 0.0,
             graph_color_mode: GraphColorMode::Signed,
@@ -281,6 +338,10 @@ impl SceneObject {
             opacity: 0.85,
             tract_color_mode: TractColorMode::LocalOrientation,
             tract_bundles: Vec::new(),
+            tract_masks: Vec::new(),
+            tract_mask_filter: TractMaskFilter::AllTracts,
+            tract_mask_selected: None,
+            tract_mask_analysis: TractMaskAnalysis::empty(0),
             graph_measure: 0,
             graph_threshold: 0.0,
             graph_color_mode: GraphColorMode::Signed,
@@ -342,6 +403,133 @@ impl SceneObject {
             ),
         }
     }
+
+    pub(super) fn add_tract_mask(&mut self, center: [f32; 3]) -> Option<usize> {
+        let SceneObjectPayload::Tracts(data) = &self.payload else {
+            return None;
+        };
+        let index = self.tract_masks.len();
+        let color = stable_label_color(index as i32 + 1, 230).to_array();
+        self.tract_masks.push(TractMask {
+            name: format!("Mask {}", mask_letter(index)),
+            center,
+            radius: (data.bounds.radius * 0.08).clamp(1.0, 15.0),
+            color,
+        });
+        self.tract_mask_selected = Some(index);
+        if self.tract_mask_filter == TractMaskFilter::AllTracts {
+            self.tract_mask_filter = TractMaskFilter::AnyMask;
+        }
+        self.refresh_tract_mask_analysis();
+        Some(index)
+    }
+
+    pub(super) fn remove_tract_mask(&mut self, mask_index: usize) -> bool {
+        if mask_index >= self.tract_masks.len() {
+            return false;
+        }
+        self.tract_masks.remove(mask_index);
+        for (index, mask) in self.tract_masks.iter_mut().enumerate() {
+            mask.name = format!("Mask {}", mask_letter(index));
+        }
+        self.tract_mask_selected = None;
+        self.tract_mask_filter = if self.tract_masks.is_empty() {
+            TractMaskFilter::AllTracts
+        } else {
+            TractMaskFilter::AnyMask
+        };
+        self.refresh_tract_mask_analysis();
+        true
+    }
+
+    pub(super) fn set_tract_mask_center(&mut self, mask_index: usize, center: [f32; 3]) -> bool {
+        let Some(mask) = self.tract_masks.get_mut(mask_index) else {
+            return false;
+        };
+        if mask.center == center || !center.iter().all(|value| value.is_finite()) {
+            return false;
+        }
+        mask.center = center;
+        self.refresh_tract_mask_analysis();
+        true
+    }
+
+    pub(super) fn set_tract_mask_radius(&mut self, mask_index: usize, radius: f32) -> bool {
+        let Some(mask) = self.tract_masks.get_mut(mask_index) else {
+            return false;
+        };
+        let radius = radius.max(0.1);
+        if !radius.is_finite() || (mask.radius - radius).abs() <= f32::EPSILON {
+            return false;
+        }
+        mask.radius = radius;
+        self.refresh_tract_mask_analysis();
+        true
+    }
+
+    pub(super) fn set_tract_mask_filter(&mut self, filter: TractMaskFilter) {
+        self.tract_mask_filter = sanitize_mask_filter(filter, self.tract_masks.len());
+        self.refresh_tract_mask_display_flags();
+    }
+
+    fn refresh_tract_mask_analysis(&mut self) {
+        let SceneObjectPayload::Tracts(data) = &self.payload else {
+            self.tract_mask_analysis = TractMaskAnalysis::empty(0);
+            return;
+        };
+        self.tract_mask_filter =
+            sanitize_mask_filter(self.tract_mask_filter, self.tract_masks.len());
+        self.tract_mask_analysis = analyze_tract_masks(
+            data,
+            self.tract_pick_index.as_ref(),
+            &self.tract_masks,
+            self.tract_mask_filter,
+        );
+    }
+
+    fn refresh_tract_mask_display_flags(&mut self) {
+        self.tract_mask_analysis.display_flags = display_flags_for_filter(
+            &self.tract_mask_analysis.hits,
+            self.tract_mask_filter,
+            self.tract_mask_analysis.display_flags.len(),
+        );
+    }
+
+    fn tract_is_displayed(&self, flat_index: usize) -> bool {
+        self.tract_mask_analysis
+            .display_flags
+            .get(flat_index)
+            .is_none_or(|flag| *flag != 0)
+    }
+}
+
+impl TractMaskAnalysis {
+    fn empty(tract_count: usize) -> Self {
+        Self {
+            mask_counts: Vec::new(),
+            pair_counts: Vec::new(),
+            hits: Vec::new(),
+            display_flags: vec![1; tract_count.max(1)],
+        }
+    }
+}
+
+fn mask_letter(index: usize) -> String {
+    if index < 26 {
+        ((b'A' + index as u8) as char).to_string()
+    } else {
+        (index + 1).to_string()
+    }
+}
+
+fn sanitize_mask_filter(filter: TractMaskFilter, mask_count: usize) -> TractMaskFilter {
+    match filter {
+        TractMaskFilter::Mask(index) if index >= mask_count => TractMaskFilter::AnyMask,
+        TractMaskFilter::Pair(first, second) if first >= mask_count || second >= mask_count => {
+            TractMaskFilter::AnyMask
+        }
+        other => other,
+    }
 }
 
 fn union_bounds(first: SpatialBounds, second: SpatialBounds) -> SpatialBounds {
@@ -361,17 +549,21 @@ fn union_bounds(first: SpatialBounds, second: SpatialBounds) -> SpatialBounds {
 impl TractPickIndex {
     fn build(data: &TractographyDataset) -> Self {
         let mut entries = Vec::with_capacity(data.tract_count());
+        let mut flat_index = 0_u32;
         for (bundle_index, bundle) in data.bundles.iter().enumerate() {
             for (tract_index, tract) in bundle.tracts.iter().enumerate() {
                 let Some(bounds) = SpatialBounds::from_points(tract.points.iter()) else {
+                    flat_index += 1;
                     continue;
                 };
                 entries.push(TractPickEntry {
                     bundle_index: bundle_index as u32,
                     tract_index: tract_index as u32,
+                    flat_index,
                     min: bounds.min,
                     max: bounds.max,
                 });
+                flat_index += 1;
             }
         }
         let mut nodes = Vec::new();
@@ -380,6 +572,133 @@ impl TractPickIndex {
         }
         Self { entries, nodes }
     }
+}
+
+fn analyze_tract_masks(
+    data: &TractographyDataset,
+    index: Option<&TractPickIndex>,
+    masks: &[TractMask],
+    filter: TractMaskFilter,
+) -> TractMaskAnalysis {
+    let tract_count = data.tract_count();
+    let mut hits = vec![vec![false; tract_count]; masks.len()];
+    if let Some(index) = index {
+        for (mask_index, mask) in masks.iter().enumerate() {
+            mark_sphere_intersections(data, index, mask, &mut hits[mask_index]);
+        }
+    }
+    let mask_counts = hits
+        .iter()
+        .map(|mask_hits| mask_hits.iter().filter(|hit| **hit).count())
+        .collect::<Vec<_>>();
+    let mut pair_counts = vec![vec![0; masks.len()]; masks.len()];
+    for first in 0..masks.len() {
+        pair_counts[first][first] = mask_counts[first];
+        for second in first + 1..masks.len() {
+            let count = hits[first]
+                .iter()
+                .zip(&hits[second])
+                .filter(|(a, b)| **a && **b)
+                .count();
+            pair_counts[first][second] = count;
+            pair_counts[second][first] = count;
+        }
+    }
+    let display_flags = display_flags_for_filter(&hits, filter, tract_count);
+    TractMaskAnalysis {
+        mask_counts,
+        pair_counts,
+        hits,
+        display_flags,
+    }
+}
+
+fn mark_sphere_intersections(
+    data: &TractographyDataset,
+    index: &TractPickIndex,
+    mask: &TractMask,
+    hits: &mut [bool],
+) {
+    if index.nodes.is_empty() || mask.radius <= 0.0 {
+        return;
+    }
+    let center = Vec3::from_array(mask.center);
+    let radius_squared = mask.radius * mask.radius;
+    let mut stack = vec![0_usize];
+    while let Some(node_index) = stack.pop() {
+        let node = index.nodes[node_index];
+        if point_aabb_distance_squared(center, node.min, node.max) > radius_squared {
+            continue;
+        }
+        if node.count == 0 {
+            stack.push(node.left as usize);
+            stack.push(node.right as usize);
+            continue;
+        }
+        for entry in &index.entries[node.start as usize..(node.start + node.count) as usize] {
+            if point_aabb_distance_squared(center, entry.min, entry.max) > radius_squared {
+                continue;
+            }
+            let tract =
+                &data.bundles[entry.bundle_index as usize].tracts[entry.tract_index as usize];
+            if tract_intersects_sphere(&tract.points, center, radius_squared)
+                && let Some(hit) = hits.get_mut(entry.flat_index as usize)
+            {
+                *hit = true;
+            }
+        }
+    }
+}
+
+fn point_aabb_distance_squared(point: Vec3, min: [f32; 3], max: [f32; 3]) -> f32 {
+    let min = Vec3::from_array(min);
+    let max = Vec3::from_array(max);
+    let clamped = point.clamp(min, max);
+    point.distance_squared(clamped)
+}
+
+fn tract_intersects_sphere(points: &[[f32; 3]], center: Vec3, radius_squared: f32) -> bool {
+    if points.len() == 1 {
+        return Vec3::from_array(points[0]).distance_squared(center) <= radius_squared;
+    }
+    points.windows(2).any(|pair| {
+        let start = Vec3::from_array(pair[0]);
+        let end = Vec3::from_array(pair[1]);
+        let segment = end - start;
+        let length_squared = segment.length_squared();
+        let fraction = if length_squared <= f32::EPSILON {
+            0.0
+        } else {
+            ((center - start).dot(segment) / length_squared).clamp(0.0, 1.0)
+        };
+        start.lerp(end, fraction).distance_squared(center) <= radius_squared
+    })
+}
+
+fn display_flags_for_filter(
+    hits: &[Vec<bool>],
+    filter: TractMaskFilter,
+    tract_count: usize,
+) -> Vec<u32> {
+    let mut flags = vec![1; tract_count.max(1)];
+    if tract_count == 0 || filter == TractMaskFilter::AllTracts {
+        return flags;
+    }
+    for flat_index in 0..tract_count {
+        let visible = match filter {
+            TractMaskFilter::AllTracts => true,
+            TractMaskFilter::AnyMask => hits.iter().any(|mask_hits| mask_hits[flat_index]),
+            TractMaskFilter::Mask(mask) => hits
+                .get(mask)
+                .is_some_and(|mask_hits| mask_hits[flat_index]),
+            TractMaskFilter::Pair(first, second) => hits
+                .get(first)
+                .zip(hits.get(second))
+                .is_some_and(|(a, b)| a[flat_index] && b[flat_index]),
+        };
+        flags[flat_index] = u32::from(visible);
+    }
+    flags
 }
 
 fn build_tract_bvh(
@@ -471,12 +790,111 @@ pub(super) fn pick_scene_objects(
                     ray_origin,
                     ray_direction,
                     tolerance,
+                    true,
                     &mut best,
                 );
             }
         }
     }
     best.map(|(_, _, pick)| pick)
+}
+
+pub(super) fn pick_tract_on_object_unfiltered(
+    objects: &[SceneObject],
+    object_index: usize,
+    model: Mat4,
+    ray_origin: Vec3,
+    ray_direction: Vec3,
+    tolerance: f32,
+) -> Option<SceneObjectPick> {
+    let object = objects.get(object_index)?;
+    let SceneObjectPayload::Tracts(data) = &object.payload else {
+        return None;
+    };
+    if !object.visible || object.opacity <= 0.0 {
+        return None;
+    }
+    let mut best = None;
+    pick_tract_object(
+        object_index,
+        object,
+        data,
+        model,
+        ray_origin,
+        ray_direction,
+        tolerance,
+        false,
+        &mut best,
+    );
+    best.map(|(_, _, pick)| pick)
+}
+
+pub(super) fn pick_tract_masks(
+    objects: &[SceneObject],
+    model: Mat4,
+    ray_origin: Vec3,
+    ray_direction: Vec3,
+) -> Option<TractMaskPick> {
+    let inverse = model.inverse();
+    let local_origin = inverse.transform_point3(ray_origin);
+    let local_direction = inverse.transform_vector3(ray_direction).normalize_or_zero();
+    if local_direction.length_squared() <= f32::EPSILON {
+        return None;
+    }
+    let mut best = None;
+    for (object_index, object) in objects.iter().enumerate() {
+        if !object.visible || !matches!(object.payload, SceneObjectPayload::Tracts(_)) {
+            continue;
+        }
+        for (mask_index, mask) in object.tract_masks.iter().enumerate() {
+            let Some(local_distance) = ray_sphere_intersection(
+                local_origin,
+                local_direction,
+                Vec3::from_array(mask.center),
+                mask.radius,
+            ) else {
+                continue;
+            };
+            let scene_hit = model.transform_point3(local_origin + local_direction * local_distance);
+            let distance = scene_hit.distance(ray_origin);
+            if best
+                .as_ref()
+                .is_none_or(|pick: &TractMaskPick| distance < pick.distance)
+            {
+                best = Some(TractMaskPick {
+                    object_index,
+                    mask_index,
+                    distance,
+                });
+            }
+        }
+    }
+    best
+}
+
+fn ray_sphere_intersection(
+    origin: Vec3,
+    direction: Vec3,
+    center: Vec3,
+    radius: f32,
+) -> Option<f32> {
+    let offset = origin - center;
+    let half_b = offset.dot(direction);
+    let c = offset.length_squared() - radius * radius;
+    let discriminant = half_b * half_b - c;
+    if discriminant < 0.0 {
+        return None;
+    }
+    let root = discriminant.sqrt();
+    let near = -half_b - root;
+    let far = -half_b + root;
+    if near >= 0.0 {
+        Some(near)
+    } else if far >= 0.0 {
+        Some(far)
+    } else {
+        None
+    }
 }
 
 fn pick_graph_object(
@@ -701,6 +1119,7 @@ fn pick_tract_object(
     ray_origin: Vec3,
     ray_direction: Vec3,
     tolerance: f32,
+    respect_mask_filter: bool,
     best: &mut Option<(f32, f32, SceneObjectPick)>,
 ) {
     let Some(index) = &object.tract_pick_index else {
@@ -741,6 +1160,9 @@ fn pick_tract_object(
                 continue;
             };
             if !appearance.visible || appearance.opacity <= 0.0 {
+                continue;
+            }
+            if respect_mask_filter && !object.tract_is_displayed(entry.flat_index as usize) {
                 continue;
             }
             if !ray_intersects_aabb(
@@ -890,13 +1312,20 @@ fn ray_intersects_aabb(
 pub(super) struct SceneObjectRenderer {
     ribbon_pipeline: wgpu::RenderPipeline,
     node_pipeline: wgpu::RenderPipeline,
+    mask_pipeline: wgpu::RenderPipeline,
     uniform_layout: wgpu::BindGroupLayout,
+    mask_vertex_buffer: wgpu::Buffer,
+    mask_index_buffer: wgpu::Buffer,
+    mask_index_count: u32,
 }
 
 pub(super) struct SceneObjectGpu {
     chunks: Vec<SceneObjectChunk>,
     node_buffer: Option<wgpu::Buffer>,
     node_count: u32,
+    mask_instance_buffer: Option<wgpu::Buffer>,
+    mask_instance_count: u32,
+    tract_mask_buffer: wgpu::Buffer,
     pub(super) uniform_buffer: wgpu::Buffer,
     pub(super) bind_group: wgpu::BindGroup,
 }
@@ -911,6 +1340,7 @@ struct SceneSegment {
     start: [f32; 3],
     end: [f32; 3],
     color: [f32; 4],
+    tract_index: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -923,16 +1353,28 @@ impl SceneObjectRenderer {
     pub(super) fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene object ribbon uniform layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene object ribbon pipeline layout"),
@@ -949,11 +1391,11 @@ impl SceneObjectRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: SEGMENT_STRIDE,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &SEGMENT_ATTRIBUTES,
-                }],
+                })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -988,11 +1430,11 @@ impl SceneObjectRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("node_vs"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: NODE_STRIDE,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &NODE_ATTRIBUTES,
-                }],
+                })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1021,10 +1463,71 @@ impl SceneObjectRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tract mask sphere pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("mask_vs"),
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 12,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &MASK_VERTEX_ATTRIBUTES,
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: MASK_INSTANCE_STRIDE,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &MASK_INSTANCE_ATTRIBUTES,
+                    }),
+                ],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("mask_fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let (mask_vertices, mask_indices) = unit_sphere_mesh(16, 24);
+        let mask_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tract mask sphere vertices"),
+            contents: &f32_bytes(&mask_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let mask_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tract mask sphere indices"),
+            contents: &u32_bytes(&mask_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
         Self {
             ribbon_pipeline,
             node_pipeline,
+            mask_pipeline,
             uniform_layout,
+            mask_vertex_buffer,
+            mask_index_buffer,
+            mask_index_count: mask_indices.len() as u32,
         }
     }
 
@@ -1043,6 +1546,7 @@ impl SceneObjectRenderer {
             floats.extend_from_slice(&segment.start);
             floats.extend_from_slice(&segment.end);
             floats.extend_from_slice(&segment.color);
+            floats.push(f32::from_bits(segment.tract_index));
             if floats.len() >= max_segments * SEGMENT_FLOATS {
                 chunks.push(upload_segment_chunk(device, &floats));
                 floats.clear();
@@ -1077,18 +1581,34 @@ impl SceneObjectRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let mask_flags = object_mask_flags(object);
+        let tract_mask_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scene object tract mask flags"),
+            contents: &u32_bytes(mask_flags),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene object ribbon bind group"),
             layout: &self.uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: tract_mask_buffer.as_entire_binding(),
+                },
+            ],
         });
+        let (mask_instance_buffer, mask_instance_count) = upload_mask_instances(device, object);
         SceneObjectGpu {
             chunks,
             node_buffer,
             node_count,
+            mask_instance_buffer,
+            mask_instance_count,
+            tract_mask_buffer,
             uniform_buffer,
             bind_group,
         }
@@ -1132,7 +1652,90 @@ impl SceneObjectRenderer {
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..6, 0..gpu.node_count);
         }
+        if let Some(buffer) = &gpu.mask_instance_buffer {
+            pass.set_pipeline(&self.mask_pipeline);
+            pass.set_vertex_buffer(0, self.mask_vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, buffer.slice(..));
+            pass.set_index_buffer(self.mask_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.mask_index_count, 0, 0..gpu.mask_instance_count);
+        }
     }
+
+    pub(super) fn refresh_masks(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        gpu: &mut SceneObjectGpu,
+        object: &SceneObject,
+    ) {
+        let (buffer, count) = upload_mask_instances(device, object);
+        gpu.mask_instance_buffer = buffer;
+        gpu.mask_instance_count = count;
+        queue.write_buffer(
+            &gpu.tract_mask_buffer,
+            0,
+            &u32_bytes(object_mask_flags(object)),
+        );
+    }
+}
+
+fn object_mask_flags(object: &SceneObject) -> &[u32] {
+    if matches!(object.payload, SceneObjectPayload::Tracts(_)) {
+        &object.tract_mask_analysis.display_flags
+    } else {
+        &[1]
+    }
+}
+
+fn upload_mask_instances(
+    device: &wgpu::Device,
+    object: &SceneObject,
+) -> (Option<wgpu::Buffer>, u32) {
+    let mut floats = Vec::with_capacity(object.tract_masks.len() * MASK_INSTANCE_FLOATS);
+    for (index, mask) in object.tract_masks.iter().enumerate() {
+        floats.extend_from_slice(&mask.center);
+        floats.push(mask.radius);
+        floats.extend_from_slice(&mask.color);
+        floats.push(f32::from(object.tract_mask_selected == Some(index)));
+    }
+    let buffer = (!floats.is_empty()).then(|| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tract mask sphere instances"),
+            contents: &f32_bytes(&floats),
+            usage: wgpu::BufferUsages::VERTEX,
+        })
+    });
+    (buffer, object.tract_masks.len() as u32)
+}
+
+fn unit_sphere_mesh(stacks: u32, slices: u32) -> (Vec<f32>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    for stack in 0..=stacks {
+        let latitude = std::f32::consts::PI * stack as f32 / stacks as f32;
+        let y = latitude.cos();
+        let ring = latitude.sin();
+        for slice in 0..=slices {
+            let longitude = std::f32::consts::TAU * slice as f32 / slices as f32;
+            vertices.extend_from_slice(&[ring * longitude.cos(), y, ring * longitude.sin()]);
+        }
+    }
+    let mut indices = Vec::new();
+    let row = slices + 1;
+    for stack in 0..stacks {
+        for slice in 0..slices {
+            let first = stack * row + slice;
+            let second = first + row;
+            indices.extend_from_slice(&[first, second, first + 1, first + 1, second, second + 1]);
+        }
+    }
+    (vertices, indices)
+}
+
+fn u32_bytes(values: &[u32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect()
 }
 
 fn upload_segment_chunk(device: &wgpu::Device, floats: &[f32]) -> SceneObjectChunk {
@@ -1153,15 +1756,19 @@ fn visit_tract_segments(
     appearances: &[TractBundleAppearance],
     mut visitor: impl FnMut(SceneSegment),
 ) {
+    let mut flat_index = 0_u32;
     for (bundle_index, bundle) in data.bundles.iter().enumerate() {
         let appearance = appearances.get(bundle_index);
-        if appearance.is_some_and(|appearance| !appearance.visible) {
-            continue;
-        }
+        let bundle_visible = !appearance.is_some_and(|appearance| !appearance.visible);
         let bundle_opacity = appearance.map_or(1.0, |appearance| appearance.opacity);
         let bundle_color =
             stable_label_color(bundle.tag.unwrap_or(bundle_index as i32 + 1), 255).to_array();
         for tract in &bundle.tracts {
+            let tract_index = flat_index;
+            flat_index += 1;
+            if !bundle_visible {
+                continue;
+            }
             let tract_color = tract
                 .points
                 .first()
@@ -1179,6 +1786,7 @@ fn visit_tract_segments(
                     start: pair[0],
                     end: pair[1],
                     color,
+                    tract_index,
                 });
             }
         }
@@ -1228,6 +1836,7 @@ fn visit_graph_segments(
                         start: pair[0],
                         end: pair[1],
                         color,
+                        tract_index: u32::MAX,
                     });
                 }
             }
@@ -1236,6 +1845,7 @@ fn visit_graph_segments(
                 start: data.nodes[source].position,
                 end: data.nodes[target].position,
                 color,
+                tract_index: u32::MAX,
             });
         }
     });
@@ -1446,6 +2056,7 @@ mod tests {
             edge_labels: vec!["weak".into(), "strong".into()],
             matrix_shape: GraphMatrixShape::Full,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: None,
         };
         let mut weak = Vec::new();
@@ -1515,6 +2126,7 @@ mod tests {
             edge_labels: vec!["weak".into(), "FA".into()],
             matrix_shape: GraphMatrixShape::Full,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: None,
         };
         let mut object = SceneObject::from_graph_with_linked_tracts(
@@ -1608,6 +2220,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mask_snap_can_pick_dimmed_tracts_outside_the_active_filter() {
+        let data = TractographyDataset {
+            path: None,
+            bundles: vec![TractBundle {
+                tag: Some(1),
+                alternate_tag: None,
+                ends: None,
+                tracts: vec![Tract {
+                    id: 2,
+                    points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                }],
+            }],
+            bounds: SpatialBounds::from_points([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]].iter()).unwrap(),
+        };
+        let mut object = SceneObject::from_tracts(PathBuf::from("tract.niml.tract"), data);
+        object.add_tract_mask([20.0, 0.0, 0.0]);
+        assert_eq!(object.tract_mask_analysis.display_flags[0], 0);
+        assert!(
+            pick_scene_objects(
+                std::slice::from_ref(&object),
+                Mat4::IDENTITY,
+                Vec3::new(0.5, 0.0, 3.0),
+                -Vec3::Z,
+                0.02,
+            )
+            .is_none()
+        );
+        assert!(
+            pick_tract_on_object_unfiltered(
+                &[object],
+                0,
+                Mat4::IDENTITY,
+                Vec3::new(0.5, 0.0, 3.0),
+                -Vec3::Z,
+                0.02,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn sphere_intersection_detects_a_crossing_segment_with_endpoints_outside() {
+        assert!(tract_intersects_sphere(
+            &[[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            Vec3::ZERO,
+            0.25,
+        ));
+        assert!(!tract_intersects_sphere(
+            &[[-2.0, 2.0, 0.0], [2.0, 2.0, 0.0]],
+            Vec3::ZERO,
+            0.25,
+        ));
+    }
+
+    #[test]
+    fn mask_connection_matrix_uses_inclusive_pairwise_counts() {
+        let data = TractographyDataset {
+            path: None,
+            bundles: vec![TractBundle {
+                tag: Some(1),
+                alternate_tag: None,
+                ends: None,
+                tracts: vec![
+                    Tract {
+                        id: 0,
+                        points: vec![[-1.0, 0.0, 0.0], [11.0, 0.0, 0.0]],
+                    },
+                    Tract {
+                        id: 1,
+                        points: vec![[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                    },
+                    Tract {
+                        id: 2,
+                        points: vec![[9.0, 0.0, 0.0], [21.0, 0.0, 0.0]],
+                    },
+                    Tract {
+                        id: 3,
+                        points: vec![[-1.0, 0.0, 0.0], [21.0, 0.0, 0.0]],
+                    },
+                ],
+            }],
+            bounds: SpatialBounds::from_points([[-1.0, 0.0, 0.0], [21.0, 0.0, 0.0]].iter())
+                .unwrap(),
+        };
+        let index = TractPickIndex::build(&data);
+        let masks = [0.0, 10.0, 20.0].map(|x| TractMask {
+            name: format!("{x}"),
+            center: [x, 0.0, 0.0],
+            radius: 1.1,
+            color: [1.0; 4],
+        });
+        let analysis =
+            analyze_tract_masks(&data, Some(&index), &masks, TractMaskFilter::Pair(0, 2));
+        assert_eq!(analysis.mask_counts, vec![3, 3, 2]);
+        assert_eq!(analysis.pair_counts[0], vec![3, 2, 1]);
+        assert_eq!(analysis.pair_counts[1], vec![2, 3, 2]);
+        assert_eq!(analysis.pair_counts[2], vec![1, 2, 2]);
+        assert_eq!(analysis.display_flags[..4], [0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn tract_mask_pick_returns_the_nearest_sphere() {
+        let data = TractographyDataset {
+            path: None,
+            bundles: vec![TractBundle {
+                tag: None,
+                alternate_tag: None,
+                ends: None,
+                tracts: vec![Tract {
+                    id: 1,
+                    points: vec![[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                }],
+            }],
+            bounds: SpatialBounds::from_points([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]].iter()).unwrap(),
+        };
+        let mut object = SceneObject::from_tracts(PathBuf::from("tract.niml.tract"), data);
+        object.add_tract_mask([0.0, 0.0, 0.0]);
+        object.tract_masks[0].radius = 0.5;
+        let pick = pick_tract_masks(
+            &[object],
+            Mat4::IDENTITY,
+            Vec3::new(0.0, 0.0, 3.0),
+            -Vec3::Z,
+        )
+        .unwrap();
+        assert_eq!(pick.object_index, 0);
+        assert_eq!(pick.mask_index, 0);
+        assert!((pick.distance - 2.5).abs() < 1.0e-5);
+    }
+
     fn linked_graph_fixture(bundle_tag: i32) -> (GraphDataset, TractographyDataset) {
         let graph = GraphDataset {
             path: None,
@@ -1628,6 +2371,7 @@ mod tests {
             edge_labels: vec!["NT".into()],
             matrix_shape: GraphMatrixShape::Full,
             edge_indices: Vec::new(),
+            edge_positions: Vec::new(),
             network_file: Some(PathBuf::from("tract.niml.tract")),
         };
         let tracts = TractographyDataset {

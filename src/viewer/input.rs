@@ -32,6 +32,10 @@ impl ViewerState {
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = (position.x, position.y);
                 self.view_cursor_position = Some(cursor);
+                if self.tract_mask_drag.is_some() {
+                    self.update_tract_mask_drag();
+                    return true;
+                }
                 if self.pair_dragging {
                     self.update_pair_drag(cursor);
                     return true;
@@ -56,10 +60,23 @@ impl ViewerState {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
+            } if self.tract_mask_drag.is_some() => {
+                self.tract_mask_drag = None;
+                true
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
             } if self.volume_slice_drag.is_some() => {
                 self.volume_slice_drag = None;
                 true
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if self.try_begin_tract_mask_drag() => true,
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
@@ -86,6 +103,9 @@ impl ViewerState {
                 button: MouseButton::Right,
                 ..
             } => {
+                if self.select_tract_mask_at_cursor() {
+                    return true;
+                }
                 let roi_draw_active = self
                     .roi_workspace
                     .active_draft()
@@ -102,6 +122,15 @@ impl ViewerState {
                     self.inspect_surface_at_cursor(!self.modifiers.shift_key());
                 }
                 true
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.modifiers.control_key() => {
+                let scroll = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y,
+                    winit::event::MouseScrollDelta::PixelDelta(position) => {
+                        position.y as f32 / 120.0
+                    }
+                };
+                self.resize_selected_tract_mask(scroll)
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
@@ -237,17 +266,13 @@ impl ViewerState {
                         true
                     }
                     PhysicalKey::Code(KeyCode::BracketLeft) => {
-                        if let Err(error) =
-                            self.toggle_pair_hemisphere_visibility(SurfaceSide::Left)
-                        {
+                        if let Err(error) = self.toggle_hemisphere_visibility(SurfaceSide::Left) {
                             self.set_error(error);
                         }
                         true
                     }
                     PhysicalKey::Code(KeyCode::BracketRight) => {
-                        if let Err(error) =
-                            self.toggle_pair_hemisphere_visibility(SurfaceSide::Right)
-                        {
+                        if let Err(error) = self.toggle_hemisphere_visibility(SurfaceSide::Right) {
                             self.set_error(error);
                         }
                         true
@@ -332,6 +357,19 @@ impl ViewerState {
             .egui
             .state
             .on_window_event(&self.roi_control.window, event);
+
+        InputResponse {
+            consumed: egui_response.consumed,
+            repaint: egui_response.repaint,
+        }
+    }
+
+    pub(super) fn mask_control_input(&mut self, event: &WindowEvent) -> InputResponse {
+        let egui_response = self
+            .mask_control
+            .egui
+            .state
+            .on_window_event(&self.mask_control.window, event);
 
         InputResponse {
             consumed: egui_response.consumed,

@@ -11,12 +11,12 @@ use sumaru::inspect::inspect_path;
 use sumaru::niml_debug::{
     NimlSendCommand, inspect_debug_path, replay_debug_path, send_debug_command,
 };
-use sumaru::viewer::{self, AfniViewerOptions, ExplicitOverlayPair};
+use sumaru::viewer::{self, AfniViewerOptions, ExplicitOverlayPair, SparseTimecourseDisplay};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "SUMA in Rust")]
 struct Cli {
-    /// Launch the viewer with one or more GIFTI surfaces.
+    /// Launch the viewer with one or more GIFTI or native FreeSurfer surfaces.
     #[arg(short = 'i', long = "surface", value_name = "PATH", num_args = 1..)]
     surface_paths: Vec<PathBuf>,
 
@@ -28,7 +28,7 @@ struct Cli {
     #[arg(long = "spec", value_name = "PATH")]
     spec: Option<PathBuf>,
 
-    /// Left-hemisphere GIFTI surface for a paired both-hemisphere scene without a
+    /// Left-hemisphere GIFTI or FreeSurfer surface for a paired scene without a
     /// spec. Requires `--surface-rh`.
     #[arg(
         long = "surface-lh",
@@ -38,7 +38,7 @@ struct Cli {
     )]
     surface_lh: Option<PathBuf>,
 
-    /// Right-hemisphere GIFTI surface for a paired both-hemisphere scene without a
+    /// Right-hemisphere GIFTI or FreeSurfer surface for a paired scene without a
     /// spec. Requires `--surface-lh`.
     #[arg(
         long = "surface-rh",
@@ -68,7 +68,7 @@ struct Cli {
     )]
     graph_paths: Vec<PathBuf>,
 
-    /// Load this GIFTI data array as a per-vertex surface overlay.
+    /// Load this GIFTI, NIML, or STC data as a per-vertex surface overlay.
     #[arg(long = "overlay", value_name = "PATH")]
     overlay: Option<PathBuf>,
 
@@ -166,7 +166,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Launch the surface timecourse viewer for a 3D+time GIFTI overlay.
+    /// Launch the surface timecourse viewer for a 3D+time GIFTI or STC overlay.
     Tc(TimeCourseArgs),
     /// Read a supported neuroimaging file and print a short summary.
     Inspect {
@@ -182,11 +182,11 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct TimeCourseArgs {
-    /// GIFTI surface underlay. A matching opposite hemisphere is loaded when present.
+    /// GIFTI or FreeSurfer surface. A matching opposite hemisphere is loaded when present.
     #[arg(short = 'i', long = "surface", value_name = "PATH")]
     surface: PathBuf,
 
-    /// One or more 3D+time GIFTI surface overlays. Repeat for multiple conditions.
+    /// One or more 3D+time GIFTI or STC overlays. Repeat for multiple conditions.
     #[arg(
         long = "overlay",
         visible_alias = "overaly",
@@ -219,6 +219,14 @@ struct TimeCourseArgs {
     /// Request the GPU adapter's native maximum buffer size.
     #[arg(long = "big-mem")]
     big_mem: bool,
+
+    /// Show only the source vertices present in a sparse STC.
+    #[arg(long = "stc-sparse", hide = true, conflicts_with = "stc_nearest")]
+    stc_sparse: bool,
+
+    /// Fill the surface with nearest-source patches instead of smoothing.
+    #[arg(long = "stc-nearest", hide = true, conflicts_with = "stc_sparse")]
+    stc_nearest: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -373,6 +381,7 @@ fn main() -> Result<()> {
                 afni,
                 niml_record_path,
                 timecourse_mode: false,
+                sparse_timecourse_display: SparseTimecourseDisplay::Smooth,
             })?;
         }
         Some(Commands::Tc(args)) => {
@@ -457,6 +466,13 @@ fn main() -> Result<()> {
                 verbose: verbose || args.verbose,
                 big_mem: big_mem || args.big_mem,
                 timecourse_mode: true,
+                sparse_timecourse_display: if args.stc_sparse {
+                    SparseTimecourseDisplay::Sparse
+                } else if args.stc_nearest {
+                    SparseTimecourseDisplay::Nearest
+                } else {
+                    SparseTimecourseDisplay::Smooth
+                },
                 ..viewer::LaunchOptions::default()
             })?;
         }

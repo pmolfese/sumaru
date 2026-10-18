@@ -411,6 +411,82 @@ impl SurfaceMesh {
         })
     }
 
+    /// Load a GIFTI surface or any mesh supported by `afni-io`.
+    ///
+    /// GIFTI retains its richer metadata path here; other formats share the
+    /// same readers used by `afni-drive`/`suma-drive`.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name.ends_with(".gii")
+            || name.ends_with(".gii.gz")
+            || name.ends_with(".gii.dset")
+            || name.ends_with(".gii.dset.gz")
+        {
+            Self::from_gifti_path(path)
+        } else {
+            let surface = afni_io::surface_io::read_surface(path)
+                .with_context(|| format!("failed to read surface {}", path.display()))?;
+            Self::from_afni_io_surface(path, surface)
+        }
+    }
+
+    fn from_afni_io_surface(path: &Path, surface: afni_io::surface::Surface) -> Result<Self> {
+        let domain = SurfaceDomain::from_triangles(surface.vertices.len(), surface.faces)?;
+        let bounds = Bounds::from_vertices(&surface.vertices)?;
+        let source_file = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let metadata = SurfaceMetadata::from_geometry(
+            Some(source_file.clone()),
+            label_from_path(&source_file),
+            &surface.vertices,
+            &domain,
+            bounds,
+            3,
+            3,
+        );
+
+        Ok(Self {
+            vertices: surface.vertices,
+            triangles: domain.triangles.clone(),
+            domain,
+            bounds,
+            metadata,
+        })
+    }
+
+    pub fn from_freesurfer_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            bail!("{} does not exist", path.display());
+        }
+        let surface = crate::io::read_freesurfer_surface(path)?;
+        let domain =
+            SurfaceDomain::from_triangles(surface.vertices.len(), surface.triangles.clone())?;
+        let bounds = Bounds::from_vertices(&surface.vertices)?;
+        let source_file = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let metadata = SurfaceMetadata::from_geometry(
+            Some(source_file.clone()),
+            label_from_path(&source_file),
+            &surface.vertices,
+            &domain,
+            bounds,
+            3,
+            3,
+        );
+
+        Ok(Self {
+            vertices: surface.vertices,
+            triangles: surface.triangles,
+            domain,
+            bounds,
+            metadata,
+        })
+    }
+
     pub fn vertex_normals(&self) -> Vec<[f32; 3]> {
         let mut normals = vec![Vec3::ZERO; self.vertices.len()];
 
