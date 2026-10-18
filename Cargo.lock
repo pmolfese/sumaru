@@ -44,6 +44,7 @@ dependencies = [
 [[package]]
 name = "afni-io"
 version = "0.1.0"
+source = "git+https://github.com/pmolfese/afni-io?rev=0368b56e18572b1f8e48ff48c104a61945c72015#0368b56e18572b1f8e48ff48c104a61945c72015"
 dependencies = [
  "afni-core",
  "flate2",
