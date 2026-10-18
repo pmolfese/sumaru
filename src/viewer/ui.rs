@@ -318,6 +318,11 @@ impl ViewerState {
                             actions.push(ViewerCommand::OpenGraphForPick);
                             ui.close();
                         }
+                        let mut mask_open = self.controller.panels.mask_controller_open;
+                        if ui.checkbox(&mut mask_open, "Mask Controller").changed() {
+                            actions.push(ViewerCommand::SetMaskControllerOpen(mask_open));
+                            ui.close();
+                        }
                     });
 
                     ui.menu_button("Settings", |ui| {
@@ -937,6 +942,248 @@ impl ViewerState {
         }
     }
 
+    pub(super) fn draw_mask_control_ui(&mut self, root_ui: &mut egui::Ui) -> ControlUiOutput {
+        let mut actions = Vec::new();
+        let panel_height = (self.mask_control.size.height as f32 - 24.0).max(220.0);
+        let mut desired_control_size_points = egui::vec2(
+            MASK_CONTROL_CONTENT_WIDTH_POINTS + 24.0,
+            MASK_CONTROL_MIN_INNER_HEIGHT as f32,
+        );
+
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            let scroll_output = egui::ScrollArea::vertical()
+                .max_height(panel_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_min_width(MASK_CONTROL_CONTENT_WIDTH_POINTS);
+                    self.draw_mask_control_contents(ui, &mut actions);
+                });
+            desired_control_size_points = egui::vec2(
+                scroll_output
+                    .content_size
+                    .x
+                    .max(MASK_CONTROL_CONTENT_WIDTH_POINTS)
+                    + 32.0,
+                scroll_output.content_size.y + 32.0,
+            );
+        });
+
+        ControlUiOutput {
+            actions,
+            desired_control_size_points,
+        }
+    }
+
+    fn draw_mask_control_contents(&self, ui: &mut egui::Ui, actions: &mut Vec<ViewerCommand>) {
+        ui.heading("Tract Mask Controller");
+        ui.small(
+            "Right-click selects a sphere. Left-drag moves it in the view plane; Shift-drag snaps to any tract; Ctrl+wheel changes radius.",
+        );
+        ui.small("Unmatched tracts stay visible as dim spatial context.");
+        ui.add_space(8.0);
+
+        let tract_indices = self
+            .scene_objects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, object)| {
+                matches!(object.payload, SceneObjectPayload::Tracts(_)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let object_index = self
+            .active_scene_object
+            .filter(|index| tract_indices.contains(index))
+            .or_else(|| tract_indices.first().copied());
+        let Some(object_index) = object_index else {
+            ui.weak("No tractography object is loaded.");
+            if ui.button("Open tracts…").clicked() {
+                actions.push(ViewerCommand::PickTract);
+            }
+            return;
+        };
+
+        let object = &self.scene_objects[object_index];
+        ui.horizontal(|ui| {
+            ui.label("Tractogram:");
+            egui::ComboBox::from_id_salt("mask_controller_tractogram")
+                .selected_text(&object.name)
+                .show_ui(ui, |ui| {
+                    for index in &tract_indices {
+                        if ui
+                            .selectable_label(
+                                *index == object_index,
+                                &self.scene_objects[*index].name,
+                            )
+                            .clicked()
+                        {
+                            actions.push(ViewerCommand::SelectSceneObject(*index));
+                        }
+                    }
+                });
+            if ui.button("Add sphere").clicked() {
+                actions.push(ViewerCommand::AddTractMask(object_index));
+            }
+        });
+
+        if object.tract_masks.is_empty() {
+            ui.add_space(8.0);
+            ui.weak("No masks yet. Add a sphere, then drag it through the tractogram.");
+            return;
+        }
+
+        ui.add_space(8.0);
+        ui.strong("Masks");
+        for (mask_index, mask) in object.tract_masks.iter().enumerate() {
+            let selected = object.tract_mask_selected == Some(mask_index);
+            ui.horizontal(|ui| {
+                let rgba = egui::Rgba::from_rgba_unmultiplied(
+                    mask.color[0],
+                    mask.color[1],
+                    mask.color[2],
+                    1.0,
+                );
+                ui.colored_label(egui::Color32::from(rgba), "●");
+                if ui.selectable_label(selected, &mask.name).clicked() {
+                    actions.push(ViewerCommand::SelectTractMask(
+                        object_index,
+                        Some(mask_index),
+                    ));
+                }
+                let count = object
+                    .tract_mask_analysis
+                    .mask_counts
+                    .get(mask_index)
+                    .copied()
+                    .unwrap_or(0);
+                ui.weak(format!("{count} tracts"));
+            });
+            if selected {
+                let mut radius = mask.radius;
+                let max_radius = (object.bounds.radius * 0.5).max(2.0);
+                if ui
+                    .add(egui::Slider::new(&mut radius, 0.1..=max_radius).text("Radius (mm)"))
+                    .changed()
+                {
+                    actions.push(ViewerCommand::SetTractMaskRadius(
+                        object_index,
+                        mask_index,
+                        radius,
+                    ));
+                }
+                ui.monospace(format!(
+                    "Center: {:.2}, {:.2}, {:.2} mm",
+                    mask.center[0], mask.center[1], mask.center[2]
+                ));
+                if ui.button("Delete selected mask").clicked() {
+                    actions.push(ViewerCommand::RemoveTractMask(object_index, mask_index));
+                }
+            }
+        }
+
+        ui.add_space(7.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Emphasize:");
+            if ui
+                .selectable_label(
+                    object.tract_mask_filter == TractMaskFilter::AllTracts,
+                    "All tracts",
+                )
+                .clicked()
+            {
+                actions.push(ViewerCommand::SetTractMaskFilter(
+                    object_index,
+                    TractMaskFilter::AllTracts,
+                ));
+            }
+            if ui
+                .selectable_label(
+                    object.tract_mask_filter == TractMaskFilter::AnyMask,
+                    "Any mask",
+                )
+                .clicked()
+            {
+                actions.push(ViewerCommand::SetTractMaskFilter(
+                    object_index,
+                    TractMaskFilter::AnyMask,
+                ));
+            }
+            ui.weak(object.tract_mask_filter.label());
+        });
+
+        ui.add_space(6.0);
+        ui.strong("Inclusive tract connections");
+        ui.small("Click a diagonal for one mask or an off-diagonal cell for a pair.");
+        let mask_count = object.tract_masks.len();
+        let max_count = object
+            .tract_mask_analysis
+            .pair_counts
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        egui::ScrollArea::both()
+            .id_salt(("tract_mask_matrix", object_index))
+            .max_height(300.0)
+            .show(ui, |ui| {
+                egui::Grid::new(("tract_mask_grid", object_index))
+                    .spacing(egui::vec2(3.0, 3.0))
+                    .show(ui, |ui| {
+                        ui.label("");
+                        for column in 0..mask_count {
+                            ui.strong(mask_matrix_label(column));
+                        }
+                        ui.end_row();
+                        for row in 0..mask_count {
+                            ui.strong(mask_matrix_label(row));
+                            for column in 0..mask_count {
+                                let count = object.tract_mask_analysis.pair_counts[row][column];
+                                let selected = match object.tract_mask_filter {
+                                    TractMaskFilter::Mask(mask) => row == column && row == mask,
+                                    TractMaskFilter::Pair(first, second) => {
+                                        row != column
+                                            && ((row == first && column == second)
+                                                || (row == second && column == first))
+                                    }
+                                    _ => false,
+                                };
+                                let intensity = (count as f32 / max_count as f32).sqrt();
+                                let fill = egui::Color32::from_rgb(
+                                    (35.0 + 35.0 * intensity) as u8,
+                                    (65.0 + 115.0 * intensity) as u8,
+                                    (85.0 + 135.0 * intensity) as u8,
+                                );
+                                let response = ui
+                                    .add_sized(
+                                        [48.0, 28.0],
+                                        egui::Button::new(count.to_string())
+                                            .fill(fill)
+                                            .selected(selected),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{} ↔ {}\n{count} inclusive tracts",
+                                        object.tract_masks[row].name,
+                                        object.tract_masks[column].name
+                                    ));
+                                if response.clicked() {
+                                    let filter = if row == column {
+                                        TractMaskFilter::Mask(row)
+                                    } else {
+                                        TractMaskFilter::Pair(row, column)
+                                    };
+                                    actions.push(ViewerCommand::SetTractMaskFilter(
+                                        object_index,
+                                        filter,
+                                    ));
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
     pub(super) fn draw_graph_contents(&self, ui: &mut egui::Ui) {
         ui.set_min_width(GRAPH_MIN_PLOT_WIDTH_POINTS);
         let Some(snapshot) = self.graph_snapshot.as_ref() else {
@@ -1394,6 +1641,10 @@ impl ViewerState {
                                 }
                             }
                         });
+                    ui.add_space(8.0);
+                    if ui.button("Open Mask Controller…").clicked() {
+                        actions.push(ViewerCommand::SetMaskControllerOpen(true));
+                    }
                 }
                 SceneObjectPayload::Graph(data) => {
                     if let Some(linked) = object.linked_tracts.as_ref() {
@@ -2584,6 +2835,14 @@ fn compact_matrix_label(label: &str, index: usize) -> String {
         format!("{compact}…")
     } else {
         compact
+    }
+}
+
+fn mask_matrix_label(index: usize) -> String {
+    if index < 26 {
+        ((b'A' + index as u8) as char).to_string()
+    } else {
+        (index + 1).to_string()
     }
 }
 

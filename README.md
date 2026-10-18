@@ -116,7 +116,8 @@ refreshed as the viewer changes.
 - A `--volume` mode that renders orthogonal NIfTI slice planes in the 3D scene.
 - AFNI/FATCAT `.niml.tract` objects with adjustable screen-space ribbon width,
   per-bundle visibility/opacity, and SUMA-style local-orientation,
-  tract-orientation, or bundle coloring.
+  tract-orientation, or bundle coloring, plus draggable spherical masks and an
+  inclusive pairwise tract-connection matrix.
 - AFNI `Graph_Bucket .niml.dset` objects with shaded 3D node glyphs, straight
   or tract-bundle edges, and an interactive matrix view; full, triangular, and
   sparse edge encodings are parsed.
@@ -160,6 +161,12 @@ Right-click a visible tract, graph node, or displayed graph edge to inspect it.
 Graph node labels can be toggled per object. Tract hit-testing uses a compact
 streamline bounding-volume hierarchy so large whole-brain datasets do not scan
 every segment for each click.
+Open the separate tract-mask window from **Controllers → Mask Controller**.
+Right-click a sphere to select it, left-drag to move it in the current view
+plane, Shift-drag to snap it to any tract, and use Ctrl+wheel to resize it.
+Multiple masks report per-mask and inclusive pairwise streamline counts;
+clicking the matrix diagonal or a pair cell emphasizes that mask or connection
+while unmatched tracts remain visible as dim spatial context.
 Choose **Open matrix view** in a graph's inspector for a floating, scrollable
 heatmap. It shares the 3D graph's selected measure, signed/magnitude coloring,
 and absolute-value threshold; thresholded cells are dimmed rather than removed.

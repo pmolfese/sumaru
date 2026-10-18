@@ -186,7 +186,7 @@ impl Camera {
         true
     }
 
-    fn stop_momentum(&mut self) {
+    pub(super) fn stop_momentum(&mut self) {
         self.momentum_delta = (0.0, 0.0);
     }
 

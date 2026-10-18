@@ -104,10 +104,12 @@ mod ui;
 mod volume_view;
 use edit::{CoordConvention, GoToLocationState};
 use instacorr::{InstaCorrSession, InstaCorrWorkerResult};
-pub use scene_objects::{GraphColorMode, GraphEdgeGeometry, GraphMatrixPlacement, TractColorMode};
+pub use scene_objects::{
+    GraphColorMode, GraphEdgeGeometry, GraphMatrixPlacement, TractColorMode, TractMaskFilter,
+};
 use scene_objects::{
     SceneObject, SceneObjectGpu, SceneObjectPayload, SceneObjectPick, SceneObjectRenderer,
-    normalization_model, pick_scene_objects,
+    normalization_model, pick_scene_objects, pick_tract_masks, pick_tract_on_object_unfiltered,
 };
 pub use timecourse::{
     TimeCourseBaseline, TimeCourseControls, TimeCourseDisplay, TimeCourseMeasure,
@@ -312,6 +314,12 @@ const ROI_CONTROL_INNER_WIDTH: u32 = 430;
 const ROI_CONTROL_INNER_HEIGHT: u32 = 260;
 const ROI_CONTROL_MAX_INNER_WIDTH: u32 = 1100;
 const ROI_CONTROL_MIN_INNER_HEIGHT: u32 = 260;
+const MASK_CONTROL_CONTENT_WIDTH_POINTS: f32 = 430.0;
+const MASK_CONTROL_MIN_INNER_WIDTH: u32 = 500;
+const MASK_CONTROL_INNER_WIDTH: u32 = 500;
+const MASK_CONTROL_INNER_HEIGHT: u32 = 520;
+const MASK_CONTROL_MAX_INNER_WIDTH: u32 = 1300;
+const MASK_CONTROL_MIN_INNER_HEIGHT: u32 = 320;
 const GRAPH_WINDOW_INNER_WIDTH: u32 = 600;
 const GRAPH_WINDOW_INNER_HEIGHT: u32 = 400;
 const GRAPH_MIN_INITIAL_INNER_WIDTH: u32 = 420;
@@ -575,6 +583,17 @@ impl ViewerApp {
                     .with_visible(false),
             )?,
         );
+        let mask_control_window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("sumaru mask controls")
+                    .with_inner_size(PhysicalSize::new(
+                        MASK_CONTROL_INNER_WIDTH,
+                        MASK_CONTROL_INNER_HEIGHT,
+                    ))
+                    .with_visible(false),
+            )?,
+        );
         let graph_window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
@@ -589,6 +608,8 @@ impl ViewerApp {
             control_window.set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y));
             roi_control_window
                 .set_outer_position(PhysicalPosition::new(position.x + 1320, raised_y + 760));
+            mask_control_window
+                .set_outer_position(PhysicalPosition::new(position.x + 1360, raised_y + 120));
             graph_window.set_outer_position(PhysicalPosition::new(position.x + 80, raised_y + 80));
         }
         self.state = Some(pollster::block_on(ViewerState::new(
@@ -596,6 +617,7 @@ impl ViewerApp {
                 view: view_window,
                 control: control_window,
                 roi_control: roi_control_window,
+                mask_control: mask_control_window,
                 graph: graph_window,
             },
             InitialScene {
@@ -787,6 +809,47 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             return;
         }
 
+        if window_id == state.mask_control_window().id() {
+            let input = state.mask_control_input(&event);
+            if input.repaint {
+                state.mask_control_window().request_redraw();
+            }
+            if input.consumed {
+                state.mask_control_window().request_redraw();
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested => {
+                    state.apply_commands(vec![ViewerCommand::SetMaskControllerOpen(false)]);
+                }
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::MaskControl, occluded);
+                }
+                WindowEvent::Resized(size) => {
+                    state.resize_mask_control(size);
+                    if !state.mask_control.occluded {
+                        state.mask_control_window().request_redraw();
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.mask_control.occluded {
+                        return;
+                    }
+                    match state.render_mask_control() {
+                        RenderStatus::Rendered => {}
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_mask_control(state.mask_control.size);
+                            state.mask_control_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("mask control validation error"),
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if window_id == state.graph_window().id() {
             let input = state.graph_input(&event);
             if input.repaint {
@@ -851,6 +914,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     if state.controller.panels.roi_controller_open {
                         state.roi_control_window().request_redraw();
                     }
+                    if state.controller.panels.mask_controller_open {
+                        state.mask_control_window().request_redraw();
+                    }
                     if state.controller.panels.graph_window_open {
                         state.view_window().request_redraw();
                     }
@@ -873,6 +939,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                     }
                     if state.controller.panels.roi_controller_open {
                         state.roi_control_window().request_redraw();
+                    }
+                    if state.controller.panels.mask_controller_open {
+                        state.mask_control_window().request_redraw();
                     }
                     if state.graph_matrix_window_open() {
                         state.graph_window().request_redraw();
@@ -917,6 +986,12 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             .roi_controller_open
             .then_some(state.roi_control.repaint_at)
             .flatten();
+        let next_mask_control = state
+            .controller
+            .panels
+            .mask_controller_open
+            .then_some(state.mask_control.repaint_at)
+            .flatten();
         let next_graph = state
             .graph_matrix_window_open()
             .then_some(state.graph.repaint_at)
@@ -924,6 +999,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         let view_due = repaint_due(now, next_view, state.view.occluded);
         let control_due = repaint_due(now, next_control, state.control.occluded);
         let roi_control_due = repaint_due(now, next_roi_control, state.roi_control.occluded);
+        let mask_control_due = repaint_due(now, next_mask_control, state.mask_control.occluded);
         let graph_due = repaint_due(now, next_graph, state.graph.occluded);
         if view_due {
             state.view_window().request_redraw();
@@ -933,6 +1009,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         }
         if roi_control_due {
             state.roi_control_window().request_redraw();
+        }
+        if mask_control_due {
+            state.mask_control_window().request_redraw();
         }
         if graph_due {
             state.graph_window().request_redraw();
@@ -944,12 +1023,13 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 (next_view, state.view.occluded),
                 (next_control, state.control.occluded),
                 (next_roi_control, state.roi_control.occluded),
+                (next_mask_control, state.mask_control.occluded),
                 (next_graph, state.graph.occluded),
             ],
         );
         match next_wake {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None if view_due || control_due || roi_control_due || graph_due => {
+            None if view_due || control_due || roi_control_due || mask_control_due || graph_due => {
                 event_loop.set_control_flow(ControlFlow::Wait)
             }
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -957,8 +1037,8 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
     }
 }
 
-/// Per-window egui plumbing. Each of the four windows (view, control, ROI
-/// control, graph) owns one of these instead of five parallel fields on
+/// Per-window egui plumbing. Each application window owns one of these instead
+/// of maintaining parallel surface, renderer, input, and repaint fields on
 /// `ViewerState`.
 struct EguiPane {
     ctx: egui::Context,
@@ -1044,6 +1124,7 @@ struct WindowPane {
 enum AuxWindowPane {
     Control,
     RoiControl,
+    MaskControl,
     Graph,
 }
 
@@ -1358,12 +1439,13 @@ impl ViewerOverlayState {
     }
 }
 
-/// The four application windows handed to [`ViewerState::new`]. Bundled so the
-/// constructor takes one argument for the window set instead of four.
+/// The application windows handed to [`ViewerState::new`]. Bundled so the
+/// constructor takes one argument for the complete window set.
 struct ViewerWindows {
     view: Arc<Window>,
     control: Arc<Window>,
     roi_control: Arc<Window>,
+    mask_control: Arc<Window>,
     graph: Arc<Window>,
 }
 
@@ -1495,6 +1577,7 @@ struct ViewerState {
     view: WindowPane,
     control: WindowPane,
     roi_control: WindowPane,
+    mask_control: WindowPane,
     graph: WindowPane,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1622,8 +1705,18 @@ struct ViewerState {
     pair_drag_changed: bool,
     /// Index of the volume slice currently being left-dragged, if any.
     volume_slice_drag: Option<usize>,
+    tract_mask_drag: Option<TractMaskDrag>,
     modifiers: ModifiersState,
     mode_label: Option<ModeLabel>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TractMaskDrag {
+    object_index: usize,
+    mask_index: usize,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+    grab_offset: Vec3,
 }
 
 impl ViewerState {
@@ -1642,6 +1735,7 @@ impl ViewerState {
             view: view_window,
             control: control_window,
             roi_control: roi_control_window,
+            mask_control: mask_control_window,
             graph: graph_window,
         } = windows;
         let InitialScene {
@@ -1670,11 +1764,13 @@ impl ViewerState {
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
         let roi_control_size = roi_control_window.inner_size();
+        let mask_control_size = mask_control_window.inner_size();
         let graph_size = graph_window.inner_size();
         let instance = wgpu::Instance::default();
         let view_surface = instance.create_surface(view_window.clone())?;
         let control_surface = instance.create_surface(control_window.clone())?;
         let roi_control_surface = instance.create_surface(roi_control_window.clone())?;
+        let mask_control_surface = instance.create_surface(mask_control_window.clone())?;
         let graph_surface = instance.create_surface(graph_window.clone())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -1709,6 +1805,7 @@ impl ViewerState {
         let view_caps = view_surface.get_capabilities(&adapter);
         let control_caps = control_surface.get_capabilities(&adapter);
         let roi_control_caps = roi_control_surface.get_capabilities(&adapter);
+        let mask_control_caps = mask_control_surface.get_capabilities(&adapter);
         let graph_caps = graph_surface.get_capabilities(&adapter);
         let surface_format = choose_surface_format(&view_caps, &control_caps);
         let present_mode = choose_present_mode(&view_caps, &control_caps);
@@ -1724,6 +1821,18 @@ impl ViewerState {
         ensure!(
             roi_control_caps.alpha_modes.contains(&alpha_mode),
             "ROI controller surface does not support selected alpha mode {alpha_mode:?}"
+        );
+        ensure!(
+            mask_control_caps.formats.contains(&surface_format),
+            "mask controller surface does not support selected format {surface_format:?}"
+        );
+        ensure!(
+            mask_control_caps.present_modes.contains(&present_mode),
+            "mask controller surface does not support selected present mode {present_mode:?}"
+        );
+        ensure!(
+            mask_control_caps.alpha_modes.contains(&alpha_mode),
+            "mask controller surface does not support selected alpha mode {alpha_mode:?}"
         );
         ensure!(
             graph_caps.formats.contains(&surface_format),
@@ -1770,6 +1879,17 @@ impl ViewerState {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        let mask_control_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: mask_control_size.width.max(1),
+            height: mask_control_size.height.max(1),
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
         let graph_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -1784,6 +1904,7 @@ impl ViewerState {
         view_surface.configure(&device, &view_config);
         control_surface.configure(&device, &control_config);
         roi_control_surface.configure(&device, &roi_control_config);
+        mask_control_surface.configure(&device, &mask_control_config);
         graph_surface.configure(&device, &graph_config);
 
         let camera = Camera::default();
@@ -1999,6 +2120,18 @@ impl ViewerState {
         );
         roi_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
         let roi_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
+        let mask_egui_ctx = egui::Context::default();
+        mask_egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut mask_egui_state = egui_winit::State::new(
+            mask_egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            mask_control_window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        mask_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
+        let mask_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
         let graph_egui_ctx = egui::Context::default();
         graph_egui_ctx.set_visuals(egui::Visuals::dark());
         let mut graph_egui_state = egui_winit::State::new(
@@ -2061,6 +2194,13 @@ impl ViewerState {
                 roi_control_config,
                 roi_control_size,
                 EguiPane::new(roi_egui_ctx, roi_egui_state, roi_egui_renderer),
+            ),
+            mask_control: WindowPane::new(
+                mask_control_window,
+                mask_control_surface,
+                mask_control_config,
+                mask_control_size,
+                EguiPane::new(mask_egui_ctx, mask_egui_state, mask_egui_renderer),
             ),
             graph: WindowPane::new(
                 graph_window,
@@ -2164,6 +2304,7 @@ impl ViewerState {
             pair_drag_last_cursor: None,
             pair_drag_changed: false,
             volume_slice_drag: None,
+            tract_mask_drag: None,
             modifiers: ModifiersState::empty(),
             mode_label: None,
         };
@@ -2252,6 +2393,10 @@ impl ViewerState {
         &self.roi_control.window
     }
 
+    fn mask_control_window(&self) -> &Window {
+        &self.mask_control.window
+    }
+
     fn graph_window(&self) -> &Window {
         &self.graph.window
     }
@@ -2304,6 +2449,9 @@ impl ViewerState {
         if self.controller.panels.roi_controller_open {
             self.roi_control.window.request_redraw();
         }
+        if self.controller.panels.mask_controller_open {
+            self.mask_control.window.request_redraw();
+        }
         if self.graph_matrix_window_open() {
             self.graph.window.request_redraw();
         }
@@ -2313,6 +2461,7 @@ impl ViewerState {
         let window = match pane {
             AuxWindowPane::Control => &mut self.control,
             AuxWindowPane::RoiControl => &mut self.roi_control,
+            AuxWindowPane::MaskControl => &mut self.mask_control,
             AuxWindowPane::Graph => &mut self.graph,
         };
         if window.occluded == occluded {
@@ -2339,6 +2488,10 @@ impl ViewerState {
 
     fn resize_roi_control(&mut self, size: PhysicalSize<u32>) {
         self.roi_control.resize(&self.device, size);
+    }
+
+    fn resize_mask_control(&mut self, size: PhysicalSize<u32>) {
+        self.mask_control.resize(&self.device, size);
     }
 
     fn resize_graph(&mut self, size: PhysicalSize<u32>) {
@@ -2459,6 +2612,9 @@ impl ViewerState {
         }
         self.view.window.request_redraw();
         self.control.window.request_redraw();
+        if self.controller.panels.mask_controller_open {
+            self.mask_control.window.request_redraw();
+        }
     }
 
     fn rebuild_scene_object_gpu(&mut self, index: usize) {
@@ -2466,6 +2622,238 @@ impl ViewerState {
             return;
         };
         self.scene_object_gpu[index] = self.scene_object_renderer.upload(&self.device, object);
+    }
+
+    fn refresh_scene_object_masks_gpu(&mut self, index: usize) {
+        let (Some(object), Some(gpu)) = (
+            self.scene_objects.get(index),
+            self.scene_object_gpu.get_mut(index),
+        ) else {
+            return;
+        };
+        self.scene_object_renderer
+            .refresh_masks(&self.device, &self.queue, gpu, object);
+        self.view.window.request_redraw();
+        self.control.window.request_redraw();
+    }
+
+    fn add_tract_mask(&mut self, object_index: usize) {
+        let center = self
+            .scene_object_pick
+            .as_ref()
+            .and_then(|pick| match pick {
+                SceneObjectPick::Tract {
+                    object_index: picked_object,
+                    position,
+                    ..
+                } if *picked_object == object_index => Some(*position),
+                _ => None,
+            })
+            .or_else(|| {
+                self.controller
+                    .interaction
+                    .pick
+                    .map(|pick| pick.surface_position)
+            })
+            .or_else(|| {
+                self.scene_objects
+                    .get(object_index)
+                    .map(|object| object.bounds.center)
+            });
+        let Some(center) = center else {
+            return;
+        };
+        self.clear_tract_mask_selection();
+        let added = self
+            .scene_objects
+            .get_mut(object_index)
+            .and_then(|object| object.add_tract_mask(center));
+        if let Some(mask_index) = added {
+            self.active_scene_object = Some(object_index);
+            self.refresh_scene_object_masks_gpu(object_index);
+            self.log_status(format!(
+                "Added Mask {}. Right-click it to select; left-drag to move; Shift-drag snaps to tracts.",
+                mask_index + 1
+            ));
+        }
+    }
+
+    fn clear_tract_mask_selection(&mut self) {
+        let changed = self
+            .scene_objects
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, object)| object.tract_mask_selected.take().map(|_| index))
+            .collect::<Vec<_>>();
+        for index in changed {
+            self.refresh_scene_object_masks_gpu(index);
+        }
+    }
+
+    fn select_tract_mask(&mut self, object_index: usize, mask_index: Option<usize>) {
+        self.clear_tract_mask_selection();
+        let selected = self
+            .scene_objects
+            .get_mut(object_index)
+            .is_some_and(|object| {
+                if let Some(mask_index) = mask_index {
+                    if mask_index >= object.tract_masks.len() {
+                        return false;
+                    }
+                    object.tract_mask_selected = Some(mask_index);
+                }
+                true
+            });
+        if selected {
+            self.active_scene_object = Some(object_index);
+            self.refresh_scene_object_masks_gpu(object_index);
+        }
+    }
+
+    fn select_tract_mask_at_cursor(&mut self) -> bool {
+        let Some(cursor) = self.view_cursor_position else {
+            return false;
+        };
+        let scene_size = self.scene_viewport_size();
+        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
+            return false;
+        };
+        let Some(pick) = pick_tract_masks(
+            &self.scene_objects,
+            self.scene_object_model(),
+            origin,
+            direction,
+        ) else {
+            self.clear_tract_mask_selection();
+            return false;
+        };
+        self.select_tract_mask(pick.object_index, Some(pick.mask_index));
+        if let Some(mask) = self.scene_objects[pick.object_index]
+            .tract_masks
+            .get(pick.mask_index)
+        {
+            self.log_status(format!(
+                "{} selected — left-drag to move, Shift-drag to snap to tracts, Ctrl+wheel to resize.",
+                mask.name
+            ));
+        }
+        true
+    }
+
+    fn selected_tract_mask(&self) -> Option<(usize, usize)> {
+        self.scene_objects
+            .iter()
+            .enumerate()
+            .find_map(|(object_index, object)| {
+                object
+                    .tract_mask_selected
+                    .map(|mask_index| (object_index, mask_index))
+            })
+    }
+
+    fn try_begin_tract_mask_drag(&mut self) -> bool {
+        let Some((object_index, mask_index)) = self.selected_tract_mask() else {
+            return false;
+        };
+        let Some(cursor) = self.view_cursor_position else {
+            return false;
+        };
+        let scene_size = self.scene_viewport_size();
+        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
+            return false;
+        };
+        let model = self.scene_object_model();
+        let hit = pick_tract_masks(&self.scene_objects, model, origin, direction);
+        if !hit.is_some_and(|hit| hit.object_index == object_index && hit.mask_index == mask_index)
+        {
+            return false;
+        }
+        let center = self.scene_objects[object_index].tract_masks[mask_index].center;
+        let plane_point = model.transform_point3(Vec3::from_array(center));
+        let plane_normal = self.camera.view_axes().0.normalize_or_zero();
+        let Some(grab_point) = ray_plane_intersection(origin, direction, plane_point, plane_normal)
+        else {
+            return false;
+        };
+        self.camera.stop_momentum();
+        self.tract_mask_drag = Some(TractMaskDrag {
+            object_index,
+            mask_index,
+            plane_point,
+            plane_normal,
+            grab_offset: plane_point - grab_point,
+        });
+        if self.modifiers.shift_key() {
+            self.update_tract_mask_drag();
+        }
+        true
+    }
+
+    fn update_tract_mask_drag(&mut self) {
+        let Some(drag) = self.tract_mask_drag else {
+            return;
+        };
+        let Some(cursor) = self.view_cursor_position else {
+            return;
+        };
+        let scene_size = self.scene_viewport_size();
+        let Some((origin, direction)) = screen_ray(&self.camera, scene_size, cursor) else {
+            return;
+        };
+        let model = self.scene_object_model();
+        let next_center = if self.modifiers.shift_key() {
+            let tolerance =
+                (2.0 * self.camera.distance * (camera::CAMERA_FOV_Y_RADIANS * 0.5).tan() * 18.0
+                    / scene_size.height.max(1) as f32)
+                    .clamp(0.006, 0.12);
+            match pick_tract_on_object_unfiltered(
+                &self.scene_objects,
+                drag.object_index,
+                model,
+                origin,
+                direction,
+                tolerance,
+            ) {
+                Some(SceneObjectPick::Tract {
+                    object_index,
+                    position,
+                    ..
+                }) if object_index == drag.object_index => Some(position),
+                _ => None,
+            }
+        } else {
+            ray_plane_intersection(origin, direction, drag.plane_point, drag.plane_normal).map(
+                |point| {
+                    model
+                        .inverse()
+                        .transform_point3(point + drag.grab_offset)
+                        .to_array()
+                },
+            )
+        };
+        let Some(next_center) = next_center else {
+            return;
+        };
+        let changed = self
+            .scene_objects
+            .get_mut(drag.object_index)
+            .is_some_and(|object| object.set_tract_mask_center(drag.mask_index, next_center));
+        if changed {
+            self.refresh_scene_object_masks_gpu(drag.object_index);
+        }
+    }
+
+    fn resize_selected_tract_mask(&mut self, scroll: f32) -> bool {
+        let Some((object_index, mask_index)) = self.selected_tract_mask() else {
+            return false;
+        };
+        let radius = self.scene_objects[object_index].tract_masks[mask_index].radius;
+        let changed = self.scene_objects[object_index]
+            .set_tract_mask_radius(mask_index, radius * 1.08_f32.powf(scroll));
+        if changed {
+            self.refresh_scene_object_masks_gpu(object_index);
+        }
+        true
     }
 
     fn clear_scene_object_pick_for(&mut self, index: usize) -> bool {
@@ -2621,6 +3009,9 @@ impl ViewerState {
             self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
                 self.roi_control.window.request_redraw();
+            }
+            if self.controller.panels.mask_controller_open {
+                self.mask_control.window.request_redraw();
             }
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
@@ -2911,6 +3302,9 @@ impl ViewerState {
             if self.controller.panels.roi_controller_open {
                 self.roi_control.window.request_redraw();
             }
+            if self.controller.panels.mask_controller_open {
+                self.mask_control.window.request_redraw();
+            }
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
             }
@@ -2972,6 +3366,9 @@ impl ViewerState {
             if self.controller.panels.roi_controller_open {
                 self.roi_control.window.request_redraw();
             }
+            if self.controller.panels.mask_controller_open {
+                self.mask_control.window.request_redraw();
+            }
             if self.controller.panels.graph_window_open {
                 self.view.window.request_redraw();
             }
@@ -3002,6 +3399,58 @@ impl ViewerState {
         )
     }
 
+    fn render_mask_control(&mut self) -> RenderStatus {
+        let raw_input = self.mask_control.take_egui_input();
+        let egui_ctx = self.mask_control.egui.ctx.clone();
+        let mut ui_actions = Vec::new();
+        let mut desired_size_points = egui::Vec2::ZERO;
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let output = self.draw_mask_control_ui(ui);
+            ui_actions = output.actions;
+            desired_size_points = output.desired_control_size_points;
+        });
+        self.mask_control.repaint_at = repaint_delay_to_instant(&full_output);
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        let actions_present = !ui_actions.is_empty();
+        self.mask_control
+            .egui
+            .state
+            .handle_platform_output(&self.mask_control.window, full_output.platform_output);
+        if repaint_delay != Duration::ZERO {
+            self.fit_mask_control_window(desired_size_points, full_output.pixels_per_point);
+        }
+        self.apply_commands(ui_actions);
+        if actions_present {
+            self.view.window.request_redraw();
+            self.control.window.request_redraw();
+            self.mask_control.window.request_redraw();
+        }
+
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [
+                self.mask_control.config.width,
+                self.mask_control.config.height,
+            ],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        self.mask_control
+            .egui
+            .pending_textures
+            .append(full_output.textures_delta);
+        self.mask_control.present_egui_frame(
+            &self.device,
+            &self.queue,
+            &paint_jobs,
+            &screen_descriptor,
+            "mask control render encoder",
+        )
+    }
+
     fn render_graph(&mut self) -> RenderStatus {
         let raw_input = self.graph.take_egui_input();
         let egui_ctx = self.graph.egui.ctx.clone();
@@ -3021,6 +3470,9 @@ impl ViewerState {
             self.control.window.request_redraw();
             if self.controller.panels.roi_controller_open {
                 self.roi_control.window.request_redraw();
+            }
+            if self.controller.panels.mask_controller_open {
+                self.mask_control.window.request_redraw();
             }
             if self.graph_matrix_window_open() {
                 self.graph.window.request_redraw();
@@ -3165,6 +3617,36 @@ impl ViewerState {
         self.roi_control.window.request_redraw();
     }
 
+    fn fit_mask_control_window(
+        &mut self,
+        desired_control_size_points: egui::Vec2,
+        pixels_per_point: f32,
+    ) {
+        let Some(desired_size) = desired_panel_size(
+            &self.mask_control.window,
+            desired_control_size_points,
+            pixels_per_point,
+            MASK_CONTROL_MIN_INNER_WIDTH,
+            MASK_CONTROL_MIN_INNER_HEIGHT,
+            0.7,
+            MASK_CONTROL_MAX_INNER_WIDTH,
+            0.75,
+            820,
+        ) else {
+            return;
+        };
+        if size_is_close(self.mask_control.size, desired_size)
+            || self.mask_control.last_requested_size == Some(desired_size)
+        {
+            return;
+        }
+        self.mask_control.last_requested_size = Some(desired_size);
+        if let Some(actual_size) = self.mask_control.window.request_inner_size(desired_size) {
+            self.resize_mask_control(actual_size);
+        }
+        self.mask_control.window.request_redraw();
+    }
+
     fn apply_commands(&mut self, actions: Vec<ViewerCommand>) {
         for action in actions {
             match action {
@@ -3302,6 +3784,36 @@ impl ViewerState {
                         appearance.opacity = opacity.clamp(0.0, 1.0);
                         self.rebuild_scene_object_gpu(index);
                         let _ = self.clear_scene_object_pick_for(index);
+                    }
+                }
+                ViewerCommand::AddTractMask(index) => self.add_tract_mask(index),
+                ViewerCommand::SelectTractMask(index, mask_index) => {
+                    self.select_tract_mask(index, mask_index);
+                }
+                ViewerCommand::RemoveTractMask(index, mask_index) => {
+                    let removed = self
+                        .scene_objects
+                        .get_mut(index)
+                        .is_some_and(|object| object.remove_tract_mask(mask_index));
+                    if removed {
+                        self.refresh_scene_object_masks_gpu(index);
+                    }
+                }
+                ViewerCommand::SetTractMaskRadius(index, mask_index, radius) => {
+                    let changed = self
+                        .scene_objects
+                        .get_mut(index)
+                        .is_some_and(|object| object.set_tract_mask_radius(mask_index, radius));
+                    if changed {
+                        self.refresh_scene_object_masks_gpu(index);
+                    }
+                }
+                ViewerCommand::SetTractMaskFilter(index, filter) => {
+                    if let Some(object) = self.scene_objects.get_mut(index)
+                        && matches!(object.payload, SceneObjectPayload::Tracts(_))
+                    {
+                        object.set_tract_mask_filter(filter);
+                        self.refresh_scene_object_masks_gpu(index);
                     }
                 }
                 ViewerCommand::SetGraphMeasure(index, measure) => {
@@ -3701,6 +4213,9 @@ impl ViewerState {
                 }
                 ViewerCommand::SetRoiControllerOpen(open) => {
                     self.set_roi_controller_open(open);
+                }
+                ViewerCommand::SetMaskControllerOpen(open) => {
+                    self.set_mask_controller_open(open);
                 }
                 ViewerCommand::OpenGraphForPick => {
                     if let Err(error) = self.open_graph_for_current_pick() {
@@ -4634,6 +5149,15 @@ impl ViewerState {
         self.roi_control.window.set_visible(open);
         if open {
             self.roi_control.window.request_redraw();
+        }
+        self.view.window.request_redraw();
+    }
+
+    fn set_mask_controller_open(&mut self, open: bool) {
+        self.controller.panels.mask_controller_open = open;
+        self.mask_control.window.set_visible(open);
+        if open {
+            self.mask_control.window.request_redraw();
         }
         self.view.window.request_redraw();
     }
@@ -9847,6 +10371,20 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
         bytes.extend_from_slice(&value.to_ne_bytes());
     }
     bytes
+}
+
+fn ray_plane_intersection(
+    origin: Vec3,
+    direction: Vec3,
+    point: Vec3,
+    normal: Vec3,
+) -> Option<Vec3> {
+    let denominator = direction.dot(normal);
+    if denominator.abs() <= 1.0e-6 {
+        return None;
+    }
+    let distance = (point - origin).dot(normal) / denominator;
+    (distance >= 0.0).then_some(origin + direction * distance)
 }
 
 pub(super) fn symmetric_value_range(range: ValueRange) -> ValueRange {

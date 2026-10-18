@@ -457,6 +457,7 @@ impl From<SurfacePick> for CrosshairState {
 pub struct PanelState {
     pub surface_controller_visible: bool,
     pub roi_controller_open: bool,
+    pub mask_controller_open: bool,
     pub graph_window_open: bool,
 }
 
@@ -465,6 +466,7 @@ impl Default for PanelState {
         Self {
             surface_controller_visible: true,
             roi_controller_open: false,
+            mask_controller_open: false,
             graph_window_open: false,
         }
     }
@@ -530,6 +532,11 @@ pub enum ViewerCommand {
     SetTractColorMode(usize, crate::viewer::TractColorMode),
     SetTractBundleVisible(usize, usize, bool),
     SetTractBundleOpacity(usize, usize, f32),
+    AddTractMask(usize),
+    SelectTractMask(usize, Option<usize>),
+    RemoveTractMask(usize, usize),
+    SetTractMaskRadius(usize, usize, f32),
+    SetTractMaskFilter(usize, crate::viewer::TractMaskFilter),
     SetGraphMeasure(usize, usize),
     SetGraphThreshold(usize, f32),
     SetGraphColorMode(usize, crate::viewer::GraphColorMode),
@@ -582,6 +589,7 @@ pub enum ViewerCommand {
     SaveAllRois,
     SetSurfaceControllerVisible(bool),
     SetRoiControllerOpen(bool),
+    SetMaskControllerOpen(bool),
     OpenGraphForPick,
     SetGraphWindowOpen(bool),
     NudgeCamera(ViewNudge),

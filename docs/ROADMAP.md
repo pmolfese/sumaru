@@ -73,8 +73,10 @@ AFNI, SUMA, SUMAvista, and `sumaru`.
   `FATCAT_DEMO`, recording any new wire messages and visual/spatial failures.
 - [ ] Add tract coordinate metadata validation before treating surface, volume,
   and tract alignment as compatibility-complete.
-- [ ] Add InstaTract-style movable tract masks; surface prying remains a later,
-  separate interaction milestone.
+- [x] Add InstaTract-style movable spherical tract masks with view-plane and
+  tract-snapped dragging, live inclusive connection counts, and matrix-driven
+  emphasis with dim spatial context; surface prying remains a later, separate
+  interaction milestone.
 
 ### NIML Talk With AFNI
 
