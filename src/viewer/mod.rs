@@ -10107,6 +10107,60 @@ struct ThresholdBarInteraction {
     dragging: bool,
 }
 
+// Tried the afniru-style slider, but we preferred the original control because
+// this version felt jerky. Retained as a commented-out alternative.
+/*
+fn vertical_threshold_bar(
+    ui: &mut egui::Ui,
+    appearance: &mut OverlayAppearance,
+    threshold_range: ValueRange,
+) -> ThresholdBarInteraction {
+    let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
+    let mut value = appearance.threshold.value;
+    let response = ui
+        .horizontal(|ui| {
+            // Keep the color reference separate from the standard egui slider,
+            // as in afniru. Scope the slider length to this control.
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(22.0, OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter_at(rect);
+            for step in 0..80 {
+                let t0 = step as f32 / 80.0;
+                let t1 = (step + 1) as f32 / 80.0;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), rect.bottom() - rect.height() * t1),
+                        egui::pos2(rect.right(), rect.bottom() - rect.height() * t0),
+                    ),
+                    0,
+                    color32_from_rgba(sample_colormap(appearance.colormap, (t0 + t1) * 0.5)),
+                );
+            }
+            ui.spacing_mut().slider_width = OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS;
+            ui.add(
+                egui::Slider::new(&mut value, min..=max)
+                    .vertical()
+                    .show_value(false),
+            )
+            .on_hover_text("Threshold")
+        })
+        .inner;
+
+    if response.changed() {
+        appearance.threshold.value = value;
+        appearance.threshold.enabled = true;
+    }
+    ThresholdBarInteraction {
+        // The timecourse path needs a release event to commit deferred
+        // contour and cluster updates, even if the final value is unchanged.
+        changed: response.changed() || response.drag_stopped(),
+        dragging: response.dragged(),
+    }
+}
+*/
+
 fn vertical_threshold_bar(
     ui: &mut egui::Ui,
     appearance: &mut OverlayAppearance,
