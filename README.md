@@ -66,15 +66,44 @@ and treatment of third-party material.
 
 ## Install
 
-This is currently a source build:
+Sumaru is currently built from source and requires Rust and Cargo.
 
-```
+To add Sumaru to your existing AFNI installation:
+
+```bash
 git clone https://github.com/pmolfese/sumaru
 cd sumaru
 cargo build --release
+cp target/release/sumaru ~/abin
 ```
-Then copy the `sumaru` binary to somewhere on your path, or run it through
-`cargo run` while experimenting.
+
+These steps assume your AFNI programs are in `~/abin` and that directory is on
+your `PATH`. If AFNI is installed elsewhere, copy `target/release/sumaru` to
+that directory or another directory on your `PATH` instead.
+
+### Running Sumaru
+
+After copying the release binary onto your `PATH`, launch it with `sumaru`
+from any directory. The usage examples below use this installed command:
+
+```sh
+sumaru
+sumaru --surface /path/to/surface.gii
+```
+
+You can also run the release build directly from the repository with
+`./target/release/sumaru`.
+
+Alternatively, run through Cargo from the repository while experimenting.
+Replace `sumaru` in any example with `cargo run --release --`, keeping the
+same arguments:
+
+```sh
+cargo run --release
+cargo run --release -- --surface /path/to/surface.gii
+```
+
+Use `cargo run --` instead if you prefer a debug build.
 
 ## A Look at the Interface
 
@@ -126,25 +155,25 @@ refreshed as the viewer changes.
 Some useful ways to launch it:
 
 ```sh
-cargo run
-cargo run -- -i /path/to/surface.gii
-cargo run -- --surface /path/to/surface.gii
-cargo run -- --surface /path/to/surface.gii --overlay /path/to/overlay.shape.gii
-cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset
-cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.gii.dset
-cargo run -- --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset --verbose
-cargo run -- tc -i /path/to/underlay-lh.gii --overlay /path/to/stc-lh.gii
-cargo run -- -spec /path/to/subj_rh.spec
-cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
-cargo run -- -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --preload
-cargo run -- --volume /path/to/subj_SurfVol.nii
-cargo run -- --volume /path/to/anat+tlrc.
-cargo run -- --tract /path/to/network.niml.tract
-cargo run -- --volume /path/to/anat.nii.gz --tract /path/to/network.niml.tract
-cargo run -- --graph /path/to/network.niml.dset
-cargo run -- --vol /path/to/anat+orig. --gdset /path/to/network.niml.dset
-cargo run -- -vol /path/to/anat+orig. -gdset /path/to/network.grid
-cargo run -- inspect /path/to/file.nii.gz
+sumaru
+sumaru -i /path/to/surface.gii
+sumaru --surface /path/to/surface.gii
+sumaru --surface /path/to/surface.gii --overlay /path/to/overlay.shape.gii
+sumaru --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset
+sumaru --surface /path/to/surface.gii --overlay /path/to/stats.gii.dset
+sumaru --surface /path/to/surface.gii --overlay /path/to/stats.niml.dset --verbose
+sumaru tc -i /path/to/underlay-lh.gii --overlay /path/to/stc-lh.gii
+sumaru -spec /path/to/subj_rh.spec
+sumaru -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii
+sumaru -spec /path/to/subj_rh.spec -sv /path/to/subj_SurfVol.nii --preload
+sumaru --volume /path/to/subj_SurfVol.nii
+sumaru --volume /path/to/anat+tlrc.
+sumaru --tract /path/to/network.niml.tract
+sumaru --volume /path/to/anat.nii.gz --tract /path/to/network.niml.tract
+sumaru --graph /path/to/network.niml.dset
+sumaru --vol /path/to/anat+orig. --gdset /path/to/network.niml.dset
+sumaru -vol /path/to/anat+orig. -gdset /path/to/network.grid
+sumaru inspect /path/to/file.nii.gz
 ```
 
 For SUMA compatibility, `--vol` aliases `--volume`, while `--gdset` and
@@ -179,9 +208,9 @@ edge with the bundle identified by its `Bundle_Tag` or reciprocal
 `Bundle_Alt_Tag`. Thresholding, coloring, and picking continue to use the
 selected graph measure, and unmatched edges retain the straight-edge fallback.
 
-## Cargo Commands
+## Development with Cargo
 
-The project defines a few Cargo aliases in `.cargo/config.toml`:
+For development, the project defines a few Cargo aliases in `.cargo/config.toml`:
 
 ```sh
 cargo check-all
@@ -320,7 +349,7 @@ For a quick look at any supported file, use the generic inspector. It covers
 GIFTI, NIFTI, raw NIML datasets/ROIs/label tables, and recorded NIML traces:
 
 ```sh
-cargo run -- inspect path/to/file
+sumaru inspect path/to/file
 ```
 
 For reproducible AFNI talk debugging, add
@@ -331,22 +360,22 @@ gzip the file afterward if you want to archive or share it. The debug readers
 accept both `.nimlrec` and `.nimlrec.gz`:
 
 ```sh
-cargo run -- niml inspect path/to/session.nimlrec
-cargo run -- niml replay path/to/session.nimlrec.gz
+sumaru niml inspect path/to/session.nimlrec
+sumaru niml replay path/to/session.nimlrec.gz
 ```
 
 Small test messages can be sent directly to an AFNI/SUMA NIML socket:
 
 ```sh
-cargo run -- --afni-port 53211 niml send raw path/to/message.niml
-cargo run -- --afni-port 53211 niml send crosshair --surface-id SURF_ID --node 42 --xyz 1,2,3
-cargo run -- --afni-port 53211 niml send command reset-camera
+sumaru --afni-port 53211 niml send raw path/to/message.niml
+sumaru --afni-port 53211 niml send crosshair --surface-id SURF_ID --node 42 --xyz 1,2,3
+sumaru --afni-port 53211 niml send command reset-camera
 ```
 
 Example:
 
 ```sh
-cargo run -- --spec path/to/fsaverage_lh.spec --sv path/to/SurfVol.nii --talk-afni --niml-record afni_session.nimlrec
+sumaru --spec path/to/fsaverage_lh.spec --sv path/to/SurfVol.nii --talk-afni --niml-record afni_session.nimlrec
 ```
 
 The same module also defines `sumaru`-side NIML state messages for active surface,
@@ -397,7 +426,7 @@ differences, examples, diagnostics, and known limitations.
 
 ## Viewer Controls
 
-- Launch with `cargo run` to open an empty viewer and a separate controls
+- Launch with `sumaru` to open an empty viewer and a separate controls
   window, then use the `Open:` buttons for a surface, overlay, spec, or surface
   volume. The controls window auto-fits to its current contents, capped by
   the monitor size.
