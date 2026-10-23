@@ -10107,9 +10107,6 @@ struct ThresholdBarInteraction {
     dragging: bool,
 }
 
-// Tried the afniru-style slider, but we preferred the original control because
-// this version felt jerky. Retained as a commented-out alternative.
-/*
 fn vertical_threshold_bar(
     ui: &mut egui::Ui,
     appearance: &mut OverlayAppearance,
@@ -10159,8 +10156,9 @@ fn vertical_threshold_bar(
         dragging: response.dragged(),
     }
 }
-*/
 
+// Original combined color bar and threshold interaction, retained for an easy revert.
+/*
 fn vertical_threshold_bar(
     ui: &mut egui::Ui,
     appearance: &mut OverlayAppearance,
@@ -10234,6 +10232,7 @@ fn vertical_threshold_bar(
 
     interaction
 }
+*/
 
 fn file_display(path: Option<&PathBuf>) -> String {
     path.map_or_else(|| "none".to_string(), |path| file_name_display(path))
@@ -10509,6 +10508,7 @@ fn threshold_q_value_display(qvalue: Option<f64>) -> String {
     }
 }
 
+#[cfg(test)]
 fn threshold_bar_y_for_value(rect: egui::Rect, min: f32, max: f32, value: f32) -> f32 {
     let span = (max - min).abs();
     let span = if span.is_finite() && span > 0.0 {
@@ -10520,6 +10520,7 @@ fn threshold_bar_y_for_value(rect: egui::Rect, min: f32, max: f32, value: f32) -
     rect.bottom() - rect.height() * t
 }
 
+#[cfg(test)]
 fn threshold_value_from_bar_y(rect: egui::Rect, min: f32, max: f32, y: f32) -> f32 {
     let t = ((rect.bottom() - y) / rect.height().max(f32::EPSILON)).clamp(0.0, 1.0);
     min + (max - min) * t
