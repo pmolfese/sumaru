@@ -166,11 +166,13 @@ impl ViewerState {
     pub(super) fn graph_snapshot_for_pick(&self, pick: SurfacePick) -> Option<GraphSnapshot> {
         let mut points = Vec::new();
         let mut comparison_series = Vec::new();
-        if let Some(timecourse) = self.timecourse.as_ref()
-            && let Some(row) = dataset_row_for_node(&timecourse.source_dataset, pick.node_index)
-        {
+        if let Some(timecourse) = self.timecourse.as_ref() {
             for sample_index in 0..timecourse.time_columns.len() {
-                let Some(value) = timecourse.sample_value(row, sample_index) else {
+                let Some(value) = timecourse.node_sample_value(
+                    timecourse.active_condition(),
+                    pick.node_index,
+                    sample_index,
+                ) else {
                     continue;
                 };
                 points.push(GraphPoint {
@@ -183,12 +185,6 @@ impl ViewerState {
                 if condition_index == timecourse.active_condition() {
                     continue;
                 }
-                let Some(dataset) = timecourse.condition_dataset(condition_index) else {
-                    continue;
-                };
-                let Some(condition_row) = dataset_row_for_node(dataset, pick.node_index) else {
-                    continue;
-                };
                 let condition_points = (0..timecourse.sample_count())
                     .filter_map(|sample_index| {
                         Some(GraphPoint {
@@ -197,9 +193,9 @@ impl ViewerState {
                                 "{:.1} ms",
                                 timecourse.sample_time(sample_index) * 1000.0
                             ),
-                            value: timecourse.condition_sample_value(
+                            value: timecourse.node_sample_value(
                                 condition_index,
-                                condition_row,
+                                pick.node_index,
                                 sample_index,
                             )?,
                         })
@@ -231,7 +227,7 @@ impl ViewerState {
             }
         }
 
-        if points.is_empty() {
+        if points.is_empty() && self.timecourse.is_none() {
             if let Some(value) = pick.overlay_value {
                 points.push(GraphPoint {
                     column_index: self.overlay.data.columns().intensity,

@@ -1548,7 +1548,7 @@ fn dataset_contour_levels(
         let low = range.min.min(range.max);
         let high = range.min.max(range.max);
         let span = high - low;
-        if !span.is_finite() || span <= f32::EPSILON {
+        if !span.is_finite() || span == 0.0 {
             Vec::new()
         } else {
             (1..10)
@@ -1561,7 +1561,7 @@ fn dataset_contour_levels(
     let luminances = levels
         .iter()
         .map(|level| {
-            let t = if span.is_finite() && span.abs() > f32::EPSILON {
+            let t = if span.is_finite() && span != 0.0 {
                 ((*level as f32 - range.min) / span).clamp(0.0, 1.0)
             } else {
                 0.5
@@ -3499,24 +3499,10 @@ impl ViewerState {
     }
 
     fn sanitize_overlay_appearance(&mut self) {
-        let range = &mut self.overlay.render.appearance.range;
-        if !range.min.is_finite() || !range.max.is_finite() {
-            *range = DEFAULT_OVERLAY_RANGE;
-        }
-
-        if self.overlay.render.appearance.symmetric_range {
-            let extent = range.min.abs().max(range.max.abs()).max(0.0001);
-            *range = ValueRange {
-                min: -extent,
-                max: extent,
-            };
-        } else if range.max < range.min {
-            std::mem::swap(&mut range.min, &mut range.max);
-        }
-
-        if (range.max - range.min).abs() <= f32::EPSILON {
-            range.max = range.min + 1.0;
-        }
+        self.overlay.render.appearance.range = sanitized_color_range(
+            self.overlay.render.appearance.range,
+            self.overlay.render.appearance.symmetric_range,
+        );
 
         if let Some(brightness_range) = self.overlay.render.appearance.brightness_range.as_mut() {
             if !brightness_range.min.is_finite() || !brightness_range.max.is_finite() {
@@ -5276,9 +5262,7 @@ impl ViewerState {
             .interaction
             .pick
             .and_then(|pick| self.graph_snapshot_for_pick(pick));
-        if snapshot.is_some() {
-            self.graph_snapshot = snapshot;
-        }
+        self.graph_snapshot = snapshot;
         self.view.window.request_redraw();
     }
 
@@ -10317,6 +10301,36 @@ fn float_color_channel(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+// Range validity depends on distinct endpoints, not an absolute epsilon:
+// source estimates routinely use values many orders of magnitude below one.
+fn sanitized_color_range(mut range: ValueRange, symmetric: bool) -> ValueRange {
+    if !range.min.is_finite() || !range.max.is_finite() {
+        return DEFAULT_OVERLAY_RANGE;
+    }
+    if symmetric {
+        let extent = range.min.abs().max(range.max.abs());
+        let extent = if extent > 0.0 { extent } else { 1.0 };
+        return ValueRange {
+            min: -extent,
+            max: extent,
+        };
+    }
+    if range.max < range.min {
+        std::mem::swap(&mut range.min, &mut range.max);
+    }
+    if range.min == range.max {
+        // Include zero for constant nonzero data, preserving its magnitude.
+        if range.min > 0.0 {
+            range.min = 0.0;
+        } else if range.max < 0.0 {
+            range.max = 0.0;
+        } else {
+            range.max = 1.0;
+        }
+    }
+    range
+}
+
 fn range_drag_speed(range: ValueRange) -> f32 {
     let span = (range.max - range.min).abs();
     if span.is_finite() && span > 0.0 {
@@ -10910,6 +10924,72 @@ mod tests {
         assert_eq!(super::scalar_value_label(0.0), "0.0000");
         assert!(super::scalar_value_label(1.2e-10).contains('e'));
         assert!(super::overlay_value_label(Some(-3.4e-8)).contains('e'));
+    }
+
+    #[test]
+    fn tiny_color_ranges_retain_contour_bands() {
+        let (levels, luminances) = super::dataset_contour_levels(
+            &[],
+            ValueRange {
+                min: -2.393e-13,
+                max: 2.393e-13,
+            },
+            super::OverlayColorMap::SpectrumRedToBlue,
+        );
+        assert_eq!(levels.len(), 9);
+        assert!(levels.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(luminances.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn color_ranges_preserve_small_values_and_handle_constant_data() {
+        for extent in [2.393e-13, 1.0e-20, 2.0] {
+            let signed = ValueRange {
+                min: -extent,
+                max: extent,
+            };
+            assert_eq!(super::sanitized_color_range(signed, true), signed);
+            assert_eq!(super::sanitized_color_range(signed, false), signed);
+            let positive = ValueRange {
+                min: 0.0,
+                max: extent,
+            };
+            assert_eq!(super::sanitized_color_range(positive, false), positive);
+            assert_eq!(
+                super::sanitized_color_range(
+                    ValueRange {
+                        min: extent,
+                        max: extent
+                    },
+                    false
+                ),
+                positive
+            );
+            assert_eq!(
+                super::sanitized_color_range(
+                    ValueRange {
+                        min: extent,
+                        max: -extent
+                    },
+                    false
+                ),
+                signed
+            );
+        }
+        for symmetric in [false, true] {
+            let zero = super::sanitized_color_range(ValueRange { min: 0.0, max: 0.0 }, symmetric);
+            assert!(zero.min.is_finite() && zero.max.is_finite() && zero.min < zero.max);
+            assert_eq!(
+                super::sanitized_color_range(
+                    ValueRange {
+                        min: f32::NAN,
+                        max: 1.0
+                    },
+                    symmetric
+                ),
+                super::DEFAULT_OVERLAY_RANGE
+            );
+        }
     }
 
     #[test]

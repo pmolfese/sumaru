@@ -91,7 +91,7 @@ impl ColumnRange {
     }
 
     pub(crate) fn normalized(&self, value: f64) -> f64 {
-        if (self.max - self.min).abs() <= f64::EPSILON {
+        if self.max == self.min {
             0.5
         } else {
             ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
@@ -587,6 +587,24 @@ fn range_step(range: Option<ColumnRange>, value: f64) -> Option<ColumnRange> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tiny_color_ranges_use_the_entire_color_scale() {
+        for extent in [2.393e-13, 1.0e-20, 2.0] {
+            let range = super::ColumnRange {
+                min: -extent,
+                max: extent,
+            };
+            assert_eq!(range.normalized(-extent), 0.0);
+            assert_eq!(range.normalized(0.0), 0.5);
+            assert_eq!(range.normalized(extent), 1.0);
+            assert_eq!(range.normalized(2.0 * extent), 1.0);
+        }
+        assert_eq!(
+            super::ColumnRange { min: 0.0, max: 0.0 }.normalized(0.0),
+            0.5
+        );
+    }
+
     use super::{
         ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds,
     };

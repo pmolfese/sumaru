@@ -284,11 +284,14 @@ A single hemisphere works normally. `-onestate` controls how multiple surface
 geometry files are grouped and is not needed for multiple timecourse
 conditions.
 
-Sparse STC values are smoothed over the full display mesh by default using a
-cached, MNE-style row-normalized upsampling matrix (10 topological steps), so a
+Sparse STC and indexed GIFTI time-series values are smoothed over the full
+display mesh by default using a cached, MNE-style row-normalized upsampling
+matrix (10 topological steps), so a
 low-resolution source estimate can be viewed on the subject's high-resolution
-FreeSurfer or GIFTI geometry without changing vertex numbering. This projection
-is applied only to datasets read from STC files. The advanced hidden flags
+FreeSurfer or GIFTI geometry without changing vertex numbering. The picked-node
+waveform uses the same projection, so clicking a display vertex plots its
+interpolated time course. Unreached vertices use the nearest
+source in their connected mesh component. The advanced hidden flags
 `--stc-sparse` and `--stc-nearest` instead show only source vertices or
 nearest-source patches, respectively.
 

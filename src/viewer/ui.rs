@@ -2601,18 +2601,19 @@ impl ViewerState {
                     .range
                     .min
                     .abs()
-                    .max(self.overlay.render.appearance.range.max.abs())
-                    .max(0.0001);
-                let speed = (extent / 100.0).max(0.001);
+                    .max(self.overlay.render.appearance.range.max.abs());
+                let speed = range_drag_speed(self.overlay.render.appearance.range);
                 if ui
                     .add(
                         egui::DragValue::new(&mut extent)
                             .speed(speed)
-                            .prefix("+/- "),
+                            .prefix("+/- ")
+                            .custom_formatter(|value, _| scalar_value_label(value as f32))
+                            .custom_parser(|text| text.trim().parse::<f64>().ok()),
                     )
                     .changed()
                 {
-                    let extent = extent.abs().max(0.0001);
+                    let extent = extent.abs();
                     self.overlay.render.appearance.range = ValueRange {
                         min: -extent,
                         max: extent,
@@ -2625,14 +2626,18 @@ impl ViewerState {
                     .add(
                         egui::DragValue::new(&mut self.overlay.render.appearance.range.min)
                             .speed(speed)
-                            .prefix("min "),
+                            .prefix("min ")
+                            .custom_formatter(|value, _| scalar_value_label(value as f32))
+                            .custom_parser(|text| text.trim().parse::<f64>().ok()),
                     )
                     .changed();
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut self.overlay.render.appearance.range.max)
                             .speed(speed)
-                            .prefix("max "),
+                            .prefix("max ")
+                            .custom_formatter(|value, _| scalar_value_label(value as f32))
+                            .custom_parser(|text| text.trim().parse::<f64>().ok()),
                     )
                     .changed();
             }

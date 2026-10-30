@@ -328,6 +328,23 @@ impl TimeCourseState {
         )
     }
 
+    /// Evaluate the same spatial operator used by the displayed cursor map.
+    pub(super) fn node_sample_value(
+        &self,
+        condition: usize,
+        node: u32,
+        sample: usize,
+    ) -> Option<f32> {
+        if let Some(projection) = &self.sparse_projection {
+            projection.sample_node(node as usize, |row| {
+                self.condition_sample_value(condition, row, sample)
+            })
+        } else {
+            let dataset = self.condition_dataset(condition)?;
+            self.condition_sample_value(condition, dataset_row_for_node(dataset, node)?, sample)
+        }
+    }
+
     pub(super) fn sample_count(&self) -> usize {
         self.time_columns.len()
     }
@@ -360,6 +377,7 @@ impl TimeCourseState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn sample_value(&self, row: usize, sample: usize) -> Option<f32> {
         let column = self
             .source_dataset
@@ -486,20 +504,19 @@ impl ViewerState {
             conditions.push((overlay.display_text(), dataset));
         }
         let mut timecourse = TimeCourseState::from_conditions(conditions, active)?;
-        let sparse_stc_nodes = timecourse
+        let sparse_source_nodes = timecourse
             .conditions
             .iter()
             .map(|condition| &condition.dataset)
             .find(|dataset| {
-                dataset_is_stc(dataset)
-                    && dataset.is_sparse()
+                dataset.is_sparse()
                     && self
                         .mesh
                         .as_ref()
                         .is_some_and(|mesh| dataset.row_count < mesh.domain.node_count)
             })
             .and_then(|dataset| dataset.node_indices.clone());
-        if let Some(source_nodes) = sparse_stc_nodes {
+        if let Some(source_nodes) = sparse_source_nodes {
             let mesh = self
                 .mesh
                 .as_ref()
@@ -623,7 +640,6 @@ impl ViewerState {
             overlay_dataset_from_canonical_dataset(&dataset, node_count, columns)?;
         let projected = dataset.is_sparse()
             && dataset.row_count < node_count
-            && dataset_is_stc(&dataset)
             && state.sparse_projection.is_some();
         if projected && let Some(projection) = state.sparse_projection.as_ref() {
             node_values = projection.apply(node_values)?;
@@ -1151,6 +1167,17 @@ enum SparseTimecourseProjection {
 }
 
 impl SparseTimecourseProjection {
+    fn sample_node(
+        &self,
+        node: usize,
+        mut source: impl FnMut(usize) -> Option<f32>,
+    ) -> Option<f32> {
+        match self {
+            Self::Smooth(matrix) => matrix.sample_node(node, source),
+            Self::Nearest(projection) => source((*projection.source_for_node.get(node)?)? as usize),
+        }
+    }
+
     fn apply(&self, mut overlay: OverlayDataset) -> Result<OverlayDataset> {
         let project = |values: &[f32]| match self {
             Self::Smooth(matrix) => matrix.apply_dense_seeds(values),
@@ -1239,6 +1266,19 @@ impl SparseUpsamplingMatrix {
             rows = next;
         }
 
+        // Ten smoothing steps normally cover the mesh. Fill any remaining
+        // reachable vertices without mixing disconnected hemispheres.
+        if rows.iter().any(Vec::is_empty) {
+            let nearest = NearestSourceProjection::build(neighbors, source_nodes)?;
+            for (row, source) in rows.iter_mut().zip(nearest.source_for_node) {
+                if row.is_empty()
+                    && let Some(source) = source
+                {
+                    row.push((source, 1.0));
+                }
+            }
+        }
+
         let mut row_offsets = Vec::with_capacity(rows.len() + 1);
         let mut column_indices = Vec::new();
         let mut weights = Vec::new();
@@ -1256,6 +1296,23 @@ impl SparseUpsamplingMatrix {
         })
     }
 
+    fn sample_node(
+        &self,
+        node: usize,
+        mut source: impl FnMut(usize) -> Option<f32>,
+    ) -> Option<f32> {
+        let start = *self.row_offsets.get(node)?;
+        let end = *self.row_offsets.get(node + 1)?;
+        if start == end {
+            return None;
+        }
+        let mut value = 0.0;
+        for entry in start..end {
+            value += source(self.column_indices[entry] as usize)? * self.weights[entry];
+        }
+        value.is_finite().then_some(value)
+    }
+
     fn apply_dense_seeds(&self, values: &[f32]) -> Result<Vec<f32>> {
         ensure!(
             values.len() + 1 == self.row_offsets.len(),
@@ -1270,16 +1327,9 @@ impl SparseUpsamplingMatrix {
             .collect::<Vec<_>>();
         let mut output = vec![f32::NAN; values.len()];
         for (node, slot) in output.iter_mut().enumerate() {
-            let start = self.row_offsets[node];
-            let end = self.row_offsets[node + 1];
-            if start == end {
-                continue;
-            }
-            let mut value = 0.0;
-            for entry in start..end {
-                value += source_values[self.column_indices[entry] as usize] * self.weights[entry];
-            }
-            *slot = value;
+            *slot = self
+                .sample_node(node, |row| Some(source_values[row]))
+                .unwrap_or(f32::NAN);
         }
         Ok(output)
     }
@@ -1368,6 +1418,107 @@ fn dense_timecourse_render_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smoothing_matches_mne_ten_step_reference() {
+        // MNE _surf_upsampling_mat([0, 4], adjacency + identity, 10).
+        let neighbors = vec![vec![1], vec![0, 2], vec![1, 3], vec![2, 4], vec![3]];
+        let matrix = SparseUpsamplingMatrix::build(&neighbors, &[0, 4], 10).unwrap();
+        let result = matrix
+            .apply_dense_seeds(&[1.0, f32::NAN, f32::NAN, f32::NAN, 0.0])
+            .unwrap();
+        for (actual, expected) in
+            result
+                .into_iter()
+                .zip([0.6395408236, 0.5930272157, 0.5, 0.4069727843, 0.3604591764])
+        {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn picked_waveforms_match_projected_maps_for_all_conditions_and_baselines() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let make_dataset = || {
+            Dataset::sparse(
+                DatasetKind::SurfaceTimeSeries,
+                &domain,
+                vec![0, 2],
+                event_locked_dataset().columns,
+            )
+            .unwrap()
+            .with_time_start_seconds(Some(-0.1))
+            .with_time_step_seconds(Some(0.1))
+        };
+        let mut state = TimeCourseState::from_conditions(
+            vec![("A".into(), make_dataset()), ("B".into(), make_dataset())],
+            0,
+        )
+        .unwrap();
+        state.controls.baseline_end = 1;
+        for condition in &mut state.conditions {
+            condition.baseline_stats =
+                baseline_statistics(&condition.dataset, &condition.time_columns, 0, 1);
+        }
+        state.baseline_stats = state.conditions[0].baseline_stats.clone();
+        let neighbors = vec![vec![1], vec![0, 2], vec![1]];
+        for projection in [
+            SparseTimecourseProjection::Smooth(
+                SparseUpsamplingMatrix::build(&neighbors, &[0, 2], 2).unwrap(),
+            ),
+            SparseTimecourseProjection::Nearest(
+                NearestSourceProjection::build(&neighbors, &[0, 2]).unwrap(),
+            ),
+        ] {
+            state.sparse_projection = Some(projection);
+            for baseline in [
+                TimeCourseBaseline::Raw,
+                TimeCourseBaseline::SubtractMean,
+                TimeCourseBaseline::ZScore,
+            ] {
+                state.controls.baseline = baseline;
+                for condition in 0..2 {
+                    for sample in 0..state.sample_count() {
+                        let seeds = vec![
+                            state.condition_sample_value(condition, 0, sample).unwrap(),
+                            f32::NAN,
+                            state.condition_sample_value(condition, 1, sample).unwrap(),
+                        ];
+                        let overlay = OverlayDataset {
+                            range: ValueRange::from_values(&seeds).unwrap(),
+                            values: seeds,
+                            threshold_values: None,
+                        };
+                        let projected = state
+                            .sparse_projection
+                            .as_ref()
+                            .unwrap()
+                            .apply(overlay)
+                            .unwrap();
+                        for node in 0..3 {
+                            assert_eq!(
+                                state.node_sample_value(condition, node, sample),
+                                Some(projected.values[node as usize])
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        state.sparse_projection = None;
+        assert_eq!(state.node_sample_value(0, 1, 0), None);
+    }
+
+    #[test]
+    fn smoothing_fills_reachable_nodes_but_not_disconnected_components() {
+        let neighbors = vec![vec![1], vec![0, 2], vec![1, 3], vec![2], vec![]];
+        let matrix = SparseUpsamplingMatrix::build(&neighbors, &[0], 1).unwrap();
+        let projected = matrix
+            .apply_dense_seeds(&[2.0, f32::NAN, f32::NAN, f32::NAN, f32::NAN])
+            .unwrap();
+        assert_eq!(&projected[..4], &[2.0; 4]);
+        assert!(projected[4].is_nan());
+    }
 
     #[test]
     fn sparse_smoothing_spreads_values_over_mesh_neighbors() {
