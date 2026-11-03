@@ -116,6 +116,26 @@ impl ColorMap {
         Self::Continuous(ContinuousColorMap::blue_white_red())
     }
 
+    /// Sequential absolute-amplitude palette: black, red, yellow, white.
+    pub fn hot() -> Self {
+        Self::Continuous(ContinuousColorMap {
+            name: "hot".into(),
+            stops: [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, [r, g, b])| ColorStop {
+                position: index as f32 / 3.0,
+                color: Rgba::new_unchecked(r, g, b, 1.0),
+            })
+            .collect(),
+        })
+    }
+
     pub fn fire() -> Self {
         Self::Continuous(ContinuousColorMap::fire())
     }

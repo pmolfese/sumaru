@@ -269,6 +269,7 @@ pub(super) enum OverlayColorMap {
     AfniP2Spanned,
     BlueWhiteRed,
     Fire,
+    Hot,
     Grayscale,
 }
 
@@ -1101,7 +1102,7 @@ impl OverlayAppearance {
 }
 
 impl OverlayColorMap {
-    pub(super) const ALL: [Self; 15] = [
+    pub(super) const ALL: [Self; 16] = [
         Self::DiscreteLabels,
         Self::AmberMonochrome,
         Self::SpectrumRedToBlue,
@@ -1116,6 +1117,7 @@ impl OverlayColorMap {
         Self::AfniP2Spanned,
         Self::BlueWhiteRed,
         Self::Fire,
+        Self::Hot,
         Self::Grayscale,
     ];
 
@@ -1135,6 +1137,7 @@ impl OverlayColorMap {
             Self::AfniP2Spanned => "afni_p2spanned",
             Self::BlueWhiteRed => "blue-white-red",
             Self::Fire => "nih_fire",
+            Self::Hot => "hot",
             Self::Grayscale => "grayscale",
         }
     }
@@ -1155,6 +1158,7 @@ impl OverlayColorMap {
             Self::AfniP2Spanned => Some(ColorMap::afni_p2_spanned()),
             Self::BlueWhiteRed => Some(ColorMap::blue_white_red()),
             Self::Fire => Some(ColorMap::fire()),
+            Self::Hot => Some(ColorMap::hot()),
             Self::Grayscale => Some(ColorMap::grayscale()),
         }
     }

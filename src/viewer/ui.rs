@@ -2141,6 +2141,7 @@ impl ViewerState {
                                 &mut self.overlay.render.appearance.threshold.absolute,
                                 "Abs",
                             )
+                            .on_hover_text("Compare absolute values to the threshold; does not change displayed amplitudes.")
                             .changed();
                     });
                     if self.overlay.render.appearance.transparent_threshold {

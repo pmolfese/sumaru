@@ -28,6 +28,22 @@ pub enum TimeCourseBaseline {
     ZScore,
 }
 
+/// Display amplitude independently of baseline correction and threshold comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeCourseAmplitude {
+    Signed,
+    Magnitude,
+}
+
+impl TimeCourseAmplitude {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Signed => "Signed",
+            Self::Magnitude => "Magnitude",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeCourseScale {
     AutoRobust,
@@ -63,6 +79,14 @@ pub enum TimeCourseMeasure {
 }
 
 impl TimeCourseMeasure {
+    fn display_label(self, amplitude: TimeCourseAmplitude) -> &'static str {
+        if self == Self::PositivePeak && amplitude == TimeCourseAmplitude::Magnitude {
+            "Peak magnitude"
+        } else {
+            self.label()
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Mean => "Mean",
@@ -83,6 +107,7 @@ pub struct TimeCourseControls {
     pub response_end: usize,
     pub display: TimeCourseDisplay,
     pub baseline: TimeCourseBaseline,
+    pub amplitude: TimeCourseAmplitude,
     pub scale: TimeCourseScale,
     pub measure: TimeCourseMeasure,
     pub threshold_enabled: bool,
@@ -216,6 +241,7 @@ impl TimeCourseState {
             } else {
                 TimeCourseBaseline::Raw
             },
+            amplitude: TimeCourseAmplitude::Signed,
             scale: TimeCourseScale::AutoRobust,
             measure: TimeCourseMeasure::PositivePeak,
             threshold_enabled: false,
@@ -258,7 +284,7 @@ impl TimeCourseState {
             });
         }
         let (cursor_full_range, cursor_robust_range) =
-            timecourse_condition_ranges(&conditions, controls.baseline)?;
+            timecourse_condition_ranges(&conditions, controls.baseline, controls.amplitude)?;
         let active = &conditions[active_condition];
         Ok(Self {
             source_dataset: active.dataset.clone(),
@@ -325,6 +351,7 @@ impl TimeCourseState {
             value,
             *condition.baseline_stats.get(row)?,
             self.controls.baseline,
+            self.controls.amplitude,
         )
     }
 
@@ -385,7 +412,12 @@ impl TimeCourseState {
             .get(*self.time_columns.get(sample)?)?;
         let value = numeric_column_value_as_f32(column, row)?;
         let stats = *self.baseline_stats.get(row)?;
-        let value = transform_timecourse_value(value, stats, self.controls.baseline)?;
+        let value = transform_timecourse_value(
+            value,
+            stats,
+            self.controls.baseline,
+            self.controls.amplitude,
+        )?;
         value.is_finite().then_some(value)
     }
 
@@ -401,6 +433,11 @@ impl TimeCourseState {
     }
 
     fn sanitize_controls(&self, controls: &mut TimeCourseControls) {
+        if controls.amplitude == TimeCourseAmplitude::Magnitude
+            && controls.measure == TimeCourseMeasure::NegativePeak
+        {
+            controls.measure = TimeCourseMeasure::PositivePeak;
+        }
         let last = self.sample_count() - 1;
         controls.cursor = controls.cursor.min(last);
         controls.baseline_start = controls.baseline_start.min(last);
@@ -446,16 +483,12 @@ impl TimeCourseState {
             }
             TimeCourseDisplay::Window => format!(
                 "{} {:.1}..{:.1} ms",
-                self.controls.measure.label(),
+                self.controls.measure.display_label(self.controls.amplitude),
                 self.sample_time(self.controls.response_start) * 1000.0,
                 self.sample_time(self.controls.response_end) * 1000.0
             ),
         };
-        let units = self
-            .source_dataset
-            .columns
-            .get(self.time_columns[0])
-            .and_then(|column| column.units.clone());
+        let units = self.display_units();
         let column = DataColumn::new(
             label,
             ColumnRole::Intensity,
@@ -472,6 +505,16 @@ impl TimeCourseState {
             time_start_seconds: None,
             parent_ids: self.source_dataset.parent_ids.clone(),
         })
+    }
+
+    fn display_units(&self) -> Option<String> {
+        if self.controls.baseline == TimeCourseBaseline::ZScore {
+            return Some("z-score".to_string());
+        }
+        self.source_dataset
+            .columns
+            .get(self.time_columns[0])
+            .and_then(|column| column.units.clone())
     }
 }
 
@@ -576,7 +619,8 @@ impl ViewerState {
         state.sanitize_controls(&mut controls);
         let baseline_window_changed = controls.baseline_start != state.controls.baseline_start
             || controls.baseline_end != state.controls.baseline_end;
-        let baseline_transform_changed = controls.baseline != state.controls.baseline;
+        let baseline_transform_changed = controls.baseline != state.controls.baseline
+            || controls.amplitude != state.controls.amplitude;
         let starting_playback = controls.playing && !state.controls.playing;
         state.controls = controls;
         if baseline_window_changed {
@@ -594,8 +638,11 @@ impl ViewerState {
             state.cursor_scale_dirty = true;
         }
         if baseline_transform_changed || (recompute_scale && state.cursor_scale_dirty) {
-            (state.cursor_full_range, state.cursor_robust_range) =
-                timecourse_condition_ranges(&state.conditions, state.controls.baseline)?;
+            (state.cursor_full_range, state.cursor_robust_range) = timecourse_condition_ranges(
+                &state.conditions,
+                state.controls.baseline,
+                state.controls.amplitude,
+            )?;
             state.cursor_scale_dirty = false;
         }
         if starting_playback {
@@ -647,6 +694,12 @@ impl ViewerState {
         let range = node_values.range;
         let display_range = match controls.display {
             TimeCourseDisplay::Cursor => state.cursor_color_range(),
+            TimeCourseDisplay::Window if controls.amplitude == TimeCourseAmplitude::Magnitude => {
+                ValueRange {
+                    min: 0.0,
+                    max: range.max,
+                }
+            }
             TimeCourseDisplay::Window => symmetric_value_range(range),
         };
 
@@ -662,7 +715,10 @@ impl ViewerState {
         };
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.overlay.source.label_table = None;
-        self.overlay.render.appearance.colormap = OverlayColorMap::SpectrumRedToBlue;
+        self.overlay.render.appearance.colormap = match controls.amplitude {
+            TimeCourseAmplitude::Signed => OverlayColorMap::SpectrumRedToBlue,
+            TimeCourseAmplitude::Magnitude => OverlayColorMap::Hot,
+        };
         self.overlay.render.appearance.range = display_range;
         self.overlay.render.appearance.symmetric_range =
             display_range.min < 0.0 && display_range.max > 0.0;
@@ -747,6 +803,19 @@ impl ViewerState {
                             .changed();
                     }
                 });
+            egui::ComboBox::from_id_salt("tc_amplitude")
+                .selected_text(controls.amplitude.label())
+                .show_ui(ui, |ui| {
+                    for choice in [TimeCourseAmplitude::Signed, TimeCourseAmplitude::Magnitude] {
+                        changed |= ui
+                            .selectable_value(&mut controls.amplitude, choice, choice.label())
+                            .changed();
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Absolute amplitude after the selected baseline transformation; not power.",
+                );
             egui::ComboBox::from_id_salt("tc_scale")
                 .selected_text(controls.scale.label())
                 .show_ui(ui, |ui| {
@@ -830,7 +899,7 @@ impl ViewerState {
 
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("tc_measure")
-                .selected_text(controls.measure.label())
+                .selected_text(controls.measure.display_label(controls.amplitude))
                 .show_ui(ui, |ui| {
                     for choice in [
                         TimeCourseMeasure::Mean,
@@ -839,9 +908,19 @@ impl ViewerState {
                         TimeCourseMeasure::AbsolutePeak,
                         TimeCourseMeasure::AreaUnderCurve,
                     ] {
-                        changed |= ui
-                            .selectable_value(&mut controls.measure, choice, choice.label())
-                            .changed();
+                        ui.add_enabled_ui(
+                            controls.amplitude != TimeCourseAmplitude::Magnitude
+                                || choice != TimeCourseMeasure::NegativePeak,
+                            |ui| {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut controls.measure,
+                                        choice,
+                                        choice.display_label(controls.amplitude),
+                                    )
+                                    .changed();
+                            },
+                        );
                     }
                 });
             changed |= ui
@@ -885,6 +964,14 @@ impl ViewerState {
         }
 
         ui.add_space(3.0);
+        ui.label(format!(
+            "{} amplitude{}",
+            controls.amplitude.label(),
+            state
+                .display_units()
+                .map(|units| format!(" ({units})"))
+                .unwrap_or_default()
+        ));
         if let Some(snapshot) = self.graph_snapshot.as_ref() {
             if let Some(interaction) = draw_graph_snapshot(
                 ui,
@@ -954,7 +1041,9 @@ fn timecourse_values(
         .map(|row| {
             let stats = baseline_stats[row];
             let transform = |value: Option<f32>| {
-                value.and_then(|value| transform_timecourse_value(value, stats, controls.baseline))
+                value.and_then(|value| {
+                    transform_timecourse_value(value, stats, controls.baseline, controls.amplitude)
+                })
             };
 
             if controls.display == TimeCourseDisplay::Cursor {
@@ -977,6 +1066,7 @@ fn transform_timecourse_value(
     value: f32,
     stats: BaselineStats,
     baseline: TimeCourseBaseline,
+    amplitude: TimeCourseAmplitude,
 ) -> Option<f32> {
     let value = match baseline {
         TimeCourseBaseline::Raw => value,
@@ -988,12 +1078,17 @@ fn transform_timecourse_value(
             (value - stats.mean) / standard_deviation
         }
     };
+    let value = match amplitude {
+        TimeCourseAmplitude::Signed => value,
+        TimeCourseAmplitude::Magnitude => value.abs(),
+    };
     value.is_finite().then_some(value)
 }
 
 fn timecourse_condition_ranges(
     conditions: &[TimeCourseCondition],
     baseline: TimeCourseBaseline,
+    amplitude: TimeCourseAmplitude,
 ) -> Result<(ValueRange, ValueRange)> {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
@@ -1014,7 +1109,9 @@ fn timecourse_condition_ranges(
             for column_index in &condition.time_columns {
                 let Some(value) =
                     numeric_column_value_as_f32(&condition.dataset.columns[*column_index], row)
-                        .and_then(|value| transform_timecourse_value(value, stats, baseline))
+                        .and_then(|value| {
+                            transform_timecourse_value(value, stats, baseline, amplitude)
+                        })
                 else {
                     continue;
                 };
@@ -1031,6 +1128,15 @@ fn timecourse_condition_ranges(
     let robust_extent = nearest_rank_percentile(&mut magnitudes, 0.995)
         .filter(|extent| *extent > 0.0)
         .unwrap_or_else(|| min.abs().max(max.abs()).max(1.0));
+    if amplitude == TimeCourseAmplitude::Magnitude {
+        return Ok((
+            ValueRange { min: 0.0, max },
+            ValueRange {
+                min: 0.0,
+                max: robust_extent,
+            },
+        ));
+    }
     Ok((
         timecourse_color_range(min, max, min.abs().max(max.abs())),
         timecourse_color_range(min, max, robust_extent),
@@ -1420,6 +1526,154 @@ mod tests {
     use super::*;
 
     #[test]
+    fn magnitude_follows_baseline_without_changing_signed_results() {
+        let stats = BaselineStats {
+            mean: 1.0,
+            standard_deviation: Some(2.0),
+        };
+        let samples = [-3.0, -1.0, 0.0, 2.0];
+        for (baseline, signed) in [
+            (TimeCourseBaseline::Raw, samples),
+            (TimeCourseBaseline::SubtractMean, [-4.0, -2.0, -1.0, 1.0]),
+            (TimeCourseBaseline::ZScore, [-2.0, -1.0, -0.5, 0.5]),
+        ] {
+            for (value, expected) in samples.into_iter().zip(signed) {
+                assert_eq!(
+                    transform_timecourse_value(value, stats, baseline, TimeCourseAmplitude::Signed),
+                    Some(expected)
+                );
+                assert_eq!(
+                    transform_timecourse_value(
+                        value,
+                        stats,
+                        baseline,
+                        TimeCourseAmplitude::Magnitude
+                    ),
+                    Some(expected.abs())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn magnitude_maps_graphs_ranges_and_summaries_share_source_transformation() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let make_dataset = |scale: f32| {
+            Dataset::sparse(
+                DatasetKind::SurfaceTimeSeries,
+                &domain,
+                vec![0, 2],
+                [[-3.0, 3.0], [-1.0, 1.0], [0.0, 0.0], [2.0, -2.0]]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, values)| {
+                        DataColumn::new(
+                            index.to_string(),
+                            ColumnRole::TimePoint,
+                            Some("nAm".into()),
+                            ColumnData::Float32(values.map(|x| x * scale).to_vec()),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let mut state = TimeCourseState::from_conditions(
+            vec![
+                ("A".into(), make_dataset(1.0)),
+                ("B".into(), make_dataset(10.0)),
+            ],
+            0,
+        )
+        .unwrap();
+        let originals = state
+            .conditions
+            .iter()
+            .map(|c| c.dataset.clone())
+            .collect::<Vec<_>>();
+        state.sparse_projection = Some(SparseTimecourseProjection::Smooth(
+            SparseUpsamplingMatrix::build(&[vec![1], vec![0, 2], vec![1]], &[0, 2], 1).unwrap(),
+        ));
+        state.controls.baseline = TimeCourseBaseline::Raw;
+        for amplitude in [
+            TimeCourseAmplitude::Signed,
+            TimeCourseAmplitude::Magnitude,
+            TimeCourseAmplitude::Signed,
+        ] {
+            state.controls.amplitude = amplitude;
+            let (full, robust) =
+                timecourse_condition_ranges(&state.conditions, state.controls.baseline, amplitude)
+                    .unwrap();
+            assert_eq!(
+                full,
+                ValueRange {
+                    min: if amplitude == TimeCourseAmplitude::Signed {
+                        -30.0
+                    } else {
+                        0.0
+                    },
+                    max: 30.0
+                }
+            );
+            assert_eq!(robust, full);
+            for condition in 0..2 {
+                state.activate_condition(condition).unwrap();
+                for sample in 0..4 {
+                    state.controls.cursor = sample;
+                    let display = state.display_dataset().unwrap();
+                    let overlay = overlay_dataset_from_canonical_dataset(
+                        &display,
+                        3,
+                        OverlayColumnSelections::default(),
+                    )
+                    .unwrap();
+                    let projected = state
+                        .sparse_projection
+                        .as_ref()
+                        .unwrap()
+                        .apply(overlay)
+                        .unwrap();
+                    for node in 0..3 {
+                        assert_eq!(
+                            state.node_sample_value(condition, node, sample),
+                            Some(projected.values[node as usize])
+                        );
+                    }
+                }
+                let expected = if amplitude == TimeCourseAmplitude::Signed {
+                    0.0
+                } else {
+                    3.0 * if condition == 0 { 1.0 } else { 10.0 }
+                };
+                assert_eq!(state.node_sample_value(condition, 1, 0), Some(expected));
+            }
+        }
+        state.activate_condition(0).unwrap();
+        state.controls.amplitude = TimeCourseAmplitude::Magnitude;
+        state.controls.display = TimeCourseDisplay::Window;
+        state.controls.response_start = 0;
+        state.controls.response_end = 3;
+        state.controls.measure = TimeCourseMeasure::Mean;
+        assert_eq!(
+            state.display_dataset().unwrap().columns[0].values,
+            ColumnData::Float32(vec![1.5, 1.5])
+        );
+        state.controls.threshold_absolute = false;
+        let before = state.display_dataset().unwrap();
+        state.controls.threshold_absolute = true;
+        assert_eq!(state.display_dataset().unwrap(), before);
+        let mut controls = state.controls.clone();
+        controls.measure = TimeCourseMeasure::NegativePeak;
+        state.sanitize_controls(&mut controls);
+        assert_eq!(controls.measure, TimeCourseMeasure::PositivePeak);
+        for (condition, original) in state.conditions.iter().zip(&originals) {
+            assert_eq!(&condition.dataset, original);
+        }
+        assert_eq!(state.source_dataset, originals[0]);
+    }
+
+    #[test]
     fn smoothing_matches_mne_ten_step_reference() {
         // MNE _surf_upsampling_mat([0, 4], adjacency + identity, 10).
         let neighbors = vec![vec![1], vec![0, 2], vec![1, 3], vec![2, 4], vec![3]];
@@ -1471,12 +1725,18 @@ mod tests {
             ),
         ] {
             state.sparse_projection = Some(projection);
-            for baseline in [
+            for (baseline, amplitude) in [
                 TimeCourseBaseline::Raw,
                 TimeCourseBaseline::SubtractMean,
                 TimeCourseBaseline::ZScore,
-            ] {
+            ]
+            .into_iter()
+            .flat_map(|baseline| {
+                [TimeCourseAmplitude::Signed, TimeCourseAmplitude::Magnitude]
+                    .map(|amplitude| (baseline, amplitude))
+            }) {
                 state.controls.baseline = baseline;
+                state.controls.amplitude = amplitude;
                 for condition in 0..2 {
                     for sample in 0..state.sample_count() {
                         let seeds = vec![
@@ -1652,6 +1912,7 @@ mod tests {
                 standard_deviation: Some(2.0e-11),
             },
             TimeCourseBaseline::ZScore,
+            TimeCourseAmplitude::Signed,
         )
         .unwrap();
 
