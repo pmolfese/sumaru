@@ -234,6 +234,27 @@ to reconstruct q-values while loading; the default is `NO`. Treat this as a view
 convenience rather than a statistics package: it is meant to help inspect the
 data you already understand.
 
+The **Color range** controls set the intensity values mapped to the bottom and
+top of a continuous colorbar. Right-click the colorbar for **Set range…**,
+**Fit to data**, **Robust 2–98%**, or **Symmetric about zero**. Fit uses the full
+range of the selected intensity column; Robust uses its finite samples'
+nearest-rank percentiles, including zeros. With symmetry enabled, either preset
+expands to equal negative and positive endpoints.
+
+Click a range value to enter a number, scientific notation such as `1e-9`, or a
+percentile such as `2%` or `98%`; drag it for small adjustments. Manual edits and
+presets enable **Lock range for this dataset**, preserving the range across
+intensity-column changes and timecourse playback. Each loaded overlay remembers
+its range and lock during the session. Unlock to resume automatic ranges on the
+next column or timecourse update; choosing a different timecourse scale also
+resumes automatic scaling. Timecourse presets use the currently displayed
+intensity column and hold that range during playback.
+
+Color range changes affect display colors only; the threshold slider stays
+independent. Values outside the range use the endpoint colors. Discrete label
+palettes keep their fixed colors. The colorbar shows its endpoints, which are
+also included in exported `_cmap` screenshot legends.
+
 Opening another overlay adds it to the overlay workbench and makes it active.
 Use the dataset selector or Control-PageUp/Control-PageDown to switch between
 loaded overlays; only the active overlay is rendered. Reopening an existing

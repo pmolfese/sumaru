@@ -91,7 +91,7 @@ impl ColumnRange {
     }
 
     pub(crate) fn normalized(&self, value: f64) -> f64 {
-        if (self.max - self.min).abs() <= f64::EPSILON {
+        if self.max == self.min {
             0.5
         } else {
             ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)

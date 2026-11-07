@@ -108,7 +108,28 @@ impl ViewerState {
         let height = base.height.max(1);
         let bar_width = (base.width / 25).clamp(20, 60);
         let left_margin = bar_width / 2;
-        let right_margin = bar_width;
+        let range = self.overlay.render.appearance.range;
+        let labels = [
+            color_range::endpoint_label(range.max),
+            color_range::endpoint_label(range.min),
+        ];
+        let label_scale = (height / 300).clamp(1, 4);
+        let right_margin = if self
+            .overlay
+            .render
+            .appearance
+            .colormap
+            .uses_continuous_range()
+        {
+            labels
+                .iter()
+                .map(|text| text.len() as u32 * 4 * label_scale)
+                .max()
+                .unwrap_or(0)
+                + 12
+        } else {
+            bar_width
+        };
         let panel_width = left_margin + bar_width + right_margin;
 
         let vertical_margin = (height / 12).max(4).min(height / 2);
@@ -161,8 +182,29 @@ impl ViewerState {
             set_pixel(frame_right, y, border);
         }
 
-        ScreenshotImage::new(panel_width, height, rgba)
-            .expect("colorbar panel dimensions match its buffer")
+        let mut image = ScreenshotImage::new(panel_width, height, rgba)
+            .expect("colorbar panel dimensions match its buffer");
+        if self
+            .overlay
+            .render
+            .appearance
+            .colormap
+            .uses_continuous_range()
+        {
+            for (text, y) in [
+                (&labels[0], bar_top),
+                (&labels[1], bar_bottom.saturating_sub(5 * label_scale)),
+            ] {
+                screenshot::draw_numeric_label(
+                    &mut image,
+                    text,
+                    [frame_right + 6, y],
+                    label_scale,
+                    border,
+                );
+            }
+        }
+        image
     }
 
     /// Capture the single-surface left/right/top/bottom montage.

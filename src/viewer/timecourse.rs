@@ -561,6 +561,9 @@ impl ViewerState {
             || controls.baseline_end != state.controls.baseline_end;
         let baseline_transform_changed = controls.baseline != state.controls.baseline;
         let starting_playback = controls.playing && !state.controls.playing;
+        if controls.scale != state.controls.scale {
+            self.overlay.render.appearance.range_locked = false;
+        }
         state.controls = controls;
         if baseline_window_changed {
             for condition in &mut state.conditions {
@@ -647,9 +650,11 @@ impl ViewerState {
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.overlay.source.label_table = None;
         self.overlay.render.appearance.colormap = OverlayColorMap::SpectrumRedToBlue;
-        self.overlay.render.appearance.range = display_range;
-        self.overlay.render.appearance.symmetric_range =
-            display_range.min < 0.0 && display_range.max > 0.0;
+        color_range::apply_automatic_range(
+            &mut self.overlay.render.appearance,
+            display_range,
+            Some(display_range.min < 0.0 && display_range.max > 0.0),
+        );
         self.overlay.render.appearance.threshold = OverlayThreshold {
             enabled: controls.threshold_enabled,
             absolute: controls.threshold_absolute,

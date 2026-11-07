@@ -1521,6 +1521,39 @@ mod tests {
     }
 
     #[test]
+    fn tiny_manual_color_ranges_use_full_colormap_and_clamp_endpoints() {
+        let domain = SurfaceDomain::from_triangles(5, vec![[0, 1, 2], [2, 3, 4]]).unwrap();
+        let dataset = Dataset::dense(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![
+                DataColumn::new(
+                    "tiny",
+                    ColumnRole::Intensity,
+                    None,
+                    ColumnData::Float64(vec![-2e-20, -1e-20, 0.0, 1e-20, 2e-20]),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut overlay = Overlay::from_dataset(&dataset, &domain, OverlayColumns::new(0))
+            .unwrap()
+            .with_intensity_range(RangeSelection::Manual(ColumnRange {
+                min: -1e-20,
+                max: 1e-20,
+            }));
+        overlay.rebuild_color_cache(&dataset, &domain).unwrap();
+        let colors = &overlay.color_cache.colors;
+        assert_eq!(colors[0], colors[1]);
+        assert_eq!(colors[3], colors[4]);
+        assert_ne!(colors[1], colors[2]);
+        assert_ne!(colors[2], colors[3]);
+        assert_ne!(colors[1], colors[3]);
+        assert!(colors.iter().all(|color| color[3] > 0.0));
+    }
+
+    #[test]
     fn overlay_can_clip_outside_manual_intensity_range() {
         let domain = triangle_domain();
         let dataset = scalar_dataset(&domain);

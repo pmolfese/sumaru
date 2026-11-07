@@ -114,6 +114,17 @@ This is the completed-work ledger for `sumaru`. The active to-do plan lives in
 
 ## Viewer, Controllers, And Interaction
 
+- [x] Added visible **Color range** controls and a right-click colorbar menu
+  with manual endpoint editing, full-data fitting, robust 2–98% fitting, and
+  symmetry about zero. Endpoint entry supports scientific notation and
+  percentiles; drag precision and color normalization preserve tiny values.
+  Manual edits lock ranges per dataset across column switches and timecourse
+  playback, while overlay switching preserves each overlay's settings.
+  The threshold remains independent, discrete palettes stay fixed, and
+  exported screenshot colorbars include numeric endpoint labels.
+  See [SUMA controller range controls](https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/SUMA/Controllers.html)
+  for the reference behavior.
+
 - [x] Built a desktop viewer using `winit` for windowing and `wgpu` for
   rendering.
 - [x] Rendered a single GIFTI mesh in a native window.
