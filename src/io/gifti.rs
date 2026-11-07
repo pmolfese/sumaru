@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! GIFTI surface-dataset loading: turning a `gifti-rs` image into sumaru's
 //! domain `Dataset`, including intent-name normalization and the
 //! NIFTI-intent -> column-role / stat metadata mapping.

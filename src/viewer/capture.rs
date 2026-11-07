@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! Screenshot and montage capture on `ViewerState`: saving the current view,
 //! preset montages, the colorbar companion image, camera framing, and offscreen
 //! surface capture. Extracted from `viewer/mod.rs`. Distinct from

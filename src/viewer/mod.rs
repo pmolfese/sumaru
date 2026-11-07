@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -10098,67 +10107,71 @@ fn vertical_threshold_bar(
     let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
     let mut value = appearance.threshold.value;
     let mut range_changed = false;
+    let continuous = appearance.colormap.uses_continuous_range();
     let response = ui
-        .horizontal(|ui| {
-            // Keep the color reference separate from the standard egui slider,
-            // as in afniru. Scope the slider length to this control.
-            let continuous = appearance.colormap.uses_continuous_range();
-            let (rect, bar_response) = ui.allocate_exact_size(
-                egui::vec2(64.0, OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS),
-                egui::Sense::click(),
-            );
-            bar_response.on_hover_text(if continuous {
-                "Color range: right-click to edit. The adjacent slider controls threshold separately."
-            } else {
-                "Discrete label palette (fixed colors)"
-            }).context_menu(|ui| {
-                ui.add_enabled_ui(continuous, |ui| {
-                    ui.menu_button("Set range…", |ui| {
-                        range_changed |= color_range::draw_range_editor(ui, appearance, intensity_column);
-                    });
-                    range_changed |= color_range::draw_range_presets(ui, appearance, intensity_column);
-                    if ui.checkbox(&mut appearance.symmetric_range, "Symmetric about zero").changed() {
-                        appearance.range_locked = true;
-                        color_range::sanitize_color_range(appearance);
-                        range_changed = true;
-                    }
-                });
-            });
-            let painter = ui.painter_at(rect);
-            for step in 0..80 {
-                let t0 = step as f32 / 80.0;
-                let t1 = (step + 1) as f32 / 80.0;
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(rect.left(), rect.bottom() - rect.height() * t1),
-                        egui::pos2(rect.right(), rect.bottom() - rect.height() * t0),
-                    ),
-                    0,
-                    color32_from_rgba(sample_colormap(appearance.colormap, (t0 + t1) * 0.5)),
+        .vertical(|ui| {
+            if continuous {
+                ui.label(
+                    egui::RichText::new(color_range::endpoint_label(appearance.range.max))
+                        .monospace()
+                        .size(10.0),
                 );
             }
+            let response = ui
+                .horizontal(|ui| {
+                    // Keep the color reference separate from the standard egui slider,
+                    // as in afniru. Scope the slider length to this control.
+                    let (rect, bar_response) = ui.allocate_exact_size(
+                        egui::vec2(22.0, OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS),
+                        egui::Sense::click(),
+                    );
+                    bar_response.on_hover_text(if continuous {
+                        "Color range: right-click to edit. The adjacent slider controls threshold separately."
+                    } else {
+                        "Discrete label palette (fixed colors)"
+                    }).context_menu(|ui| {
+                        ui.add_enabled_ui(continuous, |ui| {
+                            ui.menu_button("Set range…", |ui| {
+                                range_changed |= color_range::draw_range_editor(ui, appearance, intensity_column);
+                            });
+                            range_changed |= color_range::draw_range_presets(ui, appearance, intensity_column);
+                            if ui.checkbox(&mut appearance.symmetric_range, "Symmetric about zero").changed() {
+                                appearance.range_locked = true;
+                                color_range::sanitize_color_range(appearance);
+                                range_changed = true;
+                            }
+                        });
+                    });
+                    let painter = ui.painter_at(rect);
+                    for step in 0..80 {
+                        let t0 = step as f32 / 80.0;
+                        let t1 = (step + 1) as f32 / 80.0;
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.left(), rect.bottom() - rect.height() * t1),
+                                egui::pos2(rect.right(), rect.bottom() - rect.height() * t0),
+                            ),
+                            0,
+                            color32_from_rgba(sample_colormap(appearance.colormap, (t0 + t1) * 0.5)),
+                        );
+                    }
+                    ui.spacing_mut().slider_width = OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS;
+                    ui.add(
+                        egui::Slider::new(&mut value, min..=max)
+                            .vertical()
+                            .show_value(false),
+                    )
+                    .on_hover_text("Threshold")
+                })
+                .inner;
             if continuous {
-                for (y, value, anchor) in [
-                    (rect.top(), appearance.range.max, egui::Align2::LEFT_TOP),
-                    (rect.bottom(), appearance.range.min, egui::Align2::LEFT_BOTTOM),
-                ] {
-                    let text = color_range::endpoint_label(value);
-                    let font_size = (rect.width() / (text.len() as f32 * 0.65)).clamp(7.0, 10.0);
-                    let font = egui::FontId::monospace(font_size);
-                    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
-                    let position = egui::pos2(rect.left(), y);
-                    let label_rect = anchor.anchor_size(position, galley.size());
-                    painter.rect_filled(label_rect, 0.0, egui::Color32::BLACK);
-                    painter.galley(label_rect.min, galley, egui::Color32::WHITE);
-                }
+                ui.label(
+                    egui::RichText::new(color_range::endpoint_label(appearance.range.min))
+                        .monospace()
+                        .size(10.0),
+                );
             }
-            ui.spacing_mut().slider_width = OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS;
-            ui.add(
-                egui::Slider::new(&mut value, min..=max)
-                    .vertical()
-                    .show_value(false),
-            )
-            .on_hover_text("Threshold")
+            response
         })
         .inner;
 
