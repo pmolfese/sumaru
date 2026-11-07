@@ -1900,12 +1900,15 @@ impl ViewerState {
                     ),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
-                        ui.label("Thresh");
+                        ui.label("Color / Thresh");
                         let threshold_range = self.selected_threshold_range();
                         let threshold_interaction = vertical_threshold_bar(
                             ui,
                             &mut self.overlay.render.appearance,
                             threshold_range,
+                            self.overlay.data.dataset().and_then(|dataset| {
+                                dataset.columns.get(self.overlay.data.columns().intensity)
+                            }),
                         );
                         changed |= threshold_interaction.changed;
                         if self.timecourse.is_some() {
@@ -2584,66 +2587,17 @@ impl ViewerState {
     }
 
     pub(super) fn draw_overlay_range_controls(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut changed = false;
-
+        let column = self
+            .overlay
+            .data
+            .dataset()
+            .and_then(|dataset| dataset.columns.get(self.overlay.data.columns().intensity));
+        let mut changed =
+            color_range::draw_range_editor(ui, &mut self.overlay.render.appearance, column);
         ui.horizontal(|ui| {
-            changed |= ui
-                .checkbox(
-                    &mut self.overlay.render.appearance.symmetric_range,
-                    "Symmetric",
-                )
-                .changed();
-
-            if self.overlay.render.appearance.symmetric_range {
-                let mut extent = self
-                    .overlay
-                    .render
-                    .appearance
-                    .range
-                    .min
-                    .abs()
-                    .max(self.overlay.render.appearance.range.max.abs());
-                let speed = range_drag_speed(self.overlay.render.appearance.range);
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut extent)
-                            .speed(speed)
-                            .prefix("+/- ")
-                            .custom_formatter(|value, _| scalar_value_label(value as f32))
-                            .custom_parser(|text| text.trim().parse::<f64>().ok()),
-                    )
-                    .changed()
-                {
-                    let extent = extent.abs();
-                    self.overlay.render.appearance.range = ValueRange {
-                        min: -extent,
-                        max: extent,
-                    };
-                    changed = true;
-                }
-            } else {
-                let speed = range_drag_speed(self.overlay.render.appearance.range);
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut self.overlay.render.appearance.range.min)
-                            .speed(speed)
-                            .prefix("min ")
-                            .custom_formatter(|value, _| scalar_value_label(value as f32))
-                            .custom_parser(|text| text.trim().parse::<f64>().ok()),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut self.overlay.render.appearance.range.max)
-                            .speed(speed)
-                            .prefix("max ")
-                            .custom_formatter(|value, _| scalar_value_label(value as f32))
-                            .custom_parser(|text| text.trim().parse::<f64>().ok()),
-                    )
-                    .changed();
-            }
+            changed |=
+                color_range::draw_range_presets(ui, &mut self.overlay.render.appearance, column);
         });
-
         changed
     }
 

@@ -209,6 +209,7 @@ impl SelectionHighlight {
 pub(super) struct OverlayAppearance {
     pub(super) range: ValueRange,
     pub(super) symmetric_range: bool,
+    pub(super) range_locked: bool,
     pub(super) brightness_range: Option<ValueRange>,
     pub(super) brightness_scale: [f32; 2],
     pub(super) brightness_compat_initialized: bool,
@@ -1077,6 +1078,7 @@ impl OverlayAppearance {
         Self {
             range: super::symmetric_value_range(range),
             symmetric_range: true,
+            range_locked: false,
             brightness_range: None,
             brightness_scale: [0.0, 1.0],
             brightness_compat_initialized: false,

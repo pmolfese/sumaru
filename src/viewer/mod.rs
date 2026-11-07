@@ -84,6 +84,7 @@ use transform::*;
 mod afni;
 mod camera;
 mod capture;
+mod color_range;
 mod edit;
 mod gpu;
 mod graph;
@@ -3499,10 +3500,7 @@ impl ViewerState {
     }
 
     fn sanitize_overlay_appearance(&mut self) {
-        self.overlay.render.appearance.range = sanitized_color_range(
-            self.overlay.render.appearance.range,
-            self.overlay.render.appearance.symmetric_range,
-        );
+        color_range::sanitize_color_range(&mut self.overlay.render.appearance);
 
         if let Some(brightness_range) = self.overlay.render.appearance.brightness_range.as_mut() {
             if !brightness_range.min.is_finite() || !brightness_range.max.is_finite() {
@@ -10095,17 +10093,37 @@ fn vertical_threshold_bar(
     ui: &mut egui::Ui,
     appearance: &mut OverlayAppearance,
     threshold_range: ValueRange,
+    intensity_column: Option<&DataColumn>,
 ) -> ThresholdBarInteraction {
     let (min, max) = threshold_bounds(threshold_range, appearance.threshold.absolute);
     let mut value = appearance.threshold.value;
+    let mut range_changed = false;
     let response = ui
         .horizontal(|ui| {
             // Keep the color reference separate from the standard egui slider,
             // as in afniru. Scope the slider length to this control.
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(22.0, OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS),
-                egui::Sense::hover(),
+            let continuous = appearance.colormap.uses_continuous_range();
+            let (rect, bar_response) = ui.allocate_exact_size(
+                egui::vec2(64.0, OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS),
+                egui::Sense::click(),
             );
+            bar_response.on_hover_text(if continuous {
+                "Color range: right-click to edit. The adjacent slider controls threshold separately."
+            } else {
+                "Discrete label palette (fixed colors)"
+            }).context_menu(|ui| {
+                ui.add_enabled_ui(continuous, |ui| {
+                    ui.menu_button("Set range…", |ui| {
+                        range_changed |= color_range::draw_range_editor(ui, appearance, intensity_column);
+                    });
+                    range_changed |= color_range::draw_range_presets(ui, appearance, intensity_column);
+                    if ui.checkbox(&mut appearance.symmetric_range, "Symmetric about zero").changed() {
+                        appearance.range_locked = true;
+                        color_range::sanitize_color_range(appearance);
+                        range_changed = true;
+                    }
+                });
+            });
             let painter = ui.painter_at(rect);
             for step in 0..80 {
                 let t0 = step as f32 / 80.0;
@@ -10118,6 +10136,21 @@ fn vertical_threshold_bar(
                     0,
                     color32_from_rgba(sample_colormap(appearance.colormap, (t0 + t1) * 0.5)),
                 );
+            }
+            if continuous {
+                for (y, value, anchor) in [
+                    (rect.top(), appearance.range.max, egui::Align2::LEFT_TOP),
+                    (rect.bottom(), appearance.range.min, egui::Align2::LEFT_BOTTOM),
+                ] {
+                    let text = color_range::endpoint_label(value);
+                    let font_size = (rect.width() / (text.len() as f32 * 0.65)).clamp(7.0, 10.0);
+                    let font = egui::FontId::monospace(font_size);
+                    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
+                    let position = egui::pos2(rect.left(), y);
+                    let label_rect = anchor.anchor_size(position, galley.size());
+                    painter.rect_filled(label_rect, 0.0, egui::Color32::BLACK);
+                    painter.galley(label_rect.min, galley, egui::Color32::WHITE);
+                }
             }
             ui.spacing_mut().slider_width = OVERLAY_THRESHOLD_BAR_HEIGHT_POINTS;
             ui.add(
@@ -10136,7 +10169,7 @@ fn vertical_threshold_bar(
     ThresholdBarInteraction {
         // The timecourse path needs a release event to commit deferred
         // contour and cluster updates, even if the final value is unchanged.
-        changed: response.changed() || response.drag_stopped(),
+        changed: range_changed || response.changed() || response.drag_stopped(),
         dragging: response.dragged(),
     }
 }

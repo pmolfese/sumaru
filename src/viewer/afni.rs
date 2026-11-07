@@ -827,8 +827,10 @@ impl ViewerState {
                         let range = ValueRange { min, max };
                         if self.overlay.render.appearance.range != range
                             || self.overlay.render.appearance.symmetric_range != symmetric
+                            || !self.overlay.render.appearance.range_locked
                         {
                             self.overlay.render.appearance.range = range;
+                            self.overlay.render.appearance.range_locked = true;
                             self.overlay.render.appearance.symmetric_range = symmetric;
                             self.refresh_overlay_appearance()?;
                             self.log_status(format!(
@@ -1127,6 +1129,7 @@ impl ViewerState {
         }
         if let Some(range) = state.intensity_range {
             self.overlay.render.appearance.range = range;
+            self.overlay.render.appearance.range_locked = true;
             changed = true;
         }
         if let Some(threshold) = state.threshold {

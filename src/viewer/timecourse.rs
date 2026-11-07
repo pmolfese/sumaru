@@ -622,6 +622,9 @@ impl ViewerState {
         let baseline_transform_changed = controls.baseline != state.controls.baseline
             || controls.amplitude != state.controls.amplitude;
         let starting_playback = controls.playing && !state.controls.playing;
+        if controls.scale != state.controls.scale {
+            self.overlay.render.appearance.range_locked = false;
+        }
         state.controls = controls;
         if baseline_window_changed {
             for condition in &mut state.conditions {
@@ -719,9 +722,11 @@ impl ViewerState {
             TimeCourseAmplitude::Signed => OverlayColorMap::SpectrumRedToBlue,
             TimeCourseAmplitude::Magnitude => OverlayColorMap::Hot,
         };
-        self.overlay.render.appearance.range = display_range;
-        self.overlay.render.appearance.symmetric_range =
-            display_range.min < 0.0 && display_range.max > 0.0;
+        color_range::apply_automatic_range(
+            &mut self.overlay.render.appearance,
+            display_range,
+            Some(display_range.min < 0.0 && display_range.max > 0.0),
+        );
         self.overlay.render.appearance.threshold = OverlayThreshold {
             enabled: controls.threshold_enabled,
             absolute: controls.threshold_absolute,
@@ -1524,6 +1529,52 @@ fn dense_timecourse_render_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_timecourse_auto_scales_survive_range_sanitization() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        for extent in [2.393e-13_f32, 1e-20] {
+            let dataset = Dataset::dense(
+                DatasetKind::SurfaceTimeSeries,
+                &domain,
+                (0..2)
+                    .map(|sample| {
+                        DataColumn::new(
+                            sample.to_string(),
+                            ColumnRole::TimePoint,
+                            None,
+                            ColumnData::Float32(vec![-extent, 0.0, extent]),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let state =
+                TimeCourseState::from_conditions(vec![("tiny".into(), dataset)], 0).unwrap();
+            for amplitude in [TimeCourseAmplitude::Signed, TimeCourseAmplitude::Magnitude] {
+                let (full, robust) = timecourse_condition_ranges(
+                    &state.conditions,
+                    TimeCourseBaseline::Raw,
+                    amplitude,
+                )
+                .unwrap();
+                let signed = amplitude == TimeCourseAmplitude::Signed;
+                let expected = ValueRange {
+                    min: if signed { -extent } else { 0.0 },
+                    max: extent,
+                };
+                for range in [full, robust] {
+                    assert_eq!(range, expected);
+                    let mut appearance = OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE);
+                    color_range::apply_automatic_range(&mut appearance, range, Some(signed));
+                    color_range::sanitize_color_range(&mut appearance);
+                    assert_eq!(appearance.range, expected);
+                    assert!(!appearance.range_locked);
+                }
+            }
+        }
+    }
 
     #[test]
     fn magnitude_follows_baseline_without_changing_signed_results() {

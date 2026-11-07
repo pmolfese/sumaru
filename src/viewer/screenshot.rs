@@ -27,6 +27,52 @@ impl ScreenshotImage {
     }
 }
 
+/// Small numeric legend font, independent of platform fonts and GPU state.
+pub(super) fn draw_numeric_label(
+    image: &mut ScreenshotImage,
+    text: &str,
+    origin: [u32; 2],
+    scale: u32,
+    color: [u8; 4],
+) {
+    for (index, character) in text.chars().enumerate() {
+        let rows: [u8; 5] = match character {
+            '0' => [7, 5, 5, 5, 7],
+            '1' => [2, 6, 2, 2, 7],
+            '2' => [7, 1, 7, 4, 7],
+            '3' => [7, 1, 7, 1, 7],
+            '4' => [5, 5, 7, 1, 1],
+            '5' => [7, 4, 7, 1, 7],
+            '6' => [7, 4, 7, 5, 7],
+            '7' => [7, 1, 1, 1, 1],
+            '8' => [7, 5, 7, 5, 7],
+            '9' => [7, 5, 7, 1, 7],
+            '-' => [0, 0, 7, 0, 0],
+            '+' => [0, 2, 7, 2, 0],
+            '.' => [0, 0, 0, 0, 2],
+            'e' => [0, 7, 7, 4, 7],
+            _ => [0; 5],
+        };
+        for (row, bits) in rows.into_iter().enumerate() {
+            for col in 0..3 {
+                if bits & (1 << (2 - col)) == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let x = origin[0] + (index as u32 * 4 + col) * scale + dx;
+                        let y = origin[1] + row as u32 * scale + dy;
+                        if x < image.width && y < image.height {
+                            let offset = ((y * image.width + x) * 4) as usize;
+                            image.rgba[offset..offset + 4].copy_from_slice(&color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn append_png_extension(path: PathBuf) -> PathBuf {
     if path.extension().is_some_and(|extension| {
         extension
@@ -305,6 +351,16 @@ mod tests {
         ScreenshotImage, append_filename_suffix, append_png_extension, crop_to_content, pad_image,
         padded_bytes_per_row, stitch_horizontal, stitch_horizontal_with_gap, texture_bytes_to_rgba,
     };
+
+    #[test]
+    fn numeric_legend_labels_draw_and_clip_to_image_bounds() {
+        let mut image = ScreenshotImage::new(40, 12, vec![0; 40 * 12 * 4]).unwrap();
+        super::draw_numeric_label(&mut image, "-1.2e-9", [1, 1], 2, [255; 4]);
+        assert!(image.rgba.iter().any(|byte| *byte == 255));
+        assert_eq!(&image.rgba[..4], &[0; 4]);
+        // Legends may be taller than a deliberately tiny screenshot.
+        super::draw_numeric_label(&mut image, "1e-20", [39, 11], 4, [255; 4]);
+    }
 
     #[test]
     fn filename_suffix_is_inserted_before_extension() {

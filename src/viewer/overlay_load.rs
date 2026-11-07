@@ -617,11 +617,7 @@ impl ViewerState {
         let column_summary = overlay_column_summary(dataset, self.overlay.data.columns());
         self.overlay.data.set_node_values(overlay);
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
-        self.overlay.render.appearance.range = if self.overlay.render.appearance.symmetric_range {
-            symmetric_value_range(range)
-        } else {
-            range
-        };
+        color_range::apply_automatic_range(&mut self.overlay.render.appearance, range, None);
         let auto_discrete_labels = self.maybe_apply_discrete_overlay_palette();
         self.sanitize_overlay_appearance();
         self.rebuild_overlay_model()?;
