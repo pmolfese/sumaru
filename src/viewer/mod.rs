@@ -898,7 +898,9 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                             state.resize_instacorr_control(state.instacorr_control.size);
                             state.instacorr_control_window().request_redraw();
                         }
-                        RenderStatus::ValidationError => eprintln!("InstaCorr control validation error"),
+                        RenderStatus::ValidationError => {
+                            eprintln!("InstaCorr control validation error")
+                        }
                     }
                 }
                 _ => {}
@@ -1101,8 +1103,11 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         let view_due = repaint_due(now, next_view, state.view.occluded);
         let control_due = repaint_due(now, next_control, state.control.occluded);
         let roi_control_due = repaint_due(now, next_roi_control, state.roi_control.occluded);
-        let instacorr_control_due =
-            repaint_due(now, next_instacorr_control, state.instacorr_control.occluded);
+        let instacorr_control_due = repaint_due(
+            now,
+            next_instacorr_control,
+            state.instacorr_control.occluded,
+        );
         if instacorr_control_due {
             state.instacorr_control_window().request_redraw();
         }
@@ -1899,7 +1904,8 @@ impl ViewerState {
         let view_surface = instance.create_surface(view_window.clone())?;
         let control_surface = instance.create_surface(control_window.clone())?;
         let roi_control_surface = instance.create_surface(roi_control_window.clone())?;
-        let instacorr_control_surface = instance.create_surface(instacorr_control_window.clone())?;
+        let instacorr_control_surface =
+            instance.create_surface(instacorr_control_window.clone())?;
         let mask_control_surface = instance.create_surface(mask_control_window.clone())?;
         let graph_surface = instance.create_surface(graph_window.clone())?;
         let adapter = instance
@@ -2301,8 +2307,10 @@ impl ViewerState {
             None,
             None,
         );
-        instacorr_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
-        let instacorr_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
+        instacorr_egui_state
+            .set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
+        let instacorr_egui_renderer =
+            Renderer::new(&device, surface_format, RendererOptions::default());
         let mask_egui_ctx = egui::Context::default();
         mask_egui_ctx.set_visuals(egui::Visuals::dark());
         let mut mask_egui_state = egui_winit::State::new(
@@ -2383,7 +2391,11 @@ impl ViewerState {
                 instacorr_control_surface,
                 instacorr_control_config,
                 instacorr_control_size,
-                EguiPane::new(instacorr_egui_ctx, instacorr_egui_state, instacorr_egui_renderer),
+                EguiPane::new(
+                    instacorr_egui_ctx,
+                    instacorr_egui_state,
+                    instacorr_egui_renderer,
+                ),
             ),
             mask_control: WindowPane::new(
                 mask_control_window,
@@ -3969,7 +3981,11 @@ impl ViewerState {
             return;
         }
         self.instacorr_control.last_requested_size = Some(desired_size);
-        if let Some(actual_size) = self.instacorr_control.window.request_inner_size(desired_size) {
+        if let Some(actual_size) = self
+            .instacorr_control
+            .window
+            .request_inner_size(desired_size)
+        {
             self.resize_instacorr_control(actual_size);
         }
         self.instacorr_control.window.request_redraw();
