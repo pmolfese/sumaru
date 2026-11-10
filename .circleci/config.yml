@@ -12,6 +12,21 @@ version: 2.1
 # tests; the crate currently has none, so test-all still covers everything.
 
 jobs:
+  docs:
+    docker:
+      - image: python:3.13-slim
+    steps:
+      - checkout
+      - run:
+          name: Install documentation dependencies
+          command: python -m pip install -r docs/requirements.txt
+      - run:
+          name: Build documentation (warnings are errors)
+          command: python -m sphinx -b html -W --keep-going docs docs/_build/html
+      - store_artifacts:
+          path: docs/_build/html
+          destination: documentation
+
   test-linux:
     docker:
       - image: rust:latest
@@ -55,3 +70,4 @@ workflows:
   build-and-test:
     jobs:
       - test-linux
+      - docs

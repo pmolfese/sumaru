@@ -286,13 +286,13 @@ display modes, and process shutdown.
 
 ## FATCAT walkthrough harness
 
-[`scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2.tcsh`](../scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2.tcsh)
+[`scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2.tcsh`](https://github.com/pmolfese/sumaru/blob/main/scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2.tcsh)
 adapts the four-example `Do_09_VISdti_SUMA_visual_ex2.tcsh` walkthrough from
 `FATCAT_DEMO`. It preserves the surfaces, anatomical volume, deterministic and
 MINIPROB tractograms, graph dataset, AFNI processes, and DriveSuma commands,
 while launching Sumaru with `-niml-suma`.
 
-[`scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh`](../scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh)
+[`scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh`](https://github.com/pmolfese/sumaru/blob/main/scripts/fatcat/Do_09_VISdti_sumaru_visual_ex2_drivesuma_rs.tcsh)
 is a separate test variant that uses `suma-drive` for both wire commands and
 native prompts. The original adapted script remains available as the legacy
 DriveSuma/`prompt_user` control.

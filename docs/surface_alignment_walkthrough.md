@@ -172,7 +172,7 @@ This uses the old script's centroid-plus-normal-projection approach. Numerical
 results need not be bit-identical to AFNI. For a comparison using the script's
 exact matrix, replace `--centroid` with
 `--affine script-centroid.1D --affine-afni` on RAS inputs. See the
-[AFNI baseline](../align_surfaces.md#stage-6-afni-baseline-and-validation-2026-11-10).
+[AFNI baseline](https://github.com/pmolfese/sumaru/blob/main/align_surfaces.md#stage-6-afni-baseline-and-validation-2026-11-10).
 
 `resample --map` automatically opens geometric QC when `--preview` is present.
 Do not also specify the parent-fill `--method`. It transfers all scalar/time-series
@@ -269,4 +269,4 @@ The user's 2026-11-10 screenshots confirm that parent/child surfaces render
 together and that the two style combinations provide useful contrast on the
 native dataset. They do not verify every QC control, screenshot sidecar,
 geometric-map display, or every stage 7 route. Numerical/IO validation and AFNI
-comparison details are recorded in [the implementation plan](../align_surfaces.md).
+comparison details are recorded in [the implementation plan](https://github.com/pmolfese/sumaru/blob/main/align_surfaces.md).
