@@ -117,17 +117,32 @@ fn inspect_gifti(path: &Path) -> Result<InspectReport> {
         .label_table
         .as_ref()
         .map_or(0, |table| table.labels.len());
+    let parent = crate::io::gifti_parent_metadata(&image)?;
+    let mut parent_summary = String::new();
+    if let Some(identity) = parent.identity {
+        parent_summary = format!(
+            "\nparent subject: {}\nparent hemisphere: {:?}\nparent vertex count: {:?}\nparent mapping: {}\nparent identity: declared, not independently verified",
+            identity.subject.as_deref().unwrap_or("unknown"),
+            identity.hemisphere,
+            identity.vertex_count,
+            parent.mapping.as_ref().map_or_else(
+                || "complete parent geometry (no index list)".to_string(),
+                |mapping| format!("{} ordered vertex IDs", mapping.indices.len()),
+            ),
+        );
+    }
 
     Ok(InspectReport {
         path: path.to_path_buf(),
         kind: FileKind::Gifti,
         summary: format!(
-            "version: {}\ndata arrays: {}\npointset arrays: {}\ntriangle arrays: {}\nlabels: {}",
+            "version: {}\ndata arrays: {}\npointset arrays: {}\ntriangle arrays: {}\nlabels: {}{}",
             image.version,
             image.data_arrays.len(),
             pointsets,
             triangles,
-            labels
+            labels,
+            parent_summary
         ),
     })
 }

@@ -62,6 +62,47 @@ pub(super) struct OverlayColumnOption {
 }
 
 impl ViewerState {
+    pub(super) fn require_full_parent_for_fill(&self, source: &Dataset) -> Result<()> {
+        if self.sparse_timecourse_display == SparseTimecourseDisplay::Sparse
+            || !source.is_sparse()
+            || self
+                .mesh
+                .as_ref()
+                .is_none_or(|mesh| source.row_count >= mesh.domain.node_count)
+            || matches!(source.kind, DatasetKind::SurfaceLabel | DatasetKind::Roi)
+        {
+            return Ok(());
+        }
+        // A composite mesh has no single parent identity; inspect its components too.
+        let child_component = self
+            .surface_scene
+            .as_ref()
+            .and_then(|scene| scene.surfaces.get(scene.active_index))
+            .is_some_and(|surface| {
+                surface.components.iter().any(|component| {
+                    component.mesh.as_ref().is_some_and(|mesh| {
+                        !crate::sparse_reconstruction::has_full_parent_connectivity(mesh)
+                    })
+                })
+            });
+        ensure!(
+            !child_component,
+            "parent-based filling requires full parent connectivity; choose sampled-only for decimated target components"
+        );
+        Ok(())
+    }
+
+    fn surface_dataset_options(&self) -> SurfaceDatasetOptions {
+        SurfaceDatasetOptions {
+            companion_surfaces: self.parent_load.companion_surfaces.clone(),
+            parent_policy: self
+                .parent_load
+                .policy_override
+                .unwrap_or(self.preferences.parent_mismatch_policy),
+            auto_qcalc: self.preferences.gifti_dset_auto_qcalc,
+        }
+    }
+
     /// Load a single overlay file onto the current surface.
     pub(super) fn load_overlay_path(&mut self, path: PathBuf) -> Result<()> {
         let mesh = self
@@ -297,13 +338,13 @@ impl ViewerState {
             let left_dataset = load_dataset_from_path(
                 &paths.left_path,
                 left_mesh,
-                self.preferences.gifti_dset_auto_qcalc,
+                &self.surface_dataset_options(),
             )
             .with_context(|| format!("failed to load {}", paths.left_path.display()))?;
             let right_dataset = load_dataset_from_path(
                 &paths.right_path,
                 right_mesh,
-                self.preferences.gifti_dset_auto_qcalc,
+                &self.surface_dataset_options(),
             )
             .with_context(|| format!("failed to load {}", paths.right_path.display()))?;
             let dataset = paired_overlay_dataset(
@@ -321,7 +362,7 @@ impl ViewerState {
         }
 
         Ok(LoadedOverlaySelection {
-            overlay: load_overlay_from_path(path, mesh, self.preferences.gifti_dset_auto_qcalc)?,
+            overlay: load_overlay_from_path(path, mesh, &self.surface_dataset_options())?,
             display_name: file_name_display(path),
         })
     }
@@ -356,18 +397,12 @@ impl ViewerState {
                     right_path.display()
                 );
 
-                let left_dataset = load_dataset_from_path(
-                    left_path,
-                    left_mesh,
-                    self.preferences.gifti_dset_auto_qcalc,
-                )
-                .with_context(|| format!("failed to load {}", left_path.display()))?;
-                let right_dataset = load_dataset_from_path(
-                    right_path,
-                    right_mesh,
-                    self.preferences.gifti_dset_auto_qcalc,
-                )
-                .with_context(|| format!("failed to load {}", right_path.display()))?;
+                let left_dataset =
+                    load_dataset_from_path(left_path, left_mesh, &self.surface_dataset_options())
+                        .with_context(|| format!("failed to load {}", left_path.display()))?;
+                let right_dataset =
+                    load_dataset_from_path(right_path, right_mesh, &self.surface_dataset_options())
+                        .with_context(|| format!("failed to load {}", right_path.display()))?;
                 paired_overlay_dataset(
                     left_dataset,
                     right_dataset,
@@ -381,12 +416,9 @@ impl ViewerState {
                     "left hemisphere overlay {} does not exist",
                     left_path.display()
                 );
-                let left_dataset = load_dataset_from_path(
-                    left_path,
-                    left_mesh,
-                    self.preferences.gifti_dset_auto_qcalc,
-                )
-                .with_context(|| format!("failed to load {}", left_path.display()))?;
+                let left_dataset =
+                    load_dataset_from_path(left_path, left_mesh, &self.surface_dataset_options())
+                        .with_context(|| format!("failed to load {}", left_path.display()))?;
                 single_hemisphere_overlay_dataset(left_dataset, &mesh.domain, 0)?
             }
             (None, Some(right_path)) => {
@@ -395,12 +427,9 @@ impl ViewerState {
                     "right hemisphere overlay {} does not exist",
                     right_path.display()
                 );
-                let right_dataset = load_dataset_from_path(
-                    right_path,
-                    right_mesh,
-                    self.preferences.gifti_dset_auto_qcalc,
-                )
-                .with_context(|| format!("failed to load {}", right_path.display()))?;
+                let right_dataset =
+                    load_dataset_from_path(right_path, right_mesh, &self.surface_dataset_options())
+                        .with_context(|| format!("failed to load {}", right_path.display()))?;
                 single_hemisphere_overlay_dataset(
                     right_dataset,
                     &mesh.domain,
@@ -724,28 +753,67 @@ impl ViewerState {
     }
 
     fn rebuild_overlay_model_with_cluster_refresh(&mut self, refresh_clusters: bool) -> Result<()> {
-        // Labels have to be current before colors are built, since cluster
-        // rejection is applied inside the color cache.
-        if refresh_clusters {
-            self.refresh_cluster_labels();
-        }
-        // A live drag previews the raw threshold and leaves the previously
-        // committed cluster result alone. Release recomputes and reapplies it.
-        let cluster_labels = refresh_clusters
-            .then(|| self.cluster_labels.clone())
-            .flatten();
-        let dataset = self
+        let source = self
             .overlay
             .data
             .dataset()
             .context("no canonical overlay dataset is loaded")?;
-        let domain = &self
+        let mesh = self
             .mesh
             .as_ref()
-            .context("load a surface before rebuilding overlay colors")?
-            .domain;
+            .context("load a surface before rebuilding overlay colors")?;
+        let selections = self.overlay.data.columns();
+        let categorical = resolved_overlay_label_table(
+            source,
+            selections.intensity,
+            self.overlay.source.label_table.as_ref(),
+        )
+        .is_some();
+        if !categorical {
+            self.require_full_parent_for_fill(source)?;
+        }
+        let projection = if categorical {
+            None
+        } else {
+            self.sparse_projection_cache.for_dataset(
+                mesh,
+                source,
+                self.sparse_timecourse_display.method(),
+                self.sparse_smoothing_steps,
+            )?
+        };
+        // Reconstruct only the displayed channels, never all time samples on a frame refresh.
+        let reconstructed = projection
+            .as_ref()
+            .map(|projection| sparse_render_dataset(source, &mesh.domain, selections, projection))
+            .transpose()?;
+        let display_selections = reconstructed
+            .as_ref()
+            .map_or(selections, |(_, columns)| *columns);
+        let display = reconstructed
+            .as_ref()
+            .map_or(source, |(dataset, _)| dataset);
+        let node_values = overlay_dataset_from_canonical_dataset(
+            display,
+            mesh.domain.node_count,
+            display_selections,
+        )?;
+        self.active_sparse_projection = projection;
+        self.overlay.data.set_node_values(node_values);
+        // Picking, contours and cluster thresholding use the same reconstructed channels.
+        if refresh_clusters {
+            self.refresh_cluster_labels();
+        }
+        let cluster_labels = refresh_clusters
+            .then(|| self.cluster_labels.clone())
+            .flatten();
+        let dataset = reconstructed.as_ref().map_or_else(
+            || self.overlay.data.dataset().unwrap(),
+            |(dataset, _)| dataset,
+        );
+        let domain = &self.mesh.as_ref().unwrap().domain;
         let columns = canonical_overlay_columns(
-            self.overlay.data.columns(),
+            display_selections,
             self.overlay.render.appearance.threshold.enabled,
         );
         let intensity_index = columns.intensity.index;
@@ -789,6 +857,8 @@ impl ViewerState {
             }
         }
         self.overlay.render.render_model = Some(overlay);
+        self.refresh_qc_source()?;
+        self.refresh_qc_measurements();
 
         Ok(())
     }
@@ -902,6 +972,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_scalar_render_channels_match_shared_projection_without_changing_source() {
+        let domain = SurfaceDomain::from_triangles(4, vec![[0, 1, 2]]).unwrap();
+        let source = Dataset::sparse(
+            DatasetKind::SurfaceScalar,
+            &domain,
+            vec![2, 0],
+            [vec![99., 99.], vec![8., 0.], vec![4., 2.]]
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    DataColumn::new(
+                        i.to_string(),
+                        ColumnRole::Intensity,
+                        None,
+                        ColumnData::Float32(v),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        let original = source.clone();
+        let projection = crate::sparse_reconstruction::SparseProjection::Smooth(
+            crate::sparse_reconstruction::SparseUpsamplingMatrix::build(
+                &[vec![1, 2], vec![0, 2], vec![0, 1], vec![]],
+                &[2, 0],
+                1,
+            )
+            .unwrap(),
+        );
+        let (display, columns) = sparse_render_dataset(
+            &source,
+            &domain,
+            OverlayColumnSelections {
+                intensity: 1,
+                threshold: Some(2),
+                brightness: Some(1),
+            },
+            &projection,
+        )
+        .unwrap();
+        assert_eq!(display.columns.len(), 2);
+        assert_eq!(columns.brightness, Some(0));
+        let values = overlay_dataset_from_canonical_dataset(&display, 4, columns).unwrap();
+        assert_eq!(&values.values[..3], &[4., 4., 4.]);
+        assert_eq!(&values.threshold_values.unwrap()[..3], &[3., 3., 3.]);
+        assert!(values.values[3].is_nan());
+        assert_eq!(source, original);
+    }
+
+    #[test]
     fn matching_niml_dset_path_finds_same_stem_gifti_match() {
         let dir =
             std::env::temp_dir().join(format!("sumaru_auto_niml_match_{}", std::process::id()));
@@ -973,4 +1094,53 @@ mod tests {
             ColumnData::Int32(vec![9, 9, 10, 10])
         );
     }
+}
+
+/// A small display-only dataset with channels remapped to compact column indices.
+fn sparse_render_dataset(
+    source: &Dataset,
+    domain: &SurfaceDomain,
+    selections: OverlayColumnSelections,
+    projection: &crate::sparse_reconstruction::SparseProjection,
+) -> Result<(Dataset, OverlayColumnSelections)> {
+    let mut indices = vec![selections.intensity];
+    let mut add = |index: Option<usize>| {
+        index.map(|index| {
+            if let Some(position) = indices.iter().position(|i| *i == index) {
+                position
+            } else {
+                indices.push(index);
+                indices.len() - 1
+            }
+        })
+    };
+    let threshold = add(selections.threshold);
+    let brightness = add(selections.brightness);
+    let columns = indices
+        .iter()
+        .map(|index| {
+            source
+                .columns
+                .get(*index)
+                .cloned()
+                .context("overlay column out of range")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let sparse = Dataset::sparse(
+        source.kind.clone(),
+        domain,
+        source
+            .node_indices
+            .clone()
+            .context("missing sparse indices")?,
+        columns,
+    )?;
+    Ok((
+        crate::sparse_reconstruction::reconstruct_dataset(&sparse, domain.node_count, projection)?,
+        OverlayColumnSelections {
+            intensity: 0,
+            threshold,
+            brightness,
+        },
+    ))
 }

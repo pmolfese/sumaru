@@ -1,0 +1,28 @@
+<GIFTI Version="1.0" NumberOfDataArrays="2">
+  <MetaData>
+    <MD>
+      <Name>MNEParentVertexIndices</Name>
+      <Value>8 1 4</Value>
+    </MD>
+    <MD>
+      <Name>MNEParentVertexCount</Name>
+      <Value>10</Value>
+    </MD>
+    <MD>
+      <Name>MNEParentHemisphere</Name>
+      <Value>lh</Value>
+    </MD>
+    <MD>
+      <Name>MNEParentSubject</Name>
+      <Value>synthetic</Value>
+    </MD>
+  </MetaData>
+  <DataArray Intent="NIFTI_INTENT_POINTSET" DataType="NIFTI_TYPE_FLOAT32" ArrayIndexingOrder="RowMajorOrder" Dimensionality="2" Encoding="ASCII" Endian="LittleEndian" ExternalFileName="" ExternalFileOffset="0" Dim0="3" Dim1="3">
+    <MetaData />
+    <Data>0 0 0 1 0 0 0 1 0</Data>
+  </DataArray>
+  <DataArray Intent="NIFTI_INTENT_TRIANGLE" DataType="NIFTI_TYPE_INT32" ArrayIndexingOrder="RowMajorOrder" Dimensionality="2" Encoding="ASCII" Endian="LittleEndian" ExternalFileName="" ExternalFileOffset="0" Dim0="1" Dim1="3">
+    <MetaData />
+    <Data>0 1 2</Data>
+  </DataArray>
+</GIFTI>

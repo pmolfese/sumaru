@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::surface_align::ParentMismatchPolicy;
+
 const PREFERENCES_FILE_NAME: &str = ".sumaru";
 
 /// How a threshold is transferred when the active overlay changes.
@@ -84,6 +86,7 @@ impl OverlayThresholdSync {
 pub struct AppPreferences {
     pub overlay_threshold_sync: OverlayThresholdSync,
     pub gifti_dset_auto_qcalc: bool,
+    pub parent_mismatch_policy: ParentMismatchPolicy,
 }
 
 impl AppPreferences {
@@ -152,6 +155,20 @@ impl AppPreferences {
                             line_number + 1
                         )
                     })?;
+            } else if key.trim() == "SUMARU_ParentMismatchPolicy" {
+                preferences.parent_mismatch_policy = match unquote(value)
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "warn" => ParentMismatchPolicy::Warn,
+                    "strict" => ParentMismatchPolicy::Strict,
+                    _ => bail!(
+                        "invalid SUMARU_ParentMismatchPolicy at {}:{} (expected warn or strict)",
+                        path.display(),
+                        line_number + 1
+                    ),
+                };
             } else if matches!(
                 key.trim(),
                 "GIFTI_DSET_AUTO_QCALC" | "SUMARU_GIFTI_DSET_AUTO_QCALC"
@@ -224,12 +241,22 @@ impl AppPreferences {
 //     YES: calculate missing GIFTI q-values while loading the dataset.\n\
 //     NO: leave missing GIFTI q-values unavailable.\n\
 //     default:   GIFTI_DSET_AUTO_QCALC = NO\n\
-   GIFTI_DSET_AUTO_QCALC = {}\n",
+   GIFTI_DSET_AUTO_QCALC = {}\n\
+// 002-SUMARU_ParentMismatchPolicy:\n\
+//     warn: allow structurally valid parent mappings with identity warnings.\n\
+//     strict: reject mismatched or incomplete parent identity.\n\
+//     Invalid indices and conflicting export metadata always fail.\n\
+//     default: SUMARU_ParentMismatchPolicy = warn\n\
+   SUMARU_ParentMismatchPolicy = {}\n",
             self.overlay_threshold_sync.file_value(),
             if self.gifti_dset_auto_qcalc {
                 "YES"
             } else {
                 "NO"
+            },
+            match self.parent_mismatch_policy {
+                ParentMismatchPolicy::Warn => "warn",
+                ParentMismatchPolicy::Strict => "strict",
             }
         )
     }
@@ -333,6 +360,7 @@ mod tests {
         AppPreferences {
             overlay_threshold_sync: OverlayThresholdSync::MatchPValue,
             gifti_dset_auto_qcalc: true,
+            parent_mismatch_policy: ParentMismatchPolicy::Strict,
         }
         .save(&path)
         .unwrap();
@@ -345,7 +373,36 @@ mod tests {
             OverlayThresholdSync::MatchPValue
         );
         assert!(preferences.gifti_dset_auto_qcalc);
+        assert_eq!(
+            preferences.parent_mismatch_policy,
+            ParentMismatchPolicy::Strict
+        );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parent_policy_defaults_to_warn_and_validates_explicit_values() {
+        let path = Path::new("test.sumaru");
+        assert_eq!(
+            AppPreferences::parse_document(path, "")
+                .unwrap()
+                .parent_mismatch_policy,
+            ParentMismatchPolicy::Warn
+        );
+        assert_eq!(
+            AppPreferences::parse_document(path, "SUMARU_ParentMismatchPolicy = strict")
+                .unwrap()
+                .parent_mismatch_policy,
+            ParentMismatchPolicy::Strict
+        );
+        assert!(
+            AppPreferences::parse_document(path, "SUMARU_ParentMismatchPolicy = ignore").is_err()
+        );
+        assert!(
+            AppPreferences::default()
+                .to_documented_text()
+                .contains("SUMARU_ParentMismatchPolicy = warn")
+        );
     }
 
     #[test]

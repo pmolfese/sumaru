@@ -31,9 +31,11 @@ impl ViewerState {
             return Ok(());
         };
 
+        self.check_qc_capture_paths(&path)?;
         let camera = self.camera.clone();
         let image = self.capture_surface_view(&camera)?;
         screenshot::save_png(&path, &image)?;
+        self.save_qc_report(&path)?;
         self.log_status(format!("Saved screenshot {}.", path.display()));
         self.save_colormap_companion(&image, &path)?;
 
@@ -61,6 +63,7 @@ impl ViewerState {
             return Ok(());
         };
 
+        self.check_qc_capture_paths(&path)?;
         let result = if self.has_both_scene() {
             self.capture_paired_spec_montage()
         } else {
@@ -70,6 +73,7 @@ impl ViewerState {
 
         let montage = result?;
         screenshot::save_png(&path, &montage)?;
+        self.save_qc_report(&path)?;
         self.log_status(format!("Saved montage {}.", path.display()));
         self.save_colormap_companion(&montage, &path)?;
 

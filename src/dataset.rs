@@ -24,6 +24,10 @@ pub struct Dataset {
     /// Time of the first time-series column, in seconds relative to the event.
     pub time_start_seconds: Option<f64>,
     pub parent_ids: DatasetParentIds,
+    /// Original row-to-parent correspondence, independent of display indexing.
+    pub parent_mapping: Option<crate::surface_align::ParentVertexMapping>,
+    /// Persistent diagnostics from resolving data onto a display surface.
+    pub mapping_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +144,8 @@ impl Dataset {
             time_step_seconds: None,
             time_start_seconds: None,
             parent_ids: DatasetParentIds::default(),
+            parent_mapping: None,
+            mapping_warnings: Vec::new(),
         })
     }
 
@@ -175,7 +181,31 @@ impl Dataset {
             time_step_seconds: None,
             time_start_seconds: None,
             parent_ids: DatasetParentIds::default(),
+            parent_mapping: None,
+            mapping_warnings: Vec::new(),
         })
+    }
+
+    /// Normalize existing sparse indexing without changing its domain or row order.
+    /// A supplied identity describes the domain indexed by NODE_INDEX/STC IDs.
+    pub fn vertex_mapping(
+        &self,
+        indexed_domain: crate::surface_align::ParentDomainIdentity,
+    ) -> Result<Option<crate::surface_align::ParentVertexMapping>> {
+        if let Some(mapping) = &self.parent_mapping {
+            mapping.validate(self.row_count)?;
+            return Ok(Some(mapping.clone()));
+        }
+        self.node_indices
+            .as_ref()
+            .map(|indices| {
+                crate::surface_align::ParentVertexMapping::new(
+                    indexed_domain,
+                    indices.clone(),
+                    self.row_count,
+                )
+            })
+            .transpose()
     }
 
     pub fn with_parent_ids(mut self, parent_ids: DatasetParentIds) -> Self {

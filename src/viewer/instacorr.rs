@@ -65,7 +65,7 @@ impl ViewerState {
             }
             self.instacorr_sessions[index].enabled = enabled;
             self.active_instacorr_session = Some(id);
-            self.instacorr_window_open = true;
+            self.set_instacorr_window_open(true);
             self.log_status(if enabled {
                 "InstaCorr active; ordinary selections recalculate the seed."
             } else {
@@ -133,7 +133,7 @@ impl ViewerState {
             status: "Ready to calculate.".to_string(),
         });
         self.active_instacorr_session = Some(id);
-        self.instacorr_window_open = true;
+        self.set_instacorr_window_open(true);
 
         if self
             .instacorr_sessions
@@ -151,6 +151,9 @@ impl ViewerState {
     }
 
     pub(super) fn note_instacorr_pick(&mut self, node: u32) {
+        if self.instacorr_window_open {
+            self.instacorr_control.window.request_redraw();
+        }
         let Some(id) = self.active_instacorr_session else {
             return;
         };
@@ -178,12 +181,20 @@ impl ViewerState {
         }
     }
 
-    pub(super) fn draw_instacorr_window(&mut self, ctx: &egui::Context) {
+    pub(super) fn set_instacorr_window_open(&mut self, open: bool) {
+        self.instacorr_window_open = open;
+        self.instacorr_control.window.set_visible(open);
+        if open {
+            self.instacorr_control.window.request_redraw();
+        }
+    }
+
+    pub(super) fn draw_instacorr_control_contents(&mut self, ui: &mut egui::Ui) {
         if !self.instacorr_window_open {
             return;
         }
         let Some(id) = self.active_instacorr_session else {
-            self.instacorr_window_open = false;
+            self.set_instacorr_window_open(false);
             return;
         };
         let Some(index) = self
@@ -191,22 +202,18 @@ impl ViewerState {
             .iter()
             .position(|session| session.id == id)
         else {
-            self.instacorr_window_open = false;
+            self.set_instacorr_window_open(false);
             return;
         };
 
-        let mut open = true;
         let mut recalculate = false;
         let mut seed_now = false;
-        egui::Window::new("InstaCorr")
-            .open(&mut open)
-            .default_width(390.0)
-            .resizable(false)
-            .show(ctx, |ui| {
+        let mut active_changed = false;
+        ui.vertical(|ui| {
                 let session = &mut self.instacorr_sessions[index];
                 ui.heading(&session.source_label);
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut session.enabled, "Active");
+                    active_changed = ui.checkbox(&mut session.enabled, "Active").changed();
                     if session.busy {
                         ui.spinner();
                         ui.label("Calculating…");
@@ -305,7 +312,9 @@ impl ViewerState {
                     .color(egui::Color32::GRAY),
                 );
             });
-        self.instacorr_window_open = open;
+        if active_changed {
+            self.control.window.request_redraw();
+        }
         if recalculate {
             self.request_instacorr_recalculate(id);
         } else if seed_now && let Some(node) = self.current_pick_node() {
@@ -358,6 +367,8 @@ impl ViewerState {
     }
 
     fn request_instacorr_recalculate(&mut self, id: u64) {
+        self.instacorr_control.window.request_redraw();
+        self.control.window.request_redraw();
         let Some(index) = self
             .instacorr_sessions
             .iter()
@@ -424,6 +435,8 @@ impl ViewerState {
     }
 
     fn request_instacorr_seed_update(&mut self, id: u64, seed_node: u32) {
+        self.instacorr_control.window.request_redraw();
+        self.control.window.request_redraw();
         let Some(session) = self
             .instacorr_sessions
             .iter_mut()
@@ -560,6 +573,8 @@ impl ViewerState {
             domain_id: source_dataset.domain_id.clone(),
             row_count: source_dataset.row_count,
             node_indices: source_dataset.node_indices.clone(),
+            parent_mapping: source_dataset.parent_mapping.clone(),
+            mapping_warnings: source_dataset.mapping_warnings.clone(),
             columns: vec![column],
             time_step_seconds: None,
             time_start_seconds: None,
@@ -637,14 +652,14 @@ impl ViewerState {
                 .any(|session| session.id == id)
         }) {
             self.active_instacorr_session = None;
-            self.instacorr_window_open = false;
+            self.set_instacorr_window_open(false);
         }
     }
 
     pub(super) fn clear_instacorr_sessions(&mut self) {
         self.instacorr_sessions.clear();
         self.active_instacorr_session = None;
-        self.instacorr_window_open = false;
+        self.set_instacorr_window_open(false);
     }
 }
 

@@ -25,6 +25,20 @@ use sumaru::viewer::{self, AfniViewerOptions, ExplicitOverlayPair, SparseTimecou
 #[derive(Debug, Parser)]
 #[command(version, about = "SUMA in Rust")]
 struct Cli {
+    /// Companion decimated geometry for older exports without parent IDs. Repeat for each hemisphere.
+    #[arg(long = "companion-surface", global = true, value_name = "PATH")]
+    companion_surfaces: Vec<PathBuf>,
+    /// Reject mismatched or incomplete parent identity (overrides ~/.sumaru).
+    #[arg(
+        long = "strict-parent",
+        global = true,
+        conflicts_with = "allow_parent_mismatch"
+    )]
+    strict_parent: bool,
+    /// Allow structurally valid mappings with warnings (overrides ~/.sumaru).
+    #[arg(long = "allow-parent-mismatch", global = true)]
+    allow_parent_mismatch: bool,
+
     /// Launch the viewer with one or more GIFTI or native FreeSurfer surfaces.
     #[arg(short = 'i', long = "surface", value_name = "PATH", num_args = 1..)]
     surface_paths: Vec<PathBuf>,
@@ -76,6 +90,25 @@ struct Cli {
         value_name = "PATH"
     )]
     graph_paths: Vec<PathBuf>,
+
+    /// Sparse display filling (scalar overlays and tc). Smoothing changes sampled values too.
+    #[arg(long, global = true, value_parser = ["sampled-only", "mesh-nearest", "mne-smooth"])]
+    sparse_fill: Option<String>,
+
+    /// Overlay a mapped child surface for parent/child correspondence QC (single parent).
+    #[arg(long, global = true, value_name = "CHILD_SURFACE")]
+    qc_child: Option<PathBuf>,
+
+    /// Inspect an explicit geometric map on the loaded target surface.
+    #[arg(
+        long,
+        global = true,
+        requires = "qc_source",
+        conflicts_with = "qc_child"
+    )]
+    qc_map: Option<PathBuf>,
+    #[arg(long, global = true, requires = "qc_map")]
+    qc_source: Option<PathBuf>,
 
     /// Load this GIFTI, NIML, or STC data as a per-vertex surface overlay.
     #[arg(long = "overlay", value_name = "PATH")]
@@ -175,6 +208,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Construct an explicit geometric, registered-sphere, ancestry or M2M mapping.
+    SurfaceMap(sumaru::surface_mapping_cli::MapArgs),
+    /// Recover unique, essentially exact parent IDs; never a geometric fallback.
+    RecoverParentIds(sumaru::surface_mapping_cli::RecoverArgs),
+    /// Validate a reusable map against both meshes and print diagnostics.
+    MapInfo {
+        #[arg(long)]
+        map: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+    },
+    /// Export exact parent placement or explicit sparse reconstruction without a GUI.
+    Resample(ResampleArgs),
     /// Launch the surface timecourse viewer for a 3D+time GIFTI or STC overlay.
     Tc(TimeCourseArgs),
     /// Read a supported neuroimaging file and print a short summary.
@@ -187,6 +235,35 @@ enum Commands {
         #[command(subcommand)]
         command: NimlCommands,
     },
+}
+
+#[derive(Debug, Args)]
+struct ResampleArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    target: PathBuf,
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Required; export never inherits the viewer display default.
+    #[arg(long, required_unless_present="map", conflicts_with="map", value_parser = ["sampled-only", "mesh-nearest", "mne-smooth"])]
+    method: Option<String>,
+    /// Reuse a checked surface-map file for geometric resampling.
+    #[arg(long, requires = "source_surface")]
+    map: Option<PathBuf>,
+    #[arg(long, requires = "map")]
+    source_surface: Option<PathBuf>,
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
+    smoothing_steps: u32,
+    /// Zero-based column(s); time-series selections must be contiguous and increasing.
+    #[arg(long = "column")]
+    columns: Vec<usize>,
+    /// Defaults to OUTPUT.json. Existing paths are never replaced.
+    #[arg(long)]
+    report: Option<PathBuf>,
+    /// Open the exported file in the viewer; combine with --qc-child for wireframe QC.
+    #[arg(long)]
+    preview: bool,
 }
 
 #[derive(Debug, Args)]
@@ -297,6 +374,11 @@ fn main() -> Result<()> {
     let args = normalized_afni_style_args();
     let cli = Cli::parse_from(args.clone());
     validate_onestate_order(&args)?;
+    let sparse_display = match cli.sparse_fill.as_deref() {
+        Some("sampled-only") => SparseTimecourseDisplay::Sparse,
+        Some("mesh-nearest") => SparseTimecourseDisplay::Nearest,
+        _ => SparseTimecourseDisplay::Smooth,
+    };
     let verbose = cli.verbose;
     let preload = cli.preload && !cli.no_preload;
     let big_mem = cli.big_mem;
@@ -350,7 +432,136 @@ fn main() -> Result<()> {
     let roi = cli.roi;
     let auto_color_niml = cli.auto_color_niml;
 
+    let parent_load = viewer::ParentLoadOptions {
+        companion_surfaces: cli.companion_surfaces,
+        qc_child: cli.qc_child,
+        qc_map: cli.qc_map,
+        qc_source: cli.qc_source,
+        policy_override: if cli.strict_parent {
+            Some(sumaru::surface_align::ParentMismatchPolicy::Strict)
+        } else if cli.allow_parent_mismatch {
+            Some(sumaru::surface_align::ParentMismatchPolicy::Warn)
+        } else {
+            None
+        },
+    };
+    if !matches!(
+        cli.command,
+        None | Some(Commands::Tc(_)) | Some(Commands::Resample(_))
+    ) && (!parent_load.companion_surfaces.is_empty()
+        || parent_load.policy_override.is_some()
+        || parent_load.qc_child.is_some()
+        || parent_load.qc_map.is_some())
+    {
+        bail!("parent loading options only apply to viewer launches or tc");
+    }
+
     match cli.command {
+        Some(Commands::SurfaceMap(args)) => sumaru::surface_mapping_cli::run_map(&args)?,
+        Some(Commands::RecoverParentIds(args)) => sumaru::surface_mapping_cli::recover(&args)?,
+        Some(Commands::MapInfo {
+            map,
+            source,
+            target,
+        }) => {
+            let map = sumaru::surface_mapping_cli::read_map(
+                &map,
+                &sumaru::surface::SurfaceMesh::from_path(source)?,
+                &sumaru::surface::SurfaceMesh::from_path(target)?,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&map.summary())?);
+        }
+        Some(Commands::Resample(args)) => {
+            use sumaru::sparse_reconstruction::SparseFillMethod;
+            let policy = if let Some(policy) = parent_load.policy_override {
+                policy
+            } else {
+                let preferences = sumaru::preferences::default_preferences_path()
+                    .filter(|p| p.exists())
+                    .map(|p| sumaru::preferences::AppPreferences::load(&p))
+                    .transpose()?
+                    .unwrap_or_default();
+                preferences.parent_mismatch_policy
+            };
+            if let Some(map) = &args.map {
+                anyhow::ensure!(
+                    args.columns.is_empty(),
+                    "geometric map application currently transfers all columns; select columns before mapping"
+                );
+                let report = args
+                    .report
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(format!("{}.json", args.output.display())));
+                let source = args.source_surface.as_ref().unwrap();
+                sumaru::surface_mapping_cli::apply_map(
+                    &args.input,
+                    source,
+                    &args.target,
+                    map,
+                    &args.output,
+                    &report,
+                    &sumaru::io::SurfaceDatasetOptions {
+                        companion_surfaces: parent_load.companion_surfaces.clone(),
+                        parent_policy: policy,
+                        auto_qcalc: false,
+                    },
+                )?;
+                if args.preview {
+                    viewer::run(viewer::LaunchOptions {
+                        surface_paths: vec![args.target],
+                        overlay_path: Some(args.output),
+                        parent_load: viewer::ParentLoadOptions {
+                            qc_map: Some(map.clone()),
+                            qc_source: Some(source.clone()),
+                            ..Default::default()
+                        },
+                        sparse_timecourse_display: SparseTimecourseDisplay::Sparse,
+                        ..Default::default()
+                    })?;
+                }
+                return Ok(());
+            }
+            let method = match args.method.as_deref().unwrap() {
+                "sampled-only" => SparseFillMethod::SampledOnly,
+                "mesh-nearest" => SparseFillMethod::Nearest,
+                _ => SparseFillMethod::Smooth,
+            };
+            let report = args
+                .report
+                .unwrap_or_else(|| PathBuf::from(format!("{}.json", args.output.display())));
+            sumaru::resample::run(&sumaru::resample::ResampleOptions {
+                input: args.input,
+                target: args.target.clone(),
+                output: args.output.clone(),
+                report: report.clone(),
+                method,
+                smoothing_steps: args.smoothing_steps as usize,
+                columns: args.columns,
+                loading: sumaru::io::SurfaceDatasetOptions {
+                    companion_surfaces: parent_load.companion_surfaces.clone(),
+                    parent_policy: policy,
+                    auto_qcalc: false,
+                },
+            })?;
+            println!(
+                "Saved {}\nReport {}",
+                args.output.display(),
+                report.display()
+            );
+            if args.preview {
+                // The export embeds its mapping; source companions may have a
+                // different row count and must not be reused to parse the output.
+                let mut preview_parent_load = parent_load;
+                preview_parent_load.companion_surfaces.clear();
+                viewer::run(viewer::LaunchOptions {
+                    surface_paths: vec![args.target],
+                    overlay_path: Some(args.output),
+                    parent_load: preview_parent_load,
+                    sparse_timecourse_display: SparseTimecourseDisplay::Sparse,
+                    ..Default::default()
+                })?;
+            }
+        }
         None => {
             validate_viewer_launch(
                 &surface_paths,
@@ -366,6 +577,7 @@ fn main() -> Result<()> {
                 &p_value,
             )?;
             viewer::run(viewer::LaunchOptions {
+                parent_load,
                 surface_paths,
                 onestate,
                 spec_path: spec,
@@ -390,7 +602,7 @@ fn main() -> Result<()> {
                 afni,
                 niml_record_path,
                 timecourse_mode: false,
-                sparse_timecourse_display: SparseTimecourseDisplay::Smooth,
+                sparse_timecourse_display: sparse_display,
             })?;
         }
         Some(Commands::Tc(args)) => {
@@ -419,9 +631,17 @@ fn main() -> Result<()> {
 
             let mut condition_overlays = args.overlay;
             condition_overlays.extend(args.overlay_multi);
+            if (parent_load.qc_child.is_some() || parent_load.qc_map.is_some())
+                && args.surface_rh.is_some()
+            {
+                bail!("surface QC uses one hemisphere; omit --surface-rh");
+            }
             let (surface_lh_path, surface_rh_path) = if let Some(right) = args.surface_rh {
                 (Some(args.surface.clone()), Some(right))
-            } else if let Some((left, right)) = discover_hemisphere_pair(&args.surface) {
+            } else if parent_load.qc_child.is_none()
+                && parent_load.qc_map.is_none()
+                && let Some((left, right)) = discover_hemisphere_pair(&args.surface)
+            {
                 (Some(left), Some(right))
             } else {
                 (None, None)
@@ -467,6 +687,7 @@ fn main() -> Result<()> {
             };
 
             viewer::run(viewer::LaunchOptions {
+                parent_load,
                 surface_paths,
                 surface_lh_path,
                 surface_rh_path,
@@ -480,7 +701,7 @@ fn main() -> Result<()> {
                 } else if args.stc_nearest {
                     SparseTimecourseDisplay::Nearest
                 } else {
-                    SparseTimecourseDisplay::Smooth
+                    sparse_display
                 },
                 ..viewer::LaunchOptions::default()
             })?;
@@ -887,6 +1108,61 @@ mod tests {
     }
 
     #[test]
+    fn export_requires_explicit_method_and_qc_options_work_in_both_viewer_modes() {
+        assert!(
+            Cli::try_parse_from([
+                "sumaru", "resample", "--input", "a.gii", "--target", "p.gii", "--output", "o.gii"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "sumaru",
+            "resample",
+            "--input",
+            "a.gii",
+            "--target",
+            "p.gii",
+            "--output",
+            "o.gii",
+            "--method",
+            "sampled-only",
+            "--qc-child",
+            "c.gii",
+            "--preview",
+        ])
+        .unwrap();
+        assert_eq!(cli.qc_child, Some(PathBuf::from("c.gii")));
+        assert!(
+            matches!(cli.command,Some(Commands::Resample(args)) if args.preview && args.method.as_deref()==Some("sampled-only"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sumaru",
+                "tc",
+                "-i",
+                "p.gii",
+                "--overlay",
+                "a.gii",
+                "--qc-child",
+                "c.gii"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sumaru",
+                "-i",
+                "p.gii",
+                "--overlay",
+                "a.gii",
+                "--qc-child",
+                "c.gii"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn timecourse_subcommand_parses_compact_launch_syntax() {
         let cli = Cli::parse_from([
             "sumaru",
@@ -902,6 +1178,32 @@ mod tests {
                 if args.surface == PathBuf::from("underlay-lh.gii")
                     && args.overlay == vec![PathBuf::from("stc-lh.gii")]
         ));
+    }
+
+    #[test]
+    fn parent_loading_options_apply_to_viewer_and_tc_and_conflict_cleanly() {
+        let cli = Cli::try_parse_from([
+            "sumaru",
+            "tc",
+            "-i",
+            "parent.gii",
+            "--overlay",
+            "data.time.gii",
+            "--companion-surface",
+            "child-lh.gii",
+            "--companion-surface",
+            "child-rh.gii",
+            "--strict-parent",
+        ])
+        .unwrap();
+        assert!(cli.strict_parent);
+        assert_eq!(cli.companion_surfaces.len(), 2);
+        let cli =
+            Cli::try_parse_from(["sumaru", "-i", "parent.gii", "--allow-parent-mismatch"]).unwrap();
+        assert!(cli.allow_parent_mismatch);
+        assert!(
+            Cli::try_parse_from(["sumaru", "--strict-parent", "--allow-parent-mismatch"]).is_err()
+        );
     }
 
     #[test]
@@ -1753,5 +2055,49 @@ mod tests {
             OsString::from("1"),
         ]);
         assert_eq!(cli.npb, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod geometric_cli_tests {
+    use super::*;
+    #[test]
+    fn explicit_maps_require_both_geometries_and_exclude_parent_fill() {
+        let base = [
+            "sumaru", "resample", "--input", "d.gii", "--target", "t.gii", "--output", "out.gii",
+        ];
+        let mut args = base.to_vec();
+        args.extend(["--map", "map.json"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+        args.extend(["--source-surface", "s.gii"]);
+        assert!(Cli::try_parse_from(&args).is_ok());
+        args.extend(["--method", "mne-smooth"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "sumaru",
+                "surface-map",
+                "--source",
+                "s.gii",
+                "--target",
+                "t.gii",
+                "--method",
+                "normal-projection",
+                "--centroid",
+                "--output",
+                "map.json"
+            ])
+            .is_ok()
+        );
+    }
+    #[test]
+    fn geometric_qc_requires_source_and_excludes_exact_parent_qc() {
+        let base = ["sumaru", "-i", "t.gii", "--qc-map", "map.json"];
+        assert!(Cli::try_parse_from(base).is_err());
+        let mut args = base.to_vec();
+        args.extend(["--qc-source", "s.gii"]);
+        assert!(Cli::try_parse_from(&args).is_ok());
+        args.extend(["--qc-child", "c.gii"]);
+        assert!(Cli::try_parse_from(&args).is_err());
     }
 }

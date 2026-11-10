@@ -373,6 +373,19 @@ impl ViewerState {
         }
     }
 
+    pub(super) fn instacorr_control_input(&mut self, event: &WindowEvent) -> InputResponse {
+        let egui_response = self
+            .instacorr_control
+            .egui
+            .state
+            .on_window_event(&self.instacorr_control.window, event);
+
+        InputResponse {
+            consumed: egui_response.consumed,
+            repaint: egui_response.repaint,
+        }
+    }
+
     pub(super) fn mask_control_input(&mut self, event: &WindowEvent) -> InputResponse {
         let egui_response = self
             .mask_control

@@ -53,8 +53,8 @@ use crate::dataset::{
 use crate::graph_dataset::read_graph_bucket;
 use crate::instacorr::{InstaCorrOptions, PreparedInstaCorr, prepare_dataset};
 use crate::io::{
-    NimlElement, dataset_is_stc, mark_dataset_as_paired_stc, read_gifti_dataset,
-    read_gifti_dataset_with_auto_qcalc, read_gifti_image, read_niml_dataset,
+    NimlElement, SurfaceDatasetOptions, dataset_is_stc, mark_dataset_as_paired_stc,
+    read_gifti_dataset, read_gifti_dataset_for_surface, read_gifti_image, read_niml_dataset,
     read_niml_dataset_with_label_table, read_niml_roi, read_stc_dataset, write_niml_roi,
 };
 use crate::niml_debug::NimlRecorder;
@@ -95,6 +95,7 @@ mod camera;
 mod capture;
 mod color_range;
 mod edit;
+mod geometric_qc;
 mod gpu;
 mod graph;
 mod input;
@@ -108,6 +109,9 @@ mod roi;
 mod scene;
 mod scene_objects;
 mod screenshot;
+mod surface_qc;
+use geometric_qc::GeometricQcState;
+use surface_qc::SurfaceQcState;
 mod timecourse;
 mod transform;
 mod ui;
@@ -324,6 +328,12 @@ const ROI_CONTROL_INNER_WIDTH: u32 = 430;
 const ROI_CONTROL_INNER_HEIGHT: u32 = 260;
 const ROI_CONTROL_MAX_INNER_WIDTH: u32 = 1100;
 const ROI_CONTROL_MIN_INNER_HEIGHT: u32 = 260;
+const INSTACORR_CONTROL_CONTENT_WIDTH_POINTS: f32 = 360.0;
+const INSTACORR_CONTROL_MIN_INNER_WIDTH: u32 = 430;
+const INSTACORR_CONTROL_INNER_WIDTH: u32 = 430;
+const INSTACORR_CONTROL_INNER_HEIGHT: u32 = 420;
+const INSTACORR_CONTROL_MAX_INNER_WIDTH: u32 = 1100;
+const INSTACORR_CONTROL_MIN_INNER_HEIGHT: u32 = 260;
 const MASK_CONTROL_CONTENT_WIDTH_POINTS: f32 = 430.0;
 const MASK_CONTROL_MIN_INNER_WIDTH: u32 = 500;
 const MASK_CONTROL_INNER_WIDTH: u32 = 500;
@@ -392,8 +402,29 @@ pub enum SparseTimecourseDisplay {
     Nearest,
 }
 
+impl SparseTimecourseDisplay {
+    fn method(self) -> crate::sparse_reconstruction::SparseFillMethod {
+        use crate::sparse_reconstruction::SparseFillMethod;
+        match self {
+            Self::Smooth => SparseFillMethod::Smooth,
+            Self::Sparse => SparseFillMethod::SampledOnly,
+            Self::Nearest => SparseFillMethod::Nearest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ParentLoadOptions {
+    pub qc_child: Option<PathBuf>,
+    pub qc_map: Option<PathBuf>,
+    pub qc_source: Option<PathBuf>,
+    pub companion_surfaces: Vec<PathBuf>,
+    pub policy_override: Option<crate::surface_align::ParentMismatchPolicy>,
+}
+
 #[derive(Debug, Default)]
 pub struct LaunchOptions {
+    pub parent_load: ParentLoadOptions,
     pub surface_paths: Vec<PathBuf>,
     pub onestate: bool,
     pub spec_path: Option<PathBuf>,
@@ -507,6 +538,7 @@ struct ViewerApp {
     initial_overlay_path: Option<PathBuf>,
     initial_overlay_pair_paths: Option<ExplicitOverlayPair>,
     initial_overlay_paths: Vec<PathBuf>,
+    parent_load: ParentLoadOptions,
     initial_overlay_pair_paths_list: Vec<ExplicitOverlayPair>,
     initial_roi_path: Option<PathBuf>,
     initial_auto_color_niml: bool,
@@ -540,6 +572,7 @@ impl ViewerApp {
             initial_overlay_path: options.overlay_path,
             initial_overlay_pair_paths: options.overlay_pair_paths,
             initial_overlay_paths: options.overlay_paths,
+            parent_load: options.parent_load,
             initial_overlay_pair_paths_list: options.overlay_pair_paths_list,
             initial_roi_path: options.roi_path,
             initial_auto_color_niml: options.auto_color_niml,
@@ -593,6 +626,17 @@ impl ViewerApp {
                     .with_visible(false),
             )?,
         );
+        let instacorr_control_window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("sumaru InstaCorr controls")
+                    .with_inner_size(PhysicalSize::new(
+                        INSTACORR_CONTROL_INNER_WIDTH,
+                        INSTACORR_CONTROL_INNER_HEIGHT,
+                    ))
+                    .with_visible(false),
+            )?,
+        );
         let mask_control_window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
@@ -627,10 +671,12 @@ impl ViewerApp {
                 view: view_window,
                 control: control_window,
                 roi_control: roi_control_window,
+                instacorr_control: instacorr_control_window,
                 mask_control: mask_control_window,
                 graph: graph_window,
             },
             InitialScene {
+                parent_load: self.parent_load.clone(),
                 surface_paths: std::mem::take(&mut self.initial_surface_paths),
                 onestate: self.initial_onestate,
                 spec_path: self.initial_spec_path.take(),
@@ -819,6 +865,47 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             return;
         }
 
+        if window_id == state.instacorr_control_window().id() {
+            let input = state.instacorr_control_input(&event);
+            if input.repaint {
+                state.instacorr_control_window().request_redraw();
+            }
+            if input.consumed {
+                state.instacorr_control_window().request_redraw();
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested => {
+                    state.set_instacorr_window_open(false);
+                }
+                WindowEvent::Occluded(occluded) => {
+                    state.set_aux_window_occluded(AuxWindowPane::InstaCorrControl, occluded);
+                }
+                WindowEvent::Resized(size) => {
+                    state.resize_instacorr_control(size);
+                    if !state.instacorr_control.occluded {
+                        state.instacorr_control_window().request_redraw();
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    if state.instacorr_control.occluded {
+                        return;
+                    }
+                    match state.render_instacorr_control() {
+                        RenderStatus::Rendered => {}
+                        RenderStatus::Skipped => {}
+                        RenderStatus::Reconfigure => {
+                            state.resize_instacorr_control(state.instacorr_control.size);
+                            state.instacorr_control_window().request_redraw();
+                        }
+                        RenderStatus::ValidationError => eprintln!("InstaCorr control validation error"),
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if window_id == state.mask_control_window().id() {
             let input = state.mask_control_input(&event);
             if input.repaint {
@@ -965,6 +1052,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 }
             }
             ViewerEvent::InstaCorrComputed => {
+                state.instacorr_control_window().request_redraw();
                 if state.drain_instacorr_results() {
                     state.view_window().request_redraw();
                     state.control_window().request_redraw();
@@ -996,6 +1084,10 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             .roi_controller_open
             .then_some(state.roi_control.repaint_at)
             .flatten();
+        let next_instacorr_control = state
+            .instacorr_window_open
+            .then_some(state.instacorr_control.repaint_at)
+            .flatten();
         let next_mask_control = state
             .controller
             .panels
@@ -1009,6 +1101,11 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         let view_due = repaint_due(now, next_view, state.view.occluded);
         let control_due = repaint_due(now, next_control, state.control.occluded);
         let roi_control_due = repaint_due(now, next_roi_control, state.roi_control.occluded);
+        let instacorr_control_due =
+            repaint_due(now, next_instacorr_control, state.instacorr_control.occluded);
+        if instacorr_control_due {
+            state.instacorr_control_window().request_redraw();
+        }
         let mask_control_due = repaint_due(now, next_mask_control, state.mask_control.occluded);
         let graph_due = repaint_due(now, next_graph, state.graph.occluded);
         if view_due {
@@ -1033,13 +1130,20 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 (next_view, state.view.occluded),
                 (next_control, state.control.occluded),
                 (next_roi_control, state.roi_control.occluded),
+                (next_instacorr_control, state.instacorr_control.occluded),
                 (next_mask_control, state.mask_control.occluded),
                 (next_graph, state.graph.occluded),
             ],
         );
         match next_wake {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None if view_due || control_due || roi_control_due || mask_control_due || graph_due => {
+            None if view_due
+                || control_due
+                || roi_control_due
+                || instacorr_control_due
+                || mask_control_due
+                || graph_due =>
+            {
                 event_loop.set_control_flow(ControlFlow::Wait)
             }
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -1134,6 +1238,7 @@ struct WindowPane {
 enum AuxWindowPane {
     Control,
     RoiControl,
+    InstaCorrControl,
     MaskControl,
     Graph,
 }
@@ -1455,6 +1560,7 @@ struct ViewerWindows {
     view: Arc<Window>,
     control: Arc<Window>,
     roi_control: Arc<Window>,
+    instacorr_control: Arc<Window>,
     mask_control: Arc<Window>,
     graph: Arc<Window>,
 }
@@ -1464,6 +1570,7 @@ struct ViewerWindows {
 /// instead of eight.
 #[derive(Default)]
 struct InitialScene {
+    parent_load: ParentLoadOptions,
     surface_paths: Vec<PathBuf>,
     onestate: bool,
     spec_path: Option<PathBuf>,
@@ -1493,6 +1600,8 @@ struct SurfaceRenderPipelines {
     filled: wgpu::RenderPipeline,
     filled_flat: wgpu::RenderPipeline,
     triangles: wgpu::RenderPipeline,
+    qc_wire: wgpu::RenderPipeline,
+    qc_points: wgpu::RenderPipeline,
     vertices: wgpu::RenderPipeline,
     threshold_contour: wgpu::RenderPipeline,
 }
@@ -1587,6 +1696,7 @@ struct ViewerState {
     view: WindowPane,
     control: WindowPane,
     roi_control: WindowPane,
+    instacorr_control: WindowPane,
     mask_control: WindowPane,
     graph: WindowPane,
     device: wgpu::Device,
@@ -1633,6 +1743,7 @@ struct ViewerState {
     overlay: ViewerOverlayState,
     overlay_stack: ViewerOverlayStack,
     preferences: AppPreferences,
+    parent_load: ParentLoadOptions,
     preferences_path: Option<PathBuf>,
     preferences_open: bool,
     preferences_status: Option<String>,
@@ -1655,6 +1766,11 @@ struct ViewerState {
     /// Enables a color-only preview while the `tc` threshold rail is dragged.
     timecourse_threshold_dragging: bool,
     sparse_timecourse_display: SparseTimecourseDisplay,
+    sparse_projection_cache: crate::sparse_reconstruction::SparseProjectionCache,
+    active_sparse_projection: Option<Arc<crate::sparse_reconstruction::SparseProjection>>,
+    sparse_smoothing_steps: usize,
+    surface_qc: Option<SurfaceQcState>,
+    geometric_qc: Option<GeometricQcState>,
     surface_volume_path: Option<PathBuf>,
     surface_volume_idcode: Option<String>,
     /// Loaded display volume and its slice-plane render state (`--volume` mode).
@@ -1745,10 +1861,12 @@ impl ViewerState {
             view: view_window,
             control: control_window,
             roi_control: roi_control_window,
+            instacorr_control: instacorr_control_window,
             mask_control: mask_control_window,
             graph: graph_window,
         } = windows;
         let InitialScene {
+            parent_load,
             surface_paths: initial_surface_paths,
             onestate: initial_onestate,
             spec_path: initial_spec_path,
@@ -1774,12 +1892,14 @@ impl ViewerState {
         let view_size = view_window.inner_size();
         let control_size = control_window.inner_size();
         let roi_control_size = roi_control_window.inner_size();
+        let instacorr_control_size = instacorr_control_window.inner_size();
         let mask_control_size = mask_control_window.inner_size();
         let graph_size = graph_window.inner_size();
         let instance = wgpu::Instance::default();
         let view_surface = instance.create_surface(view_window.clone())?;
         let control_surface = instance.create_surface(control_window.clone())?;
         let roi_control_surface = instance.create_surface(roi_control_window.clone())?;
+        let instacorr_control_surface = instance.create_surface(instacorr_control_window.clone())?;
         let mask_control_surface = instance.create_surface(mask_control_window.clone())?;
         let graph_surface = instance.create_surface(graph_window.clone())?;
         let adapter = instance
@@ -1815,6 +1935,7 @@ impl ViewerState {
         let view_caps = view_surface.get_capabilities(&adapter);
         let control_caps = control_surface.get_capabilities(&adapter);
         let roi_control_caps = roi_control_surface.get_capabilities(&adapter);
+        let instacorr_control_caps = instacorr_control_surface.get_capabilities(&adapter);
         let mask_control_caps = mask_control_surface.get_capabilities(&adapter);
         let graph_caps = graph_surface.get_capabilities(&adapter);
         let surface_format = choose_surface_format(&view_caps, &control_caps);
@@ -1831,6 +1952,18 @@ impl ViewerState {
         ensure!(
             roi_control_caps.alpha_modes.contains(&alpha_mode),
             "ROI controller surface does not support selected alpha mode {alpha_mode:?}"
+        );
+        ensure!(
+            instacorr_control_caps.formats.contains(&surface_format),
+            "InstaCorr controller surface does not support selected format {surface_format:?}"
+        );
+        ensure!(
+            instacorr_control_caps.present_modes.contains(&present_mode),
+            "InstaCorr controller surface does not support selected present mode {present_mode:?}"
+        );
+        ensure!(
+            instacorr_control_caps.alpha_modes.contains(&alpha_mode),
+            "InstaCorr controller surface does not support selected alpha mode {alpha_mode:?}"
         );
         ensure!(
             mask_control_caps.formats.contains(&surface_format),
@@ -1889,6 +2022,17 @@ impl ViewerState {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        let instacorr_control_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: instacorr_control_size.width.max(1),
+            height: instacorr_control_size.height.max(1),
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
         let mask_control_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -1914,6 +2058,7 @@ impl ViewerState {
         view_surface.configure(&device, &view_config);
         control_surface.configure(&device, &control_config);
         roi_control_surface.configure(&device, &roi_control_config);
+        instacorr_control_surface.configure(&device, &instacorr_control_config);
         mask_control_surface.configure(&device, &mask_control_config);
         graph_surface.configure(&device, &graph_config);
 
@@ -2001,8 +2146,12 @@ impl ViewerState {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    depth_write_enabled: Some(!label.starts_with("QC xray")),
+                    depth_compare: Some(if label.starts_with("QC xray") {
+                        wgpu::CompareFunction::Always
+                    } else {
+                        wgpu::CompareFunction::Less
+                    }),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -2023,6 +2172,18 @@ impl ViewerState {
                 wgpu::PrimitiveTopology::TriangleList,
                 "flat_vs_main",
                 "flat_fs_main",
+            ),
+            qc_points: make_surface_pipeline(
+                "QC xray points",
+                wgpu::PrimitiveTopology::PointList,
+                "vs_main",
+                "fs_main",
+            ),
+            qc_wire: make_surface_pipeline(
+                "QC xray wire",
+                wgpu::PrimitiveTopology::LineList,
+                "vs_main",
+                "fs_main",
             ),
             triangles: make_surface_pipeline(
                 "surface render pipeline triangles",
@@ -2130,6 +2291,18 @@ impl ViewerState {
         );
         roi_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
         let roi_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
+        let instacorr_egui_ctx = egui::Context::default();
+        instacorr_egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut instacorr_egui_state = egui_winit::State::new(
+            instacorr_egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            instacorr_control_window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        instacorr_egui_state.set_max_texture_side(device.limits().max_texture_dimension_2d as usize);
+        let instacorr_egui_renderer = Renderer::new(&device, surface_format, RendererOptions::default());
         let mask_egui_ctx = egui::Context::default();
         mask_egui_ctx.set_visuals(egui::Visuals::dark());
         let mut mask_egui_state = egui_winit::State::new(
@@ -2205,6 +2378,13 @@ impl ViewerState {
                 roi_control_size,
                 EguiPane::new(roi_egui_ctx, roi_egui_state, roi_egui_renderer),
             ),
+            instacorr_control: WindowPane::new(
+                instacorr_control_window,
+                instacorr_control_surface,
+                instacorr_control_config,
+                instacorr_control_size,
+                EguiPane::new(instacorr_egui_ctx, instacorr_egui_state, instacorr_egui_renderer),
+            ),
             mask_control: WindowPane::new(
                 mask_control_window,
                 mask_control_surface,
@@ -2254,6 +2434,7 @@ impl ViewerState {
             overlay: ViewerOverlayState::default(),
             overlay_stack: ViewerOverlayStack::default(),
             preferences,
+            parent_load,
             preferences_path,
             preferences_open: false,
             preferences_status: None,
@@ -2275,6 +2456,11 @@ impl ViewerState {
             timecourse: None,
             timecourse_threshold_dragging: false,
             sparse_timecourse_display,
+            sparse_projection_cache: Default::default(),
+            active_sparse_projection: None,
+            sparse_smoothing_steps: 10,
+            surface_qc: None,
+            geometric_qc: None,
             surface_volume_path: initial_surface_volume_path.clone(),
             surface_volume_idcode: initial_surface_volume_idcode,
             volume_view: None,
@@ -2368,6 +2554,8 @@ impl ViewerState {
         for pair in initial_overlay_pair_paths_list {
             state.load_overlay_pair_paths(pair)?;
         }
+        state.load_surface_qc()?;
+        state.load_geometric_qc()?;
         if initial_timecourse_mode {
             if state.overlay_count() > 1 {
                 state.select_overlay(0)?;
@@ -2401,6 +2589,10 @@ impl ViewerState {
 
     fn roi_control_window(&self) -> &Window {
         &self.roi_control.window
+    }
+
+    fn instacorr_control_window(&self) -> &Window {
+        &self.instacorr_control.window
     }
 
     fn mask_control_window(&self) -> &Window {
@@ -2471,6 +2663,7 @@ impl ViewerState {
         let window = match pane {
             AuxWindowPane::Control => &mut self.control,
             AuxWindowPane::RoiControl => &mut self.roi_control,
+            AuxWindowPane::InstaCorrControl => &mut self.instacorr_control,
             AuxWindowPane::MaskControl => &mut self.mask_control,
             AuxWindowPane::Graph => &mut self.graph,
         };
@@ -2498,6 +2691,10 @@ impl ViewerState {
 
     fn resize_roi_control(&mut self, size: PhysicalSize<u32>) {
         self.roi_control.resize(&self.device, size);
+    }
+
+    fn resize_instacorr_control(&mut self, size: PhysicalSize<u32>) {
+        self.instacorr_control.resize(&self.device, size);
     }
 
     fn resize_mask_control(&mut self, size: PhysicalSize<u32>) {
@@ -2935,6 +3132,26 @@ impl ViewerState {
                 );
             }
         }
+        for instance in self
+            .surface_qc
+            .as_ref()
+            .into_iter()
+            .flat_map(|qc| [qc.instance.as_ref(), qc.measured_instance.as_ref()])
+            .flatten()
+            .chain(
+                self.geometric_qc
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|qc| [qc.instance.as_ref(), qc.distance_instance.as_ref()])
+                    .flatten(),
+            )
+        {
+            self.queue.write_buffer(
+                &instance.uniform_buffer,
+                0,
+                &camera.uniform_bytes_with_model(aspect, instance.model_matrix, lighting_mode, 1.0),
+            );
+        }
         if let Some(instance) = self.selection_instance.as_ref() {
             self.queue.write_buffer(
                 &instance.uniform_buffer,
@@ -3190,39 +3407,107 @@ impl ViewerState {
         render_pass.set_scissor_rect(0, 0, viewport_size.width, viewport_size.height);
         let surface_style = self.active_surface_render_style();
 
-        if let Some(render_set) = &self.surface_render_set {
-            render_pass.set_pipeline(self.active_surface_pipeline(false));
-            for instance in &render_set.instances {
-                if !self
-                    .controller
-                    .display
-                    .pair_visibility
-                    .is_visible(&instance.side)
-                {
-                    continue;
+        if self.surface_qc.as_ref().is_none_or(|qc| qc.parent_visible) {
+            if let Some(render_set) = &self.surface_render_set {
+                render_pass.set_pipeline(self.active_surface_pipeline(false));
+                for instance in &render_set.instances {
+                    if !self
+                        .controller
+                        .display
+                        .pair_visibility
+                        .is_visible(&instance.side)
+                    {
+                        continue;
+                    }
+                    render_pass.set_bind_group(0, &instance.bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+                    render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        instance.index_buffer(surface_style).slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.draw_indexed(0..instance.index_count(surface_style), 0, 0..1);
                 }
-                render_pass.set_bind_group(0, &instance.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
+            } else if let Some(buffers) = &self.surface_buffers {
+                render_pass.set_pipeline(self.active_surface_pipeline(buffers.flat_colors));
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, buffers.color_buffer.slice(..));
                 render_pass.set_index_buffer(
-                    instance.index_buffer(surface_style).slice(..),
+                    buffers.index_buffer(surface_style).slice(..),
                     wgpu::IndexFormat::Uint32,
                 );
-                render_pass.draw_indexed(0..instance.index_count(surface_style), 0, 0..1);
+                render_pass.draw_indexed(0..buffers.index_count(surface_style), 0, 0..1);
             }
-        } else if let Some(buffers) = &self.surface_buffers {
-            render_pass.set_pipeline(self.active_surface_pipeline(buffers.flat_colors));
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, buffers.color_buffer.slice(..));
+        }
+        if let Some(qc) = &self.surface_qc
+            && qc.child_visible
+            && let Some(instance) = &qc.instance
+        {
+            let pipeline = match qc.child_style {
+                SurfaceRenderStyle::Filled => &self.surface_render_pipelines.filled,
+                SurfaceRenderStyle::Triangles if qc.xray => &self.surface_render_pipelines.qc_wire,
+                SurfaceRenderStyle::Triangles => &self.surface_render_pipelines.triangles,
+                _ => &self.surface_render_pipelines.vertices,
+            };
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, &instance.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
             render_pass.set_index_buffer(
-                buffers.index_buffer(surface_style).slice(..),
+                instance.index_buffer(qc.child_style).slice(..),
                 wgpu::IndexFormat::Uint32,
             );
-            render_pass.draw_indexed(0..buffers.index_count(surface_style), 0, 0..1);
+            render_pass.draw_indexed(0..instance.index_count(qc.child_style), 0, 0..1);
         }
 
-        if !self.threshold_contour_instances.is_empty() {
+        if let Some(qc) = &self.geometric_qc {
+            for (instance, style, pipeline) in [
+                (
+                    qc.visible.then_some(qc.instance.as_ref()).flatten(),
+                    SurfaceRenderStyle::Triangles,
+                    &self.surface_render_pipelines.qc_wire,
+                ),
+                (
+                    qc.show_distances
+                        .then_some(qc.distance_instance.as_ref())
+                        .flatten(),
+                    SurfaceRenderStyle::Vertices,
+                    &self.surface_render_pipelines.qc_points,
+                ),
+            ] {
+                if let Some(instance) = instance {
+                    render_pass.set_pipeline(pipeline);
+                    render_pass.set_bind_group(0, &instance.bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+                    render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        instance.index_buffer(style).slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.draw_indexed(0..instance.index_count(style), 0, 0..1);
+                }
+            }
+        }
+
+        if let Some(qc) = &self.surface_qc
+            && qc.show_measured
+            && let Some(instance) = &qc.measured_instance
+        {
+            render_pass.set_pipeline(&self.surface_render_pipelines.qc_points);
+            render_pass.set_bind_group(0, &instance.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, instance.color_buffer.slice(..));
+            render_pass.set_index_buffer(
+                instance.point_index_buffer.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            render_pass.draw_indexed(0..instance.point_index_count, 0, 0..1);
+        }
+
+        if self.surface_qc.as_ref().is_none_or(|qc| qc.parent_visible)
+            && !self.threshold_contour_instances.is_empty()
+        {
             let draws_halo = self.overlay.render.appearance.contour.draws_halo();
             render_pass.set_pipeline(&self.surface_render_pipelines.threshold_contour);
             for instance in &self.threshold_contour_instances {
@@ -3247,7 +3532,9 @@ impl ViewerState {
             }
         }
 
-        if let Some(instance) = &self.selection_instance {
+        if self.surface_qc.as_ref().is_none_or(|qc| qc.parent_visible)
+            && let Some(instance) = &self.selection_instance
+        {
             render_pass.set_pipeline(self.active_surface_pipeline(false));
             render_pass.set_bind_group(0, &instance.bind_group, &[]);
             render_pass.set_vertex_buffer(0, instance.vertex_buffer.slice(..));
@@ -3406,6 +3693,53 @@ impl ViewerState {
             &paint_jobs,
             &screen_descriptor,
             "ROI control render encoder",
+        )
+    }
+
+    fn render_instacorr_control(&mut self) -> RenderStatus {
+        let raw_input = self.instacorr_control.take_egui_input();
+        let egui_ctx = self.instacorr_control.egui.ctx.clone();
+        let mut desired_instacorr_control_size_points = egui::Vec2::ZERO;
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let output = self.draw_instacorr_control_ui(ui);
+            desired_instacorr_control_size_points = output.desired_control_size_points;
+        });
+        self.instacorr_control.repaint_at = repaint_delay_to_instant(&full_output);
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+            .unwrap_or(Duration::MAX);
+
+        self.instacorr_control
+            .egui
+            .state
+            .handle_platform_output(&self.instacorr_control.window, full_output.platform_output);
+        if repaint_delay != Duration::ZERO {
+            self.fit_instacorr_control_window(
+                desired_instacorr_control_size_points,
+                full_output.pixels_per_point,
+            );
+        }
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [
+                self.instacorr_control.config.width,
+                self.instacorr_control.config.height,
+            ],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        self.instacorr_control
+            .egui
+            .pending_textures
+            .append(full_output.textures_delta);
+
+        self.instacorr_control.present_egui_frame(
+            &self.device,
+            &self.queue,
+            &paint_jobs,
+            &screen_descriptor,
+            "InstaCorr control render encoder",
         )
     }
 
@@ -3608,6 +3942,37 @@ impl ViewerState {
             self.resize_roi_control(actual_size);
         }
         self.roi_control.window.request_redraw();
+    }
+
+    fn fit_instacorr_control_window(
+        &mut self,
+        desired_control_size_points: egui::Vec2,
+        pixels_per_point: f32,
+    ) {
+        let Some(desired_size) = desired_panel_size(
+            &self.instacorr_control.window,
+            desired_control_size_points,
+            pixels_per_point,
+            INSTACORR_CONTROL_MIN_INNER_WIDTH,
+            INSTACORR_CONTROL_MIN_INNER_HEIGHT,
+            0.65,
+            INSTACORR_CONTROL_MAX_INNER_WIDTH,
+            0.45,
+            520,
+        ) else {
+            return;
+        };
+        if size_is_close(self.instacorr_control.size, desired_size) {
+            return;
+        }
+        if self.instacorr_control.last_requested_size == Some(desired_size) {
+            return;
+        }
+        self.instacorr_control.last_requested_size = Some(desired_size);
+        if let Some(actual_size) = self.instacorr_control.window.request_inner_size(desired_size) {
+            self.resize_instacorr_control(actual_size);
+        }
+        self.instacorr_control.window.request_redraw();
     }
 
     fn fit_mask_control_window(
@@ -5283,6 +5648,13 @@ impl ViewerState {
         {
             return None;
         }
+        if self
+            .surface_qc
+            .as_ref()
+            .is_some_and(|qc| qc.child_visible && qc.pick_child)
+        {
+            return self.pick_qc_child(cursor);
+        }
         if let Some(pick) = self.pick_active_component_surface_at_cursor(cursor) {
             return Some(pick);
         }
@@ -6019,6 +6391,28 @@ impl ViewerState {
     }
 
     fn upload_surface_buffers(&mut self) {
+        if self.geometric_qc.as_ref().is_some_and(|qc| {
+            self.mesh.as_ref().is_none_or(|mesh| {
+                crate::surface_mapping::mesh_fingerprint(mesh) != qc.map.target_fingerprint
+            })
+        }) {
+            self.geometric_qc = None;
+            self.set_error(anyhow::anyhow!(
+                "Geometric QC disabled: target geometry changed; build a map for this surface"
+            ));
+        }
+
+        if self.surface_qc.as_ref().is_some_and(|qc| {
+            self.mesh.as_ref().is_none_or(|mesh| {
+                qc.parent_domain != mesh.domain.id || qc.parent_surface_id != mesh.metadata.id
+            })
+        }) {
+            self.surface_qc = None;
+            if let Err(error) = self.load_surface_qc() {
+                self.set_error(error);
+            }
+        }
+
         self.upload_surface_buffers_inner();
         self.refresh_threshold_contour_buffers();
     }
@@ -8220,6 +8614,7 @@ fn single_hemisphere_overlay_dataset(
     domain: &SurfaceDomain,
     node_offset: u32,
 ) -> Result<Dataset> {
+    let mapping_warnings = dataset.mapping_warnings.clone();
     let kind = dataset.kind.clone();
     let time_step_seconds = dataset.time_step_seconds;
     let time_start_seconds = dataset.time_start_seconds;
@@ -8238,7 +8633,8 @@ fn single_hemisphere_overlay_dataset(
     };
 
     Dataset::sparse(kind, domain, node_indices, columns)
-        .map(|dataset| {
+        .map(|mut dataset| {
+            dataset.mapping_warnings = mapping_warnings;
             dataset
                 .with_parent_ids(parent_ids)
                 .with_time_step_seconds(time_step_seconds)
@@ -8330,6 +8726,12 @@ fn paired_overlay_dataset(
     domain: &SurfaceDomain,
     right_node_offset: u32,
 ) -> Result<Dataset> {
+    let mapping_warnings: Vec<String> = left
+        .mapping_warnings
+        .iter()
+        .map(|s| format!("Left: {s}"))
+        .chain(right.mapping_warnings.iter().map(|s| format!("Right: {s}")))
+        .collect();
     let left_is_stc = dataset_is_stc(&left);
     let right_is_stc = dataset_is_stc(&right);
     ensure!(
@@ -8369,7 +8771,8 @@ fn paired_overlay_dataset(
         && left_row_count + right_row_count == domain.node_count
     {
         let dataset = Dataset::dense(kind, domain, columns)
-            .map(|dataset| {
+            .map(|mut dataset| {
+                dataset.mapping_warnings = mapping_warnings.clone();
                 dataset
                     .with_time_step_seconds(time_step_seconds)
                     .with_time_start_seconds(time_start_seconds)
@@ -8395,7 +8798,8 @@ fn paired_overlay_dataset(
     }
 
     let dataset = Dataset::sparse(kind, domain, node_indices, columns)
-        .map(|dataset| {
+        .map(|mut dataset| {
+            dataset.mapping_warnings = mapping_warnings.clone();
             dataset
                 .with_time_step_seconds(time_step_seconds)
                 .with_time_start_seconds(time_start_seconds)
@@ -8501,36 +8905,31 @@ fn paired_column_data(left: ColumnData, right: ColumnData) -> Result<ColumnData>
 fn load_dataset_from_path(
     path: &Path,
     mesh: &SurfaceMesh,
-    gifti_dset_auto_qcalc: bool,
+    options: &SurfaceDatasetOptions,
 ) -> Result<Dataset> {
-    if is_stc_path(path) {
-        read_stc_dataset(path, &mesh.domain)
+    let dataset = if is_stc_path(path) {
+        read_stc_dataset(path, &mesh.domain)?
     } else if is_niml_dset_path(path) {
-        read_niml_dataset(path, &mesh.domain)
+        read_niml_dataset(path, &mesh.domain)?
     } else if is_gifti_path(path) {
-        read_gifti_dataset_with_auto_qcalc(path, &mesh.domain, gifti_dset_auto_qcalc).or_else(
-            |dataset_error| {
-            let overlay_values =
-                OverlayDataset::from_gifti_path(path, mesh.vertices.len()).with_context(|| {
-                    format!(
-                        "failed to load GIFTI as canonical dataset ({dataset_error:#}) or simple overlay"
-                    )
-                })?;
-            dataset_from_simple_overlay(&mesh.domain, overlay_values.values)
-            },
-        )
+        // A metadata error must never fall back to an unindexed overlay.
+        read_gifti_dataset_for_surface(path, mesh, options)?
     } else {
         let overlay_values = OverlayDataset::from_gifti_path(path, mesh.vertices.len())?;
-        dataset_from_simple_overlay(&mesh.domain, overlay_values.values)
+        dataset_from_simple_overlay(&mesh.domain, overlay_values.values)?
+    };
+    for warning in &dataset.mapping_warnings {
+        eprintln!("Warning: {}: {warning}", path.display());
     }
+    Ok(dataset)
 }
 
 fn load_overlay_from_path(
     path: &Path,
     mesh: &SurfaceMesh,
-    gifti_dset_auto_qcalc: bool,
+    options: &SurfaceDatasetOptions,
 ) -> Result<LoadedOverlay> {
-    let dataset = load_dataset_from_path(path, mesh, gifti_dset_auto_qcalc)?;
+    let dataset = load_dataset_from_path(path, mesh, options)?;
     loaded_overlay_from_dataset(dataset, mesh.vertices.len(), "overlay")
 }
 
@@ -12432,6 +12831,39 @@ mod tests {
             panic!("expected float values");
         };
         assert_eq!(values, &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn parent_resolved_overlays_keep_missing_nodes_and_paired_notices() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parent_mapping");
+        let mut parent = SurfaceMesh::new(vec![[0., 0., 0.]; 10], vec![[0, 1, 2]]).unwrap();
+        parent.metadata.parent_identity = SurfaceMesh::from_path(root.join("lh.gii"))
+            .unwrap()
+            .metadata
+            .parent_identity;
+        parent.metadata.parent_identity.as_mut().unwrap().subject = Some("different".into());
+        let options = crate::io::SurfaceDatasetOptions::default();
+        let left =
+            super::load_dataset_from_path(&root.join("lh.time.gii"), &parent, &options).unwrap();
+        let loaded = super::loaded_overlay_from_dataset(left.clone(), 10, "test").unwrap();
+        assert_eq!(loaded.overlay_values.values[8], 10.);
+        assert!(loaded.overlay_values.values[0].is_nan());
+        parent.metadata.parent_identity = SurfaceMesh::from_path(root.join("rh.gii"))
+            .unwrap()
+            .metadata
+            .parent_identity;
+        parent.metadata.parent_identity.as_mut().unwrap().subject = Some("different".into());
+        let right =
+            super::load_dataset_from_path(&root.join("rh.time.gii"), &parent, &options).unwrap();
+        let combined = SurfaceDomain::from_triangles(20, vec![[0, 1, 2], [10, 11, 12]]).unwrap();
+        let pair = super::paired_overlay_dataset(left, right, &combined, 10).unwrap();
+        assert_eq!(pair.node_indices, Some(vec![8, 1, 4, 17, 12, 15]));
+        assert!(pair.mapping_warnings.iter().any(|s| s.starts_with("Left:")));
+        assert!(
+            pair.mapping_warnings
+                .iter()
+                .any(|s| s.starts_with("Right:"))
+        );
     }
 
     #[test]

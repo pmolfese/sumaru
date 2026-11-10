@@ -42,6 +42,10 @@ pub struct SurfaceMetadata {
     pub anatomically_correct: AnatomicalCorrectness,
     pub sphere: Option<SphereMetadata>,
     pub lineage: SurfaceLineage,
+    /// Ordered local-to-parent IDs; local triangles remain unchanged.
+    pub parent_mapping: Option<crate::surface_align::ParentVertexMapping>,
+    /// Declared parent identity, also available on complete parent geometry.
+    pub parent_identity: Option<crate::surface_align::ParentDomainIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -401,7 +405,7 @@ impl SurfaceMesh {
         let domain = SurfaceDomain::from_triangles(vertices.len(), triangles.clone())?;
         let bounds = Bounds::from_vertices(&vertices)?;
         let source_file = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let metadata = SurfaceMetadata::from_gifti(
+        let mut metadata = SurfaceMetadata::from_gifti(
             &source_file,
             &image,
             pointset,
@@ -410,6 +414,9 @@ impl SurfaceMesh {
             &domain,
             bounds,
         );
+        let parent = crate::io::gifti_parent_metadata(&image)?;
+        metadata.parent_mapping = parent.mapping;
+        metadata.parent_identity = parent.identity;
 
         Ok(Self {
             vertices,
@@ -1209,56 +1216,67 @@ impl SurfaceMesh {
     }
 
     pub fn nodewise_mapping_to(&self, target: &Self) -> SurfaceToSurfaceMap {
-        if self.domain.node_count == target.domain.node_count
+        if self.domain.shares_topology_with(&target.domain)
             && self.metadata.can_share_nodewise_data_with(&target.metadata)
         {
-            let kind = if self.domain.shares_topology_with(&target.domain) {
-                SurfaceMappingKind::SameTopology
-            } else {
-                SurfaceMappingKind::SameStandardNodeCount
-            };
-            return SurfaceToSurfaceMap::identity_like(&self.domain, &target.domain, kind);
+            return SurfaceToSurfaceMap::identity_like(
+                &self.domain,
+                &target.domain,
+                SurfaceMappingKind::SameTopology,
+            );
         }
 
         self.nearest_node_mapping_to(target)
     }
 
     pub fn nearest_node_mapping_to(&self, target: &Self) -> SurfaceToSurfaceMap {
-        let target_weights = target
-            .vertices
-            .iter()
-            .copied()
-            .map(|vertex| {
-                let source_node = self
-                    .nearest_node_to_world(vertex)
-                    .map(|(node, _)| node)
-                    .unwrap_or(0);
-                NodeWeights {
-                    weights: vec![(source_node, 1.0)],
-                }
-            })
-            .collect();
-
-        SurfaceToSurfaceMap {
-            source_domain_id: self.domain.id.clone(),
-            target_domain_id: target.domain.id.clone(),
-            kind: SurfaceMappingKind::NearestNode,
-            target_weights,
-        }
+        self.geometric_mapping_to(
+            target,
+            crate::surface_mapping::MappingMethod::NearestNode,
+            SurfaceMappingKind::NearestNode,
+        )
     }
 
     pub fn barycentric_triangle_mapping_to(&self, target: &Self) -> SurfaceToSurfaceMap {
-        let target_weights = target
-            .vertices
-            .iter()
-            .copied()
-            .map(|vertex| closest_triangle_weights(&self.vertices, &self.domain.triangles, vertex))
-            .collect();
+        self.geometric_mapping_to(
+            target,
+            crate::surface_mapping::MappingMethod::ClosestTriangle,
+            SurfaceMappingKind::BarycentricTriangle,
+        )
+    }
 
+    fn geometric_mapping_to(
+        &self,
+        target: &Self,
+        method: crate::surface_mapping::MappingMethod,
+        kind: SurfaceMappingKind,
+    ) -> SurfaceToSurfaceMap {
+        let map = crate::surface_mapping::GeometricMap::build(
+            self,
+            target,
+            &crate::surface_mapping::MappingOptions {
+                method,
+                ..Default::default()
+            },
+        );
+        let target_weights = match map {
+            Ok(map) => map
+                .rows
+                .into_iter()
+                .map(|r| NodeWeights {
+                    weights: r
+                        .source_nodes
+                        .into_iter()
+                        .zip(r.weights.into_iter().map(|w| w as f32))
+                        .collect(),
+                })
+                .collect(),
+            Err(_) => vec![NodeWeights { weights: vec![] }; target.vertices.len()],
+        };
         SurfaceToSurfaceMap {
             source_domain_id: self.domain.id.clone(),
             target_domain_id: target.domain.id.clone(),
-            kind: SurfaceMappingKind::BarycentricTriangle,
+            kind,
             target_weights,
         }
     }
@@ -1651,6 +1669,8 @@ impl SurfaceMetadata {
             anatomically_correct: AnatomicalCorrectness::Unknown,
             sphere,
             lineage,
+            parent_mapping: None,
+            parent_identity: None,
         }
     }
 
@@ -1863,6 +1883,27 @@ impl SurfaceLineage {
 }
 
 impl SurfaceDomain {
+    /// Temporary indexing space for parsing data before attachment to geometry.
+    /// Never use this domain as evidence of surface/topology correspondence.
+    pub(crate) fn unbound_data(node_count: usize) -> Result<Self> {
+        ensure!(
+            node_count > 0 && node_count <= u32::MAX as usize,
+            "invalid data domain size"
+        );
+        Ok(Self {
+            id: SurfaceDomainId(format!("unbound-data:{node_count}")),
+            node_count,
+            node_ids: None,
+            row_to_node: RowToNodeMapping::Dense,
+            sorted_nodes: SortedNodeMetadata {
+                is_sorted: true,
+                has_duplicates: false,
+            },
+            triangles: Vec::new(),
+            topology_hash: String::new(),
+        })
+    }
+
     pub fn from_triangles(node_count: usize, triangles: Vec<[u32; 3]>) -> Result<Self> {
         Self::from_parts(node_count, None, RowToNodeMapping::Dense, triangles)
     }
@@ -3127,74 +3168,6 @@ fn push_unique_point(points: &mut Vec<[f32; 3]>, point: [f32; 3]) {
         .any(|existing| vertex_distance(*existing, point) <= 1e-5)
     {
         points.push(point);
-    }
-}
-
-fn closest_triangle_weights(
-    vertices: &[[f32; 3]],
-    triangles: &[[u32; 3]],
-    target: [f32; 3],
-) -> NodeWeights {
-    let target_vec = Vec3::from_array(target);
-    let triangle = triangles
-        .iter()
-        .copied()
-        .min_by(|left, right| {
-            let left_distance = triangle_centroid(vertices, *left).distance_squared(target_vec);
-            let right_distance = triangle_centroid(vertices, *right).distance_squared(target_vec);
-            left_distance
-                .partial_cmp(&right_distance)
-                .unwrap_or(Ordering::Equal)
-        })
-        .unwrap_or([0, 0, 0]);
-    let [a, b, c] = triangle;
-    let weights = barycentric_weights(
-        Vec3::from_array(vertices[a as usize]),
-        Vec3::from_array(vertices[b as usize]),
-        Vec3::from_array(vertices[c as usize]),
-        target_vec,
-    );
-
-    NodeWeights {
-        weights: vec![(a, weights[0]), (b, weights[1]), (c, weights[2])],
-    }
-}
-
-fn triangle_centroid(vertices: &[[f32; 3]], triangle: [u32; 3]) -> Vec3 {
-    let [a, b, c] = triangle;
-    (Vec3::from_array(vertices[a as usize])
-        + Vec3::from_array(vertices[b as usize])
-        + Vec3::from_array(vertices[c as usize]))
-        / 3.0
-}
-
-fn barycentric_weights(a: Vec3, b: Vec3, c: Vec3, p: Vec3) -> [f32; 3] {
-    let v0 = b - a;
-    let v1 = c - a;
-    let v2 = p - a;
-    let d00 = v0.dot(v0);
-    let d01 = v0.dot(v1);
-    let d11 = v1.dot(v1);
-    let d20 = v2.dot(v0);
-    let d21 = v2.dot(v1);
-    let denominator = d00 * d11 - d01 * d01;
-
-    if denominator.abs() <= f32::EPSILON {
-        return [1.0, 0.0, 0.0];
-    }
-
-    let v = (d11 * d20 - d01 * d21) / denominator;
-    let w = (d00 * d21 - d01 * d20) / denominator;
-    let u = 1.0 - v - w;
-    normalize_weights([u.max(0.0), v.max(0.0), w.max(0.0)])
-}
-
-fn normalize_weights(weights: [f32; 3]) -> [f32; 3] {
-    let sum = weights[0] + weights[1] + weights[2];
-    if sum <= f32::EPSILON {
-        [1.0, 0.0, 0.0]
-    } else {
-        [weights[0] / sum, weights[1] / sum, weights[2] / sum]
     }
 }
 

@@ -75,6 +75,7 @@ pub(crate) fn gifti_image_to_dataset(
     path: &Path,
     auto_qcalc: bool,
 ) -> Result<Dataset> {
+    let parent_mapping = gifti_parent_mapping(image)?;
     let index_arrays: Vec<_> = image
         .data_arrays
         .iter()
@@ -184,7 +185,8 @@ pub(crate) fn gifti_image_to_dataset(
     } else {
         Dataset::dense(kind, domain, columns)
     };
-    dataset.map(|dataset| {
+    dataset.map(|mut dataset| {
+        dataset.parent_mapping = parent_mapping;
         dataset
             .with_parent_ids(parent_ids)
             .with_time_step_seconds(time_step_seconds)
