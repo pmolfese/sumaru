@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 use anyhow::{Result, ensure};
 
 use crate::stats::{AfniStatSpec, normal_two_tailed_p_value};
@@ -15,6 +24,10 @@ pub struct Dataset {
     /// Time of the first time-series column, in seconds relative to the event.
     pub time_start_seconds: Option<f64>,
     pub parent_ids: DatasetParentIds,
+    /// Original row-to-parent correspondence, independent of display indexing.
+    pub parent_mapping: Option<crate::surface_align::ParentVertexMapping>,
+    /// Persistent diagnostics from resolving data onto a display surface.
+    pub mapping_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +104,7 @@ impl ColumnRange {
     }
 
     pub(crate) fn normalized(&self, value: f64) -> f64 {
-        if (self.max - self.min).abs() <= f64::EPSILON {
+        if self.max == self.min {
             0.5
         } else {
             ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
@@ -131,6 +144,8 @@ impl Dataset {
             time_step_seconds: None,
             time_start_seconds: None,
             parent_ids: DatasetParentIds::default(),
+            parent_mapping: None,
+            mapping_warnings: Vec::new(),
         })
     }
 
@@ -166,7 +181,31 @@ impl Dataset {
             time_step_seconds: None,
             time_start_seconds: None,
             parent_ids: DatasetParentIds::default(),
+            parent_mapping: None,
+            mapping_warnings: Vec::new(),
         })
+    }
+
+    /// Normalize existing sparse indexing without changing its domain or row order.
+    /// A supplied identity describes the domain indexed by NODE_INDEX/STC IDs.
+    pub fn vertex_mapping(
+        &self,
+        indexed_domain: crate::surface_align::ParentDomainIdentity,
+    ) -> Result<Option<crate::surface_align::ParentVertexMapping>> {
+        if let Some(mapping) = &self.parent_mapping {
+            mapping.validate(self.row_count)?;
+            return Ok(Some(mapping.clone()));
+        }
+        self.node_indices
+            .as_ref()
+            .map(|indices| {
+                crate::surface_align::ParentVertexMapping::new(
+                    indexed_domain,
+                    indices.clone(),
+                    self.row_count,
+                )
+            })
+            .transpose()
     }
 
     pub fn with_parent_ids(mut self, parent_ids: DatasetParentIds) -> Self {
@@ -587,6 +626,24 @@ fn range_step(range: Option<ColumnRange>, value: f64) -> Option<ColumnRange> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tiny_color_ranges_use_the_entire_color_scale() {
+        for extent in [2.393e-13, 1.0e-20, 2.0] {
+            let range = super::ColumnRange {
+                min: -extent,
+                max: extent,
+            };
+            assert_eq!(range.normalized(-extent), 0.0);
+            assert_eq!(range.normalized(0.0), 0.5);
+            assert_eq!(range.normalized(extent), 1.0);
+            assert_eq!(range.normalized(2.0 * extent), 1.0);
+        }
+        assert_eq!(
+            super::ColumnRange { min: 0.0, max: 0.0 }.normalized(0.0),
+            0.5
+        );
+    }
+
     use super::{
         ColumnData, ColumnRange, ColumnRole, DataColumn, Dataset, DatasetKind, DatasetParentIds,
     };

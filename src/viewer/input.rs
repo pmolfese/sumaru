@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! Window input handling for the viewer windows: the view window's mouse and
 //! keyboard routing (camera, pair-drag, ROI picking, volume slice scrubbing,
 //! and keyboard shortcuts) plus the egui passthrough for the control, ROI, and
@@ -357,6 +366,19 @@ impl ViewerState {
             .egui
             .state
             .on_window_event(&self.roi_control.window, event);
+
+        InputResponse {
+            consumed: egui_response.consumed,
+            repaint: egui_response.repaint,
+        }
+    }
+
+    pub(super) fn instacorr_control_input(&mut self, event: &WindowEvent) -> InputResponse {
+        let egui_response = self
+            .instacorr_control
+            .egui
+            .state
+            .on_window_event(&self.instacorr_control.window, event);
 
         InputResponse {
             consumed: egui_response.consumed,

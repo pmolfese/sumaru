@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! Picked-node graph window and bottom dock: opening from a pick, dock
 //! show/hide and view-window growth, dock height, and building the graph
 //! snapshot. Extracted from `viewer/mod.rs`; all methods stay on `ViewerState`.
@@ -166,11 +175,13 @@ impl ViewerState {
     pub(super) fn graph_snapshot_for_pick(&self, pick: SurfacePick) -> Option<GraphSnapshot> {
         let mut points = Vec::new();
         let mut comparison_series = Vec::new();
-        if let Some(timecourse) = self.timecourse.as_ref()
-            && let Some(row) = dataset_row_for_node(&timecourse.source_dataset, pick.node_index)
-        {
+        if let Some(timecourse) = self.timecourse.as_ref() {
             for sample_index in 0..timecourse.time_columns.len() {
-                let Some(value) = timecourse.sample_value(row, sample_index) else {
+                let Some(value) = timecourse.node_sample_value(
+                    timecourse.active_condition(),
+                    pick.node_index,
+                    sample_index,
+                ) else {
                     continue;
                 };
                 points.push(GraphPoint {
@@ -179,16 +190,30 @@ impl ViewerState {
                     value,
                 });
             }
+            let raw_points = (0..timecourse.sample_count())
+                .filter_map(|sample| {
+                    Some(GraphPoint {
+                        column_index: sample,
+                        label: format!("{:.1} ms", timecourse.sample_time(sample) * 1000.0),
+                        value: timecourse.raw_node_sample_value(
+                            timecourse.active_condition(),
+                            pick.node_index,
+                            sample,
+                        )?,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !raw_points.is_empty() {
+                comparison_series.push(GraphSeries {
+                    label: "Raw sampled data (no baseline or spatial fill)".into(),
+                    color_index: timecourse.condition_count(),
+                    points: raw_points,
+                });
+            }
             for condition_index in 0..timecourse.condition_count() {
                 if condition_index == timecourse.active_condition() {
                     continue;
                 }
-                let Some(dataset) = timecourse.condition_dataset(condition_index) else {
-                    continue;
-                };
-                let Some(condition_row) = dataset_row_for_node(dataset, pick.node_index) else {
-                    continue;
-                };
                 let condition_points = (0..timecourse.sample_count())
                     .filter_map(|sample_index| {
                         Some(GraphPoint {
@@ -197,9 +222,9 @@ impl ViewerState {
                                 "{:.1} ms",
                                 timecourse.sample_time(sample_index) * 1000.0
                             ),
-                            value: timecourse.condition_sample_value(
+                            value: timecourse.node_sample_value(
                                 condition_index,
-                                condition_row,
+                                pick.node_index,
                                 sample_index,
                             )?,
                         })
@@ -216,22 +241,75 @@ impl ViewerState {
                     });
                 }
             }
-        } else if let Some(dataset) = self.overlay.data.dataset()
-            && let Some(row) = dataset_row_for_node(dataset, pick.node_index)
-        {
+        } else if let Some(dataset) = self.overlay.data.dataset() {
+            let mut raw_points = Vec::new();
             for (column_index, column) in dataset.columns.iter().enumerate() {
-                let Some(value) = numeric_column_value_as_f32(column, row) else {
+                if column.role == ColumnRole::NodeIndex {
                     continue;
-                };
-                points.push(GraphPoint {
-                    column_index,
-                    label: graph_column_label(column_index, column),
-                    value,
+                }
+                let raw = dataset_row_for_node(dataset, pick.node_index)
+                    .and_then(|row| numeric_column_value_as_f32(column, row));
+                let value = self
+                    .active_sparse_projection
+                    .as_ref()
+                    .map_or(raw, |projection| {
+                        projection.sample_node(pick.node_index as usize, |row| {
+                            numeric_column_value_as_f32(column, row)
+                        })
+                    });
+                let label = graph_column_label(column_index, column);
+                if let Some(value) = value {
+                    points.push(GraphPoint {
+                        column_index,
+                        label: label.clone(),
+                        value,
+                    });
+                }
+                if let Some(value) = raw {
+                    raw_points.push(GraphPoint {
+                        column_index,
+                        label,
+                        value,
+                    });
+                }
+            }
+            if self.active_sparse_projection.is_some() && !raw_points.is_empty() {
+                comparison_series.push(GraphSeries {
+                    label: "Raw sampled data".into(),
+                    color_index: 1,
+                    points: raw_points,
                 });
             }
         }
 
-        if points.is_empty() {
+        if let Some(source) = self
+            .surface_qc
+            .as_ref()
+            .and_then(|qc| qc.raw_source.as_ref())
+            && let Some(row) = dataset_row_for_node(source, pick.node_index)
+        {
+            let raw = source
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(column_index, column)| {
+                    Some(GraphPoint {
+                        column_index,
+                        label: graph_column_label(column_index, column),
+                        value: numeric_column_value_as_f32(column, row)?,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !raw.is_empty() {
+                comparison_series.push(GraphSeries {
+                    label: "Original sampled source (before export reconstruction)".into(),
+                    color_index: 2,
+                    points: raw,
+                });
+            }
+        }
+
+        if points.is_empty() && self.timecourse.is_none() {
             if let Some(value) = pick.overlay_value {
                 points.push(GraphPoint {
                     column_index: self.overlay.data.columns().intensity,
@@ -258,7 +336,11 @@ impl ViewerState {
             node_index: pick.node_index,
             surface_position: pick.surface_position,
             surface_label: self.pick_surface_display_text(),
-            overlay_label: self.pick_overlay_display_text(),
+            overlay_label: if self.active_sparse_projection.is_some() || self.timecourse.is_some() {
+                format!("{} (display trace)", self.pick_overlay_display_text())
+            } else {
+                self.pick_overlay_display_text()
+            },
             points,
             active_series_index: self
                 .timecourse

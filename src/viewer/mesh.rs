@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 use std::collections::BTreeSet;
 use std::ops::Range;
 
@@ -209,6 +218,7 @@ impl SelectionHighlight {
 pub(super) struct OverlayAppearance {
     pub(super) range: ValueRange,
     pub(super) symmetric_range: bool,
+    pub(super) range_locked: bool,
     pub(super) brightness_range: Option<ValueRange>,
     pub(super) brightness_scale: [f32; 2],
     pub(super) brightness_compat_initialized: bool,
@@ -269,6 +279,7 @@ pub(super) enum OverlayColorMap {
     AfniP2Spanned,
     BlueWhiteRed,
     Fire,
+    Hot,
     Grayscale,
 }
 
@@ -1076,6 +1087,7 @@ impl OverlayAppearance {
         Self {
             range: super::symmetric_value_range(range),
             symmetric_range: true,
+            range_locked: false,
             brightness_range: None,
             brightness_scale: [0.0, 1.0],
             brightness_compat_initialized: false,
@@ -1101,7 +1113,7 @@ impl OverlayAppearance {
 }
 
 impl OverlayColorMap {
-    pub(super) const ALL: [Self; 15] = [
+    pub(super) const ALL: [Self; 16] = [
         Self::DiscreteLabels,
         Self::AmberMonochrome,
         Self::SpectrumRedToBlue,
@@ -1116,6 +1128,7 @@ impl OverlayColorMap {
         Self::AfniP2Spanned,
         Self::BlueWhiteRed,
         Self::Fire,
+        Self::Hot,
         Self::Grayscale,
     ];
 
@@ -1135,6 +1148,7 @@ impl OverlayColorMap {
             Self::AfniP2Spanned => "afni_p2spanned",
             Self::BlueWhiteRed => "blue-white-red",
             Self::Fire => "nih_fire",
+            Self::Hot => "hot",
             Self::Grayscale => "grayscale",
         }
     }
@@ -1155,6 +1169,7 @@ impl OverlayColorMap {
             Self::AfniP2Spanned => Some(ColorMap::afni_p2_spanned()),
             Self::BlueWhiteRed => Some(ColorMap::blue_white_red()),
             Self::Fire => Some(ColorMap::fire()),
+            Self::Hot => Some(ColorMap::hot()),
             Self::Grayscale => Some(ColorMap::grayscale()),
         }
     }

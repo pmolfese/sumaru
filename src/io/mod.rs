@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -15,16 +24,20 @@ use crate::surface::{SurfaceDomain, SurfaceSide};
 mod freesurfer;
 mod gifti;
 mod niml;
+mod parent_mapping;
 mod roi;
 mod stc;
+mod surface_dataset;
 
 // The public face of `io`: read/write entry points and the NIML data model,
 // re-exported from the topical submodules so callers keep using `crate::io::*`.
 pub use freesurfer::*;
 pub use gifti::*;
 pub use niml::*;
+pub use parent_mapping::*;
 pub use roi::*;
 pub use stc::*;
+pub use surface_dataset::*;
 
 const MINIMAL_DSET_SAMPLE: &str = r#"
 <AFNI_dataset

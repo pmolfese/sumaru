@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! SUMA-compatible seed correlation preprocessing.
 //!
 //! SUMA's InstaCorr path removes a polynomial baseline, applies an FFT
@@ -184,6 +193,21 @@ pub fn prepare_rows(
         });
     }
 
+    // Correlation is invariant to a positive scale factor. Work at unit peak
+    // amplitude so the residual-norm tolerance is relative to each input row,
+    // rather than rejecting valid signals expressed in small physical units.
+    // This also avoids overflow/underflow in detrending and normalization.
+    for row in &mut rows {
+        if row.iter().all(|value| value.is_finite()) {
+            let peak = row.iter().map(|value| value.abs()).fold(0.0, f64::max);
+            if peak > 0.0 {
+                for value in row {
+                    *value /= peak;
+                }
+            }
+        }
+    }
+
     let regressors = legendre_regressors(sample_count, options.polort);
     let mut filtered_regressors = regressors.clone();
     // SUMA asks THD_bandpass_vectors for qdet=1 in addition to the selected
@@ -340,8 +364,12 @@ fn bandpass(values: &mut [f64], tr: f64, low_hz: f64, high_hz: f64, has_orts: bo
             buffer[nfft - index] = Complex::ZERO;
         }
     }
-    buffer[jtop] *= taper;
-    buffer[nfft - jtop] *= taper;
+    // DC has no separate negative-frequency bin. When the upper cutoff
+    // rounds to DC, it is already zero and nfft - jtop would be out of bounds.
+    if jtop >= 1 {
+        buffer[jtop] *= taper;
+        buffer[nfft - jtop] *= taper;
+    }
     for index in (jtop + 1)..nby2 {
         buffer[index] = Complex::ZERO;
         buffer[nfft - index] = Complex::ZERO;
@@ -432,6 +460,39 @@ mod tests {
     }
 
     #[test]
+    fn correlations_are_invariant_to_signal_units() {
+        let signal = (0..361)
+            .map(|index| (index as f64 * 0.2).sin() + 0.2 * (index as f64 * 0.7).cos())
+            .collect::<Vec<_>>();
+        for bandpass_enabled in [false, true] {
+            let rows = [1.0, 1.0e-15, 1.0e-200, 1.0e200, -1.0e-15]
+                .into_iter()
+                .map(|scale| signal.iter().map(|value| value * scale).collect())
+                .collect();
+            let prepared = prepare_rows(
+                rows,
+                InstaCorrOptions {
+                    bandpass_enabled,
+                    polort: 2,
+                    ..options()
+                },
+            )
+            .unwrap();
+            for seed in 0..5 {
+                let correlations = prepared.correlate(seed).unwrap();
+                for (node, correlation) in correlations.iter().enumerate() {
+                    let expected = if (seed == 4) == (node == 4) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    assert!((correlation - expected).abs() < 1.0e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn constant_rows_are_invalid() {
         let prepared = prepare_rows(
             vec![vec![1.0, 3.0, 2.0, 5.0], vec![4.0, 4.0, 4.0, 4.0]],
@@ -468,6 +529,37 @@ mod tests {
         let correlations = prepared.correlate(0).unwrap();
         assert!((correlations[0] - 1.0).abs() < 1.0e-5);
         assert!((correlations[1] + 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn bandpass_upper_cutoff_rounding_to_dc_removes_all_frequencies() {
+        for sample_count in [16, 361, 362] {
+            for has_orts in [false, true] {
+                let mut signal = (0..sample_count)
+                    .map(|index| (index as f64 * 0.2).sin())
+                    .collect::<Vec<_>>();
+                // The upper cutoff is below half the first nonzero FFT bin.
+                let high_hz = 0.25 / next_even(sample_count) as f64;
+                bandpass(&mut signal, 1.0, 0.0, high_hz, has_orts);
+                assert!(signal.iter().all(|value| value.abs() < 1.0e-12));
+            }
+        }
+    }
+
+    #[test]
+    fn preprocessing_with_dc_only_passband_returns_invalid_seed_error() {
+        let signal = (0..362)
+            .map(|index| (index as f64 * 0.2).sin())
+            .collect::<Vec<_>>();
+        let prepared = prepare_rows(
+            vec![signal],
+            InstaCorrOptions {
+                tr_seconds: Some(0.001),
+                ..InstaCorrOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(prepared.correlate(0).is_err());
     }
 
     #[test]

@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! Compact 3D+time mode built on the normal overlay renderer.
 //!
 //! The source dataset stays intact here while the active overlay is replaced by
@@ -26,6 +35,22 @@ pub enum TimeCourseBaseline {
     Raw,
     SubtractMean,
     ZScore,
+}
+
+/// Display amplitude independently of baseline correction and threshold comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeCourseAmplitude {
+    Signed,
+    Magnitude,
+}
+
+impl TimeCourseAmplitude {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Signed => "Signed",
+            Self::Magnitude => "Magnitude",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +88,14 @@ pub enum TimeCourseMeasure {
 }
 
 impl TimeCourseMeasure {
+    fn display_label(self, amplitude: TimeCourseAmplitude) -> &'static str {
+        if self == Self::PositivePeak && amplitude == TimeCourseAmplitude::Magnitude {
+            "Peak magnitude"
+        } else {
+            self.label()
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Mean => "Mean",
@@ -83,6 +116,7 @@ pub struct TimeCourseControls {
     pub response_end: usize,
     pub display: TimeCourseDisplay,
     pub baseline: TimeCourseBaseline,
+    pub amplitude: TimeCourseAmplitude,
     pub scale: TimeCourseScale,
     pub measure: TimeCourseMeasure,
     pub threshold_enabled: bool,
@@ -117,22 +151,22 @@ pub(super) enum TimeCoursePlotInteraction {
 pub(super) struct TimeCourseState {
     pub(super) source_dataset: Dataset,
     pub(super) time_columns: Vec<usize>,
-    conditions: Vec<TimeCourseCondition>,
+    pub(super) conditions: Vec<TimeCourseCondition>,
     active_condition: usize,
     times_seconds: Vec<f64>,
     baseline_stats: Vec<BaselineStats>,
     cursor_full_range: ValueRange,
     cursor_robust_range: ValueRange,
     cursor_scale_dirty: bool,
-    sparse_projection: Option<SparseTimecourseProjection>,
+    pub(super) sparse_projections: Vec<Option<Arc<SparseTimecourseProjection>>>,
     pub(super) controls: TimeCourseControls,
     next_frame_at: Instant,
     frame_interval: Duration,
 }
 
-struct TimeCourseCondition {
+pub(super) struct TimeCourseCondition {
     label: String,
-    dataset: Dataset,
+    pub(super) dataset: Dataset,
     time_columns: Vec<usize>,
     baseline_stats: Vec<BaselineStats>,
 }
@@ -172,8 +206,6 @@ impl TimeCourseState {
         let step = datasets[0].1.time_step_seconds.unwrap_or(1.0);
         let start = datasets[0].1.time_start_seconds.unwrap_or(0.0);
         let expected_domain = datasets[0].1.domain_id.clone();
-        let expected_rows = datasets[0].1.row_count;
-        let expected_nodes = datasets[0].1.node_indices.clone();
         let times_seconds = (0..time_columns.len())
             .map(|index| start + index as f64 * step)
             .collect::<Vec<_>>();
@@ -216,6 +248,7 @@ impl TimeCourseState {
             } else {
                 TimeCourseBaseline::Raw
             },
+            amplitude: TimeCourseAmplitude::Signed,
             scale: TimeCourseScale::AutoRobust,
             measure: TimeCourseMeasure::PositivePeak,
             threshold_enabled: false,
@@ -241,8 +274,6 @@ impl TimeCourseState {
                 start,
                 step,
                 &expected_domain,
-                expected_rows,
-                expected_nodes.as_deref(),
             )?;
             let condition_stats = baseline_statistics(
                 &dataset,
@@ -258,7 +289,8 @@ impl TimeCourseState {
             });
         }
         let (cursor_full_range, cursor_robust_range) =
-            timecourse_condition_ranges(&conditions, controls.baseline)?;
+            timecourse_condition_ranges(&conditions, controls.baseline, controls.amplitude)?;
+        let condition_count = conditions.len();
         let active = &conditions[active_condition];
         Ok(Self {
             source_dataset: active.dataset.clone(),
@@ -270,7 +302,7 @@ impl TimeCourseState {
             cursor_full_range,
             cursor_robust_range,
             cursor_scale_dirty: false,
-            sparse_projection: None,
+            sparse_projections: vec![None; condition_count],
             controls,
             next_frame_at: Instant::now() + frame_interval,
             frame_interval,
@@ -325,6 +357,44 @@ impl TimeCourseState {
             value,
             *condition.baseline_stats.get(row)?,
             self.controls.baseline,
+            self.controls.amplitude,
+        )
+    }
+
+    /// Evaluate the same spatial operator used by the displayed cursor map.
+    pub(super) fn node_sample_value(
+        &self,
+        condition: usize,
+        node: u32,
+        sample: usize,
+    ) -> Option<f32> {
+        if let Some(projection) = &self
+            .sparse_projections
+            .get(condition)
+            .and_then(Option::as_ref)
+        {
+            projection.sample_node(node as usize, |row| {
+                self.condition_sample_value(condition, row, sample)
+            })
+        } else {
+            let dataset = self.condition_dataset(condition)?;
+            self.condition_sample_value(condition, dataset_row_for_node(dataset, node)?, sample)
+        }
+    }
+
+    pub(super) fn raw_node_sample_value(
+        &self,
+        condition: usize,
+        node: u32,
+        sample: usize,
+    ) -> Option<f32> {
+        let dataset = self.condition_dataset(condition)?;
+        let row = dataset_row_for_node(dataset, node)?;
+        numeric_column_value_as_f32(
+            dataset
+                .columns
+                .get(*self.conditions.get(condition)?.time_columns.get(sample)?)?,
+            row,
         )
     }
 
@@ -360,6 +430,7 @@ impl TimeCourseState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn sample_value(&self, row: usize, sample: usize) -> Option<f32> {
         let column = self
             .source_dataset
@@ -367,7 +438,12 @@ impl TimeCourseState {
             .get(*self.time_columns.get(sample)?)?;
         let value = numeric_column_value_as_f32(column, row)?;
         let stats = *self.baseline_stats.get(row)?;
-        let value = transform_timecourse_value(value, stats, self.controls.baseline)?;
+        let value = transform_timecourse_value(
+            value,
+            stats,
+            self.controls.baseline,
+            self.controls.amplitude,
+        )?;
         value.is_finite().then_some(value)
     }
 
@@ -383,6 +459,11 @@ impl TimeCourseState {
     }
 
     fn sanitize_controls(&self, controls: &mut TimeCourseControls) {
+        if controls.amplitude == TimeCourseAmplitude::Magnitude
+            && controls.measure == TimeCourseMeasure::NegativePeak
+        {
+            controls.measure = TimeCourseMeasure::PositivePeak;
+        }
         let last = self.sample_count() - 1;
         controls.cursor = controls.cursor.min(last);
         controls.baseline_start = controls.baseline_start.min(last);
@@ -428,16 +509,12 @@ impl TimeCourseState {
             }
             TimeCourseDisplay::Window => format!(
                 "{} {:.1}..{:.1} ms",
-                self.controls.measure.label(),
+                self.controls.measure.display_label(self.controls.amplitude),
                 self.sample_time(self.controls.response_start) * 1000.0,
                 self.sample_time(self.controls.response_end) * 1000.0
             ),
         };
-        let units = self
-            .source_dataset
-            .columns
-            .get(self.time_columns[0])
-            .and_then(|column| column.units.clone());
+        let units = self.display_units();
         let column = DataColumn::new(
             label,
             ColumnRole::Intensity,
@@ -449,11 +526,23 @@ impl TimeCourseState {
             domain_id: self.source_dataset.domain_id.clone(),
             row_count: self.source_dataset.row_count,
             node_indices: self.source_dataset.node_indices.clone(),
+            parent_mapping: self.source_dataset.parent_mapping.clone(),
+            mapping_warnings: self.source_dataset.mapping_warnings.clone(),
             columns: vec![column],
             time_step_seconds: None,
             time_start_seconds: None,
             parent_ids: self.source_dataset.parent_ids.clone(),
         })
+    }
+
+    fn display_units(&self) -> Option<String> {
+        if self.controls.baseline == TimeCourseBaseline::ZScore {
+            return Some("z-score".to_string());
+        }
+        self.source_dataset
+            .columns
+            .get(self.time_columns[0])
+            .and_then(|column| column.units.clone())
     }
 }
 
@@ -486,38 +575,18 @@ impl ViewerState {
             conditions.push((overlay.display_text(), dataset));
         }
         let mut timecourse = TimeCourseState::from_conditions(conditions, active)?;
-        let sparse_stc_nodes = timecourse
-            .conditions
-            .iter()
-            .map(|condition| &condition.dataset)
-            .find(|dataset| {
-                dataset_is_stc(dataset)
-                    && dataset.is_sparse()
-                    && self
-                        .mesh
-                        .as_ref()
-                        .is_some_and(|mesh| dataset.row_count < mesh.domain.node_count)
-            })
-            .and_then(|dataset| dataset.node_indices.clone());
-        if let Some(source_nodes) = sparse_stc_nodes {
-            let mesh = self
-                .mesh
-                .as_ref()
-                .context("load a surface before displaying a sparse timecourse")?;
-            let neighbors = mesh.topology().node_neighbors;
-            timecourse.sparse_projection = match self.sparse_timecourse_display {
-                SparseTimecourseDisplay::Smooth => Some(SparseTimecourseProjection::Smooth(
-                    SparseUpsamplingMatrix::build(
-                        &neighbors,
-                        &source_nodes,
-                        DEFAULT_SPARSE_SMOOTHING_STEPS,
-                    )?,
-                )),
-                SparseTimecourseDisplay::Nearest => Some(SparseTimecourseProjection::Nearest(
-                    NearestSourceProjection::build(&neighbors, &source_nodes)?,
-                )),
-                SparseTimecourseDisplay::Sparse => None,
-            };
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("load a surface before displaying a timecourse")?;
+        for (index, condition) in timecourse.conditions.iter().enumerate() {
+            self.require_full_parent_for_fill(&condition.dataset)?;
+            timecourse.sparse_projections[index] = self.sparse_projection_cache.for_dataset(
+                mesh,
+                &condition.dataset,
+                self.sparse_timecourse_display.method(),
+                self.sparse_smoothing_steps,
+            )?;
         }
         self.timecourse = Some(timecourse);
         self.set_graph_window_open(true);
@@ -559,8 +628,12 @@ impl ViewerState {
         state.sanitize_controls(&mut controls);
         let baseline_window_changed = controls.baseline_start != state.controls.baseline_start
             || controls.baseline_end != state.controls.baseline_end;
-        let baseline_transform_changed = controls.baseline != state.controls.baseline;
+        let baseline_transform_changed = controls.baseline != state.controls.baseline
+            || controls.amplitude != state.controls.amplitude;
         let starting_playback = controls.playing && !state.controls.playing;
+        if controls.scale != state.controls.scale {
+            self.overlay.render.appearance.range_locked = false;
+        }
         state.controls = controls;
         if baseline_window_changed {
             for condition in &mut state.conditions {
@@ -577,8 +650,11 @@ impl ViewerState {
             state.cursor_scale_dirty = true;
         }
         if baseline_transform_changed || (recompute_scale && state.cursor_scale_dirty) {
-            (state.cursor_full_range, state.cursor_robust_range) =
-                timecourse_condition_ranges(&state.conditions, state.controls.baseline)?;
+            (state.cursor_full_range, state.cursor_robust_range) = timecourse_condition_ranges(
+                &state.conditions,
+                state.controls.baseline,
+                state.controls.amplitude,
+            )?;
             state.cursor_scale_dirty = false;
         }
         if starting_playback {
@@ -623,14 +699,21 @@ impl ViewerState {
             overlay_dataset_from_canonical_dataset(&dataset, node_count, columns)?;
         let projected = dataset.is_sparse()
             && dataset.row_count < node_count
-            && dataset_is_stc(&dataset)
-            && state.sparse_projection.is_some();
-        if projected && let Some(projection) = state.sparse_projection.as_ref() {
+            && state.sparse_projections[state.active_condition].is_some();
+        if projected
+            && let Some(projection) = state.sparse_projections[state.active_condition].as_ref()
+        {
             node_values = projection.apply(node_values)?;
         }
         let range = node_values.range;
         let display_range = match controls.display {
             TimeCourseDisplay::Cursor => state.cursor_color_range(),
+            TimeCourseDisplay::Window if controls.amplitude == TimeCourseAmplitude::Magnitude => {
+                ValueRange {
+                    min: 0.0,
+                    max: range.max,
+                }
+            }
             TimeCourseDisplay::Window => symmetric_value_range(range),
         };
 
@@ -646,10 +729,15 @@ impl ViewerState {
         };
         self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
         self.overlay.source.label_table = None;
-        self.overlay.render.appearance.colormap = OverlayColorMap::SpectrumRedToBlue;
-        self.overlay.render.appearance.range = display_range;
-        self.overlay.render.appearance.symmetric_range =
-            display_range.min < 0.0 && display_range.max > 0.0;
+        self.overlay.render.appearance.colormap = match controls.amplitude {
+            TimeCourseAmplitude::Signed => OverlayColorMap::SpectrumRedToBlue,
+            TimeCourseAmplitude::Magnitude => OverlayColorMap::Hot,
+        };
+        color_range::apply_automatic_range(
+            &mut self.overlay.render.appearance,
+            display_range,
+            Some(display_range.min < 0.0 && display_range.max > 0.0),
+        );
         self.overlay.render.appearance.threshold = OverlayThreshold {
             enabled: controls.threshold_enabled,
             absolute: controls.threshold_absolute,
@@ -731,6 +819,19 @@ impl ViewerState {
                             .changed();
                     }
                 });
+            egui::ComboBox::from_id_salt("tc_amplitude")
+                .selected_text(controls.amplitude.label())
+                .show_ui(ui, |ui| {
+                    for choice in [TimeCourseAmplitude::Signed, TimeCourseAmplitude::Magnitude] {
+                        changed |= ui
+                            .selectable_value(&mut controls.amplitude, choice, choice.label())
+                            .changed();
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Absolute amplitude after the selected baseline transformation; not power.",
+                );
             egui::ComboBox::from_id_salt("tc_scale")
                 .selected_text(controls.scale.label())
                 .show_ui(ui, |ui| {
@@ -814,7 +915,7 @@ impl ViewerState {
 
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("tc_measure")
-                .selected_text(controls.measure.label())
+                .selected_text(controls.measure.display_label(controls.amplitude))
                 .show_ui(ui, |ui| {
                     for choice in [
                         TimeCourseMeasure::Mean,
@@ -823,9 +924,19 @@ impl ViewerState {
                         TimeCourseMeasure::AbsolutePeak,
                         TimeCourseMeasure::AreaUnderCurve,
                     ] {
-                        changed |= ui
-                            .selectable_value(&mut controls.measure, choice, choice.label())
-                            .changed();
+                        ui.add_enabled_ui(
+                            controls.amplitude != TimeCourseAmplitude::Magnitude
+                                || choice != TimeCourseMeasure::NegativePeak,
+                            |ui| {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut controls.measure,
+                                        choice,
+                                        choice.display_label(controls.amplitude),
+                                    )
+                                    .changed();
+                            },
+                        );
                     }
                 });
             changed |= ui
@@ -869,6 +980,14 @@ impl ViewerState {
         }
 
         ui.add_space(3.0);
+        ui.label(format!(
+            "{} amplitude{}",
+            controls.amplitude.label(),
+            state
+                .display_units()
+                .map(|units| format!(" ({units})"))
+                .unwrap_or_default()
+        ));
         if let Some(snapshot) = self.graph_snapshot.as_ref() {
             if let Some(interaction) = draw_graph_snapshot(
                 ui,
@@ -938,7 +1057,9 @@ fn timecourse_values(
         .map(|row| {
             let stats = baseline_stats[row];
             let transform = |value: Option<f32>| {
-                value.and_then(|value| transform_timecourse_value(value, stats, controls.baseline))
+                value.and_then(|value| {
+                    transform_timecourse_value(value, stats, controls.baseline, controls.amplitude)
+                })
             };
 
             if controls.display == TimeCourseDisplay::Cursor {
@@ -961,6 +1082,7 @@ fn transform_timecourse_value(
     value: f32,
     stats: BaselineStats,
     baseline: TimeCourseBaseline,
+    amplitude: TimeCourseAmplitude,
 ) -> Option<f32> {
     let value = match baseline {
         TimeCourseBaseline::Raw => value,
@@ -972,12 +1094,17 @@ fn transform_timecourse_value(
             (value - stats.mean) / standard_deviation
         }
     };
+    let value = match amplitude {
+        TimeCourseAmplitude::Signed => value,
+        TimeCourseAmplitude::Magnitude => value.abs(),
+    };
     value.is_finite().then_some(value)
 }
 
 fn timecourse_condition_ranges(
     conditions: &[TimeCourseCondition],
     baseline: TimeCourseBaseline,
+    amplitude: TimeCourseAmplitude,
 ) -> Result<(ValueRange, ValueRange)> {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
@@ -998,7 +1125,9 @@ fn timecourse_condition_ranges(
             for column_index in &condition.time_columns {
                 let Some(value) =
                     numeric_column_value_as_f32(&condition.dataset.columns[*column_index], row)
-                        .and_then(|value| transform_timecourse_value(value, stats, baseline))
+                        .and_then(|value| {
+                            transform_timecourse_value(value, stats, baseline, amplitude)
+                        })
                 else {
                     continue;
                 };
@@ -1015,6 +1144,15 @@ fn timecourse_condition_ranges(
     let robust_extent = nearest_rank_percentile(&mut magnitudes, 0.995)
         .filter(|extent| *extent > 0.0)
         .unwrap_or_else(|| min.abs().max(max.abs()).max(1.0));
+    if amplitude == TimeCourseAmplitude::Magnitude {
+        return Ok((
+            ValueRange { min: 0.0, max },
+            ValueRange {
+                min: 0.0,
+                max: robust_extent,
+            },
+        ));
+    }
     Ok((
         timecourse_color_range(min, max, min.abs().max(max.abs())),
         timecourse_color_range(min, max, robust_extent),
@@ -1028,8 +1166,6 @@ fn validate_timecourse_condition(
     expected_start: f64,
     expected_step: f64,
     expected_domain: &crate::surface::SurfaceDomainId,
-    expected_rows: usize,
-    expected_nodes: Option<&[u32]>,
 ) -> Result<()> {
     ensure!(
         time_columns.len() == expected_samples,
@@ -1047,9 +1183,7 @@ fn validate_timecourse_condition(
         "timecourse conditions must have the same sample interval"
     );
     ensure!(
-        &dataset.domain_id == expected_domain
-            && dataset.row_count == expected_rows
-            && dataset.node_indices.as_deref() == expected_nodes,
+        &dataset.domain_id == expected_domain,
         "timecourse conditions must map to the same surface vertices"
     );
     Ok(())
@@ -1143,19 +1277,13 @@ fn summarize_response(
     })
 }
 
-const DEFAULT_SPARSE_SMOOTHING_STEPS: usize = 10;
-
-enum SparseTimecourseProjection {
-    Smooth(SparseUpsamplingMatrix),
-    Nearest(NearestSourceProjection),
-}
+use crate::sparse_reconstruction::SparseProjection as SparseTimecourseProjection;
+#[cfg(test)]
+use crate::sparse_reconstruction::{NearestSourceProjection, SparseUpsamplingMatrix};
 
 impl SparseTimecourseProjection {
     fn apply(&self, mut overlay: OverlayDataset) -> Result<OverlayDataset> {
-        let project = |values: &[f32]| match self {
-            Self::Smooth(matrix) => matrix.apply_dense_seeds(values),
-            Self::Nearest(projection) => projection.apply_dense_seeds(values),
-        };
+        let project = |values: &[f32]| self.apply_dense_seeds(values);
         overlay.values = project(&overlay.values)?;
         overlay.range = ValueRange::from_values(&overlay.values)?;
         if let Some(threshold_values) = overlay.threshold_values.as_mut() {
@@ -1164,182 +1292,6 @@ impl SparseTimecourseProjection {
         Ok(overlay)
     }
 }
-
-/// CSR source-to-surface operator matching MNE's `_surf_upsampling_mat`:
-/// adjacency includes each node itself, active rows expand one ring per step,
-/// and every output row is normalized after each multiplication.
-struct SparseUpsamplingMatrix {
-    source_nodes: Vec<u32>,
-    row_offsets: Vec<usize>,
-    column_indices: Vec<u32>,
-    weights: Vec<f32>,
-}
-
-impl SparseUpsamplingMatrix {
-    fn build(neighbors: &[Vec<u32>], source_nodes: &[u32], steps: usize) -> Result<Self> {
-        ensure!(steps > 0, "sparse smoothing requires at least one step");
-        ensure!(
-            !source_nodes.is_empty(),
-            "sparse smoothing has no source nodes"
-        );
-        let mut seen = HashSet::with_capacity(source_nodes.len());
-        let mut rows = vec![Vec::<(u32, f32)>::new(); neighbors.len()];
-        for (column, node) in source_nodes.iter().copied().enumerate() {
-            ensure!(
-                (node as usize) < neighbors.len(),
-                "source node {node} is outside the display surface"
-            );
-            ensure!(
-                seen.insert(node),
-                "source node {node} appears more than once"
-            );
-            rows[node as usize].push((column as u32, 1.0));
-        }
-
-        let mut accumulator = vec![0.0_f32; source_nodes.len()];
-        let mut marks = vec![0_u32; source_nodes.len()];
-        let mut generation = 0_u32;
-        let mut touched = Vec::new();
-        for _ in 0..steps {
-            let mut next = vec![Vec::<(u32, f32)>::new(); neighbors.len()];
-            for node in 0..neighbors.len() {
-                generation = generation.wrapping_add(1);
-                if generation == 0 {
-                    marks.fill(0);
-                    generation = 1;
-                }
-                touched.clear();
-                let mut contributing_rows = 0_usize;
-                for adjacent in std::iter::once(node)
-                    .chain(neighbors[node].iter().map(|neighbor| *neighbor as usize))
-                {
-                    if rows[adjacent].is_empty() {
-                        continue;
-                    }
-                    contributing_rows += 1;
-                    for (column, weight) in &rows[adjacent] {
-                        let column = *column as usize;
-                        if marks[column] != generation {
-                            marks[column] = generation;
-                            accumulator[column] = 0.0;
-                            touched.push(column);
-                        }
-                        accumulator[column] += *weight;
-                    }
-                }
-                if contributing_rows == 0 {
-                    continue;
-                }
-                let normalization = 1.0 / contributing_rows as f32;
-                next[node].reserve(touched.len());
-                for column in &touched {
-                    next[node].push((*column as u32, accumulator[*column] * normalization));
-                }
-            }
-            rows = next;
-        }
-
-        let mut row_offsets = Vec::with_capacity(rows.len() + 1);
-        let mut column_indices = Vec::new();
-        let mut weights = Vec::new();
-        row_offsets.push(0);
-        for row in rows {
-            column_indices.extend(row.iter().map(|(column, _)| *column));
-            weights.extend(row.iter().map(|(_, weight)| *weight));
-            row_offsets.push(column_indices.len());
-        }
-        Ok(Self {
-            source_nodes: source_nodes.to_vec(),
-            row_offsets,
-            column_indices,
-            weights,
-        })
-    }
-
-    fn apply_dense_seeds(&self, values: &[f32]) -> Result<Vec<f32>> {
-        ensure!(
-            values.len() + 1 == self.row_offsets.len(),
-            "sparse smoothing input has {} nodes but matrix targets {}",
-            values.len(),
-            self.row_offsets.len().saturating_sub(1)
-        );
-        let source_values = self
-            .source_nodes
-            .iter()
-            .map(|node| values[*node as usize])
-            .collect::<Vec<_>>();
-        let mut output = vec![f32::NAN; values.len()];
-        for (node, slot) in output.iter_mut().enumerate() {
-            let start = self.row_offsets[node];
-            let end = self.row_offsets[node + 1];
-            if start == end {
-                continue;
-            }
-            let mut value = 0.0;
-            for entry in start..end {
-                value += source_values[self.column_indices[entry] as usize] * self.weights[entry];
-            }
-            *slot = value;
-        }
-        Ok(output)
-    }
-}
-
-struct NearestSourceProjection {
-    source_nodes: Vec<u32>,
-    source_for_node: Vec<Option<u32>>,
-}
-
-impl NearestSourceProjection {
-    fn build(neighbors: &[Vec<u32>], source_nodes: &[u32]) -> Result<Self> {
-        let mut source_for_node = vec![None; neighbors.len()];
-        let mut queue = VecDeque::new();
-        let mut ordered_sources = source_nodes.iter().copied().enumerate().collect::<Vec<_>>();
-        ordered_sources.sort_by_key(|(_, node)| *node);
-        for (column, node) in ordered_sources {
-            ensure!(
-                (node as usize) < neighbors.len(),
-                "source node {node} is outside the display surface"
-            );
-            source_for_node[node as usize] = Some(column as u32);
-            queue.push_back(node as usize);
-        }
-        while let Some(node) = queue.pop_front() {
-            let source = source_for_node[node];
-            for neighbor in &neighbors[node] {
-                let neighbor = *neighbor as usize;
-                if source_for_node[neighbor].is_none() {
-                    source_for_node[neighbor] = source;
-                    queue.push_back(neighbor);
-                }
-            }
-        }
-        Ok(Self {
-            source_nodes: source_nodes.to_vec(),
-            source_for_node,
-        })
-    }
-
-    fn apply_dense_seeds(&self, values: &[f32]) -> Result<Vec<f32>> {
-        ensure!(
-            values.len() == self.source_for_node.len(),
-            "nearest projection input has {} nodes but projection targets {}",
-            values.len(),
-            self.source_for_node.len()
-        );
-        let source_values = self
-            .source_nodes
-            .iter()
-            .map(|node| values[*node as usize])
-            .collect::<Vec<_>>();
-        Ok(self
-            .source_for_node
-            .iter()
-            .map(|source| source.map_or(f32::NAN, |source| source_values[source as usize]))
-            .collect())
-    }
-}
-
 fn dense_timecourse_render_dataset(
     source: &Dataset,
     overlay: &OverlayDataset,
@@ -1357,7 +1309,8 @@ fn dense_timecourse_render_dataset(
     )?
     .with_stat(source_column.stat.clone())
     .with_fdr_curve(source_column.fdr_curve.clone());
-    Dataset::dense(DatasetKind::SurfaceScalar, domain, vec![column]).map(|dataset| {
+    Dataset::dense(DatasetKind::SurfaceScalar, domain, vec![column]).map(|mut dataset| {
+        dataset.mapping_warnings = source.mapping_warnings.clone();
         dataset
             .with_parent_ids(source.parent_ids.clone())
             .with_time_start_seconds(source.time_start_seconds)
@@ -1368,6 +1321,308 @@ fn dense_timecourse_render_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_timecourse_auto_scales_survive_range_sanitization() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        for extent in [2.393e-13_f32, 1e-20] {
+            let dataset = Dataset::dense(
+                DatasetKind::SurfaceTimeSeries,
+                &domain,
+                (0..2)
+                    .map(|sample| {
+                        DataColumn::new(
+                            sample.to_string(),
+                            ColumnRole::TimePoint,
+                            None,
+                            ColumnData::Float32(vec![-extent, 0.0, extent]),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let state =
+                TimeCourseState::from_conditions(vec![("tiny".into(), dataset)], 0).unwrap();
+            for amplitude in [TimeCourseAmplitude::Signed, TimeCourseAmplitude::Magnitude] {
+                let (full, robust) = timecourse_condition_ranges(
+                    &state.conditions,
+                    TimeCourseBaseline::Raw,
+                    amplitude,
+                )
+                .unwrap();
+                let signed = amplitude == TimeCourseAmplitude::Signed;
+                let expected = ValueRange {
+                    min: if signed { -extent } else { 0.0 },
+                    max: extent,
+                };
+                for range in [full, robust] {
+                    assert_eq!(range, expected);
+                    let mut appearance = OverlayAppearance::from_range(DEFAULT_OVERLAY_RANGE);
+                    color_range::apply_automatic_range(&mut appearance, range, Some(signed));
+                    color_range::sanitize_color_range(&mut appearance);
+                    assert_eq!(appearance.range, expected);
+                    assert!(!appearance.range_locked);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn magnitude_follows_baseline_without_changing_signed_results() {
+        let stats = BaselineStats {
+            mean: 1.0,
+            standard_deviation: Some(2.0),
+        };
+        let samples = [-3.0, -1.0, 0.0, 2.0];
+        for (baseline, signed) in [
+            (TimeCourseBaseline::Raw, samples),
+            (TimeCourseBaseline::SubtractMean, [-4.0, -2.0, -1.0, 1.0]),
+            (TimeCourseBaseline::ZScore, [-2.0, -1.0, -0.5, 0.5]),
+        ] {
+            for (value, expected) in samples.into_iter().zip(signed) {
+                assert_eq!(
+                    transform_timecourse_value(value, stats, baseline, TimeCourseAmplitude::Signed),
+                    Some(expected)
+                );
+                assert_eq!(
+                    transform_timecourse_value(
+                        value,
+                        stats,
+                        baseline,
+                        TimeCourseAmplitude::Magnitude
+                    ),
+                    Some(expected.abs())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn magnitude_maps_graphs_ranges_and_summaries_share_source_transformation() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let make_dataset = |scale: f32| {
+            Dataset::sparse(
+                DatasetKind::SurfaceTimeSeries,
+                &domain,
+                vec![0, 2],
+                [[-3.0, 3.0], [-1.0, 1.0], [0.0, 0.0], [2.0, -2.0]]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, values)| {
+                        DataColumn::new(
+                            index.to_string(),
+                            ColumnRole::TimePoint,
+                            Some("nAm".into()),
+                            ColumnData::Float32(values.map(|x| x * scale).to_vec()),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let mut state = TimeCourseState::from_conditions(
+            vec![
+                ("A".into(), make_dataset(1.0)),
+                ("B".into(), make_dataset(10.0)),
+            ],
+            0,
+        )
+        .unwrap();
+        let originals = state
+            .conditions
+            .iter()
+            .map(|c| c.dataset.clone())
+            .collect::<Vec<_>>();
+        state.sparse_projections = vec![
+            Some(Arc::new(SparseTimecourseProjection::Smooth(
+                SparseUpsamplingMatrix::build(&[vec![1], vec![0, 2], vec![1]], &[0, 2], 1).unwrap(),
+            )));
+            state.condition_count()
+        ];
+        state.controls.baseline = TimeCourseBaseline::Raw;
+        for amplitude in [
+            TimeCourseAmplitude::Signed,
+            TimeCourseAmplitude::Magnitude,
+            TimeCourseAmplitude::Signed,
+        ] {
+            state.controls.amplitude = amplitude;
+            let (full, robust) =
+                timecourse_condition_ranges(&state.conditions, state.controls.baseline, amplitude)
+                    .unwrap();
+            assert_eq!(
+                full,
+                ValueRange {
+                    min: if amplitude == TimeCourseAmplitude::Signed {
+                        -30.0
+                    } else {
+                        0.0
+                    },
+                    max: 30.0
+                }
+            );
+            assert_eq!(robust, full);
+            for condition in 0..2 {
+                state.activate_condition(condition).unwrap();
+                for sample in 0..4 {
+                    state.controls.cursor = sample;
+                    let display = state.display_dataset().unwrap();
+                    let overlay = overlay_dataset_from_canonical_dataset(
+                        &display,
+                        3,
+                        OverlayColumnSelections::default(),
+                    )
+                    .unwrap();
+                    let projected = state.sparse_projections[state.active_condition]
+                        .as_ref()
+                        .unwrap()
+                        .apply(overlay)
+                        .unwrap();
+                    for node in 0..3 {
+                        assert_eq!(
+                            state.node_sample_value(condition, node, sample),
+                            Some(projected.values[node as usize])
+                        );
+                    }
+                }
+                let expected = if amplitude == TimeCourseAmplitude::Signed {
+                    0.0
+                } else {
+                    3.0 * if condition == 0 { 1.0 } else { 10.0 }
+                };
+                assert_eq!(state.node_sample_value(condition, 1, 0), Some(expected));
+            }
+        }
+        state.activate_condition(0).unwrap();
+        state.controls.amplitude = TimeCourseAmplitude::Magnitude;
+        state.controls.display = TimeCourseDisplay::Window;
+        state.controls.response_start = 0;
+        state.controls.response_end = 3;
+        state.controls.measure = TimeCourseMeasure::Mean;
+        assert_eq!(
+            state.display_dataset().unwrap().columns[0].values,
+            ColumnData::Float32(vec![1.5, 1.5])
+        );
+        state.controls.threshold_absolute = false;
+        let before = state.display_dataset().unwrap();
+        state.controls.threshold_absolute = true;
+        assert_eq!(state.display_dataset().unwrap(), before);
+        let mut controls = state.controls.clone();
+        controls.measure = TimeCourseMeasure::NegativePeak;
+        state.sanitize_controls(&mut controls);
+        assert_eq!(controls.measure, TimeCourseMeasure::PositivePeak);
+        for (condition, original) in state.conditions.iter().zip(&originals) {
+            assert_eq!(&condition.dataset, original);
+        }
+        assert_eq!(state.source_dataset, originals[0]);
+    }
+
+    #[test]
+    fn smoothing_matches_mne_ten_step_reference() {
+        // MNE _surf_upsampling_mat([0, 4], adjacency + identity, 10).
+        let neighbors = vec![vec![1], vec![0, 2], vec![1, 3], vec![2, 4], vec![3]];
+        let matrix = SparseUpsamplingMatrix::build(&neighbors, &[0, 4], 10).unwrap();
+        let result = matrix
+            .apply_dense_seeds(&[1.0, f32::NAN, f32::NAN, f32::NAN, 0.0])
+            .unwrap();
+        for (actual, expected) in
+            result
+                .into_iter()
+                .zip([0.6395408236, 0.5930272157, 0.5, 0.4069727843, 0.3604591764])
+        {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn picked_waveforms_match_projected_maps_for_all_conditions_and_baselines() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let make_dataset = || {
+            Dataset::sparse(
+                DatasetKind::SurfaceTimeSeries,
+                &domain,
+                vec![0, 2],
+                event_locked_dataset().columns,
+            )
+            .unwrap()
+            .with_time_start_seconds(Some(-0.1))
+            .with_time_step_seconds(Some(0.1))
+        };
+        let mut state = TimeCourseState::from_conditions(
+            vec![("A".into(), make_dataset()), ("B".into(), make_dataset())],
+            0,
+        )
+        .unwrap();
+        state.controls.baseline_end = 1;
+        for condition in &mut state.conditions {
+            condition.baseline_stats =
+                baseline_statistics(&condition.dataset, &condition.time_columns, 0, 1);
+        }
+        state.baseline_stats = state.conditions[0].baseline_stats.clone();
+        let neighbors = vec![vec![1], vec![0, 2], vec![1]];
+        for projection in [
+            SparseTimecourseProjection::Smooth(
+                SparseUpsamplingMatrix::build(&neighbors, &[0, 2], 2).unwrap(),
+            ),
+            SparseTimecourseProjection::Nearest(
+                NearestSourceProjection::build(&neighbors, &[0, 2]).unwrap(),
+            ),
+        ] {
+            state.sparse_projections = vec![Some(Arc::new(projection)); state.condition_count()];
+            for (baseline, amplitude) in [
+                TimeCourseBaseline::Raw,
+                TimeCourseBaseline::SubtractMean,
+                TimeCourseBaseline::ZScore,
+            ]
+            .into_iter()
+            .flat_map(|baseline| {
+                [TimeCourseAmplitude::Signed, TimeCourseAmplitude::Magnitude]
+                    .map(|amplitude| (baseline, amplitude))
+            }) {
+                state.controls.baseline = baseline;
+                state.controls.amplitude = amplitude;
+                for condition in 0..2 {
+                    for sample in 0..state.sample_count() {
+                        let seeds = vec![
+                            state.condition_sample_value(condition, 0, sample).unwrap(),
+                            f32::NAN,
+                            state.condition_sample_value(condition, 1, sample).unwrap(),
+                        ];
+                        let overlay = OverlayDataset {
+                            range: ValueRange::from_values(&seeds).unwrap(),
+                            values: seeds,
+                            threshold_values: None,
+                        };
+                        let projected = state.sparse_projections[state.active_condition]
+                            .as_ref()
+                            .unwrap()
+                            .apply(overlay)
+                            .unwrap();
+                        for node in 0..3 {
+                            assert_eq!(
+                                state.node_sample_value(condition, node, sample),
+                                Some(projected.values[node as usize])
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        state.sparse_projections = vec![None; state.condition_count()];
+        assert_eq!(state.node_sample_value(0, 1, 0), None);
+    }
+
+    #[test]
+    fn smoothing_fills_reachable_nodes_but_not_disconnected_components() {
+        let neighbors = vec![vec![1], vec![0, 2], vec![1, 3], vec![2], vec![]];
+        let matrix = SparseUpsamplingMatrix::build(&neighbors, &[0], 1).unwrap();
+        let projected = matrix
+            .apply_dense_seeds(&[2.0, f32::NAN, f32::NAN, f32::NAN, f32::NAN])
+            .unwrap();
+        assert_eq!(&projected[..4], &[2.0; 4]);
+        assert!(projected[4].is_nan());
+    }
 
     #[test]
     fn sparse_smoothing_spreads_values_over_mesh_neighbors() {
@@ -1501,6 +1756,7 @@ mod tests {
                 standard_deviation: Some(2.0e-11),
             },
             TimeCourseBaseline::ZScore,
+            TimeCourseAmplitude::Signed,
         )
         .unwrap();
 
@@ -1577,6 +1833,56 @@ mod tests {
         assert_eq!(state.active_condition(), 1);
         assert_eq!(state.sample_value(0, 1), Some(20.0));
         assert!(state.cursor_full_range.max >= 40.0);
+    }
+
+    #[test]
+    fn conditions_with_different_ordered_subsets_use_their_own_projection() {
+        let domain = SurfaceDomain::from_triangles(3, vec![[0, 1, 2]]).unwrap();
+        let make = |nodes, values: Vec<f32>| {
+            Dataset::sparse(
+                DatasetKind::SurfaceTimeSeries,
+                &domain,
+                nodes,
+                (0..2)
+                    .map(|i| {
+                        DataColumn::new(
+                            i.to_string(),
+                            ColumnRole::TimePoint,
+                            None,
+                            ColumnData::Float32(values.clone()),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let mut state = TimeCourseState::from_conditions(
+            vec![
+                ("A".into(), make(vec![2, 0], vec![4., 0.])),
+                ("B".into(), make(vec![1], vec![9.])),
+            ],
+            0,
+        )
+        .unwrap();
+        state.controls.baseline = TimeCourseBaseline::Raw;
+        let mut cache = crate::sparse_reconstruction::SparseProjectionCache::default();
+        for (i, condition) in state.conditions.iter().enumerate() {
+            state.sparse_projections[i] = cache
+                .get(
+                    &[vec![1, 2], vec![0, 2], vec![0, 1]],
+                    condition.dataset.node_indices.as_deref().unwrap(),
+                    crate::sparse_reconstruction::SparseFillMethod::Smooth,
+                    1,
+                )
+                .unwrap();
+        }
+        assert_eq!(state.node_sample_value(0, 1, 0), Some(2.));
+        assert_eq!(state.node_sample_value(1, 1, 0), Some(9.));
+        assert_eq!(state.raw_node_sample_value(0, 1, 0), None);
+        assert_eq!(state.raw_node_sample_value(0, 2, 0), Some(4.));
+        state.activate_condition(1).unwrap();
+        assert_eq!(state.display_dataset().unwrap().row_count, 1);
     }
 
     #[test]

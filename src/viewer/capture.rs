@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! Screenshot and montage capture on `ViewerState`: saving the current view,
 //! preset montages, the colorbar companion image, camera framing, and offscreen
 //! surface capture. Extracted from `viewer/mod.rs`. Distinct from
@@ -22,9 +31,11 @@ impl ViewerState {
             return Ok(());
         };
 
+        self.check_qc_capture_paths(&path)?;
         let camera = self.camera.clone();
         let image = self.capture_surface_view(&camera)?;
         screenshot::save_png(&path, &image)?;
+        self.save_qc_report(&path)?;
         self.log_status(format!("Saved screenshot {}.", path.display()));
         self.save_colormap_companion(&image, &path)?;
 
@@ -52,6 +63,7 @@ impl ViewerState {
             return Ok(());
         };
 
+        self.check_qc_capture_paths(&path)?;
         let result = if self.has_both_scene() {
             self.capture_paired_spec_montage()
         } else {
@@ -61,6 +73,7 @@ impl ViewerState {
 
         let montage = result?;
         screenshot::save_png(&path, &montage)?;
+        self.save_qc_report(&path)?;
         self.log_status(format!("Saved montage {}.", path.display()));
         self.save_colormap_companion(&montage, &path)?;
 
@@ -108,7 +121,28 @@ impl ViewerState {
         let height = base.height.max(1);
         let bar_width = (base.width / 25).clamp(20, 60);
         let left_margin = bar_width / 2;
-        let right_margin = bar_width;
+        let range = self.overlay.render.appearance.range;
+        let labels = [
+            color_range::endpoint_label(range.max),
+            color_range::endpoint_label(range.min),
+        ];
+        let label_scale = (height / 300).clamp(1, 4);
+        let right_margin = if self
+            .overlay
+            .render
+            .appearance
+            .colormap
+            .uses_continuous_range()
+        {
+            labels
+                .iter()
+                .map(|text| text.len() as u32 * 4 * label_scale)
+                .max()
+                .unwrap_or(0)
+                + 12
+        } else {
+            bar_width
+        };
         let panel_width = left_margin + bar_width + right_margin;
 
         let vertical_margin = (height / 12).max(4).min(height / 2);
@@ -161,8 +195,29 @@ impl ViewerState {
             set_pixel(frame_right, y, border);
         }
 
-        ScreenshotImage::new(panel_width, height, rgba)
-            .expect("colorbar panel dimensions match its buffer")
+        let mut image = ScreenshotImage::new(panel_width, height, rgba)
+            .expect("colorbar panel dimensions match its buffer");
+        if self
+            .overlay
+            .render
+            .appearance
+            .colormap
+            .uses_continuous_range()
+        {
+            for (text, y) in [
+                (&labels[0], bar_top),
+                (&labels[1], bar_bottom.saturating_sub(5 * label_scale)),
+            ] {
+                screenshot::draw_numeric_label(
+                    &mut image,
+                    text,
+                    [frame_right + 6, y],
+                    label_scale,
+                    border,
+                );
+            }
+        }
+        image
     }
 
     /// Capture the single-surface left/right/top/bottom montage.

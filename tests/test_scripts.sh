@@ -1,4 +1,13 @@
 #!/bin/bash
+# Developed by P. Molfese, National Institutes of Health (NIH).
+#
+# This software is a "work of the United States Government" prepared by a federal
+# employee as part of official duties. As such, it is not subject to copyright
+# protection within the United States (17 U.S.C. § 105). International copyrights
+# may apply.
+#
+# See LICENSE for the full public-domain notice and disclaimer.
+
 
 #draw an roi here
 cargo run -- --surface testing/fs_lowres_std-lh.gii

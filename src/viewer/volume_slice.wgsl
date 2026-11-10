@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 // Orthogonal volume slice planes. Each plane is a quad in world space; the
 // fragment shader reconstructs the voxel coordinate from the interpolated world
 // position and samples the 3D intensity texture, so planes stay correct under

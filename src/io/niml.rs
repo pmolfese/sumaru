@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! NIML wire format: the element model, the ASCII/binary parser, the
 //! serializer, dataset-payload reading, label-table decoding, and the
 //! low-level text/number helpers the other `io` submodules build on.
@@ -723,6 +732,32 @@ impl NimlDatasetPayload {
             originator_id: self.filename.clone(),
         };
         dataset.time_step_seconds = self.time_step_seconds;
+        if let Some(json) = self
+            .history
+            .as_deref()
+            .and_then(|h| h.strip_prefix("SUMARU_RESAMPLE_JSON\n"))
+        {
+            let report: serde_json::Value =
+                serde_json::from_str(json).context("invalid Sumaru export provenance")?;
+            ensure!(
+                report["schema"] == "sumaru-parent-resample-1"
+                    || report["schema"] == "sumaru-geometric-resample-1",
+                "unsupported Sumaru export schema"
+            );
+            dataset.time_start_seconds = report["time_start_seconds"].as_f64();
+            if let Some(columns) = report["columns"].as_array() {
+                ensure!(
+                    columns.len() == dataset.columns.len(),
+                    "export provenance column count mismatch"
+                );
+                for (column, metadata) in dataset.columns.iter_mut().zip(columns) {
+                    column.units = metadata["units"].as_str().map(str::to_owned);
+                    if let Some(name) = metadata["name"].as_str() {
+                        column.label = name.to_owned();
+                    }
+                }
+            }
+        }
 
         Ok(dataset)
     }

@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! egui drawing for the viewer's panels: the control window's surface/overlay
 //! and ROI/pick sections, the view window's menu bar and transient overlays,
 //! and the graph window/dock. Extracted from `viewer/mod.rs`; all drawing stays
@@ -412,7 +421,6 @@ impl ViewerState {
         let ctx = root_ui.ctx().clone();
         self.draw_go_to_location(&ctx, &mut actions);
         self.draw_preferences_window(&ctx);
-        self.draw_instacorr_window(&ctx);
         self.draw_scene_object_labels(&ctx);
         self.draw_view_transient_label(&ctx);
 
@@ -931,6 +939,38 @@ impl ViewerState {
                     .content_size
                     .x
                     .max(ROI_CONTROL_CONTENT_WIDTH_POINTS)
+                    + 32.0,
+                scroll_output.content_size.y + 32.0,
+            );
+        });
+
+        ControlUiOutput {
+            actions,
+            desired_control_size_points,
+        }
+    }
+
+    pub(super) fn draw_instacorr_control_ui(&mut self, root_ui: &mut egui::Ui) -> ControlUiOutput {
+        let actions = Vec::new();
+        let panel_height = (self.instacorr_control.size.height as f32 - 24.0).max(160.0);
+        let mut desired_control_size_points = egui::vec2(
+            INSTACORR_CONTROL_CONTENT_WIDTH_POINTS + 24.0,
+            INSTACORR_CONTROL_MIN_INNER_HEIGHT as f32,
+        );
+
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            let scroll_output = egui::ScrollArea::vertical()
+                .max_height(panel_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_min_width(INSTACORR_CONTROL_CONTENT_WIDTH_POINTS);
+                    self.draw_instacorr_control_contents(ui);
+                });
+            desired_control_size_points = egui::vec2(
+                scroll_output
+                    .content_size
+                    .x
+                    .max(INSTACORR_CONTROL_CONTENT_WIDTH_POINTS)
                     + 32.0,
                 scroll_output.content_size.y + 32.0,
             );
@@ -1810,6 +1850,7 @@ impl ViewerState {
         ui: &mut egui::Ui,
         actions: &mut Vec<ViewerCommand>,
     ) {
+        self.draw_surface_qc_controls(ui, actions);
         let overlay_loaded = self.overlay.is_loaded();
         let column_options = self
             .overlay
@@ -1821,10 +1862,51 @@ impl ViewerState {
         // it and we write it back through `set_columns` only if it changed. The
         // copy avoids borrowing into the `Loaded` variant across the closures.
         let mut columns = self.overlay.data.columns();
+        let mut sparse_changed = false;
         let mut columns_changed = false;
         let mut changed = false;
 
         controller_section(ui, "OVERLAY WORKBENCH", true, |ui| {
+            if let Some(dataset) = self.overlay.data.dataset()
+                && !dataset.mapping_warnings.is_empty()
+            {
+                ui.colored_label(egui::Color32::YELLOW, "Mapping notice")
+                    .on_hover_text(dataset.mapping_warnings.join("\n"));
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("Sparse fill");
+                egui::ComboBox::from_id_salt("sparse_fill_method")
+                    .selected_text(match self.sparse_timecourse_display {
+                        SparseTimecourseDisplay::Sparse => "Sampled only",
+                        SparseTimecourseDisplay::Nearest => "Mesh nearest",
+                        SparseTimecourseDisplay::Smooth => "MNE smooth",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (method, label) in [
+                            (SparseTimecourseDisplay::Sparse, "Sampled only"),
+                            (SparseTimecourseDisplay::Nearest, "Mesh nearest"),
+                            (SparseTimecourseDisplay::Smooth, "MNE smooth"),
+                        ] {
+                            sparse_changed |= ui
+                                .selectable_value(
+                                    &mut self.sparse_timecourse_display,
+                                    method,
+                                    label,
+                                )
+                                .changed();
+                        }
+                    });
+            });
+            if self.sparse_timecourse_display == SparseTimecourseDisplay::Smooth {
+                sparse_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.sparse_smoothing_steps, 1..=30)
+                            .text("Smoothing steps"),
+                    )
+                    .changed();
+                ui.small("Changes sampled values too; mesh-nearest fallback fills uncovered reachable nodes. Labels stay sampled-only.");
+            }
             if self.overlay_count() > 0 {
                 let active = self.active_overlay_index().unwrap_or(0);
                 let mut requested = active;
@@ -1880,7 +1962,7 @@ impl ViewerState {
                     ui.label(egui::RichText::new("InstaCorr").color(accent_color()));
                     ui.label(state);
                     if ui.small_button("Controls").clicked() {
-                        self.instacorr_window_open = true;
+                        self.set_instacorr_window_open(true);
                         self.view_window().request_redraw();
                     }
                 });
@@ -1900,12 +1982,15 @@ impl ViewerState {
                     ),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
-                        ui.label("Thresh");
+                        ui.label("Color / Thresh");
                         let threshold_range = self.selected_threshold_range();
                         let threshold_interaction = vertical_threshold_bar(
                             ui,
                             &mut self.overlay.render.appearance,
                             threshold_range,
+                            self.overlay.data.dataset().and_then(|dataset| {
+                                dataset.columns.get(self.overlay.data.columns().intensity)
+                            }),
                         );
                         changed |= threshold_interaction.changed;
                         if self.timecourse.is_some() {
@@ -2141,6 +2226,7 @@ impl ViewerState {
                                 &mut self.overlay.render.appearance.threshold.absolute,
                                 "Abs",
                             )
+                            .on_hover_text("Compare absolute values to the threshold; does not change displayed amplitudes.")
                             .changed();
                     });
                     if self.overlay.render.appearance.transparent_threshold {
@@ -2502,6 +2588,36 @@ impl ViewerState {
             });
         });
 
+        if sparse_changed && overlay_loaded {
+            self.overlay_data_generation = self.overlay_data_generation.wrapping_add(1);
+            let result = if self.timecourse.is_some() {
+                (|| -> Result<()> {
+                    for condition in &self.timecourse.as_ref().unwrap().conditions {
+                        self.require_full_parent_for_fill(&condition.dataset)?;
+                    }
+                    let state = self.timecourse.as_mut().unwrap();
+                    let mesh = self.mesh.as_ref().context("no surface")?;
+                    for (index, condition) in state.conditions.iter().enumerate() {
+                        state.sparse_projections[index] =
+                            self.sparse_projection_cache.for_dataset(
+                                mesh,
+                                &condition.dataset,
+                                self.sparse_timecourse_display.method(),
+                                self.sparse_smoothing_steps,
+                            )?;
+                    }
+                    self.apply_timecourse_overlay()
+                })()
+            } else {
+                self.rebuild_overlay_model()
+            };
+            if let Err(error) = result {
+                self.set_error(error);
+            }
+            self.refresh_pick_overlay_value();
+            self.refresh_graph_snapshot_if_open();
+            self.upload_surface_buffers();
+        }
         if columns_changed {
             self.overlay.data.set_columns(columns);
             actions.push(ViewerCommand::RefreshOverlayColumns);
@@ -2583,61 +2699,17 @@ impl ViewerState {
     }
 
     pub(super) fn draw_overlay_range_controls(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut changed = false;
-
+        let column = self
+            .overlay
+            .data
+            .dataset()
+            .and_then(|dataset| dataset.columns.get(self.overlay.data.columns().intensity));
+        let mut changed =
+            color_range::draw_range_editor(ui, &mut self.overlay.render.appearance, column);
         ui.horizontal(|ui| {
-            changed |= ui
-                .checkbox(
-                    &mut self.overlay.render.appearance.symmetric_range,
-                    "Symmetric",
-                )
-                .changed();
-
-            if self.overlay.render.appearance.symmetric_range {
-                let mut extent = self
-                    .overlay
-                    .render
-                    .appearance
-                    .range
-                    .min
-                    .abs()
-                    .max(self.overlay.render.appearance.range.max.abs())
-                    .max(0.0001);
-                let speed = (extent / 100.0).max(0.001);
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut extent)
-                            .speed(speed)
-                            .prefix("+/- "),
-                    )
-                    .changed()
-                {
-                    let extent = extent.abs().max(0.0001);
-                    self.overlay.render.appearance.range = ValueRange {
-                        min: -extent,
-                        max: extent,
-                    };
-                    changed = true;
-                }
-            } else {
-                let speed = range_drag_speed(self.overlay.render.appearance.range);
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut self.overlay.render.appearance.range.min)
-                            .speed(speed)
-                            .prefix("min "),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut self.overlay.render.appearance.range.max)
-                            .speed(speed)
-                            .prefix("max "),
-                    )
-                    .changed();
-            }
+            changed |=
+                color_range::draw_range_presets(ui, &mut self.overlay.render.appearance, column);
         });
-
         changed
     }
 

@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! GIFTI surface-dataset loading: turning a `gifti-rs` image into sumaru's
 //! domain `Dataset`, including intent-name normalization and the
 //! NIFTI-intent -> column-role / stat metadata mapping.
@@ -66,11 +75,69 @@ pub(crate) fn gifti_image_to_dataset(
     path: &Path,
     auto_qcalc: bool,
 ) -> Result<Dataset> {
+    let parent_mapping = gifti_parent_mapping(image)?;
+    let index_arrays: Vec<_> = image
+        .data_arrays
+        .iter()
+        .filter(|array| array.intent == gifti_rs::intent::NODE_INDEX)
+        .collect();
+    ensure!(
+        index_arrays.len() <= 1,
+        "GIFTI dataset has multiple NODE_INDEX arrays"
+    );
+    let node_indices = index_arrays
+        .first()
+        .map(|array| -> Result<Vec<u32>> {
+            ensure!(
+                array.dims.len() == 1,
+                "GIFTI NODE_INDEX array must be one-dimensional"
+            );
+            let indices = match column_data_from_gifti_array(array)? {
+                ColumnData::UInt32(values) => values,
+                ColumnData::Int32(values) => values
+                    .into_iter()
+                    .map(|value| {
+                        u32::try_from(value).context("GIFTI node indices must be nonnegative")
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                _ => anyhow::bail!("GIFTI NODE_INDEX array must contain integers"),
+            };
+            ensure!(!indices.is_empty(), "GIFTI NODE_INDEX array is empty");
+            let mut seen = std::collections::HashSet::new();
+            for &node in &indices {
+                ensure!(
+                    (node as usize) < domain.node_count,
+                    "GIFTI node index {node} is outside surface node count {}",
+                    domain.node_count
+                );
+                ensure!(
+                    seen.insert(node),
+                    "GIFTI NODE_INDEX contains duplicate node {node}"
+                );
+            }
+            Ok(indices)
+        })
+        .transpose()?;
+    let row_count = node_indices.as_ref().map_or(domain.node_count, Vec::len);
+    if node_indices.is_some() {
+        for array in &image.data_arrays {
+            if array.intent != gifti_rs::intent::NODE_INDEX
+                && array.intent != gifti_rs::intent::TRIANGLE
+                && !gifti_array_is_surface_pointset(array)
+            {
+                ensure!(
+                    array.data.len() == row_count,
+                    "GIFTI scalar array has {} values but NODE_INDEX has {row_count} entries",
+                    array.data.len()
+                );
+            }
+        }
+    }
     let columns = image
         .data_arrays
         .iter()
         .enumerate()
-        .filter(|(_, array)| gifti_array_is_dataset_column(array, domain.node_count))
+        .filter(|(_, array)| gifti_array_is_dataset_column(array, row_count))
         .map(|(index, array)| {
             let embedded_fdr_curve = gifti_fdr_curve_from_metadata(image, array, index)?;
             gifti_array_to_data_column(array, index, embedded_fdr_curve, auto_qcalc)
@@ -113,7 +180,13 @@ pub(crate) fn gifti_image_to_dataset(
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite());
 
-    Dataset::dense(kind, domain, columns).map(|dataset| {
+    let dataset = if let Some(indices) = node_indices {
+        Dataset::sparse(kind, domain, indices, columns)
+    } else {
+        Dataset::dense(kind, domain, columns)
+    };
+    dataset.map(|mut dataset| {
+        dataset.parent_mapping = parent_mapping;
         dataset
             .with_parent_ids(parent_ids)
             .with_time_step_seconds(time_step_seconds)
@@ -192,7 +265,8 @@ fn parse_gifti_fdr_curve(encoded: &str, column_index: usize) -> Result<AfniFdrCu
 }
 
 fn gifti_array_is_dataset_column(array: &DataArray, node_count: usize) -> bool {
-    array.intent != gifti_rs::intent::TRIANGLE
+    array.intent != gifti_rs::intent::NODE_INDEX
+        && array.intent != gifti_rs::intent::TRIANGLE
         && !gifti_array_is_surface_pointset(array)
         && array.data.len() == node_count
 }
@@ -356,6 +430,65 @@ mod tests {
             meta: Vec::new(),
             data: ArrayData::Int32(values),
         }
+    }
+
+    fn sparse_time_image(indices: Vec<i32>) -> GiftiImage {
+        GiftiImage {
+            version: "1.0".into(),
+            num_data_arrays: 3,
+            meta: vec![
+                ("TimeStart".into(), "-0.2".into()),
+                ("TimeStep".into(), "0.0033333333333333335".into()),
+            ],
+            label_table: None,
+            data_arrays: vec![
+                int_array(gifti_rs::intent::NODE_INDEX, vec![indices.len()], indices),
+                float_array(gifti_rs::intent::TIME_SERIES, vec![2], vec![1e-13, 2e-13]),
+                float_array(gifti_rs::intent::TIME_SERIES, vec![2], vec![3e-13, 4e-13]),
+            ],
+        }
+    }
+
+    #[test]
+    fn sparse_gifti_preserves_vertex_order_and_all_time_samples() {
+        let dataset = gifti_image_to_dataset(
+            &sparse_time_image(vec![2, 0]),
+            &triangle_domain(),
+            Path::new("sparse.func.gii"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(dataset.node_indices, Some(vec![2, 0]));
+        assert_eq!(dataset.row_count, 2);
+        assert_eq!(dataset.columns.len(), 2);
+        assert_eq!(dataset.kind, DatasetKind::SurfaceTimeSeries);
+        assert_eq!(dataset.time_start_seconds, Some(-0.2));
+        assert_eq!(dataset.time_step_seconds, Some(1.0 / 300.0));
+        assert_eq!(
+            dataset.columns[1].values,
+            ColumnData::Float32(vec![3e-13, 4e-13])
+        );
+    }
+
+    #[test]
+    fn sparse_gifti_rejects_invalid_index_mappings() {
+        for indices in [vec![0, 0], vec![-1, 0], vec![0, 3], vec![0]] {
+            assert!(
+                gifti_image_to_dataset(
+                    &sparse_time_image(indices),
+                    &triangle_domain(),
+                    Path::new("bad.gii"),
+                    false
+                )
+                .is_err()
+            );
+        }
+        let mut image = sparse_time_image(vec![0, 2]);
+        image.data_arrays.push(image.data_arrays[0].clone());
+        assert!(
+            gifti_image_to_dataset(&image, &triangle_domain(), Path::new("bad.gii"), false)
+                .is_err()
+        );
     }
 
     #[test]

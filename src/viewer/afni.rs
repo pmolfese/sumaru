@@ -1,3 +1,12 @@
+// Developed by P. Molfese, National Institutes of Health (NIH).
+//
+// This software is a "work of the United States Government" prepared by a federal
+// employee as part of official duties. As such, it is not subject to copyright
+// protection within the United States (17 U.S.C. § 105). International copyrights
+// may apply.
+//
+// See LICENSE for the full public-domain notice and disclaimer.
+
 //! AFNI/SUMA NIML talk: connection lifecycle, surface registration, incoming
 //! message routing, and crosshair/overlay sync. Extracted from `viewer/mod.rs`
 //! as part of the topical-submodule split; all methods stay on `ViewerState`.
@@ -827,8 +836,10 @@ impl ViewerState {
                         let range = ValueRange { min, max };
                         if self.overlay.render.appearance.range != range
                             || self.overlay.render.appearance.symmetric_range != symmetric
+                            || !self.overlay.render.appearance.range_locked
                         {
                             self.overlay.render.appearance.range = range;
+                            self.overlay.render.appearance.range_locked = true;
                             self.overlay.render.appearance.symmetric_range = symmetric;
                             self.refresh_overlay_appearance()?;
                             self.log_status(format!(
@@ -1127,6 +1138,7 @@ impl ViewerState {
         }
         if let Some(range) = state.intensity_range {
             self.overlay.render.appearance.range = range;
+            self.overlay.render.appearance.range_locked = true;
             changed = true;
         }
         if let Some(threshold) = state.threshold {

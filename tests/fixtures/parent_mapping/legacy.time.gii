@@ -1,0 +1,28 @@
+<GIFTI Version="1.0" NumberOfDataArrays="2">
+  <MetaData>
+    <MD>
+      <Name>TimeStart</Name>
+      <Value>-0.2</Value>
+    </MD>
+    <MD>
+      <Name>TimeStep</Name>
+      <Value>0.01</Value>
+    </MD>
+    <MD>
+      <Name>TimeUnits</Name>
+      <Value>s</Value>
+    </MD>
+    <MD>
+      <Name>TimeSamples</Name>
+      <Value>2</Value>
+    </MD>
+  </MetaData>
+  <DataArray Intent="NIFTI_INTENT_POINTSET" DataType="NIFTI_TYPE_FLOAT32" ArrayIndexingOrder="RowMajorOrder" Dimensionality="1" Encoding="ASCII" Endian="LittleEndian" ExternalFileName="" ExternalFileOffset="0" Dim0="3">
+    <MetaData />
+    <Data>10 20 30</Data>
+  </DataArray>
+  <DataArray Intent="NIFTI_INTENT_POINTSET" DataType="NIFTI_TYPE_FLOAT32" ArrayIndexingOrder="RowMajorOrder" Dimensionality="1" Encoding="ASCII" Endian="LittleEndian" ExternalFileName="" ExternalFileOffset="0" Dim0="3">
+    <MetaData />
+    <Data>11 21 31</Data>
+  </DataArray>
+</GIFTI>

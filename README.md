@@ -234,6 +234,27 @@ to reconstruct q-values while loading; the default is `NO`. Treat this as a view
 convenience rather than a statistics package: it is meant to help inspect the
 data you already understand.
 
+The **Color range** controls set the intensity values mapped to the bottom and
+top of a continuous colorbar. Right-click the colorbar for **Set range…**,
+**Fit to data**, **Robust 2–98%**, or **Symmetric about zero**. Fit uses the full
+range of the selected intensity column; Robust uses its finite samples'
+nearest-rank percentiles, including zeros. With symmetry enabled, either preset
+expands to equal negative and positive endpoints.
+
+Click a range value to enter a number, scientific notation such as `1e-9`, or a
+percentile such as `2%` or `98%`; drag it for small adjustments. Manual edits and
+presets enable **Lock range for this dataset**, preserving the range across
+intensity-column changes and timecourse playback. Each loaded overlay remembers
+its range and lock during the session. Unlock to resume automatic ranges on the
+next column or timecourse update; choosing a different timecourse scale also
+resumes automatic scaling. Timecourse presets use the currently displayed
+intensity column and hold that range during playback.
+
+Color range changes affect display colors only; the threshold slider stays
+independent. Values outside the range use the endpoint colors. Discrete label
+palettes keep their fixed colors. The colorbar shows its endpoints, which are
+also included in exported `_cmap` screenshot legends.
+
 Opening another overlay adds it to the overlay workbench and makes it active.
 Use the dataset selector or Control-PageUp/Control-PageDown to switch between
 loaded overlays; only the active overlay is rendered. Reopening an existing
@@ -254,6 +275,135 @@ minimal files using `overlay_threshold_sync` remain readable and are migrated
 to the documented form the next time Preferences saves the file.
 
 ## Timecourse Mode
+
+MNE GIFTIs containing `MNEParentVertexIndices` can load directly on their
+full-resolution parent or on a child carrying the same parent correspondence.
+Rows are matched by parent vertex ID, including reordered or different child
+subsets; missing samples remain missing before display interpolation. For
+example, from the directory containing your exported files:
+
+```sh
+sumaru tc -i fsaverage_hemi-lh_desc-fullres_white.surf.gii \
+  --overlay sub-101_cond-sighted_space-fsaverage_method-LCMV-lh.time.gii
+```
+
+For older time-series exports whose mapping exists only on the decimated
+anatomical GIFTI, use `--companion-surface child-lh.gii` (repeat for each
+hemisphere). Sumaru also tries a matching `.gii` beside `.time.gii` when needed.
+A valid direct load or self-contained export does not require that companion.
+
+Parent identity is checked separately from index validity. The default
+`SUMARU_ParentMismatchPolicy = warn` in `~/.sumaru` permits structurally valid
+mappings with terminal warnings and an overlay-workbench **Mapping notice**.
+Set it to `strict` to reject mismatched or incomplete identities. Matching subject, hemisphere, and parent count are accepted without a warning;
+this is metadata agreement, not independent mesh-fingerprint verification. `--strict-parent`
+and `--allow-parent-mismatch` override the saved setting for that launch.
+Malformed/conflicting metadata and invalid indices always fail. A `std.`
+filename is not proof that AFNI standard-mesh numbering matches MNE/fsaverage.
+
+Sparse filling now works in the ordinary viewer as well as `tc`:
+
+```sh
+sumaru -i fullres_white.surf.gii --overlay estimate.time.gii --sparse-fill mne-smooth
+```
+
+Use `--sparse-fill sampled-only`, `mesh-nearest`, or `mne-smooth` (default).
+The overlay workbench provides the same choices and a smoothing-step control
+(default 10). Outside `tc`, select a time-point column through the ordinary
+overlay column selector; `tc` adds playback, baseline controls and summaries.
+Conditions may have different sampled subsets when their target domain and
+time axes match. Each subset gets its own cached projection.
+
+Mesh nearest means edge-hop distance, not physical distance. MNE-style smoothing
+can change values even at measured vertices; uncovered reachable nodes use a
+nearest fallback. Disconnected regions without samples remain missing (NaN),
+not zero. Source datasets remain intact; picked graphs distinguish display traces
+from raw sampled data. In `tc`, the raw comparison has no baseline correction.
+Categorical labels remain sampled-only. Filling needs the full parent's
+connectivity: for a decimated target with missing samples, select sampled-only
+or load its full parent. The metadata resolver itself does no geometric alignment.
+Headless library callers can use `sparse_reconstruction`; CLI export and native
+parent/child QC are available as described below.
+See [the implementation plan](align_surfaces.md).
+
+Export parent-mapped data without opening a GUI:
+
+```sh
+sumaru resample --input estimate.time.gii --target fullres_white.surf.gii \
+  --method mne-smooth --smoothing-steps 10 --output estimate.parent.time.gii
+```
+
+`--method` is required: choose `sampled-only`, `mesh-nearest`, or `mne-smooth`.
+Sampled-only preserves indexed samples; filling writes dense float32 values with
+NaN for missing locations. Existing data/report files are never overwritten.
+A JSON report defaults to `OUTPUT.json`; `--report PATH` changes its location.
+Regular timing and units are preserved. Repeat `--column N` for a zero-based
+selection (contiguous and increasing for time series), or omit it to export all
+columns. GIFTI/STC inputs are supported. Use a `.niml.dset` output name for NIML;
+its Sumaru provenance, time start and units are retained in `HISTORY_NOTE`.
+The target must be a full parent in its original vertex order. This route uses
+exact parent IDs, not geometric alignment to an independently generated mesh.
+
+For a step-by-step stages 4–7 guide, including commands using the supplied MNE
+example files, see [Surface QC and resampling](docs/surface_alignment_walkthrough.md).
+
+Compare just the high-resolution parent and its indexed low-resolution child,
+without time-series data or resampling:
+
+```sh
+sumaru -i fullres_white.surf.gii --qc-child child.gii
+```
+
+These filenames are placeholders; use the actual anatomical files. Turn off
+**Child connectivity at mapped parent positions** to inspect original child XYZ;
+the default mapped view displays the correspondence declared by parent IDs.
+
+Add a data overlay to that comparison:
+
+```sh
+sumaru -i fullres_white.surf.gii --overlay estimate.time.gii --qc-child child.gii
+```
+
+The **Parent / Child QC** controls provide independent visibility/styles, an amber
+child wireframe, optional cyan sampled-node markers, linked parent/local IDs and
+traces, and mapped-parent versus original-coordinate views. Both meshes use the
+parent's camera transform. Mapped positions and show-through wire rendering are
+explicit display choices, not registration. QC supports one hemisphere pair per
+window; `tc --qc-child` disables automatic hemisphere pairing.
+
+To inspect the actual export, add `--preview --qc-child child.gii` to `resample`.
+Preview loads the output without a second reconstruction and uses its embedded
+source mapping. When the original source is accessible and unchanged, graphs
+also show its raw sampled traces. Save QC screenshots/montages from the controls;
+a `.qc.json` sidecar records the mapping, view settings, and export provenance.
+Parent/child rendering and style contrast were observed in the user’s 2026-11-10
+screenshots. Full interactive QA, including geometric-map QC, remains pending.
+
+
+
+For independently tessellated meshes, build an explicit geometric map:
+
+```sh
+sumaru surface-map --source child.gii --target std.60.lh.white.gii \
+  --method normal-projection --centroid --output mapping.json
+sumaru resample --input child.time.gii --source-surface child.gii \
+  --target std.60.lh.white.gii --map mapping.json --output std60.time.gii --preview
+```
+
+Other methods are `nearest-node`, `closest-triangle`, `registered-sphere`,
+`area-average`, `ancestry`, and `afni-m2m`. The map records source weights,
+distances, missing/fallback rows, and geometry fingerprints. `map-info` validates
+and summarizes it. `--preview` opens an amber source wireframe with before/after
+affine and distance controls; use `--qc-source SOURCE --qc-map MAP` for a separate
+QC session. Scalar/time-series GIFTI and NIML exports preserve known timing/units;
+categorical interpolation is rejected. Missing values remain NaN.
+
+`--affine` uses loaded XYZ coordinates; add `--affine-afni` to convert an AFNI
+DICOM-basis matrix for RAS geometry. `recover-parent-ids` can explicitly recover
+unique, essentially exact parent vertices for legacy anatomy. Registered spheres
+must already be registered; area averaging uses lumped source areas rather than
+conservative triangle-overlap integration. See [stages 6–7](align_surfaces.md)
+for command details, mapping direction, AFNI comparisons, and validation limits.
 
 Launch a surface timecourse directly with:
 
@@ -284,13 +434,15 @@ A single hemisphere works normally. `-onestate` controls how multiple surface
 geometry files are grouped and is not needed for multiple timecourse
 conditions.
 
-Sparse STC values are smoothed over the full display mesh by default using a
-cached, MNE-style row-normalized upsampling matrix (10 topological steps), so a
+Sparse STC and indexed GIFTI time-series values are smoothed over the full
+display mesh by default using a cached, MNE-style row-normalized upsampling
+matrix (10 topological steps), so a
 low-resolution source estimate can be viewed on the subject's high-resolution
-FreeSurfer or GIFTI geometry without changing vertex numbering. This projection
-is applied only to datasets read from STC files. The advanced hidden flags
-`--stc-sparse` and `--stc-nearest` instead show only source vertices or
-nearest-source patches, respectively.
+FreeSurfer or GIFTI geometry without changing vertex numbering. The picked-node
+waveform uses the same projection, so clicking a display vertex plots its
+interpolated time course. Unreached vertices use the nearest
+source in their connected mesh component. The global `--sparse-fill` option controls this in either viewer mode;
+the older hidden `tc --stc-sparse` and `tc --stc-nearest` aliases still work.
 
 The bottom timecourse dock drives the existing surface renderer. Move the time
 slider, click the graph, or press **Play** to display each sample's vertex
@@ -438,12 +590,15 @@ differences, examples, diagnostics, and known limitations.
 - Right-click the surface to inspect the nearest node, triangle, and loaded
   overlay value.
 - With a surface time-series overlay active, press `D` to open or toggle
-  InstaCorr. Its floating panel exposes a SUMA preprocessing switch plus
+  InstaCorr in a separate native controller window, like the ROI controller.
+  Its panel exposes a SUMA preprocessing switch plus
   editable TR, polort, and bandpass settings; press **Recalculate** to apply
   changes. Turning preprocessing off disables those dependent settings and
   computes a raw dot product, matching SUMA's `normalize_dset` gate. Ordinary
   right-clicks then update the seed using the applied settings.
   Shift-right-click moves the crosshair without recalculating InstaCorr.
+  Closing the InstaCorr window leaves the session active; use its Active
+  checkbox or press `D` to suspend/resume seed updates.
 - Scroll to zoom.
 - Press Space to reset the camera.
 - Press `C` to switch camera mode between `orbit` and `turntable`.
