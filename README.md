@@ -64,6 +64,13 @@ United States. It is freely available for public use and reproduction. See
 [`LICENSE`](LICENSE) for the full public-domain notice, warranty disclaimer,
 and treatment of third-party material.
 
+## Documentation
+
+The user guide starts at [docs/index.md](docs/index.md), with installation,
+viewer controls, timecourses, InstaCorr, and surface mapping guides.
+See [Building and publishing the docs](docs/documentation.md) to preview the
+Sphinx site locally or connect it to Read the Docs.
+
 ## Install
 
 Sumaru is currently built from source and requires Rust and Cargo.

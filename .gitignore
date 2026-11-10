@@ -1,3 +1,8 @@
 /target/
 .DS_Store
 .claude
+
+# Documentation builds
+/.venv-docs/
+/docs/_build/
+/docs/__pycache__/
