@@ -460,6 +460,39 @@ mod tests {
     }
 
     #[test]
+    fn correlations_are_invariant_to_signal_units() {
+        let signal = (0..361)
+            .map(|index| (index as f64 * 0.2).sin() + 0.2 * (index as f64 * 0.7).cos())
+            .collect::<Vec<_>>();
+        for bandpass_enabled in [false, true] {
+            let rows = [1.0, 1.0e-15, 1.0e-200, 1.0e200, -1.0e-15]
+                .into_iter()
+                .map(|scale| signal.iter().map(|value| value * scale).collect())
+                .collect();
+            let prepared = prepare_rows(
+                rows,
+                InstaCorrOptions {
+                    bandpass_enabled,
+                    polort: 2,
+                    ..options()
+                },
+            )
+            .unwrap();
+            for seed in 0..5 {
+                let correlations = prepared.correlate(seed).unwrap();
+                for (node, correlation) in correlations.iter().enumerate() {
+                    let expected = if (seed == 4) == (node == 4) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    assert!((correlation - expected).abs() < 1.0e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn constant_rows_are_invalid() {
         let prepared = prepare_rows(
             vec![vec![1.0, 3.0, 2.0, 5.0], vec![4.0, 4.0, 4.0, 4.0]],
