@@ -1852,6 +1852,14 @@ impl ViewerState {
     ) {
         self.draw_surface_qc_controls(ui, actions);
         let overlay_loaded = self.overlay.is_loaded();
+        // Compare canonical source rows, not the reconstructed render data:
+        // an indexed NIML dataset may still cover every surface vertex.
+        let show_sparse_fill = self
+            .overlay
+            .data
+            .dataset()
+            .zip(self.mesh.as_ref())
+            .is_some_and(|(dataset, mesh)| dataset.row_count != mesh.domain.node_count);
         let column_options = self
             .overlay
             .data
@@ -1874,38 +1882,40 @@ impl ViewerState {
                     .on_hover_text(dataset.mapping_warnings.join("\n"));
             }
 
-            ui.horizontal(|ui| {
-                ui.label("Sparse fill");
-                egui::ComboBox::from_id_salt("sparse_fill_method")
-                    .selected_text(match self.sparse_timecourse_display {
-                        SparseTimecourseDisplay::Sparse => "Sampled only",
-                        SparseTimecourseDisplay::Nearest => "Mesh nearest",
-                        SparseTimecourseDisplay::Smooth => "MNE smooth",
-                    })
-                    .show_ui(ui, |ui| {
-                        for (method, label) in [
-                            (SparseTimecourseDisplay::Sparse, "Sampled only"),
-                            (SparseTimecourseDisplay::Nearest, "Mesh nearest"),
-                            (SparseTimecourseDisplay::Smooth, "MNE smooth"),
-                        ] {
-                            sparse_changed |= ui
-                                .selectable_value(
-                                    &mut self.sparse_timecourse_display,
-                                    method,
-                                    label,
-                                )
-                                .changed();
-                        }
-                    });
-            });
-            if self.sparse_timecourse_display == SparseTimecourseDisplay::Smooth {
-                sparse_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.sparse_smoothing_steps, 1..=30)
-                            .text("Smoothing steps"),
-                    )
-                    .changed();
-                ui.small("Changes sampled values too; mesh-nearest fallback fills uncovered reachable nodes. Labels stay sampled-only.");
+            if show_sparse_fill {
+                ui.horizontal(|ui| {
+                    ui.label("Sparse fill");
+                    egui::ComboBox::from_id_salt("sparse_fill_method")
+                        .selected_text(match self.sparse_timecourse_display {
+                            SparseTimecourseDisplay::Sparse => "Sampled only",
+                            SparseTimecourseDisplay::Nearest => "Mesh nearest",
+                            SparseTimecourseDisplay::Smooth => "MNE smooth",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (method, label) in [
+                                (SparseTimecourseDisplay::Sparse, "Sampled only"),
+                                (SparseTimecourseDisplay::Nearest, "Mesh nearest"),
+                                (SparseTimecourseDisplay::Smooth, "MNE smooth"),
+                            ] {
+                                sparse_changed |= ui
+                                    .selectable_value(
+                                        &mut self.sparse_timecourse_display,
+                                        method,
+                                        label,
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+                if self.sparse_timecourse_display == SparseTimecourseDisplay::Smooth {
+                    sparse_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.sparse_smoothing_steps, 1..=30)
+                                .text("Smoothing steps"),
+                        )
+                        .changed();
+                    ui.small("Changes sampled values too; mesh-nearest fallback fills uncovered reachable nodes. Labels stay sampled-only.");
+                }
             }
             if self.overlay_count() > 0 {
                 let active = self.active_overlay_index().unwrap_or(0);

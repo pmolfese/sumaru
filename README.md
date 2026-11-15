@@ -88,6 +88,34 @@ These steps assume your AFNI programs are in `~/abin` and that directory is on
 your `PATH`. If AFNI is installed elsewhere, copy `target/release/sumaru` to
 that directory or another directory on your `PATH` instead.
 
+### Signed macOS releases
+
+On a Mac with Xcode tools and a Developer ID Application certificate/private key,
+run:
+
+```bash
+./scripts/release.sh                       # Universal: Intel + Apple Silicon
+./scripts/release.sh arm64                 # Apple Silicon only
+./scripts/release.sh x86_64                # Intel only
+./scripts/release.sh --notarize            # Universal, signed and notarized
+```
+
+The script builds with Cargo, signs with hardened runtime and a secure timestamp,
+verifies the signature, and produces an executable and ZIP under
+`target/distribution/<architecture>/`. It installs missing Rust targets via
+`rustup`, and uses that same rustup toolchain for Cargo and rustc even when
+Homebrew Rust comes first on `PATH`. Set `RUSTUP_TOOLCHAIN` to select a specific
+installed toolchain. The default signing identity is
+`Developer ID Application: Peter Molfese (7V8RRF84QH)`; override it with `SIGN_ID`.
+Optional notarization reuses EVA's `eva-notary` Keychain profile; override it with
+`NOTARY_PROFILE`. No passwords are stored in the script.
+
+Signing alone does not notarize a release. `--notarize` uploads the ZIP to Apple
+and requires an `Accepted` result before publishing the output. Standalone binaries
+and ZIP archives cannot have notarization tickets stapled to them, so Gatekeeper
+needs online ticket lookup. Test the downloaded release on both architectures
+before distribution. Run `./scripts/release.sh --help` for all options.
+
 ### Running Sumaru
 
 After copying the release binary onto your `PATH`, launch it with `sumaru`
